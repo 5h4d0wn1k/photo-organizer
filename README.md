@@ -14,6 +14,10 @@ Photo organizer App is a Python tool that uses facial recognition to effortlessl
 - [Credits](#credits)
 - [License](#license)
 
+## Project Screenshot
+
+![GUI Screenshot](./gui_preview.png)
+
 ## Motivation
 
 The motivation behind this project is to simplify the process of organizing a vast number of images by automatically sorting them based on the face of a specified person.
@@ -31,15 +35,7 @@ The app then processes the images, moving the matching ones to the specified out
 
 ## Installation and Usage
 
-### Requirements
 
-- Python 3.6 or higher
-- OpenCV (`pip install opencv-python`)
-- Face Recognition (`pip install face-recognition`)
-- dlib (`pip install dlib`)
-- tqdm (`pip install tqdm`)
-- numpy (`pip install numpy`)
-- 
 
 ### How to Install and Run
 
@@ -71,6 +67,19 @@ The app then processes the images, moving the matching ones to the specified out
     ```bash
     python main.py
     ```
+    
+### Requirements
+ Only if you want to do it manually 
+- Python 3.6 or higher
+- OpenCV (`pip install opencv-python`)
+- Face Recognition (`pip install face-recognition`)
+- dlib (`pip install dlib`)
+- tqdm (`pip install tqdm`)
+- numpy (`pip install numpy`)
+- scikit-learn (`pip install scikit-learn`)
+- scikit-image (`pip install scikit-image`)
+- pillow (`pip install pillow`)
+- tkinter (`pip install tk`)
 
 ### How to Use the Project
 
