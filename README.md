@@ -1,2 +1,85 @@
 # photo-organizer
+
+## Overview
+
 Photo organizer App is a Python tool that uses facial recognition to effortlessly organize your photo collection. Simply choose a reference photo, select the folder to sort, and designate a destination folder. The app leverages GPU acceleration for optimal speed, ensuring efficient photo management. Simplify your image sorting with it.
+
+## Table of Contents
+
+- [Motivation](#motivation)
+- [Project Description](#project-description)
+- [Installation and Usage](#installation-and-usage)
+- [How to Run](#how-to-run)
+- [Features](#features)
+- [Credits](#credits)
+- [License](#license)
+
+## Motivation
+
+The motivation behind this project is to simplify the process of organizing a vast number of images by automatically sorting them based on the face of a specified person.
+
+## Project Description
+
+This application offers a user-friendly GUI that allows users to:
+
+- Select the target person's photo.
+- Choose the folder containing unorganized images.
+- Specify the destination folder for matching images.
+- Set the tolerance or accuracy level for face matching.
+
+The app then processes the images, moving the matching ones to the specified output folder.
+
+## Installation and Usage
+
+### Requirements
+
+- Python 3.6 or higher
+- OpenCV (`pip install opencv-python`)
+- Face Recognition (`pip install face-recognition`)
+- dlib (`pip install dlib`)
+- tqdm (`pip install tqdm`)
+
+### How to Install and Run
+
+1. Clone the repository:
+
+    ```bash
+    git clone https://github.com/yourusername/face-recognition-app.git
+    cd face-recognition-app
+    ```
+
+2. Install the required dependencies:
+
+    ```bash
+    pip install -r requirements.txt
+    ```
+
+3. Run the application:
+
+    ```bash
+    python main.py
+    ```
+
+### How to Use the Project
+
+1. Select the target person's photo.
+2. Choose the folder containing unorganized images.
+3. Specify the destination folder for matching images.
+4. Set the tolerance level (0.0 - 1.0) for face matching.
+5. Click the "Start Processing" button to initiate the image sorting process.
+
+## Features
+
+- Automatic image sorting based on face recognition.
+- User-friendly GUI for easy interaction.
+- Progress bar for tracking processing status.
+- Error handling for a smooth user experience.
+
+## Credits
+
+- Developed by Nikhil Nagpure
+
+## License
+
+This project is licensed under the [Apache 2.0](LICENSE).
+
