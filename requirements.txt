@@ -1,0 +1,8 @@
+opencv-python-headless
+face-recognition
+tqdm
+dlib
+tkinter
+numpy
+pillow
+scikit
