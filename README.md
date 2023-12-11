@@ -38,23 +38,35 @@ The app then processes the images, moving the matching ones to the specified out
 - Face Recognition (`pip install face-recognition`)
 - dlib (`pip install dlib`)
 - tqdm (`pip install tqdm`)
+- numpy (`pip install numpy`)
+- 
 
 ### How to Install and Run
 
-1. Clone the repository:
+1. Python
+   If you don't have Python installed on your machine, follow these steps:
+ For Windows:
+   Download the latest version of Python from python.org
+   During installation, make sure to check the box that says "Add Python to PATH.
+ For macOS and Linux:
+   Python is usually pre-installed on macOS and many Linux distributions. Open a terminal and type python3 or python to
+   check if it's already installed.
+   If not installed, you can install it using the package manager for your system.
+
+3. Clone the repository:
 
     ```bash
-    git clone https://github.com/yourusername/face-recognition-app.git
-    cd face-recognition-app
+    git clone https://github.com/5h4d0wn1k/photo-organizer.git
+    cd photo-organizer
     ```
 
-2. Install the required dependencies:
+4. Install the required dependencies:
 
     ```bash
     pip install -r requirements.txt
     ```
 
-3. Run the application:
+5. Run the application:
 
     ```bash
     python main.py
@@ -77,7 +89,7 @@ The app then processes the images, moving the matching ones to the specified out
 
 ## Credits
 
-- Developed by Nikhil Nagpure
+- Developed by [Nikhil Nagpure]
 
 ## License
 
