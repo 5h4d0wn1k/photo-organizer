@@ -16,7 +16,7 @@ Photo organizer App is a Python tool that uses facial recognition to effortlessl
 
 ## Project Screenshot
 
-![GUI Preview](./gui_preview.png)
+![GUI Preview](gui_preview.png)
 
 ## Motivation
 
