@@ -1,9 +1,11 @@
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 
 import '../features/albums/albums_screen.dart';
 import '../features/import/import_screen.dart';
 import '../features/events/events_screen.dart';
 import '../features/jobs/jobs_screen.dart';
+import '../features/mobile/mobile_pairing_screen.dart';
 import '../features/people/people_screen.dart';
 import '../features/places/places_screen.dart';
 import '../features/search/search_screen.dart';
@@ -16,18 +18,45 @@ import '../repositories/gallery_repository.dart';
 import '../repositories/resilient_gallery_repository.dart';
 import '../theme/app_theme.dart';
 
+enum GalleryClientMode {
+  desktop,
+  mobile,
+}
+
 class PrivateGalleryApp extends StatelessWidget {
-  const PrivateGalleryApp({super.key});
+  const PrivateGalleryApp({
+    super.key,
+    this.mode,
+  });
+
+  final GalleryClientMode? mode;
 
   @override
   Widget build(BuildContext context) {
+    final effectiveMode = mode ?? defaultGalleryClientMode();
     return MaterialApp(
       title: 'Private Gallery',
       debugShowCheckedModeBanner: false,
       theme: buildAppTheme(),
-      home: const GalleryBootstrapPage(),
+      home: effectiveMode == GalleryClientMode.mobile
+          ? const MobilePairingScreen()
+          : const GalleryBootstrapPage(),
     );
   }
+}
+
+GalleryClientMode defaultGalleryClientMode() {
+  if (kIsWeb) {
+    return GalleryClientMode.desktop;
+  }
+  return switch (defaultTargetPlatform) {
+    TargetPlatform.android || TargetPlatform.iOS => GalleryClientMode.mobile,
+    TargetPlatform.fuchsia ||
+    TargetPlatform.linux ||
+    TargetPlatform.macOS ||
+    TargetPlatform.windows =>
+      GalleryClientMode.desktop,
+  };
 }
 
 class GalleryBootstrapPage extends StatefulWidget {

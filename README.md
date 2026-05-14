@@ -9,6 +9,7 @@ This repository now contains a desktop-usable MVP for the first phase of the pro
 - Rust local daemon with persisted SQLite metadata.
 - Flutter desktop client with real startup, setup, import, settings, and live-data screens.
 - Cross-desktop runners for Linux, macOS, and Windows.
+- Android runner with mobile pairing and camera-roll permission readiness screens.
 - Real folder and removable-drive scan/commit imports with copy/reference modes and checksum dedupe.
 - Live timeline, places, events, and jobs views backed by persisted API state.
 - Encrypted database activation, local-only OCR indexing/search, model governance, backup verification/export surfaces, and large-library timeline pagination.
@@ -46,13 +47,14 @@ The codebase intentionally preserves API surfaces for people, scenes, semantic s
 - Local Tesseract OCR batches after encryption is active.
 - Backup readiness verification and DB/manifest export.
 - Distributed vault control-plane state: vaults, enrolled devices, storage policies, content-addressed blob records, replica health, availability status, and sync transfer planning.
+- Android mobile pairing shell with QR/manual enrollment payload capture, secure local pairing storage, and camera-roll access checks.
 
 ## Intentionally Deferred
 
 - Face clustering and real biometric indexing providers.
 - Scene tagging, semantic search, and vector indexing providers.
 - P2P media transfer execution over LAN, internet, or relay.
-- Mobile pairing/upload UX.
+- Mobile P2P handshake, camera-roll upload execution, and remote original fetches.
 - File-picker based import selection.
 - Full media-copy backup restore UX.
 - Cloud relay, public sharing, or remote ML.

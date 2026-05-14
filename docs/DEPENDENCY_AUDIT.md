@@ -36,6 +36,12 @@ This audit tracks whether current production dependencies perform network I/O or
 | `http` | Calls local Rust daemon | Loopback only | Defaults to `http://127.0.0.1:4821`. |
 | `intl` | Date formatting | No | UI formatting. |
 | `cupertino_icons` | Icons | No | Build-time asset package. |
+| `photo_manager` | Android media library discovery | No network expected | Used only after explicit OS media permission to enumerate local camera-roll assets for future upload queues. |
+| `permission_handler` | OS permission prompts | No | Requests camera/media permissions from the user; does not grant access by itself. |
+| `path_provider` | App-local filesystem paths | No | Finds the application support directory for local mobile cache/enrollment state. |
+| `flutter_secure_storage` | Mobile secret storage | No network expected | Stores pending pairing payloads/session material in platform secure storage. |
+| `mobile_scanner` | QR pairing scanner | No network expected | Uses the device camera only after camera permission is granted. |
+| `qr_flutter` | Local QR rendering | No | Renders device enrollment claim previews without external services. |
 
 ## Policy Notes
 
@@ -43,4 +49,4 @@ This audit tracks whether current production dependencies perform network I/O or
 - Model download support exists only behind `/models/install`, explicit confirmation, reviewed URL matching, personal/family approval, and SHA-256 verification.
 - Indexing jobs must remain isolated from downloader code paths and run from installed local model files only.
 - Any future dependency that can perform network I/O must be added to this document before use.
-- SQLCipher activation and OS key storage are implemented. OCR can use local Tesseract; heuristic scene indexing can use the local Python sidecar with Pillow; semantic and face indexing still require approved local model files and provider implementations.
+- SQLCipher activation and OS key storage are implemented. Android pairing stores pending enrollment data in platform secure storage. OCR can use local Tesseract; heuristic scene indexing can use the local Python sidecar with Pillow; semantic and face indexing still require approved local model files and provider implementations.
