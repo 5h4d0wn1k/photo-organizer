@@ -1,0 +1,31 @@
+.DS_Store
+.idea/
+.vscode/
+.fleet/
+
+# Flutter / Dart
+.dart_tool/
+.packages
+.flutter-plugins
+.flutter-plugins-dependencies
+.pub-cache/
+build/
+
+# Rust
+target/
+
+# Local runtime data
+runtime/
+library/
+tmp/
+
+# Generated logs and exports
+*.log
+*.sqlite
+*.sqlite3
+*.db
+*.zip
+
+# Python generated files
+__pycache__/
+*.py[cod]
