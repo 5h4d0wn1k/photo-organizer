@@ -48,6 +48,101 @@ class LocalApiClient {
     await _getObject('/health');
   }
 
+  Future<MobilePairResponse> pairMobileDevice({
+    required String pairingToken,
+    required String deviceName,
+    required String platform,
+    String? vaultId,
+  }) async {
+    final response = await _postObject('/mobile/pair', {
+      'pairing_token': pairingToken,
+      'device_name': deviceName,
+      'platform': platform,
+      if (vaultId != null && vaultId.trim().isNotEmpty) 'vault_id': vaultId,
+    });
+    return MobilePairResponse.fromJson(response);
+  }
+
+  Future<MobileSession> fetchMobileSession({
+    required String bearerToken,
+  }) async {
+    final response = await _getObject(
+      '/mobile/session',
+      headers: _mobileHeaders(bearerToken),
+    );
+    return MobileSession.fromJson(response);
+  }
+
+  Future<MobileUpload> reserveMobileUpload({
+    required String bearerToken,
+    required String originalFilename,
+    required String mediaKind,
+    required String mimeType,
+    required int bytes,
+    String? contentHash,
+    DateTime? capturedAt,
+    String? placeHint,
+  }) async {
+    final response = await _postObject(
+      '/mobile/uploads',
+      {
+        'original_filename': originalFilename,
+        'media_kind': mediaKind,
+        'mime_type': mimeType,
+        'bytes': bytes,
+        if (contentHash != null && contentHash.trim().isNotEmpty)
+          'content_hash': contentHash.trim(),
+        if (capturedAt != null)
+          'captured_at': capturedAt.toUtc().toIso8601String(),
+        if (placeHint != null && placeHint.trim().isNotEmpty)
+          'place_hint': placeHint.trim(),
+      },
+      headers: _mobileHeaders(bearerToken),
+      timeout: _heavyReadTimeout,
+    );
+    return MobileUpload.fromJson(response);
+  }
+
+  Future<MobileUpload> uploadMobileOriginal({
+    required String bearerToken,
+    required String uploadId,
+    required List<int> bytes,
+  }) async {
+    final response = await _putBytes(
+      '/mobile/uploads/$uploadId',
+      bytes,
+      headers: _mobileHeaders(bearerToken),
+      timeout: _heavyReadTimeout,
+    );
+    return MobileUpload.fromJson(response);
+  }
+
+  Future<List<MobileAssetSummary>> fetchMobileAssets({
+    required String bearerToken,
+  }) async {
+    final response = await _getList(
+      '/mobile/assets',
+      headers: _mobileHeaders(bearerToken),
+      timeout: _heavyReadTimeout,
+    );
+    return response.map(MobileAssetSummary.fromJson).toList();
+  }
+
+  Future<List<int>> downloadMobileOriginal({
+    required String bearerToken,
+    required String assetId,
+  }) async {
+    final response = await _request(
+      () => _httpClient.get(
+        _resolve('/mobile/assets/$assetId/original'),
+        headers: _mobileHeaders(bearerToken),
+      ),
+      '/mobile/assets/$assetId/original',
+      timeout: _heavyReadTimeout,
+    );
+    return response.bodyBytes;
+  }
+
   Future<DaemonDiagnostics> fetchDiagnostics() async {
     final response = await _getObject('/diagnostics');
     return DaemonDiagnostics.fromJson(response);
@@ -715,10 +810,14 @@ class LocalApiClient {
   Future<Map<String, dynamic>> _getObject(
     String path, {
     Map<String, String>? queryParameters,
+    Map<String, String>? headers,
     Duration? timeout,
   }) async {
     final response = await _request(
-      () => _httpClient.get(_resolve(path, queryParameters: queryParameters)),
+      () => _httpClient.get(
+        _resolve(path, queryParameters: queryParameters),
+        headers: headers,
+      ),
       path,
       timeout: timeout,
     );
@@ -727,10 +826,11 @@ class LocalApiClient {
 
   Future<List<Map<String, dynamic>>> _getList(
     String path, {
+    Map<String, String>? headers,
     Duration? timeout,
   }) async {
     final response = await _request(
-      () => _httpClient.get(_resolve(path)),
+      () => _httpClient.get(_resolve(path), headers: headers),
       path,
       timeout: timeout,
     );
@@ -740,12 +840,16 @@ class LocalApiClient {
   Future<Map<String, dynamic>> _postObject(
     String path,
     Map<String, dynamic> payload, {
+    Map<String, String>? headers,
     Duration? timeout,
   }) async {
     final response = await _request(
       () => _httpClient.post(
         _resolve(path),
-        headers: const {'content-type': 'application/json'},
+        headers: {
+          'content-type': 'application/json',
+          if (headers != null) ...headers,
+        },
         body: jsonEncode(payload),
       ),
       path,
@@ -757,18 +861,43 @@ class LocalApiClient {
   Future<List<Map<String, dynamic>>> _postList(
     String path,
     Map<String, dynamic> payload, {
+    Map<String, String>? headers,
     Duration? timeout,
   }) async {
     final response = await _request(
       () => _httpClient.post(
         _resolve(path),
-        headers: const {'content-type': 'application/json'},
+        headers: {
+          'content-type': 'application/json',
+          if (headers != null) ...headers,
+        },
         body: jsonEncode(payload),
       ),
       path,
       timeout: timeout,
     );
     return _decodeList(response);
+  }
+
+  Future<Map<String, dynamic>> _putBytes(
+    String path,
+    List<int> body, {
+    Map<String, String>? headers,
+    Duration? timeout,
+  }) async {
+    final response = await _request(
+      () => _httpClient.put(
+        _resolve(path),
+        headers: {
+          'content-type': 'application/octet-stream',
+          if (headers != null) ...headers,
+        },
+        body: body,
+      ),
+      path,
+      timeout: timeout,
+    );
+    return _decodeObject(response);
   }
 
   Future<void> _delete(String path) async {
@@ -834,5 +963,9 @@ class LocalApiClient {
           ),
         )
         .toList();
+  }
+
+  Map<String, String> _mobileHeaders(String bearerToken) {
+    return {'authorization': 'Bearer ${bearerToken.trim()}'};
   }
 }

@@ -237,6 +237,50 @@ void main() {
     expect(evicted.state, AssetAvailabilityState.remoteAvailable);
     expect(revoked.revoked, isTrue);
   });
+
+  test('uses authenticated mobile sync endpoints', () async {
+    final client = LocalApiClient(
+      httpClient: _MobileSyncJsonClient(),
+      baseUri: Uri.parse('http://127.0.0.1:4821'),
+    );
+
+    final paired = await client.pairMobileDevice(
+      pairingToken: 'pair-token',
+      deviceName: 'Moto G',
+      platform: 'android',
+    );
+    final session = await client.fetchMobileSession(
+      bearerToken: paired.bearerToken,
+    );
+    final reserved = await client.reserveMobileUpload(
+      bearerToken: paired.bearerToken,
+      originalFilename: 'photo.jpg',
+      mediaKind: 'photo',
+      mimeType: 'image/jpeg',
+      bytes: 3,
+      capturedAt: DateTime.parse('2026-05-13T06:00:00Z'),
+    );
+    final completed = await client.uploadMobileOriginal(
+      bearerToken: paired.bearerToken,
+      uploadId: reserved.id,
+      bytes: const [1, 2, 3],
+    );
+    final assets = await client.fetchMobileAssets(
+      bearerToken: paired.bearerToken,
+    );
+    final original = await client.downloadMobileOriginal(
+      bearerToken: paired.bearerToken,
+      assetId: assets.single.assetId,
+    );
+
+    expect(paired.device.displayName, 'Moto G');
+    expect(session.deviceId, 'device-mobile');
+    expect(reserved.status, MobileUploadStatus.pending);
+    expect(completed.status, MobileUploadStatus.completed);
+    expect(completed.assetId, 'asset-1');
+    expect(assets.single.originalFilename, 'photo.jpg');
+    expect(original, [1, 2, 3]);
+  });
 }
 
 class _DelayedJsonClient extends http.BaseClient {
@@ -493,6 +537,50 @@ class _VaultSyncJsonClient extends http.BaseClient {
   }
 }
 
+class _MobileSyncJsonClient extends http.BaseClient {
+  @override
+  Future<http.StreamedResponse> send(http.BaseRequest request) async {
+    final path = request.url.path;
+    if (path != '/mobile/pair') {
+      expect(request.headers['authorization'], 'Bearer mobile-token');
+    }
+    if (request.method == 'GET' && path == '/mobile/assets/asset-1/original') {
+      return http.StreamedResponse(
+        Stream<List<int>>.value(const [1, 2, 3]),
+        HttpStatus.ok,
+        headers: const {'content-type': 'image/jpeg'},
+      );
+    }
+
+    final body = switch ((request.method, path)) {
+      ('POST', '/mobile/pair') => _mobilePairJson(),
+      ('GET', '/mobile/session') => _mobileSessionJson(),
+      ('POST', '/mobile/uploads') => _mobileUploadJson(status: 'pending'),
+      ('PUT', '/mobile/uploads/upload-1') =>
+        _mobileUploadJson(status: 'completed', assetId: 'asset-1'),
+      ('GET', '/mobile/assets') => [_mobileAssetJson()],
+      _ => throw StateError('Unexpected ${request.method} $path'),
+    };
+
+    if (request.method == 'POST' && path == '/mobile/uploads') {
+      final streamed = request as http.Request;
+      final payload = jsonDecode(streamed.body) as Map<String, Object?>;
+      expect(payload['original_filename'], 'photo.jpg');
+      expect(payload['bytes'], 3);
+    }
+    if (request.method == 'PUT') {
+      final streamed = request as http.Request;
+      expect(streamed.bodyBytes, [1, 2, 3]);
+    }
+
+    return http.StreamedResponse(
+      Stream<List<int>>.value(utf8.encode(jsonEncode(body))),
+      HttpStatus.ok,
+      headers: const {'content-type': 'application/json'},
+    );
+  }
+}
+
 Map<String, Object?> _storagePolicyJson() {
   return {
     'mode': 'protected_min_2',
@@ -542,6 +630,70 @@ Map<String, Object?> _deviceJson({
     'enrolled_at': '2026-05-13T06:00:00Z',
     'last_seen_at': revoked ? null : '2026-05-13T06:00:00Z',
     'revoked_at': revoked ? '2026-05-13T06:05:00Z' : null,
+  };
+}
+
+Map<String, Object?> _mobileSessionJson() {
+  return {
+    'id': 'session-1',
+    'device_id': 'device-mobile',
+    'vault_id': 'vault-1',
+    'display_name': 'Moto G',
+    'platform': 'android',
+    'created_at': '2026-05-13T06:00:00Z',
+    'expires_at': '2027-05-13T06:00:00Z',
+    'last_seen_at': '2026-05-13T06:01:00Z',
+    'revoked_at': null,
+  };
+}
+
+Map<String, Object?> _mobilePairJson() {
+  return {
+    'session': _mobileSessionJson(),
+    'device': _deviceJson(
+      id: 'device-mobile',
+      displayName: 'Moto G',
+    ),
+    'bearer_token': 'mobile-token',
+    'detail': 'mobile device paired',
+  };
+}
+
+Map<String, Object?> _mobileUploadJson({
+  required String status,
+  String? assetId,
+}) {
+  return {
+    'id': 'upload-1',
+    'session_id': 'session-1',
+    'device_id': 'device-mobile',
+    'vault_id': 'vault-1',
+    'asset_id': assetId,
+    'original_filename': 'photo.jpg',
+    'media_kind': 'photo',
+    'mime_type': 'image/jpeg',
+    'bytes_total': 3,
+    'bytes_received': status == 'completed' ? 3 : 0,
+    'content_hash': 'hash-a',
+    'captured_at': '2026-05-13T06:00:00Z',
+    'place_hint': null,
+    'status': status,
+    'error_detail': null,
+    'created_at': '2026-05-13T06:00:00Z',
+    'updated_at': '2026-05-13T06:01:00Z',
+  };
+}
+
+Map<String, Object?> _mobileAssetJson() {
+  return {
+    'asset_id': 'asset-1',
+    'original_filename': 'photo.jpg',
+    'media_kind': 'photo',
+    'mime_type': 'image/jpeg',
+    'bytes': 3,
+    'content_hash': 'hash-a',
+    'captured_at': '2026-05-13T06:00:00Z',
+    'available': true,
   };
 }
 

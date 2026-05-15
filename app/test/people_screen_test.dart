@@ -203,6 +203,7 @@ PrivacyStatus _privacyStatus() {
     daemonBindAddress: '127.0.0.1:4821',
     loopbackOnly: true,
     developerMode: false,
+    remoteMobileAccessEnabled: false,
     photoProcessingNetworkAllowed: false,
     modelDownloadRequiresConfirmation: true,
     telemetryEnabled: false,

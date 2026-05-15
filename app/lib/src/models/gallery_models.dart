@@ -269,6 +269,32 @@ extension SyncTransferStatusX on SyncTransferStatus {
   }
 }
 
+enum MobileUploadStatus {
+  pending,
+  running,
+  completed,
+  failed,
+  canceled,
+}
+
+extension MobileUploadStatusX on MobileUploadStatus {
+  static MobileUploadStatus fromJson(String? value) {
+    switch (value) {
+      case 'running':
+        return MobileUploadStatus.running;
+      case 'completed':
+        return MobileUploadStatus.completed;
+      case 'failed':
+        return MobileUploadStatus.failed;
+      case 'canceled':
+        return MobileUploadStatus.canceled;
+      case 'pending':
+      default:
+        return MobileUploadStatus.pending;
+    }
+  }
+}
+
 enum SyncTransferExecutionStatus {
   completed,
   failed,
@@ -559,6 +585,7 @@ class PrivacyStatus {
     required this.daemonBindAddress,
     required this.loopbackOnly,
     required this.developerMode,
+    required this.remoteMobileAccessEnabled,
     required this.photoProcessingNetworkAllowed,
     required this.modelDownloadRequiresConfirmation,
     required this.telemetryEnabled,
@@ -573,6 +600,7 @@ class PrivacyStatus {
   final String daemonBindAddress;
   final bool loopbackOnly;
   final bool developerMode;
+  final bool remoteMobileAccessEnabled;
   final bool photoProcessingNetworkAllowed;
   final bool modelDownloadRequiresConfirmation;
   final bool telemetryEnabled;
@@ -595,6 +623,8 @@ class PrivacyStatus {
       daemonBindAddress: json['daemon_bind_address'] as String? ?? '',
       loopbackOnly: json['loopback_only'] as bool? ?? false,
       developerMode: json['developer_mode'] as bool? ?? false,
+      remoteMobileAccessEnabled:
+          json['remote_mobile_access_enabled'] as bool? ?? false,
       photoProcessingNetworkAllowed:
           json['photo_processing_network_allowed'] as bool? ?? false,
       modelDownloadRequiresConfirmation:
@@ -1229,6 +1259,170 @@ class SyncTransfer {
       updatedAt: _readDateTime(json['updated_at']) ?? DateTime.now().toUtc(),
       resumableUntil:
           _readDateTime(json['resumable_until']) ?? DateTime.now().toUtc(),
+    );
+  }
+}
+
+class MobileSession {
+  const MobileSession({
+    required this.id,
+    required this.deviceId,
+    required this.vaultId,
+    required this.displayName,
+    required this.platform,
+    required this.createdAt,
+    required this.expiresAt,
+    required this.lastSeenAt,
+    required this.revokedAt,
+  });
+
+  final String id;
+  final String deviceId;
+  final String vaultId;
+  final String displayName;
+  final String platform;
+  final DateTime createdAt;
+  final DateTime expiresAt;
+  final DateTime? lastSeenAt;
+  final DateTime? revokedAt;
+
+  factory MobileSession.fromJson(Map<String, dynamic> json) {
+    return MobileSession(
+      id: json['id'].toString(),
+      deviceId: json['device_id'].toString(),
+      vaultId: json['vault_id'].toString(),
+      displayName: json['display_name'] as String? ?? 'Mobile device',
+      platform: json['platform'] as String? ?? 'android',
+      createdAt: _readDateTime(json['created_at']) ?? DateTime.now().toUtc(),
+      expiresAt: _readDateTime(json['expires_at']) ?? DateTime.now().toUtc(),
+      lastSeenAt: _readDateTime(json['last_seen_at']),
+      revokedAt: _readDateTime(json['revoked_at']),
+    );
+  }
+}
+
+class MobileUpload {
+  const MobileUpload({
+    required this.id,
+    required this.sessionId,
+    required this.deviceId,
+    required this.vaultId,
+    required this.assetId,
+    required this.originalFilename,
+    required this.mediaKind,
+    required this.mimeType,
+    required this.bytesTotal,
+    required this.bytesReceived,
+    required this.contentHash,
+    required this.capturedAt,
+    required this.placeHint,
+    required this.status,
+    required this.errorDetail,
+    required this.createdAt,
+    required this.updatedAt,
+  });
+
+  final String id;
+  final String sessionId;
+  final String deviceId;
+  final String vaultId;
+  final String? assetId;
+  final String originalFilename;
+  final String mediaKind;
+  final String mimeType;
+  final int bytesTotal;
+  final int bytesReceived;
+  final String? contentHash;
+  final DateTime? capturedAt;
+  final String? placeHint;
+  final MobileUploadStatus status;
+  final String? errorDetail;
+  final DateTime createdAt;
+  final DateTime updatedAt;
+
+  factory MobileUpload.fromJson(Map<String, dynamic> json) {
+    return MobileUpload(
+      id: json['id'].toString(),
+      sessionId: json['session_id'].toString(),
+      deviceId: json['device_id'].toString(),
+      vaultId: json['vault_id'].toString(),
+      assetId: json['asset_id']?.toString(),
+      originalFilename: json['original_filename'] as String? ?? '',
+      mediaKind: json['media_kind'] as String? ?? 'photo',
+      mimeType: json['mime_type'] as String? ?? 'application/octet-stream',
+      bytesTotal: (json['bytes_total'] as num?)?.toInt() ?? 0,
+      bytesReceived: (json['bytes_received'] as num?)?.toInt() ?? 0,
+      contentHash: json['content_hash'] as String?,
+      capturedAt: _readDateTime(json['captured_at']),
+      placeHint: json['place_hint'] as String?,
+      status: MobileUploadStatusX.fromJson(json['status'] as String?),
+      errorDetail: json['error_detail'] as String?,
+      createdAt: _readDateTime(json['created_at']) ?? DateTime.now().toUtc(),
+      updatedAt: _readDateTime(json['updated_at']) ?? DateTime.now().toUtc(),
+    );
+  }
+}
+
+class MobilePairResponse {
+  const MobilePairResponse({
+    required this.session,
+    required this.device,
+    required this.bearerToken,
+    required this.detail,
+  });
+
+  final MobileSession session;
+  final DeviceIdentity device;
+  final String bearerToken;
+  final String detail;
+
+  factory MobilePairResponse.fromJson(Map<String, dynamic> json) {
+    return MobilePairResponse(
+      session: MobileSession.fromJson(
+        (json['session'] as Map? ?? const <String, dynamic>{})
+            .map((key, value) => MapEntry(key.toString(), value)),
+      ),
+      device: DeviceIdentity.fromJson(
+        (json['device'] as Map? ?? const <String, dynamic>{})
+            .map((key, value) => MapEntry(key.toString(), value)),
+      ),
+      bearerToken: json['bearer_token'] as String? ?? '',
+      detail: json['detail'] as String? ?? '',
+    );
+  }
+}
+
+class MobileAssetSummary {
+  const MobileAssetSummary({
+    required this.assetId,
+    required this.originalFilename,
+    required this.mediaKind,
+    required this.mimeType,
+    required this.bytes,
+    required this.contentHash,
+    required this.capturedAt,
+    required this.available,
+  });
+
+  final String assetId;
+  final String originalFilename;
+  final String mediaKind;
+  final String mimeType;
+  final int bytes;
+  final String contentHash;
+  final DateTime capturedAt;
+  final bool available;
+
+  factory MobileAssetSummary.fromJson(Map<String, dynamic> json) {
+    return MobileAssetSummary(
+      assetId: json['asset_id'].toString(),
+      originalFilename: json['original_filename'] as String? ?? '',
+      mediaKind: json['media_kind'] as String? ?? 'photo',
+      mimeType: json['mime_type'] as String? ?? 'application/octet-stream',
+      bytes: (json['bytes'] as num?)?.toInt() ?? 0,
+      contentHash: json['content_hash'] as String? ?? '',
+      capturedAt: _readDateTime(json['captured_at']) ?? DateTime.now().toUtc(),
+      available: json['available'] as bool? ?? false,
     );
   }
 }
