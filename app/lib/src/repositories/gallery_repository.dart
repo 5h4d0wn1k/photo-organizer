@@ -55,6 +55,7 @@ abstract class GalleryRepository {
     DeviceTrustLevel? trustLevel,
     DeviceRole? role,
     DeviceStorageProfile? storageProfile,
+    PeerEndpointDescriptor? endpoint,
   });
   Future<DeviceIdentity> revokeDevice(String id, {String? reason});
   Future<SyncPlan> fetchSyncPlan({String? vaultId});
@@ -63,6 +64,7 @@ abstract class GalleryRepository {
   Future<SyncNetworkStatus> fetchSyncNetworkStatus();
   Future<SyncNetworkStatus> startSyncNetwork();
   Future<SyncNetworkStatus> stopSyncNetwork();
+  Future<LocalEndpointPayload> fetchLocalEndpoint();
   Future<SyncTransfer> retrySyncTransfer(String id);
   Future<SyncTransfer> cancelSyncTransfer(String id);
   Future<AssetAvailability> fetchAssetAvailability(String assetId);

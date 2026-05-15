@@ -1,4 +1,7 @@
+import 'dart:convert';
+
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import '../../models/gallery_models.dart';
 import '../../repositories/gallery_repository.dart';
@@ -23,6 +26,7 @@ class _VaultsScreenState extends State<VaultsScreen> {
   List<DeviceIdentity> _devices = const [];
   List<SyncTransfer> _transfers = const [];
   SyncNetworkStatus? _networkStatus;
+  LocalEndpointPayload? _localEndpoint;
 
   @override
   void initState() {
@@ -68,9 +72,163 @@ class _VaultsScreenState extends State<VaultsScreen> {
 
   Future<void> _runSync() async {
     try {
-      await widget.repository.runSync();
+      final plan = await widget.repository.runSync();
       await _reload();
-      _showMessage('Sync plan queued.');
+      final completed = plan.executionResults
+          .where((result) =>
+              result.status == SyncTransferExecutionStatus.completed)
+          .length;
+      final failed = plan.executionResults
+          .where(
+              (result) => result.status == SyncTransferExecutionStatus.failed)
+          .length;
+      final skipped = plan.executionResults
+          .where(
+              (result) => result.status == SyncTransferExecutionStatus.skipped)
+          .length;
+      if (plan.executionResults.isEmpty) {
+        _showMessage('No P2P transfers ran.');
+      } else {
+        _showMessage(
+          'P2P sync: $completed completed, $failed failed, $skipped skipped.',
+        );
+      }
+    } catch (error) {
+      _showMessage('$error');
+    }
+  }
+
+  Future<void> _startNetwork() async {
+    try {
+      await widget.repository.startSyncNetwork();
+      final endpoint = await widget.repository.fetchLocalEndpoint();
+      await _reload();
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _localEndpoint = endpoint;
+      });
+      _showMessage('P2P sync network started.');
+    } catch (error) {
+      _showMessage('$error');
+    }
+  }
+
+  Future<void> _stopNetwork() async {
+    try {
+      await widget.repository.stopSyncNetwork();
+      await _reload();
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _localEndpoint = null;
+      });
+      _showMessage('P2P sync network stopped.');
+    } catch (error) {
+      _showMessage('$error');
+    }
+  }
+
+  Future<void> _showLocalEndpoint() async {
+    try {
+      final endpoint = await widget.repository.fetchLocalEndpoint();
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _localEndpoint = endpoint;
+      });
+      await showDialog<void>(
+        context: context,
+        builder: (context) {
+          return AlertDialog(
+            title: const Text('Local Endpoint'),
+            content: SizedBox(
+              width: 560,
+              child: SelectableText(endpoint.pairingPayload),
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.of(context).pop(),
+                child: const Text('Close'),
+              ),
+              FilledButton.icon(
+                onPressed: () async {
+                  await Clipboard.setData(
+                    ClipboardData(text: endpoint.pairingPayload),
+                  );
+                  if (context.mounted) {
+                    Navigator.of(context).pop();
+                  }
+                  _showMessage('Endpoint copied.');
+                },
+                icon: const Icon(Icons.copy_outlined),
+                label: const Text('Copy'),
+              ),
+            ],
+          );
+        },
+      );
+    } catch (error) {
+      _showMessage('$error');
+    }
+  }
+
+  Future<void> _enrollPeerEndpoint() async {
+    final controller = TextEditingController();
+    final payload = await showDialog<String>(
+      context: context,
+      builder: (context) {
+        return AlertDialog(
+          title: const Text('Paste Peer Endpoint'),
+          content: SizedBox(
+            width: 560,
+            child: TextField(
+              controller: controller,
+              autofocus: true,
+              minLines: 8,
+              maxLines: 12,
+              decoration: const InputDecoration(
+                labelText: 'Endpoint JSON',
+                prefixIcon: Icon(Icons.hub_outlined),
+                border: OutlineInputBorder(),
+              ),
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(),
+              child: const Text('Cancel'),
+            ),
+            FilledButton.icon(
+              onPressed: () =>
+                  Navigator.of(context).pop(controller.text.trim()),
+              icon: const Icon(Icons.link_outlined),
+              label: const Text('Enroll'),
+            ),
+          ],
+        );
+      },
+    );
+    controller.dispose();
+    if (payload == null || payload.isEmpty) {
+      return;
+    }
+    try {
+      final json = Map<String, dynamic>.from(jsonDecode(payload) as Map);
+      final endpoint = PeerEndpointDescriptor.fromJson(json);
+      await widget.repository.enrollDevice(
+        displayName: endpoint.deviceName,
+        platform: endpoint.platform,
+        publicKey: endpoint.nodeId,
+        trustLevel: endpoint.trustLevel,
+        role: endpoint.role,
+        endpoint: endpoint,
+      );
+      await _reload();
+      _showMessage('Peer endpoint enrolled.');
     } catch (error) {
       _showMessage('$error');
     }
@@ -180,12 +338,32 @@ class _VaultsScreenState extends State<VaultsScreen> {
               FilledButton.icon(
                 onPressed: _loading ? null : _runSync,
                 icon: const Icon(Icons.sync),
-                label: const Text('Run Sync'),
+                label: const Text('Run P2P Sync'),
+              ),
+              OutlinedButton.icon(
+                onPressed: _loading ? null : _startNetwork,
+                icon: const Icon(Icons.play_arrow_outlined),
+                label: const Text('Start Network'),
+              ),
+              OutlinedButton.icon(
+                onPressed: _loading ? null : _stopNetwork,
+                icon: const Icon(Icons.stop_outlined),
+                label: const Text('Stop Network'),
+              ),
+              OutlinedButton.icon(
+                onPressed: _loading ? null : _showLocalEndpoint,
+                icon: const Icon(Icons.copy_outlined),
+                label: const Text('Copy Endpoint'),
+              ),
+              OutlinedButton.icon(
+                onPressed: _loading ? null : _enrollPeerEndpoint,
+                icon: const Icon(Icons.link_outlined),
+                label: const Text('Paste Peer Endpoint'),
               ),
               OutlinedButton.icon(
                 onPressed: _loading ? null : _addStorageOnlyDevice,
                 icon: const Icon(Icons.dns_outlined),
-                label: const Text('Add Storage Device'),
+                label: const Text('Add Storage Placeholder'),
               ),
               OutlinedButton.icon(
                 onPressed: _loading ? null : _reload,
@@ -195,7 +373,7 @@ class _VaultsScreenState extends State<VaultsScreen> {
             ],
           ),
           const SizedBox(height: 20),
-          _NetworkPanel(status: _networkStatus),
+          _NetworkPanel(status: _networkStatus, endpoint: _localEndpoint),
           const SizedBox(height: 20),
           Text('Vaults', style: theme.textTheme.titleLarge),
           const SizedBox(height: 8),
@@ -241,9 +419,10 @@ class _VaultsScreenState extends State<VaultsScreen> {
 }
 
 class _NetworkPanel extends StatelessWidget {
-  const _NetworkPanel({required this.status});
+  const _NetworkPanel({required this.status, required this.endpoint});
 
   final SyncNetworkStatus? status;
+  final LocalEndpointPayload? endpoint;
 
   @override
   Widget build(BuildContext context) {
@@ -269,6 +448,10 @@ class _NetworkPanel extends StatelessWidget {
               value: status?.transport ?? 'unknown',
             ),
             _Metric(
+              label: 'State',
+              value: status?.started == true ? 'listening' : 'stopped',
+            ),
+            _Metric(
               label: 'Pending',
               value: '${status?.pendingTransferCount ?? 0}',
             ),
@@ -283,10 +466,21 @@ class _NetworkPanel extends StatelessWidget {
             SizedBox(
               width: 420,
               child: Text(
-                status?.detail ?? 'Sync network status is unavailable.',
+                endpoint?.detail ??
+                    status?.detail ??
+                    'Sync network status is unavailable.',
                 style: theme.textTheme.bodySmall,
               ),
             ),
+            if (status?.localNodeId?.isNotEmpty == true)
+              SizedBox(
+                width: 240,
+                child: Text(
+                  status!.localNodeId!,
+                  overflow: TextOverflow.ellipsis,
+                  style: theme.textTheme.bodySmall,
+                ),
+              ),
           ],
         ),
       ),

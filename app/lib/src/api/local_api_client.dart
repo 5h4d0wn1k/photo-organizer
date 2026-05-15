@@ -240,6 +240,7 @@ class LocalApiClient {
     DeviceTrustLevel? trustLevel,
     DeviceRole? role,
     DeviceStorageProfile? storageProfile,
+    PeerEndpointDescriptor? endpoint,
   }) async {
     final response = await _postObject('/devices/enroll', {
       'display_name': displayName,
@@ -250,6 +251,7 @@ class LocalApiClient {
       if (trustLevel != null) 'trust_level': trustLevel.wireValue,
       if (role != null) 'role': role.wireValue,
       if (storageProfile != null) 'storage_profile': storageProfile.toJson(),
+      if (endpoint != null) 'endpoint': endpoint.toJson(),
     });
     return DeviceIdentity.fromJson(response);
   }
@@ -297,6 +299,11 @@ class LocalApiClient {
   Future<SyncNetworkStatus> stopSyncNetwork() async {
     final response = await _postObject('/sync/network/stop', const {});
     return SyncNetworkStatus.fromJson(response);
+  }
+
+  Future<LocalEndpointPayload> fetchLocalEndpoint() async {
+    final response = await _getObject('/sync/network/local-endpoint');
+    return LocalEndpointPayload.fromJson(response);
   }
 
   Future<SyncTransfer> retrySyncTransfer(String id) async {

@@ -75,6 +75,7 @@ class ResilientGalleryRepository implements GalleryRepository {
     DeviceTrustLevel? trustLevel,
     DeviceRole? role,
     DeviceStorageProfile? storageProfile,
+    PeerEndpointDescriptor? endpoint,
   }) {
     return _delegate.enrollDevice(
       displayName: displayName,
@@ -84,6 +85,7 @@ class ResilientGalleryRepository implements GalleryRepository {
       trustLevel: trustLevel,
       role: role,
       storageProfile: storageProfile,
+      endpoint: endpoint,
     );
   }
 
@@ -120,6 +122,11 @@ class ResilientGalleryRepository implements GalleryRepository {
   @override
   Future<SyncNetworkStatus> stopSyncNetwork() {
     return _delegate.stopSyncNetwork();
+  }
+
+  @override
+  Future<LocalEndpointPayload> fetchLocalEndpoint() {
+    return _delegate.fetchLocalEndpoint();
   }
 
   @override

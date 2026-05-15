@@ -269,6 +269,37 @@ extension SyncTransferStatusX on SyncTransferStatus {
   }
 }
 
+enum SyncTransferExecutionStatus {
+  completed,
+  failed,
+  skipped,
+}
+
+extension SyncTransferExecutionStatusX on SyncTransferExecutionStatus {
+  String get wireValue {
+    switch (this) {
+      case SyncTransferExecutionStatus.completed:
+        return 'completed';
+      case SyncTransferExecutionStatus.failed:
+        return 'failed';
+      case SyncTransferExecutionStatus.skipped:
+        return 'skipped';
+    }
+  }
+
+  static SyncTransferExecutionStatus fromJson(String? value) {
+    switch (value) {
+      case 'completed':
+        return SyncTransferExecutionStatus.completed;
+      case 'skipped':
+        return SyncTransferExecutionStatus.skipped;
+      case 'failed':
+      default:
+        return SyncTransferExecutionStatus.failed;
+    }
+  }
+}
+
 enum AssetAvailabilityState {
   localAvailable,
   remoteAvailable,
@@ -1202,6 +1233,113 @@ class SyncTransfer {
   }
 }
 
+class PeerEndpointDescriptor {
+  const PeerEndpointDescriptor({
+    required this.deviceId,
+    required this.deviceName,
+    required this.platform,
+    required this.nodeId,
+    required this.relayUrls,
+    required this.directAddresses,
+    required this.expiresAt,
+    required this.trustLevel,
+    required this.role,
+  });
+
+  final String? deviceId;
+  final String deviceName;
+  final String platform;
+  final String nodeId;
+  final List<String> relayUrls;
+  final List<String> directAddresses;
+  final DateTime expiresAt;
+  final DeviceTrustLevel trustLevel;
+  final DeviceRole role;
+
+  factory PeerEndpointDescriptor.fromJson(Map<String, dynamic> json) {
+    return PeerEndpointDescriptor(
+      deviceId: json['device_id']?.toString(),
+      deviceName: json['device_name'] as String? ?? 'Peer device',
+      platform: json['platform'] as String? ?? 'desktop',
+      nodeId: json['node_id'] as String? ?? '',
+      relayUrls: _readStringList(json['relay_urls']),
+      directAddresses: _readStringList(json['direct_addresses']),
+      expiresAt: _readDateTime(json['expires_at']) ?? DateTime.now().toUtc(),
+      trustLevel: DeviceTrustLevelX.fromJson(json['trust_level'] as String?),
+      role: DeviceRoleX.fromJson(json['role'] as String?),
+    );
+  }
+
+  Map<String, dynamic> toJson() {
+    return {
+      if (deviceId != null) 'device_id': deviceId,
+      'device_name': deviceName,
+      'platform': platform,
+      'node_id': nodeId,
+      'relay_urls': relayUrls,
+      'direct_addresses': directAddresses,
+      'expires_at': expiresAt.toUtc().toIso8601String(),
+      'trust_level': trustLevel.wireValue,
+      'role': role.wireValue,
+    };
+  }
+}
+
+class LocalEndpointPayload {
+  const LocalEndpointPayload({
+    required this.descriptor,
+    required this.pairingPayload,
+    required this.detail,
+  });
+
+  final PeerEndpointDescriptor descriptor;
+  final String pairingPayload;
+  final String detail;
+
+  factory LocalEndpointPayload.fromJson(Map<String, dynamic> json) {
+    return LocalEndpointPayload(
+      descriptor: PeerEndpointDescriptor.fromJson(
+        json['descriptor'] as Map<String, dynamic>? ??
+            const <String, dynamic>{},
+      ),
+      pairingPayload: json['pairing_payload'] as String? ?? '',
+      detail: json['detail'] as String? ?? '',
+    );
+  }
+}
+
+class SyncTransferExecutionResult {
+  const SyncTransferExecutionResult({
+    required this.transferId,
+    required this.blobId,
+    required this.fromDeviceId,
+    required this.toDeviceId,
+    required this.status,
+    required this.bytesTransferred,
+    required this.detail,
+  });
+
+  final String transferId;
+  final String blobId;
+  final String? fromDeviceId;
+  final String toDeviceId;
+  final SyncTransferExecutionStatus status;
+  final int bytesTransferred;
+  final String detail;
+
+  factory SyncTransferExecutionResult.fromJson(Map<String, dynamic> json) {
+    return SyncTransferExecutionResult(
+      transferId: json['transfer_id'].toString(),
+      blobId: json['blob_id'].toString(),
+      fromDeviceId: json['from_device_id']?.toString(),
+      toDeviceId: json['to_device_id'].toString(),
+      status: SyncTransferExecutionStatusX.fromJson(json['status'] as String?),
+      bytesTransferred: (json['bytes_transferred'] as num?)?.toInt() ?? 0,
+      detail: json['detail'] as String? ?? '',
+    );
+  }
+}
+
 class SyncConflict {
   const SyncConflict({
     required this.id,
@@ -1243,6 +1381,7 @@ class SyncPlan {
     required this.underReplicatedBlobIds,
     required this.policySatisfied,
     required this.detail,
+    required this.executionResults,
   });
 
   final DateTime generatedAt;
@@ -1252,6 +1391,7 @@ class SyncPlan {
   final List<String> underReplicatedBlobIds;
   final bool policySatisfied;
   final String detail;
+  final List<SyncTransferExecutionResult> executionResults;
 
   factory SyncPlan.fromJson(Map<String, dynamic> json) {
     return SyncPlan(
@@ -1268,6 +1408,9 @@ class SyncPlan {
           _readStringList(json['under_replicated_blob_ids']),
       policySatisfied: json['policy_satisfied'] as bool? ?? false,
       detail: json['detail'] as String? ?? '',
+      executionResults: _readList(json['execution_results'])
+          .map((item) => SyncTransferExecutionResult.fromJson(item))
+          .toList(),
     );
   }
 }

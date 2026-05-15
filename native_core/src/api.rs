@@ -68,6 +68,10 @@ pub fn router(state: AppState) -> Router {
         .route("/sync/network/start", post(start_sync_network))
         .route("/sync/network/stop", post(stop_sync_network))
         .route(
+            "/sync/network/local-endpoint",
+            get(sync_network_local_endpoint),
+        )
+        .route(
             "/sync/transfers/{transfer_id}/retry",
             post(retry_sync_transfer),
         )
@@ -353,6 +357,12 @@ async fn stop_sync_network(
     State(state): State<AppState>,
 ) -> Result<Json<crate::domain::SyncNetworkStatus>, ApiError> {
     Ok(Json(state.service.stop_sync_network().await?))
+}
+
+async fn sync_network_local_endpoint(
+    State(state): State<AppState>,
+) -> Result<Json<crate::domain::LocalEndpointPayload>, ApiError> {
+    Ok(Json(state.service.sync_network_local_endpoint().await?))
 }
 
 async fn retry_sync_transfer(

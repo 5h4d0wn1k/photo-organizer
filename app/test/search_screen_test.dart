@@ -449,6 +449,7 @@ class _FakeSearchRepository implements GalleryRepository {
     DeviceTrustLevel? trustLevel,
     DeviceRole? role,
     DeviceStorageProfile? storageProfile,
+    PeerEndpointDescriptor? endpoint,
   }) {
     throw UnimplementedError();
   }
@@ -485,6 +486,11 @@ class _FakeSearchRepository implements GalleryRepository {
 
   @override
   Future<SyncNetworkStatus> stopSyncNetwork() {
+    throw UnimplementedError();
+  }
+
+  @override
+  Future<LocalEndpointPayload> fetchLocalEndpoint() {
     throw UnimplementedError();
   }
 

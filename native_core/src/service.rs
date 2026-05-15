@@ -30,47 +30,49 @@ use crate::{
         RenamePersonRequest, ReplicaHealth, RevokeDeviceRequest, RunSyncRequest,
         ScanImportSourceRequest, SceneTag, SearchIndexStatus, SearchQuery, SearchResponse,
         SplitPersonRequest, StoragePolicy, StoragePolicyMode, SyncConflict, SyncNetworkStatus,
-        SyncPlan, SyncSession, SyncTransfer, SyncTransferStatus, TimelineBucket, TimelineResponse,
+        SyncPlan, SyncSession, SyncTransfer, SyncTransferExecutionResult,
+        SyncTransferExecutionStatus, SyncTransferStatus, TimelineBucket, TimelineResponse,
         UpdateAlbumAssetsRequest, UpdateAssetFlagsRequest, UpdateAssetsFlagsRequest,
         UpdateLibrarySettingsRequest, UpdatePersonAssetsRequest, UpdateVaultStoragePolicyRequest,
         Vault, VaultInvite, VaultKeyEnvelope, VaultMember, VaultStatus, WatchFolder,
     },
     events, imports, metadata, ml_sidecar, model_registry, ocr, people, search, security,
     storage::{self, PersistedLibraryState, StorageBootstrapReport},
+    sync_transport::{self, OutboundBlobTransfer},
     vault_store,
 };
 
 #[derive(Debug, Default)]
-struct LibraryState {
-    library_settings: Option<LibrarySettings>,
-    watch_folders: Vec<WatchFolder>,
-    assets: Vec<crate::domain::Asset>,
-    albums: Vec<Album>,
-    people: Vec<PersonCluster>,
-    places: Vec<PlaceCluster>,
-    events: Vec<EventCluster>,
-    faces: Vec<crate::domain::FaceTemplate>,
-    feedback: Vec<FeedbackEvent>,
-    vaults: Vec<Vault>,
-    devices: Vec<DeviceIdentity>,
-    vault_members: Vec<VaultMember>,
-    blob_records: Vec<BlobRecord>,
-    blob_chunks: Vec<BlobChunk>,
-    blob_replicas: Vec<BlobReplica>,
-    sync_transfers: Vec<SyncTransfer>,
-    sync_conflicts: Vec<SyncConflict>,
-    vault_invites: Vec<VaultInvite>,
-    vault_key_envelopes: Vec<VaultKeyEnvelope>,
-    relay_endpoints: Vec<RelayEndpoint>,
-    capability_grants: Vec<CapabilityGrant>,
-    pairings: Vec<DevicePairing>,
-    sync_sessions: Vec<SyncSession>,
-    import_sessions: Vec<ImportSession>,
-    jobs: Vec<JobRecord>,
-    job_logs: Vec<JobLog>,
-    corrections: Vec<CorrectionRecord>,
-    ocr_blocks: Vec<OcrBlock>,
-    scene_tags: Vec<SceneTag>,
+pub(crate) struct LibraryState {
+    pub(crate) library_settings: Option<LibrarySettings>,
+    pub(crate) watch_folders: Vec<WatchFolder>,
+    pub(crate) assets: Vec<crate::domain::Asset>,
+    pub(crate) albums: Vec<Album>,
+    pub(crate) people: Vec<PersonCluster>,
+    pub(crate) places: Vec<PlaceCluster>,
+    pub(crate) events: Vec<EventCluster>,
+    pub(crate) faces: Vec<crate::domain::FaceTemplate>,
+    pub(crate) feedback: Vec<FeedbackEvent>,
+    pub(crate) vaults: Vec<Vault>,
+    pub(crate) devices: Vec<DeviceIdentity>,
+    pub(crate) vault_members: Vec<VaultMember>,
+    pub(crate) blob_records: Vec<BlobRecord>,
+    pub(crate) blob_chunks: Vec<BlobChunk>,
+    pub(crate) blob_replicas: Vec<BlobReplica>,
+    pub(crate) sync_transfers: Vec<SyncTransfer>,
+    pub(crate) sync_conflicts: Vec<SyncConflict>,
+    pub(crate) vault_invites: Vec<VaultInvite>,
+    pub(crate) vault_key_envelopes: Vec<VaultKeyEnvelope>,
+    pub(crate) relay_endpoints: Vec<RelayEndpoint>,
+    pub(crate) capability_grants: Vec<CapabilityGrant>,
+    pub(crate) pairings: Vec<DevicePairing>,
+    pub(crate) sync_sessions: Vec<SyncSession>,
+    pub(crate) import_sessions: Vec<ImportSession>,
+    pub(crate) jobs: Vec<JobRecord>,
+    pub(crate) job_logs: Vec<JobLog>,
+    pub(crate) corrections: Vec<CorrectionRecord>,
+    pub(crate) ocr_blocks: Vec<OcrBlock>,
+    pub(crate) scene_tags: Vec<SceneTag>,
 }
 
 impl From<PersistedLibraryState> for LibraryState {
@@ -110,7 +112,7 @@ impl From<PersistedLibraryState> for LibraryState {
 }
 
 impl LibraryState {
-    fn to_persisted(&self) -> PersistedLibraryState {
+    pub(crate) fn to_persisted(&self) -> PersistedLibraryState {
         PersistedLibraryState {
             library_settings: self.library_settings.clone(),
             watch_folders: self.watch_folders.clone(),
@@ -162,6 +164,7 @@ pub struct GalleryService {
     config: AppConfig,
     pub storage: StorageBootstrapReport,
     state: Arc<RwLock<LibraryState>>,
+    sync_runtime: Arc<sync_transport::SyncRuntime>,
 }
 
 impl GalleryService {
@@ -188,10 +191,18 @@ impl GalleryService {
                 .map_err(|err| ServiceError::Storage(err.to_string()))?;
         }
 
+        let state = Arc::new(RwLock::new(state));
+        let sync_runtime = Arc::new(sync_transport::SyncRuntime::new(
+            config.clone(),
+            storage.clone(),
+            Arc::clone(&state),
+        ));
+
         Ok(Self {
             config,
             storage,
-            state: Arc::new(RwLock::new(state)),
+            state,
+            sync_runtime,
         })
     }
 
@@ -457,10 +468,13 @@ impl GalleryService {
             return Err(ServiceError::NotFound(format!("vault {vault_id}")));
         }
 
+        let endpoint = request.endpoint.clone();
         let device = build_device_identity(
             request.display_name,
             request.platform,
-            request.public_key,
+            request
+                .public_key
+                .or_else(|| endpoint.as_ref().map(|value| value.node_id.clone())),
             request.trust_level,
             request.storage_profile,
         )?;
@@ -468,6 +482,16 @@ impl GalleryService {
             .role
             .unwrap_or_else(|| default_role_for_trust(device.trust_level));
         let device = add_device_to_state(&mut state, device, role, vault_id)?;
+        if let Some(endpoint) = endpoint {
+            sync_transport::upsert_relay_endpoint(
+                &mut state,
+                device.id,
+                endpoint.node_id,
+                endpoint.relay_urls.first().cloned(),
+                endpoint.direct_addresses,
+                endpoint.expires_at,
+            );
+        }
         self.persist_locked_state(&state)?;
         Ok(device)
     }
@@ -522,25 +546,33 @@ impl GalleryService {
     }
 
     pub async fn run_sync(&self, request: RunSyncRequest) -> Result<SyncPlan, ServiceError> {
-        let mut state = self.state.write().await;
-        ensure_distributed_defaults(&mut state);
-        refresh_blob_records(&self.config, &mut state);
-        let plan = build_sync_plan(&state, request.vault_id)?;
-        if !request.dry_run {
-            for transfer in &plan.transfers {
-                let duplicate = state.sync_transfers.iter().any(|existing| {
-                    existing.blob_id == transfer.blob_id
-                        && existing.to_device_id == transfer.to_device_id
-                        && matches!(
-                            existing.status,
-                            SyncTransferStatus::Pending | SyncTransferStatus::Running
-                        )
-                });
-                if !duplicate {
-                    state.sync_transfers.push(transfer.clone());
+        let mut plan = {
+            let mut state = self.state.write().await;
+            ensure_distributed_defaults(&mut state);
+            refresh_blob_records(&self.config, &mut state);
+            let plan = build_sync_plan(&state, request.vault_id)?;
+            if !request.dry_run {
+                for transfer in &plan.transfers {
+                    let duplicate = state.sync_transfers.iter().any(|existing| {
+                        existing.blob_id == transfer.blob_id
+                            && existing.to_device_id == transfer.to_device_id
+                            && matches!(
+                                existing.status,
+                                SyncTransferStatus::Pending | SyncTransferStatus::Running
+                            )
+                    });
+                    if !duplicate {
+                        state.sync_transfers.push(transfer.clone());
+                    }
                 }
+                self.persist_locked_state(&state)?;
             }
-            self.persist_locked_state(&state)?;
+            plan
+        };
+        if !request.dry_run {
+            plan.execution_results = self
+                .execute_pending_sync_transfers(request.vault_id)
+                .await?;
         }
         Ok(plan)
     }
@@ -551,19 +583,255 @@ impl GalleryService {
 
     pub async fn sync_network_status(&self) -> SyncNetworkStatus {
         let state = self.state.read().await;
-        build_sync_network_status(&state)
+        let runtime = self.sync_runtime.status().await;
+        build_sync_network_status(&state, runtime)
     }
 
     pub async fn start_sync_network(&self) -> Result<SyncNetworkStatus, ServiceError> {
-        let mut state = self.state.write().await;
-        ensure_distributed_defaults(&mut state);
-        self.persist_locked_state(&state)?;
-        Ok(build_sync_network_status(&state))
+        {
+            let mut state = self.state.write().await;
+            ensure_distributed_defaults(&mut state);
+            self.persist_locked_state(&state)?;
+        }
+        self.sync_runtime
+            .start()
+            .await
+            .map_err(sync_transport_error)?;
+        Ok(self.sync_network_status().await)
     }
 
     pub async fn stop_sync_network(&self) -> Result<SyncNetworkStatus, ServiceError> {
-        let state = self.state.read().await;
-        Ok(build_sync_network_status(&state))
+        self.sync_runtime
+            .stop()
+            .await
+            .map_err(sync_transport_error)?;
+        Ok(self.sync_network_status().await)
+    }
+
+    pub async fn sync_network_local_endpoint(
+        &self,
+    ) -> Result<crate::domain::LocalEndpointPayload, ServiceError> {
+        {
+            let mut state = self.state.write().await;
+            ensure_distributed_defaults(&mut state);
+            self.persist_locked_state(&state)?;
+        }
+        self.sync_runtime
+            .local_endpoint_payload()
+            .await
+            .map_err(sync_transport_error)
+    }
+
+    async fn execute_pending_sync_transfers(
+        &self,
+        vault_id: Option<Uuid>,
+    ) -> Result<Vec<SyncTransferExecutionResult>, ServiceError> {
+        let (library_root, jobs, mut results) = {
+            let mut state = self.state.write().await;
+            ensure_distributed_defaults(&mut state);
+            refresh_blob_records(&self.config, &mut state);
+            let local_device = local_device_id(&state).ok_or_else(|| {
+                ServiceError::Invalid("local device could not be initialized".to_string())
+            })?;
+            let library_root = PathBuf::from(effective_library_root(&state, &self.config));
+            let now = Utc::now();
+            let transfer_ids = state
+                .sync_transfers
+                .iter()
+                .filter(|transfer| {
+                    transfer.status == SyncTransferStatus::Pending
+                        && transfer.from_device_id == Some(local_device)
+                        && vault_id
+                            .map(|vault_id| transfer.vault_id == vault_id)
+                            .unwrap_or(true)
+                })
+                .map(|transfer| transfer.id)
+                .collect::<Vec<_>>();
+            let mut jobs = Vec::new();
+            let mut results = Vec::new();
+
+            for transfer_id in transfer_ids {
+                let Some(index) = state
+                    .sync_transfers
+                    .iter()
+                    .position(|transfer| transfer.id == transfer_id)
+                else {
+                    continue;
+                };
+                let transfer = state.sync_transfers[index].clone();
+                let Some(blob) = state
+                    .blob_records
+                    .iter()
+                    .find(|blob| blob.id == transfer.blob_id && blob.tombstoned_at.is_none())
+                    .cloned()
+                else {
+                    state.sync_transfers[index].status = SyncTransferStatus::Failed;
+                    state.sync_transfers[index].updated_at = now;
+                    results.push(execution_result(
+                        &transfer,
+                        SyncTransferExecutionStatus::Failed,
+                        0,
+                        "blob metadata is missing".to_string(),
+                    ));
+                    continue;
+                };
+                let chunks = state
+                    .blob_chunks
+                    .iter()
+                    .filter(|chunk| chunk.blob_id == blob.id)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if chunks.is_empty()
+                    || !vault_store::encrypted_chunk_files_exist(&library_root, &chunks)
+                {
+                    state.sync_transfers[index].status = SyncTransferStatus::Failed;
+                    state.sync_transfers[index].updated_at = now;
+                    results.push(execution_result(
+                        &transfer,
+                        SyncTransferExecutionStatus::Failed,
+                        0,
+                        "local encrypted chunks are missing or corrupt".to_string(),
+                    ));
+                    continue;
+                }
+                let Some(target_device) = state
+                    .devices
+                    .iter()
+                    .find(|device| {
+                        device.id == transfer.to_device_id
+                            && device.revoked_at.is_none()
+                            && device.storage_profile.accepts_storage
+                    })
+                    .cloned()
+                else {
+                    state.sync_transfers[index].status = SyncTransferStatus::Failed;
+                    state.sync_transfers[index].updated_at = now;
+                    results.push(execution_result(
+                        &transfer,
+                        SyncTransferExecutionStatus::Failed,
+                        0,
+                        "target device is not active or does not accept storage".to_string(),
+                    ));
+                    continue;
+                };
+                let Some(relay_endpoint) = state
+                    .relay_endpoints
+                    .iter()
+                    .find(|endpoint| endpoint.device_id == target_device.id)
+                    .cloned()
+                else {
+                    state.sync_transfers[index].status = SyncTransferStatus::Failed;
+                    state.sync_transfers[index].updated_at = now;
+                    results.push(execution_result(
+                        &transfer,
+                        SyncTransferExecutionStatus::Skipped,
+                        0,
+                        "target device has no known P2P endpoint; paste its endpoint first"
+                            .to_string(),
+                    ));
+                    continue;
+                };
+                if relay_endpoint.expires_at < now {
+                    state.sync_transfers[index].status = SyncTransferStatus::Failed;
+                    state.sync_transfers[index].updated_at = now;
+                    results.push(execution_result(
+                        &transfer,
+                        SyncTransferExecutionStatus::Skipped,
+                        0,
+                        "target device endpoint expired; paste a fresh endpoint".to_string(),
+                    ));
+                    continue;
+                }
+
+                state.sync_transfers[index].status = SyncTransferStatus::Running;
+                state.sync_transfers[index].started_at = Some(now);
+                state.sync_transfers[index].updated_at = now;
+                jobs.push(OutboundBlobTransfer {
+                    transfer,
+                    blob,
+                    chunks,
+                    target: sync_transport::peer_descriptor_for_device(
+                        &target_device,
+                        Some(&relay_endpoint),
+                    ),
+                });
+            }
+            self.persist_locked_state(&state)?;
+            (library_root, jobs, results)
+        };
+
+        if jobs.is_empty() {
+            return Ok(results);
+        }
+        if let Err(err) = self.sync_runtime.start().await {
+            let detail = err.to_string();
+            let mut state = self.state.write().await;
+            for job in jobs {
+                if let Some(transfer) = state
+                    .sync_transfers
+                    .iter_mut()
+                    .find(|transfer| transfer.id == job.transfer.id)
+                {
+                    transfer.status = SyncTransferStatus::Failed;
+                    transfer.updated_at = Utc::now();
+                }
+                results.push(execution_result(
+                    &job.transfer,
+                    SyncTransferExecutionStatus::Failed,
+                    0,
+                    detail.clone(),
+                ));
+            }
+            self.persist_locked_state(&state)?;
+            return Ok(results);
+        }
+
+        for job in jobs {
+            let result = self.sync_runtime.send_blob(&job, &library_root).await;
+            let mut state = self.state.write().await;
+            let now = Utc::now();
+            let transfer_index = state
+                .sync_transfers
+                .iter()
+                .position(|transfer| transfer.id == job.transfer.id);
+            match result {
+                Ok(bytes_transferred) => {
+                    if let Some(index) = transfer_index {
+                        state.sync_transfers[index].status = SyncTransferStatus::Completed;
+                        state.sync_transfers[index].bytes_completed = bytes_transferred;
+                        state.sync_transfers[index].updated_at = now;
+                    }
+                    sync_transport::upsert_blob_replica(
+                        &mut state,
+                        job.blob.id,
+                        job.transfer.to_device_id,
+                        job.blob.bytes,
+                        Some(job.transfer.id),
+                    );
+                    results.push(execution_result(
+                        &job.transfer,
+                        SyncTransferExecutionStatus::Completed,
+                        bytes_transferred,
+                        "encrypted chunks verified by remote peer".to_string(),
+                    ));
+                }
+                Err(err) => {
+                    if let Some(index) = transfer_index {
+                        state.sync_transfers[index].status = SyncTransferStatus::Failed;
+                        state.sync_transfers[index].updated_at = now;
+                    }
+                    results.push(execution_result(
+                        &job.transfer,
+                        SyncTransferExecutionStatus::Failed,
+                        0,
+                        err.to_string(),
+                    ));
+                }
+            }
+            self.persist_locked_state(&state)?;
+        }
+
+        Ok(results)
     }
 
     pub async fn retry_sync_transfer(
@@ -701,19 +969,10 @@ impl GalleryService {
                     .to_string(),
             ));
         }
-        let remote_healthy = state
-            .blob_replicas
-            .iter()
-            .filter(|replica| {
-                replica.blob_id == blob.id
-                    && replica.device_id != local_device
-                    && replica.health == ReplicaHealth::Healthy
-                    && device_is_active(&state.devices, replica.device_id)
-            })
-            .count();
-        if remote_healthy < vault.storage_policy.min_replicas as usize {
+        let remote_verified = verified_remote_replica_count(&state, &blob, local_device);
+        if remote_verified < vault.storage_policy.min_replicas as usize {
             return Err(ServiceError::Invalid(format!(
-                "local eviction blocked until {} healthy remote replicas exist",
+                "local eviction blocked until {} verified P2P remote replicas exist",
                 vault.storage_policy.min_replicas
             )));
         }
@@ -3513,7 +3772,7 @@ fn chunk_bytes(total_bytes: u64, chunk_index: u32, chunk_count: u32) -> u64 {
     }
 }
 
-fn local_device_id(state: &LibraryState) -> Option<Uuid> {
+pub(crate) fn local_device_id(state: &LibraryState) -> Option<Uuid> {
     state
         .devices
         .iter()
@@ -3889,7 +4148,7 @@ fn build_sync_plan(state: &LibraryState, vault_id: Option<Uuid>) -> Result<SyncP
         conflicts: state.sync_conflicts.clone(),
         policy_satisfied: under_replicated_blob_ids.is_empty(),
         detail: if transfers.is_empty() {
-            "No runnable transfers are available locally; discovery/P2P transport is not active in this build.".to_string()
+            "No runnable transfers are available locally; start P2P sync and enroll peer endpoints to move encrypted originals.".to_string()
         } else {
             format!(
                 "{} transfer(s) are ready for the P2P transport; originals stay off hosted services.",
@@ -3898,6 +4157,7 @@ fn build_sync_plan(state: &LibraryState, vault_id: Option<Uuid>) -> Result<SyncP
         },
         transfers,
         under_replicated_blob_ids,
+        execution_results: Vec::new(),
     })
 }
 
@@ -3974,7 +4234,27 @@ fn pending_transfer(
     }
 }
 
-fn build_sync_network_status(state: &LibraryState) -> SyncNetworkStatus {
+fn execution_result(
+    transfer: &SyncTransfer,
+    status: SyncTransferExecutionStatus,
+    bytes_transferred: u64,
+    detail: String,
+) -> SyncTransferExecutionResult {
+    SyncTransferExecutionResult {
+        transfer_id: transfer.id,
+        blob_id: transfer.blob_id,
+        from_device_id: transfer.from_device_id,
+        to_device_id: transfer.to_device_id,
+        status,
+        bytes_transferred,
+        detail,
+    }
+}
+
+fn build_sync_network_status(
+    state: &LibraryState,
+    runtime: sync_transport::RuntimeStatus,
+) -> SyncNetworkStatus {
     let pending_transfer_count = state
         .sync_transfers
         .iter()
@@ -4001,13 +4281,13 @@ fn build_sync_network_status(state: &LibraryState) -> SyncNetworkStatus {
         })
         .count();
     let local_device_id = local_device_id(state);
-    let relay_urls = state
+    let persisted_relay_urls = state
         .relay_endpoints
         .iter()
         .filter(|endpoint| Some(endpoint.device_id) == local_device_id)
         .filter_map(|endpoint| endpoint.relay_url.clone())
         .collect::<Vec<_>>();
-    let direct_addresses = state
+    let persisted_direct_addresses = state
         .relay_endpoints
         .iter()
         .filter(|endpoint| Some(endpoint.device_id) == local_device_id)
@@ -4015,17 +4295,33 @@ fn build_sync_network_status(state: &LibraryState) -> SyncNetworkStatus {
         .collect::<Vec<_>>();
 
     SyncNetworkStatus {
-        started: true,
-        transport: "encrypted-local-vault-store; iroh-p2p-pending-runtime".to_string(),
+        started: runtime.started,
+        transport: "iroh-quic-v1; encrypted-content-addressed-vault-chunks".to_string(),
         local_device_id,
-        local_node_id: local_device_id.map(|id| format!("local-node-{id}")),
-        direct_addresses,
-        relay_urls,
+        local_node_id: runtime.local_node_id.or_else(|| {
+            local_device_id.and_then(|id| {
+                state
+                    .devices
+                    .iter()
+                    .find(|device| device.id == id)
+                    .map(|device| device.public_key.clone())
+            })
+        }),
+        direct_addresses: if runtime.direct_addresses.is_empty() {
+            persisted_direct_addresses
+        } else {
+            runtime.direct_addresses
+        },
+        relay_urls: if runtime.relay_urls.is_empty() {
+            persisted_relay_urls
+        } else {
+            runtime.relay_urls
+        },
         active_transfer_count,
         pending_transfer_count,
         completed_transfer_count,
         failed_transfer_count,
-        detail: "Encrypted chunk storage and resumable transfer records are active; direct Iroh process networking is not required for local restore and remains the next runtime adapter.".to_string(),
+        detail: runtime.detail,
     }
 }
 
@@ -4033,6 +4329,32 @@ fn device_is_active(devices: &[DeviceIdentity], device_id: Uuid) -> bool {
     devices
         .iter()
         .any(|device| device.id == device_id && device.revoked_at.is_none())
+}
+
+fn verified_remote_replica_count(
+    state: &LibraryState,
+    blob: &BlobRecord,
+    local_device: Uuid,
+) -> usize {
+    state
+        .blob_replicas
+        .iter()
+        .filter(|replica| {
+            replica.blob_id == blob.id
+                && replica.device_id != local_device
+                && replica.health == ReplicaHealth::Healthy
+                && device_is_active(&state.devices, replica.device_id)
+                && replica.transfer_id.is_some_and(|transfer_id| {
+                    state.sync_transfers.iter().any(|transfer| {
+                        transfer.id == transfer_id
+                            && transfer.blob_id == blob.id
+                            && transfer.to_device_id == replica.device_id
+                            && transfer.status == SyncTransferStatus::Completed
+                            && transfer.bytes_completed >= blob.bytes
+                    })
+                })
+        })
+        .count()
 }
 
 fn device_is_reachable(devices: &[DeviceIdentity], device_id: Uuid) -> bool {
@@ -4422,6 +4744,18 @@ fn vault_store_error(error: vault_store::VaultStoreError) -> ServiceError {
     }
 }
 
+fn sync_transport_error(error: sync_transport::SyncTransportError) -> ServiceError {
+    match error {
+        sync_transport::SyncTransportError::Invalid(message)
+        | sync_transport::SyncTransportError::Transport(message) => ServiceError::Invalid(message),
+        sync_transport::SyncTransportError::Io(message) => ServiceError::Io(message),
+        sync_transport::SyncTransportError::Storage(message) => ServiceError::Storage(message),
+        sync_transport::SyncTransportError::NotStarted => {
+            ServiceError::Invalid("P2P sync network is not started".to_string())
+        }
+    }
+}
+
 fn sensitive_index_blocker(config: &AppConfig, required_tasks: &[ModelTask]) -> String {
     let encryption = model_registry::encryption_status(config);
     if !encryption.sensitive_indexing_allowed {
@@ -4522,7 +4856,7 @@ fn default_import_mode(state: &LibraryState) -> ImportMode {
         .unwrap_or(ImportMode::Move)
 }
 
-fn effective_library_root(state: &LibraryState, config: &AppConfig) -> String {
+pub(crate) fn effective_library_root(state: &LibraryState, config: &AppConfig) -> String {
     state
         .library_settings
         .as_ref()
@@ -4894,18 +5228,20 @@ mod tests {
     use crate::{
         config::AppConfig,
         domain::{
-            AssetAvailabilityState, CorrectDateRequest, CorrectPlaceRequest, CreateAlbumRequest,
-            CreateDeviceRequest, CreateManualPersonRequest, DeviceRole, DeviceTrustLevel,
-            EncryptionActivationRequest, ImportAssetRequest, ImportMode, ImportSourceKind,
-            MediaKind, MetadataSource, ModelImportRequest, ModelInstallRequest, NetworkPolicy,
-            RebuildRequest, RenameAlbumRequest, RunSyncRequest, ScanImportSourceRequest,
-            SearchQuery, UpdateAlbumAssetsRequest, UpdateAssetFlagsRequest,
+            AssetAvailabilityState, BlobReplica, CorrectDateRequest, CorrectPlaceRequest,
+            CreateAlbumRequest, CreateDeviceRequest, CreateManualPersonRequest, DeviceRole,
+            DeviceTrustLevel, EncryptionActivationRequest, ImportAssetRequest, ImportMode,
+            ImportSourceKind, MediaKind, MetadataSource, ModelImportRequest, ModelInstallRequest,
+            NetworkPolicy, RebuildRequest, RenameAlbumRequest, ReplicaHealth, RunSyncRequest,
+            ScanImportSourceRequest, SearchQuery, StoragePolicy, StoragePolicyMode, SyncTransfer,
+            SyncTransferStatus, UpdateAlbumAssetsRequest, UpdateAssetFlagsRequest,
             UpdateAssetsFlagsRequest, UpdateLibrarySettingsRequest, UpdatePersonAssetsRequest,
+            UpdateVaultStoragePolicyRequest,
         },
         imports,
     };
 
-    use super::GalleryService;
+    use super::{GalleryService, local_device_id};
 
     fn temp_root(name: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!(
@@ -5132,6 +5468,126 @@ mod tests {
                 .windows(original_bytes.len())
                 .any(|window| window == original_bytes)
         );
+    }
+
+    #[tokio::test]
+    async fn local_eviction_requires_completed_p2p_transfer_proof() {
+        let runtime_root = temp_root("eviction-transfer-proof");
+        let library_root = runtime_root.join("library");
+        let source = runtime_root.join("photo.jpg");
+        let original_bytes = b"family-photo-private-original";
+        fs::write(&source, original_bytes).expect("write source");
+        let service = GalleryService::new(AppConfig {
+            runtime_root: runtime_root.clone(),
+            ..AppConfig::default()
+        })
+        .expect("service");
+        service
+            .update_library_settings(UpdateLibrarySettingsRequest {
+                library_root: library_root.to_string_lossy().to_string(),
+                default_import_mode: ImportMode::Copy,
+            })
+            .await
+            .expect("settings");
+        let imported = service
+            .import_asset(ImportAssetRequest {
+                source_path: source.to_string_lossy().to_string(),
+                original_filename: "photo.jpg".to_string(),
+                media_kind: MediaKind::Photo,
+                mime_type: "image/jpeg".to_string(),
+                bytes: original_bytes.len() as u64,
+                content_hash: None,
+                captured_at: None,
+                place_hint: None,
+                import_mode: Some(ImportMode::Copy),
+            })
+            .await
+            .expect("import");
+        let vault = service.vaults().await[0].clone();
+        service
+            .update_vault_storage_policy(
+                vault.id,
+                UpdateVaultStoragePolicyRequest {
+                    policy: StoragePolicy {
+                        mode: StoragePolicyMode::Custom,
+                        min_replicas: 1,
+                        preferred_device_ids: Vec::new(),
+                        excluded_device_ids: Vec::new(),
+                        min_free_space_bytes: 0,
+                        allow_metered_network: true,
+                        pause_on_low_battery: false,
+                    },
+                },
+            )
+            .await
+            .expect("policy");
+        let storage_device = service
+            .create_device(CreateDeviceRequest {
+                display_name: "Storage".to_string(),
+                platform: "linux".to_string(),
+                public_key: Some("storage-node".to_string()),
+                trust_level: Some(DeviceTrustLevel::StorageOnly),
+                role: Some(DeviceRole::StorageOnly),
+                storage_profile: None,
+            })
+            .await
+            .expect("device");
+
+        let (blob_id, blob_bytes) = {
+            let mut state = service.state.write().await;
+            let blob = state.blob_records[0].clone();
+            state.blob_replicas.push(BlobReplica {
+                id: uuid::Uuid::new_v4(),
+                blob_id: blob.id,
+                device_id: storage_device.id,
+                health: ReplicaHealth::Healthy,
+                bytes_present: blob.bytes,
+                verified_at: Some(Utc::now()),
+                transfer_id: None,
+            });
+            service.persist_locked_state(&state).expect("persist");
+            (blob.id, blob.bytes)
+        };
+
+        let blocked = service
+            .evict_local_asset(imported.asset.id)
+            .await
+            .expect_err("unproven replica must block eviction");
+        assert!(blocked.to_string().contains("verified P2P remote replicas"));
+
+        {
+            let mut state = service.state.write().await;
+            let transfer_id = uuid::Uuid::new_v4();
+            let from_device_id = local_device_id(&state);
+            state.sync_transfers.push(SyncTransfer {
+                id: transfer_id,
+                vault_id: vault.id,
+                blob_id,
+                from_device_id,
+                to_device_id: storage_device.id,
+                status: SyncTransferStatus::Completed,
+                bytes_total: blob_bytes,
+                bytes_completed: blob_bytes,
+                started_at: Some(Utc::now()),
+                updated_at: Utc::now(),
+                resumable_until: Utc::now() + chrono::Duration::days(7),
+            });
+            let replica = state
+                .blob_replicas
+                .iter_mut()
+                .find(|replica| {
+                    replica.blob_id == blob_id && replica.device_id == storage_device.id
+                })
+                .expect("replica");
+            replica.transfer_id = Some(transfer_id);
+            service.persist_locked_state(&state).expect("persist");
+        }
+
+        let availability = service
+            .evict_local_asset(imported.asset.id)
+            .await
+            .expect("evict after proof");
+        assert!(!availability.local_replica);
     }
 
     #[tokio::test]

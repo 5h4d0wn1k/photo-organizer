@@ -292,6 +292,47 @@ pub struct SyncTransfer {
     pub resumable_until: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PeerEndpointDescriptor {
+    pub device_id: Option<Uuid>,
+    pub device_name: String,
+    pub platform: String,
+    pub node_id: String,
+    #[serde(default)]
+    pub relay_urls: Vec<String>,
+    #[serde(default)]
+    pub direct_addresses: Vec<String>,
+    pub expires_at: DateTime<Utc>,
+    pub trust_level: DeviceTrustLevel,
+    pub role: DeviceRole,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LocalEndpointPayload {
+    pub descriptor: PeerEndpointDescriptor,
+    pub pairing_payload: String,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SyncTransferExecutionStatus {
+    Completed,
+    Failed,
+    Skipped,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SyncTransferExecutionResult {
+    pub transfer_id: Uuid,
+    pub blob_id: Uuid,
+    pub from_device_id: Option<Uuid>,
+    pub to_device_id: Uuid,
+    pub status: SyncTransferExecutionStatus,
+    pub bytes_transferred: u64,
+    pub detail: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SyncConflict {
     pub id: Uuid,
@@ -312,6 +353,8 @@ pub struct SyncPlan {
     pub under_replicated_blob_ids: Vec<Uuid>,
     pub policy_satisfied: bool,
     pub detail: String,
+    #[serde(default)]
+    pub execution_results: Vec<SyncTransferExecutionResult>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1280,6 +1323,7 @@ pub struct EnrollDeviceRequest {
     pub role: Option<DeviceRole>,
     pub trust_level: Option<DeviceTrustLevel>,
     pub storage_profile: Option<DeviceStorageProfile>,
+    pub endpoint: Option<PeerEndpointDescriptor>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]

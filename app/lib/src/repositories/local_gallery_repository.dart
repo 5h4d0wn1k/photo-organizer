@@ -148,6 +148,7 @@ class LocalGalleryRepository implements GalleryRepository {
     DeviceTrustLevel? trustLevel,
     DeviceRole? role,
     DeviceStorageProfile? storageProfile,
+    PeerEndpointDescriptor? endpoint,
   }) {
     return _apiClient.enrollDevice(
       displayName: displayName,
@@ -157,6 +158,7 @@ class LocalGalleryRepository implements GalleryRepository {
       trustLevel: trustLevel,
       role: role,
       storageProfile: storageProfile,
+      endpoint: endpoint,
     );
   }
 
@@ -193,6 +195,11 @@ class LocalGalleryRepository implements GalleryRepository {
   @override
   Future<SyncNetworkStatus> stopSyncNetwork() {
     return _apiClient.stopSyncNetwork();
+  }
+
+  @override
+  Future<LocalEndpointPayload> fetchLocalEndpoint() {
+    return _apiClient.fetchLocalEndpoint();
   }
 
   @override

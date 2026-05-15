@@ -79,7 +79,7 @@ class _MobilePairingScreenState extends State<MobilePairingScreen> {
       if (!permission.isAuth) {
         setState(() {
           _status =
-              'Photo library permission is required before camera-roll upload can start.';
+              'Photo library permission is required before local camera-roll indexing can run.';
         });
         return;
       }
@@ -143,7 +143,7 @@ class _MobilePairingScreenState extends State<MobilePairingScreen> {
             ),
             const SizedBox(height: 8),
             Text(
-              'This Android client keeps media local and pairs with your desktop vault before camera-roll upload or remote original fetches are enabled.',
+              'This Android client keeps media local and pairs with your desktop vault before any future mobile media sync is enabled.',
               style: theme.textTheme.bodyLarge,
             ),
             const SizedBox(height: 20),
@@ -156,9 +156,9 @@ class _MobilePairingScreenState extends State<MobilePairingScreen> {
             const SizedBox(height: 12),
             _ReadinessTile(
               icon: Icons.photo_library_outlined,
-              title: 'Camera roll upload queue',
+              title: 'Camera roll access check',
               message:
-                  'Grant media access to prepare incremental upload scanning for the next sync step.',
+                  'Grant media access only to count local items and prepare the future mobile indexing step.',
               action: OutlinedButton.icon(
                 onPressed: _busy ? null : _checkCameraRollAccess,
                 icon: const Icon(Icons.folder_open_outlined),

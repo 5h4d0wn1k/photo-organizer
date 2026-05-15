@@ -209,6 +209,7 @@ void main() {
     final network = await client.fetchSyncNetworkStatus();
     final started = await client.startSyncNetwork();
     final stopped = await client.stopSyncNetwork();
+    final endpoint = await client.fetchLocalEndpoint();
     final retried = await client.retrySyncTransfer('transfer-1');
     final canceled = await client.cancelSyncTransfer('transfer-1');
     final availability = await client.fetchAssetAvailability('asset-1');
@@ -228,6 +229,7 @@ void main() {
     expect(network.pendingTransferCount, 1);
     expect(started.started, isTrue);
     expect(stopped.transport, contains('encrypted'));
+    expect(endpoint.descriptor.nodeId, 'local-node-device-1');
     expect(retried.status, SyncTransferStatus.pending);
     expect(canceled.status, SyncTransferStatus.aborted);
     expect(availability.state, AssetAvailabilityState.underReplicated);
@@ -457,6 +459,7 @@ class _VaultSyncJsonClient extends http.BaseClient {
       ('GET', '/sync/network/status') => _networkStatusJson(),
       ('POST', '/sync/network/start') => _networkStatusJson(),
       ('POST', '/sync/network/stop') => _networkStatusJson(),
+      ('GET', '/sync/network/local-endpoint') => _localEndpointJson(),
       ('POST', '/sync/transfers/transfer-1/retry') => _transferJson(),
       ('POST', '/sync/transfers/transfer-1/cancel') =>
         _transferJson(status: 'aborted'),
@@ -588,7 +591,7 @@ Map<String, Object?> _transferJson({String status = 'pending'}) {
 Map<String, Object?> _networkStatusJson() {
   return {
     'started': true,
-    'transport': 'encrypted-local-vault-store',
+    'transport': 'iroh-quic-v1; encrypted-content-addressed-vault-chunks',
     'local_device_id': 'device-1',
     'local_node_id': 'local-node-device-1',
     'direct_addresses': ['192.168.1.10:4433'],
@@ -601,6 +604,24 @@ Map<String, Object?> _networkStatusJson() {
   };
 }
 
+Map<String, Object?> _localEndpointJson() {
+  return {
+    'descriptor': {
+      'device_id': 'device-1',
+      'device_name': 'Laptop',
+      'platform': 'linux',
+      'node_id': 'local-node-device-1',
+      'relay_urls': [],
+      'direct_addresses': ['192.168.1.10:4433'],
+      'expires_at': '2026-05-13T06:10:00Z',
+      'trust_level': 'trusted',
+      'role': 'admin',
+    },
+    'pairing_payload': '{"node_id":"local-node-device-1"}',
+    'detail': 'P2P vault sync is listening',
+  };
+}
+
 Map<String, Object?> _syncPlanJson() {
   return {
     'generated_at': '2026-05-13T06:00:00Z',
@@ -610,6 +631,7 @@ Map<String, Object?> _syncPlanJson() {
     'under_replicated_blob_ids': ['blob-1'],
     'policy_satisfied': false,
     'detail': 'pending P2P transfer',
+    'execution_results': [],
   };
 }
 
