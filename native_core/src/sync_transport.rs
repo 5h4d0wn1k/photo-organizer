@@ -398,7 +398,7 @@ impl SyncRuntime {
             direct_addresses: direct_addresses.clone(),
             expires_at,
             trust_level: local_device.trust_level,
-            role: DeviceRole::Admin,
+            role: default_role_for_trust(local_device.trust_level),
         };
         upsert_relay_endpoint(
             &mut state,
@@ -766,21 +766,38 @@ fn commit_received_blob(
     chunks: Vec<BlobChunk>,
     bytes_received: u64,
 ) -> Result<(), SyncTransportError> {
+    let storage_only_receiver = state
+        .devices
+        .iter()
+        .find(|device| device.id == envelope.to_device_id)
+        .map(|device| device.trust_level == DeviceTrustLevel::StorageOnly)
+        .unwrap_or(false);
+    let incoming_blob = if storage_only_receiver {
+        opaque_blob_record(&envelope.blob)
+    } else {
+        envelope.blob.clone()
+    };
+
     if let Some(existing) = state
         .blob_records
         .iter_mut()
         .find(|blob| blob.id == envelope.blob.id)
     {
-        *existing = envelope.blob.clone();
+        merge_blob_record(existing, incoming_blob);
     } else {
-        state.blob_records.push(envelope.blob.clone());
+        state.blob_records.push(incoming_blob);
     }
 
     for chunk in chunks {
+        let chunk = if storage_only_receiver {
+            opaque_blob_chunk(chunk)
+        } else {
+            chunk
+        };
         if let Some(existing) = state.blob_chunks.iter_mut().find(|existing| {
             existing.blob_id == chunk.blob_id && existing.chunk_index == chunk.chunk_index
         }) {
-            *existing = chunk;
+            merge_blob_chunk(existing, chunk);
         } else {
             state.blob_chunks.push(chunk);
         }
@@ -795,6 +812,51 @@ fn commit_received_blob(
     );
     upsert_completed_transfer(state, envelope, bytes_received);
     Ok(())
+}
+
+fn merge_blob_record(existing: &mut BlobRecord, incoming: BlobRecord) {
+    let existing_content_hash = existing.content_hash.clone();
+    *existing = incoming;
+    if !is_opaque_hash(&existing_content_hash) && is_opaque_hash(&existing.content_hash) {
+        existing.content_hash = existing_content_hash;
+    }
+}
+
+fn merge_blob_chunk(existing: &mut BlobChunk, incoming: BlobChunk) {
+    let existing_content_hash = existing.content_hash.clone();
+    let existing_nonce_hex = existing.nonce_hex.clone();
+    let existing_aad = existing.aad.clone();
+    *existing = incoming;
+    if !is_opaque_hash(&existing_content_hash) && is_opaque_hash(&existing.content_hash) {
+        existing.content_hash = existing_content_hash;
+    }
+    if existing.nonce_hex.is_none() {
+        existing.nonce_hex = existing_nonce_hex;
+    }
+    if existing.aad.is_none() {
+        existing.aad = existing_aad;
+    }
+}
+
+fn opaque_blob_record(blob: &BlobRecord) -> BlobRecord {
+    let mut opaque = blob.clone();
+    opaque.content_hash = opaque_hash(&blob.encrypted_hash);
+    opaque
+}
+
+fn opaque_blob_chunk(mut chunk: BlobChunk) -> BlobChunk {
+    chunk.content_hash = opaque_hash(&chunk.encrypted_hash);
+    chunk.nonce_hex = None;
+    chunk.aad = None;
+    chunk
+}
+
+fn opaque_hash(encrypted_hash: &str) -> String {
+    format!("opaque:{encrypted_hash}")
+}
+
+fn is_opaque_hash(value: &str) -> bool {
+    value.starts_with("opaque:")
 }
 
 pub(crate) fn peer_descriptor_for_device(

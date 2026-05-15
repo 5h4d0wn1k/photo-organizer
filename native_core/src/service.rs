@@ -3551,18 +3551,33 @@ fn ensure_distributed_defaults(state: &mut LibraryState) -> bool {
         state.vaults.first().map(|vault| vault.id),
         local_device_id(state),
     ) {
-        let has_admin = state.vault_members.iter().any(|member| {
+        let has_local_member = state.vault_members.iter().any(|member| {
             member.vault_id == vault_id
                 && member.device_id == device_id
                 && member.revoked_at.is_none()
         });
-        if !has_admin {
+        if !has_local_member {
+            let (role, trust_level) = state
+                .devices
+                .iter()
+                .find(|device| device.id == device_id)
+                .map(|device| {
+                    (
+                        if device.trust_level == DeviceTrustLevel::StorageOnly {
+                            DeviceRole::StorageOnly
+                        } else {
+                            DeviceRole::Admin
+                        },
+                        device.trust_level,
+                    )
+                })
+                .unwrap_or((DeviceRole::Admin, DeviceTrustLevel::Trusted));
             state.vault_members.push(VaultMember {
                 id: Uuid::new_v4(),
                 vault_id,
                 device_id,
-                role: DeviceRole::Admin,
-                trust_level: DeviceTrustLevel::Trusted,
+                role,
+                trust_level,
                 display_name: local_device_name(state).unwrap_or_else(|| "This device".to_string()),
                 added_at: now,
                 revoked_at: None,
@@ -3804,9 +3819,6 @@ fn remove_local_encrypted_chunks(
                 fs::remove_file(path).map_err(|err| ServiceError::Io(err.to_string()))?;
             }
         }
-        chunk.nonce_hex = None;
-        chunk.aad = None;
-        chunk.encrypted_bytes = 0;
     }
     Ok(())
 }
@@ -3831,15 +3843,15 @@ pub(crate) fn local_device_id(state: &LibraryState) -> Option<Uuid> {
         .iter()
         .find(|device| {
             device.revoked_at.is_none()
-                && device.trust_level == DeviceTrustLevel::Trusted
                 && device
                     .public_key
                     .starts_with("local-device-key-pending-iroh-")
         })
         .or_else(|| {
-            state.devices.iter().find(|device| {
-                device.revoked_at.is_none() && device.trust_level == DeviceTrustLevel::Trusted
-            })
+            state
+                .devices
+                .iter()
+                .find(|device| device.revoked_at.is_none())
         })
         .map(|device| device.id)
 }
@@ -5706,6 +5718,27 @@ mod tests {
             .await
             .expect("import");
 
+        {
+            let mut state_b = service_b.state.write().await;
+            let local_b = local_device_id(&state_b).expect("local b before endpoint");
+            let device = state_b
+                .devices
+                .iter_mut()
+                .find(|device| device.id == local_b)
+                .expect("local b device");
+            device.trust_level = DeviceTrustLevel::StorageOnly;
+            device.storage_profile.accepts_storage = true;
+            for member in state_b
+                .vault_members
+                .iter_mut()
+                .filter(|member| member.device_id == local_b)
+            {
+                member.role = DeviceRole::StorageOnly;
+                member.trust_level = DeviceTrustLevel::StorageOnly;
+            }
+            service_b.persist_locked_state(&state_b).expect("persist b");
+        }
+
         let endpoint_b = service_b
             .sync_network_local_endpoint()
             .await
@@ -5714,6 +5747,11 @@ mod tests {
             .sync_network_local_endpoint()
             .await
             .expect("endpoint a");
+        assert_eq!(
+            endpoint_b.descriptor.trust_level,
+            DeviceTrustLevel::StorageOnly
+        );
+        assert_eq!(endpoint_b.descriptor.role, DeviceRole::StorageOnly);
         let storage_profile = DeviceStorageProfile {
             reserved_bytes: 0,
             ..DeviceStorageProfile::default()
@@ -5724,8 +5762,8 @@ mod tests {
                 platform: endpoint_b.descriptor.platform.clone(),
                 public_key: Some(endpoint_b.descriptor.node_id.clone()),
                 vault_id: None,
-                role: Some(DeviceRole::Contributor),
-                trust_level: Some(DeviceTrustLevel::Trusted),
+                role: Some(endpoint_b.descriptor.role.clone()),
+                trust_level: Some(endpoint_b.descriptor.trust_level),
                 storage_profile: Some(storage_profile.clone()),
                 endpoint: Some(endpoint_b.descriptor.clone()),
             })
@@ -5766,14 +5804,25 @@ mod tests {
         {
             let state_b = service_b.state.read().await;
             let local_b = local_device_id(&state_b).expect("local b");
+            assert!(state_b.assets.is_empty());
             assert_eq!(state_b.blob_records.len(), 1);
             assert_eq!(state_b.blob_records[0].bytes, original_bytes.len() as u64);
+            assert!(state_b.blob_records[0].content_hash.starts_with("opaque:"));
             assert!(
                 state_b
                     .blob_chunks
                     .iter()
                     .all(|chunk| chunk.local_path.is_some()),
                 "remote encrypted chunks should be stored locally on device b"
+            );
+            assert!(
+                state_b
+                    .blob_chunks
+                    .iter()
+                    .all(|chunk| chunk.content_hash.starts_with("opaque:")
+                        && chunk.nonce_hex.is_none()
+                        && chunk.aad.is_none()),
+                "storage-only device should not retain plaintext hashes or decrypt metadata"
             );
             assert!(state_b.blob_replicas.iter().any(|replica| {
                 replica.blob_id == state_b.blob_records[0].id
