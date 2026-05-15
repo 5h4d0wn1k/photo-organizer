@@ -181,6 +181,31 @@ class LocalGalleryRepository implements GalleryRepository {
   }
 
   @override
+  Future<SyncNetworkStatus> fetchSyncNetworkStatus() {
+    return _apiClient.fetchSyncNetworkStatus();
+  }
+
+  @override
+  Future<SyncNetworkStatus> startSyncNetwork() {
+    return _apiClient.startSyncNetwork();
+  }
+
+  @override
+  Future<SyncNetworkStatus> stopSyncNetwork() {
+    return _apiClient.stopSyncNetwork();
+  }
+
+  @override
+  Future<SyncTransfer> retrySyncTransfer(String id) {
+    return _apiClient.retrySyncTransfer(id);
+  }
+
+  @override
+  Future<SyncTransfer> cancelSyncTransfer(String id) {
+    return _apiClient.cancelSyncTransfer(id);
+  }
+
+  @override
   Future<AssetAvailability> fetchAssetAvailability(String assetId) {
     return _apiClient.fetchAssetAvailability(assetId);
   }
@@ -248,6 +273,30 @@ class LocalGalleryRepository implements GalleryRepository {
     return _apiClient.exportBackup(
       exportRoot: exportRoot,
       includeModels: includeModels,
+    );
+  }
+
+  @override
+  Future<BackupRestorePlan> planRestoreBackup({
+    required String exportRoot,
+    required String restoreRoot,
+  }) {
+    return _apiClient.planRestoreBackup(
+      exportRoot: exportRoot,
+      restoreRoot: restoreRoot,
+    );
+  }
+
+  @override
+  Future<BackupRestoreRunResult> runRestoreBackup({
+    required String exportRoot,
+    required String restoreRoot,
+    bool confirmed = true,
+  }) {
+    return _apiClient.runRestoreBackup(
+      exportRoot: exportRoot,
+      restoreRoot: restoreRoot,
+      confirmed: confirmed,
     );
   }
 

@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 axum = { version = "0.8", features = ["macros"] }
 chrono = { version = "0.4", features = ["serde"] }
+chacha20poly1305 = "0.10"
 keyring = { version = "3", features = ["apple-native", "windows-native", "linux-native-sync-persistent", "crypto-rust"] }
 nom-exif = "3.4"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
@@ -19,3 +20,4 @@ tower-http = { version = "0.6", features = ["cors", "trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["serde", "v4"] }
+zeroize = "1"

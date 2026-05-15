@@ -21,6 +21,15 @@ abstract class GalleryRepository {
     required String exportRoot,
     bool includeModels,
   });
+  Future<BackupRestorePlan> planRestoreBackup({
+    required String exportRoot,
+    required String restoreRoot,
+  });
+  Future<BackupRestoreRunResult> runRestoreBackup({
+    required String exportRoot,
+    required String restoreRoot,
+    bool confirmed,
+  });
   Future<LibrarySettings> saveLibrarySettings(LibrarySettingsDraft draft);
   Future<List<Vault>> fetchVaults();
   Future<Vault> createVault({
@@ -51,6 +60,11 @@ abstract class GalleryRepository {
   Future<SyncPlan> fetchSyncPlan({String? vaultId});
   Future<SyncPlan> runSync({String? vaultId, bool dryRun});
   Future<List<SyncTransfer>> fetchSyncTransfers();
+  Future<SyncNetworkStatus> fetchSyncNetworkStatus();
+  Future<SyncNetworkStatus> startSyncNetwork();
+  Future<SyncNetworkStatus> stopSyncNetwork();
+  Future<SyncTransfer> retrySyncTransfer(String id);
+  Future<SyncTransfer> cancelSyncTransfer(String id);
   Future<AssetAvailability> fetchAssetAvailability(String assetId);
   Future<AssetAvailability> pinLocalAsset(String assetId);
   Future<AssetAvailability> evictLocalAsset(String assetId);

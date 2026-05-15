@@ -206,6 +206,11 @@ void main() {
     final plan = await client.fetchSyncPlan(vaultId: 'vault-1');
     final runPlan = await client.runSync(vaultId: 'vault-1');
     final transfers = await client.fetchSyncTransfers();
+    final network = await client.fetchSyncNetworkStatus();
+    final started = await client.startSyncNetwork();
+    final stopped = await client.stopSyncNetwork();
+    final retried = await client.retrySyncTransfer('transfer-1');
+    final canceled = await client.cancelSyncTransfer('transfer-1');
     final availability = await client.fetchAssetAvailability('asset-1');
     final pinned = await client.pinLocalAsset('asset-1');
     final evicted = await client.evictLocalAsset('asset-1');
@@ -220,6 +225,11 @@ void main() {
     expect(plan.transfers.single.status, SyncTransferStatus.pending);
     expect(runPlan.policySatisfied, isFalse);
     expect(transfers.single.toDeviceId, 'device-2');
+    expect(network.pendingTransferCount, 1);
+    expect(started.started, isTrue);
+    expect(stopped.transport, contains('encrypted'));
+    expect(retried.status, SyncTransferStatus.pending);
+    expect(canceled.status, SyncTransferStatus.aborted);
     expect(availability.state, AssetAvailabilityState.underReplicated);
     expect(pinned.state, AssetAvailabilityState.transferPending);
     expect(evicted.state, AssetAvailabilityState.remoteAvailable);
@@ -444,6 +454,12 @@ class _VaultSyncJsonClient extends http.BaseClient {
       ('GET', '/sync/plan') => _syncPlanJson(),
       ('POST', '/sync/run') => _syncPlanJson(),
       ('GET', '/sync/transfers') => [_transferJson()],
+      ('GET', '/sync/network/status') => _networkStatusJson(),
+      ('POST', '/sync/network/start') => _networkStatusJson(),
+      ('POST', '/sync/network/stop') => _networkStatusJson(),
+      ('POST', '/sync/transfers/transfer-1/retry') => _transferJson(),
+      ('POST', '/sync/transfers/transfer-1/cancel') =>
+        _transferJson(status: 'aborted'),
       ('GET', '/assets/asset-1/availability') => _availabilityJson(),
       ('POST', '/assets/asset-1/pin-local') =>
         _availabilityJson(state: 'transfer_pending'),
@@ -553,19 +569,35 @@ Map<String, Object?> _vaultStatusJson() {
   };
 }
 
-Map<String, Object?> _transferJson() {
+Map<String, Object?> _transferJson({String status = 'pending'}) {
   return {
     'id': 'transfer-1',
     'vault_id': 'vault-1',
     'blob_id': 'blob-1',
     'from_device_id': 'device-1',
     'to_device_id': 'device-2',
-    'status': 'pending',
+    'status': status,
     'bytes_total': 100,
     'bytes_completed': 0,
     'started_at': null,
     'updated_at': '2026-05-13T06:00:00Z',
     'resumable_until': '2026-05-20T06:00:00Z',
+  };
+}
+
+Map<String, Object?> _networkStatusJson() {
+  return {
+    'started': true,
+    'transport': 'encrypted-local-vault-store',
+    'local_device_id': 'device-1',
+    'local_node_id': 'local-node-device-1',
+    'direct_addresses': ['192.168.1.10:4433'],
+    'relay_urls': [],
+    'active_transfer_count': 0,
+    'pending_transfer_count': 1,
+    'completed_transfer_count': 0,
+    'failed_transfer_count': 0,
+    'detail': 'encrypted local sync',
   };
 }
 

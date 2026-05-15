@@ -152,6 +152,9 @@ class AssetGrid extends StatelessWidget {
                                   ),
                                   if (asset.archived)
                                     const _AssetBadge(label: 'archived'),
+                                  if (!asset.isAvailable)
+                                    const _AssetBadge(
+                                        label: 'stored elsewhere'),
                                   if (asset.metadata?.geo != null)
                                     const _AssetBadge(label: 'GPS'),
                                   if (dimensions != null)

@@ -8,7 +8,7 @@ This slice prepares the local organizer for future faces, scenes, and semantic s
 - SQLCipher activation backs up plaintext DBs, exports to encrypted DBs, verifies row counts and integrity, and stores the per-library key through secure storage.
 - Durable job records now include cancel/retry metadata, and job logs are persisted separately.
 - Manual correction records are persisted for date, place, and event-title changes.
-- Backup verification checks database hash, managed asset availability, and installed model-file availability.
+- Backup verification checks database hash, managed asset availability, encrypted vault chunk availability, and installed model-file availability. Backup export writes a manifest-backed copy layout, and restore staging is explicit and non-destructive.
 - Privacy status reports the encryption gate and only allows sensitive-indexing eligibility after encrypted storage is active.
 - Offline OCR indexing uses the local Tesseract CLI and stores OCR blocks in the encrypted database.
 

@@ -11,6 +11,8 @@ This audit tracks whether current production dependencies perform network I/O or
 | `tokio` | Async runtime/TCP listener | Server only | Used for local daemon listener. |
 | `rusqlite` / `libsqlite3-sys` | SQLite metadata storage | No | Compiled with bundled SQLCipher support and used for plaintext-to-encrypted DB activation. |
 | `keyring` | OS secure key storage | No network expected | Built with native credential-store features (`linux-native-sync-persistent`, `apple-native`, `windows-native`) so SQLCipher keys are stored in OS secure storage; tests use an isolated test file store. |
+| `chacha20poly1305` | Vault chunk encryption | No | Seals imported originals into authenticated encrypted chunks with per-chunk nonces and AAD. |
+| `zeroize` | Secret memory hygiene | No | Clears in-memory vault keys after use where practical. |
 | `reqwest` | Confirm-gated model downloads | Explicit model URLs only | Used only by `/models/install`; indexing jobs must not call it. TLS-only, no redirects, SHA-256 verified before install. |
 | `chrono` | Timestamps | No | Local date/time handling. |
 | `serde`, `serde_json` | Serialization | No | API/storage payloads. |

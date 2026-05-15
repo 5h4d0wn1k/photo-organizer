@@ -270,4 +270,68 @@ void main() {
     expect(availability.state, AssetAvailabilityState.underReplicated);
     expect(availability.opensLocally, isTrue);
   });
+
+  test('parses chunk-aware backup and restore fields', () {
+    final verification = BackupVerification.fromJson({
+      'checked_at': '2026-05-15T06:00:00Z',
+      'database_path': '/library/runtime/db/gallery.sqlite3',
+      'library_root': '/library',
+      'database_sha256': 'dbhash',
+      'assets_checked': 2,
+      'missing_asset_paths': [],
+      'vault_chunks_checked': 4,
+      'missing_vault_chunk_paths': ['/library/vaults/bad.pgblob'],
+      'model_files_checked': 1,
+      'missing_model_paths': [],
+      'ok': false,
+    });
+    final export = BackupExportResult.fromJson({
+      'exported_at': '2026-05-15T06:01:00Z',
+      'export_root': '/backup',
+      'manifest_path': '/backup/manifests/private-gallery-backup-manifest.json',
+      'database_copied_to': '/backup/database/gallery.sqlite3',
+      'database_sha256': 'dbhash',
+      'assets_checked': 2,
+      'missing_asset_paths': [],
+      'media_files_copied': 1,
+      'vault_chunks_copied': 4,
+      'bytes_copied': 4096,
+      'model_files_checked': 1,
+      'missing_model_paths': [],
+      'ok': true,
+    });
+    final plan = BackupRestorePlan.fromJson({
+      'checked_at': '2026-05-15T06:02:00Z',
+      'export_root': '/backup',
+      'restore_root': '/restore',
+      'manifest_path': '/backup/manifests/private-gallery-backup-manifest.json',
+      'database_source_path': '/backup/database/gallery.sqlite3',
+      'database_target_path': '/restore/runtime/db/gallery.sqlite3',
+      'media_files_available': 1,
+      'vault_chunks_available': 4,
+      'missing_paths': [],
+      'destination_conflicts': [],
+      'requires_confirmation': true,
+      'ok': true,
+      'detail': 'Restore can be staged.',
+    });
+    final run = BackupRestoreRunResult.fromJson({
+      'restored_at': '2026-05-15T06:03:00Z',
+      'restore_root': '/restore',
+      'database_restored_to': '/restore/runtime/db/gallery.sqlite3',
+      'media_files_copied': 1,
+      'vault_chunks_copied': 4,
+      'bytes_copied': 4096,
+      'ok': true,
+      'detail': 'Restore staged.',
+    });
+
+    expect(verification.vaultChunksChecked, 4);
+    expect(verification.missingVaultChunkPaths.single, contains('bad.pgblob'));
+    expect(export.vaultChunksCopied, 4);
+    expect(export.bytesCopied, 4096);
+    expect(plan.vaultChunksAvailable, 4);
+    expect(plan.requiresConfirmation, isTrue);
+    expect(run.databaseRestoredTo, '/restore/runtime/db/gallery.sqlite3');
+  });
 }

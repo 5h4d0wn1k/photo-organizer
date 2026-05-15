@@ -659,6 +659,8 @@ class BackupVerification {
     required this.databaseSha256,
     required this.assetsChecked,
     required this.missingAssetPaths,
+    required this.vaultChunksChecked,
+    required this.missingVaultChunkPaths,
     required this.modelFilesChecked,
     required this.missingModelPaths,
     required this.ok,
@@ -670,6 +672,8 @@ class BackupVerification {
   final String? databaseSha256;
   final int assetsChecked;
   final List<String> missingAssetPaths;
+  final int vaultChunksChecked;
+  final List<String> missingVaultChunkPaths;
   final int modelFilesChecked;
   final List<String> missingModelPaths;
   final bool ok;
@@ -682,6 +686,9 @@ class BackupVerification {
       databaseSha256: json['database_sha256'] as String?,
       assetsChecked: (json['assets_checked'] as num?)?.toInt() ?? 0,
       missingAssetPaths: _readStringList(json['missing_asset_paths']),
+      vaultChunksChecked: (json['vault_chunks_checked'] as num?)?.toInt() ?? 0,
+      missingVaultChunkPaths:
+          _readStringList(json['missing_vault_chunk_paths']),
       modelFilesChecked: (json['model_files_checked'] as num?)?.toInt() ?? 0,
       missingModelPaths: _readStringList(json['missing_model_paths']),
       ok: json['ok'] as bool? ?? false,
@@ -698,6 +705,9 @@ class BackupExportResult {
     required this.databaseSha256,
     required this.assetsChecked,
     required this.missingAssetPaths,
+    required this.mediaFilesCopied,
+    required this.vaultChunksCopied,
+    required this.bytesCopied,
     required this.modelFilesChecked,
     required this.missingModelPaths,
     required this.ok,
@@ -710,6 +720,9 @@ class BackupExportResult {
   final String? databaseSha256;
   final int assetsChecked;
   final List<String> missingAssetPaths;
+  final int mediaFilesCopied;
+  final int vaultChunksCopied;
+  final int bytesCopied;
   final int modelFilesChecked;
   final List<String> missingModelPaths;
   final bool ok;
@@ -723,9 +736,99 @@ class BackupExportResult {
       databaseSha256: json['database_sha256'] as String?,
       assetsChecked: (json['assets_checked'] as num?)?.toInt() ?? 0,
       missingAssetPaths: _readStringList(json['missing_asset_paths']),
+      mediaFilesCopied: (json['media_files_copied'] as num?)?.toInt() ?? 0,
+      vaultChunksCopied: (json['vault_chunks_copied'] as num?)?.toInt() ?? 0,
+      bytesCopied: (json['bytes_copied'] as num?)?.toInt() ?? 0,
       modelFilesChecked: (json['model_files_checked'] as num?)?.toInt() ?? 0,
       missingModelPaths: _readStringList(json['missing_model_paths']),
       ok: json['ok'] as bool? ?? false,
+    );
+  }
+}
+
+class BackupRestorePlan {
+  const BackupRestorePlan({
+    required this.checkedAt,
+    required this.exportRoot,
+    required this.restoreRoot,
+    required this.manifestPath,
+    required this.databaseSourcePath,
+    required this.databaseTargetPath,
+    required this.mediaFilesAvailable,
+    required this.vaultChunksAvailable,
+    required this.missingPaths,
+    required this.destinationConflicts,
+    required this.requiresConfirmation,
+    required this.ok,
+    required this.detail,
+  });
+
+  final DateTime? checkedAt;
+  final String exportRoot;
+  final String restoreRoot;
+  final String manifestPath;
+  final String databaseSourcePath;
+  final String databaseTargetPath;
+  final int mediaFilesAvailable;
+  final int vaultChunksAvailable;
+  final List<String> missingPaths;
+  final List<String> destinationConflicts;
+  final bool requiresConfirmation;
+  final bool ok;
+  final String detail;
+
+  factory BackupRestorePlan.fromJson(Map<String, dynamic> json) {
+    return BackupRestorePlan(
+      checkedAt: _readDateTime(json['checked_at']),
+      exportRoot: json['export_root'] as String? ?? '',
+      restoreRoot: json['restore_root'] as String? ?? '',
+      manifestPath: json['manifest_path'] as String? ?? '',
+      databaseSourcePath: json['database_source_path'] as String? ?? '',
+      databaseTargetPath: json['database_target_path'] as String? ?? '',
+      mediaFilesAvailable:
+          (json['media_files_available'] as num?)?.toInt() ?? 0,
+      vaultChunksAvailable:
+          (json['vault_chunks_available'] as num?)?.toInt() ?? 0,
+      missingPaths: _readStringList(json['missing_paths']),
+      destinationConflicts: _readStringList(json['destination_conflicts']),
+      requiresConfirmation: json['requires_confirmation'] as bool? ?? true,
+      ok: json['ok'] as bool? ?? false,
+      detail: json['detail'] as String? ?? '',
+    );
+  }
+}
+
+class BackupRestoreRunResult {
+  const BackupRestoreRunResult({
+    required this.restoredAt,
+    required this.restoreRoot,
+    required this.databaseRestoredTo,
+    required this.mediaFilesCopied,
+    required this.vaultChunksCopied,
+    required this.bytesCopied,
+    required this.ok,
+    required this.detail,
+  });
+
+  final DateTime? restoredAt;
+  final String restoreRoot;
+  final String databaseRestoredTo;
+  final int mediaFilesCopied;
+  final int vaultChunksCopied;
+  final int bytesCopied;
+  final bool ok;
+  final String detail;
+
+  factory BackupRestoreRunResult.fromJson(Map<String, dynamic> json) {
+    return BackupRestoreRunResult(
+      restoredAt: _readDateTime(json['restored_at']),
+      restoreRoot: json['restore_root'] as String? ?? '',
+      databaseRestoredTo: json['database_restored_to'] as String? ?? '',
+      mediaFilesCopied: (json['media_files_copied'] as num?)?.toInt() ?? 0,
+      vaultChunksCopied: (json['vault_chunks_copied'] as num?)?.toInt() ?? 0,
+      bytesCopied: (json['bytes_copied'] as num?)?.toInt() ?? 0,
+      ok: json['ok'] as bool? ?? false,
+      detail: json['detail'] as String? ?? '',
     );
   }
 }
@@ -989,6 +1092,10 @@ class BlobChunk {
     required this.contentHash,
     required this.encryptedHash,
     required this.bytes,
+    required this.encryptedBytes,
+    required this.localPath,
+    required this.nonceHex,
+    required this.aad,
   });
 
   final String id;
@@ -997,6 +1104,10 @@ class BlobChunk {
   final String contentHash;
   final String encryptedHash;
   final int bytes;
+  final int encryptedBytes;
+  final String? localPath;
+  final String? nonceHex;
+  final String? aad;
 
   factory BlobChunk.fromJson(Map<String, dynamic> json) {
     return BlobChunk(
@@ -1006,6 +1117,10 @@ class BlobChunk {
       contentHash: json['content_hash'] as String? ?? '',
       encryptedHash: json['encrypted_hash'] as String? ?? '',
       bytes: (json['bytes'] as num?)?.toInt() ?? 0,
+      encryptedBytes: (json['encrypted_bytes'] as num?)?.toInt() ?? 0,
+      localPath: json['local_path'] as String?,
+      nonceHex: json['nonce_hex'] as String?,
+      aad: json['aad'] as String?,
     );
   }
 }
@@ -1152,6 +1267,54 @@ class SyncPlan {
       underReplicatedBlobIds:
           _readStringList(json['under_replicated_blob_ids']),
       policySatisfied: json['policy_satisfied'] as bool? ?? false,
+      detail: json['detail'] as String? ?? '',
+    );
+  }
+}
+
+class SyncNetworkStatus {
+  const SyncNetworkStatus({
+    required this.started,
+    required this.transport,
+    required this.localDeviceId,
+    required this.localNodeId,
+    required this.directAddresses,
+    required this.relayUrls,
+    required this.activeTransferCount,
+    required this.pendingTransferCount,
+    required this.completedTransferCount,
+    required this.failedTransferCount,
+    required this.detail,
+  });
+
+  final bool started;
+  final String transport;
+  final String? localDeviceId;
+  final String? localNodeId;
+  final List<String> directAddresses;
+  final List<String> relayUrls;
+  final int activeTransferCount;
+  final int pendingTransferCount;
+  final int completedTransferCount;
+  final int failedTransferCount;
+  final String detail;
+
+  factory SyncNetworkStatus.fromJson(Map<String, dynamic> json) {
+    return SyncNetworkStatus(
+      started: json['started'] as bool? ?? false,
+      transport: json['transport'] as String? ?? 'unknown',
+      localDeviceId: json['local_device_id']?.toString(),
+      localNodeId: json['local_node_id'] as String?,
+      directAddresses: _readStringList(json['direct_addresses']),
+      relayUrls: _readStringList(json['relay_urls']),
+      activeTransferCount:
+          (json['active_transfer_count'] as num?)?.toInt() ?? 0,
+      pendingTransferCount:
+          (json['pending_transfer_count'] as num?)?.toInt() ?? 0,
+      completedTransferCount:
+          (json['completed_transfer_count'] as num?)?.toInt() ?? 0,
+      failedTransferCount:
+          (json['failed_transfer_count'] as num?)?.toInt() ?? 0,
       detail: json['detail'] as String? ?? '',
     );
   }

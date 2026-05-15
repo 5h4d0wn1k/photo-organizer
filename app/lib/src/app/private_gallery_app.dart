@@ -13,6 +13,7 @@ import '../features/settings/settings_screen.dart';
 import '../features/setup/daemon_status_screen.dart';
 import '../features/setup/setup_screen.dart';
 import '../features/timeline/timeline_screen.dart';
+import '../features/vaults/vaults_screen.dart';
 import '../models/gallery_models.dart';
 import '../repositories/gallery_repository.dart';
 import '../repositories/resilient_gallery_repository.dart';
@@ -379,8 +380,10 @@ class _GalleryBootstrapPageState extends State<GalleryBootstrapPage> {
       case 5:
         return 'Search';
       case 6:
-        return 'Jobs';
+        return 'Vaults';
       case 7:
+        return 'Jobs';
+      case 8:
         return 'Settings';
       default:
         return 'Private Gallery';
@@ -589,6 +592,7 @@ class _GalleryWorkspaceShell extends StatelessWidget {
         onTitleEvent: onTitleEvent,
       ),
       SearchScreen(repository: repository),
+      VaultsScreen(repository: repository),
       JobsScreen(
         jobs: workspace.dashboard.jobs,
         onFetchLogs: repository.fetchJobLogs,
@@ -606,6 +610,8 @@ class _GalleryWorkspaceShell extends StatelessWidget {
         onVerifyModel: onVerifyModel,
         onVerifyBackup: repository.verifyBackup,
         onExportBackup: repository.exportBackup,
+        onPlanRestoreBackup: repository.planRestoreBackup,
+        onRunRestoreBackup: repository.runRestoreBackup,
         onSaveSettings: onSaveSettings,
         onAddWatchFolder: onAddWatchFolder,
         onDeleteWatchFolder: onDeleteWatchFolder,
@@ -639,6 +645,10 @@ class _GalleryWorkspaceShell extends StatelessWidget {
       NavigationRailDestination(
         icon: Icon(Icons.search_outlined),
         label: Text('Search'),
+      ),
+      NavigationRailDestination(
+        icon: Icon(Icons.hub_outlined),
+        label: Text('Vaults'),
       ),
       NavigationRailDestination(
         icon: Icon(Icons.sync_outlined),

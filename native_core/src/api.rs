@@ -15,8 +15,9 @@ use uuid::Uuid;
 
 use crate::{
     domain::{
-        BackupExportRequest, BackupVerifyRequest, CommitImportSessionRequest, CorrectDateRequest,
-        CorrectPlaceRequest, CreateAlbumRequest, CreateDeviceRequest, CreateManualPersonRequest,
+        BackupExportRequest, BackupRestorePlanRequest, BackupRestoreRunRequest,
+        BackupVerifyRequest, CommitImportSessionRequest, CorrectDateRequest, CorrectPlaceRequest,
+        CreateAlbumRequest, CreateDeviceRequest, CreateManualPersonRequest,
         CreatePairingSessionRequest, CreateVaultRequest, CreateWatchFolderRequest,
         EncryptionActivationRequest, EnrollDeviceRequest, FeedbackEvent, HidePersonRequest,
         MergePersonRequest, ModelImportRequest, ModelInstallRequest, RebuildRequest,
@@ -63,10 +64,22 @@ pub fn router(state: AppState) -> Router {
         .route("/sync/plan", get(sync_plan))
         .route("/sync/run", post(run_sync))
         .route("/sync/transfers", get(sync_transfers))
+        .route("/sync/network/status", get(sync_network_status))
+        .route("/sync/network/start", post(start_sync_network))
+        .route("/sync/network/stop", post(stop_sync_network))
+        .route(
+            "/sync/transfers/{transfer_id}/retry",
+            post(retry_sync_transfer),
+        )
+        .route(
+            "/sync/transfers/{transfer_id}/cancel",
+            post(cancel_sync_transfer),
+        )
         .route("/assets/favorites", get(list_favorite_assets))
         .route("/assets/archived", get(list_archived_assets))
         .route("/assets/flags/bulk", post(update_assets_flags))
         .route("/assets/{asset_id}/flags", post(update_asset_flags))
+        .route("/assets/{asset_id}/original", get(asset_original))
         .route("/assets/{asset_id}/availability", get(asset_availability))
         .route("/assets/{asset_id}/pin-local", post(pin_local_asset))
         .route("/assets/{asset_id}/evict-local", post(evict_local_asset))
@@ -141,6 +154,8 @@ pub fn router(state: AppState) -> Router {
         .route("/security/encryption/activate", post(activate_encryption))
         .route("/backup/export", post(export_backup))
         .route("/backup/verify", post(verify_backup))
+        .route("/backup/restore/plan", post(plan_restore_backup))
+        .route("/backup/restore/run", post(run_restore_backup))
         .route("/backup/restore/verify", post(verify_restore_backup))
         .route("/models", get(list_models))
         .route("/models/runtime-status", get(model_runtime_status))
@@ -322,6 +337,38 @@ async fn sync_transfers(
     Ok(Json(state.service.sync_transfers().await))
 }
 
+async fn sync_network_status(
+    State(state): State<AppState>,
+) -> Result<Json<crate::domain::SyncNetworkStatus>, ApiError> {
+    Ok(Json(state.service.sync_network_status().await))
+}
+
+async fn start_sync_network(
+    State(state): State<AppState>,
+) -> Result<Json<crate::domain::SyncNetworkStatus>, ApiError> {
+    Ok(Json(state.service.start_sync_network().await?))
+}
+
+async fn stop_sync_network(
+    State(state): State<AppState>,
+) -> Result<Json<crate::domain::SyncNetworkStatus>, ApiError> {
+    Ok(Json(state.service.stop_sync_network().await?))
+}
+
+async fn retry_sync_transfer(
+    State(state): State<AppState>,
+    Path(transfer_id): Path<Uuid>,
+) -> Result<Json<crate::domain::SyncTransfer>, ApiError> {
+    Ok(Json(state.service.retry_sync_transfer(transfer_id).await?))
+}
+
+async fn cancel_sync_transfer(
+    State(state): State<AppState>,
+    Path(transfer_id): Path<Uuid>,
+) -> Result<Json<crate::domain::SyncTransfer>, ApiError> {
+    Ok(Json(state.service.cancel_sync_transfer(transfer_id).await?))
+}
+
 async fn scan_import_source(
     State(state): State<AppState>,
     Json(request): Json<ScanImportSourceRequest>,
@@ -438,6 +485,16 @@ async fn asset_availability(
     Path(asset_id): Path<Uuid>,
 ) -> Result<Json<crate::domain::AssetAvailability>, ApiError> {
     Ok(Json(state.service.asset_availability(asset_id).await?))
+}
+
+async fn asset_original(
+    State(state): State<AppState>,
+    Path(asset_id): Path<Uuid>,
+) -> Result<Response, ApiError> {
+    let (mime_type, bytes) = state.service.asset_original_bytes(asset_id).await?;
+    let content_type = HeaderValue::from_str(&mime_type)
+        .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream"));
+    Ok(([(CONTENT_TYPE, content_type)], bytes).into_response())
 }
 
 async fn pin_local_asset(
@@ -863,6 +920,20 @@ async fn verify_restore_backup(
     Json(request): Json<BackupVerifyRequest>,
 ) -> Result<Json<crate::domain::BackupVerification>, ApiError> {
     Ok(Json(state.service.verify_backup(request).await?))
+}
+
+async fn plan_restore_backup(
+    State(state): State<AppState>,
+    Json(request): Json<BackupRestorePlanRequest>,
+) -> Result<Json<crate::domain::BackupRestorePlan>, ApiError> {
+    Ok(Json(state.service.plan_restore_backup(request).await?))
+}
+
+async fn run_restore_backup(
+    State(state): State<AppState>,
+    Json(request): Json<BackupRestoreRunRequest>,
+) -> Result<Json<crate::domain::BackupRestoreRunResult>, ApiError> {
+    Ok(Json(state.service.run_restore_backup(request).await?))
 }
 
 async fn diagnostics(State(state): State<AppState>) -> Result<Json<serde_json::Value>, ApiError> {

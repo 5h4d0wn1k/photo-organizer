@@ -12,6 +12,7 @@ pub mod search;
 pub mod security;
 pub mod service;
 pub mod storage;
+pub mod vault_store;
 
 pub use api::{AppState, router};
 pub use config::AppConfig;

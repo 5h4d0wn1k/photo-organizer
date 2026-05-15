@@ -235,6 +235,10 @@ CREATE TABLE IF NOT EXISTS blob_chunks (
   content_hash TEXT NOT NULL,
   encrypted_hash TEXT NOT NULL,
   bytes INTEGER NOT NULL,
+  encrypted_bytes INTEGER NOT NULL DEFAULT 0,
+  local_path TEXT,
+  nonce_hex TEXT,
+  aad TEXT,
   UNIQUE(blob_id, chunk_index),
   FOREIGN KEY(blob_id) REFERENCES blob_records(id) ON DELETE CASCADE
 );
@@ -317,6 +321,20 @@ CREATE TABLE IF NOT EXISTS capability_grants (
   FOREIGN KEY(vault_id) REFERENCES vaults(id) ON DELETE CASCADE,
   FOREIGN KEY(device_id) REFERENCES device_identities(id) ON DELETE CASCADE,
   FOREIGN KEY(granted_by_device_id) REFERENCES device_identities(id) ON DELETE SET NULL
+);
+
+CREATE TABLE IF NOT EXISTS vault_key_envelopes (
+  id TEXT PRIMARY KEY,
+  vault_id TEXT NOT NULL,
+  device_id TEXT NOT NULL,
+  key_version INTEGER NOT NULL,
+  algorithm TEXT NOT NULL,
+  encrypted_vault_key TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  revoked_at TEXT,
+  UNIQUE(vault_id, device_id, key_version),
+  FOREIGN KEY(vault_id) REFERENCES vaults(id) ON DELETE CASCADE,
+  FOREIGN KEY(device_id) REFERENCES device_identities(id) ON DELETE CASCADE
 );
 
 CREATE TABLE IF NOT EXISTS device_pairings (

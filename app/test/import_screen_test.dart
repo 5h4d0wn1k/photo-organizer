@@ -168,6 +168,23 @@ class _FakeGalleryRepository implements GalleryRepository {
   }
 
   @override
+  Future<BackupRestorePlan> planRestoreBackup({
+    required String exportRoot,
+    required String restoreRoot,
+  }) {
+    throw UnimplementedError();
+  }
+
+  @override
+  Future<BackupRestoreRunResult> runRestoreBackup({
+    required String exportRoot,
+    required String restoreRoot,
+    bool confirmed = true,
+  }) {
+    throw UnimplementedError();
+  }
+
+  @override
   Future<ImportSession> scanImport(ImportScanRequest request) async {
     scanRequests.add(request);
     return scanSession;
@@ -503,6 +520,31 @@ class _FakeGalleryRepository implements GalleryRepository {
 
   @override
   Future<List<SyncTransfer>> fetchSyncTransfers() {
+    throw UnimplementedError();
+  }
+
+  @override
+  Future<SyncNetworkStatus> fetchSyncNetworkStatus() {
+    throw UnimplementedError();
+  }
+
+  @override
+  Future<SyncNetworkStatus> startSyncNetwork() {
+    throw UnimplementedError();
+  }
+
+  @override
+  Future<SyncNetworkStatus> stopSyncNetwork() {
+    throw UnimplementedError();
+  }
+
+  @override
+  Future<SyncTransfer> retrySyncTransfer(String id) {
+    throw UnimplementedError();
+  }
+
+  @override
+  Future<SyncTransfer> cancelSyncTransfer(String id) {
     throw UnimplementedError();
   }
 

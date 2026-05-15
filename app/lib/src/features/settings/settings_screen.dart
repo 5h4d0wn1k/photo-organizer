@@ -13,6 +13,8 @@ class SettingsScreen extends StatefulWidget {
     required this.onVerifyModel,
     required this.onVerifyBackup,
     required this.onExportBackup,
+    required this.onPlanRestoreBackup,
+    required this.onRunRestoreBackup,
     required this.onSaveSettings,
     required this.onAddWatchFolder,
     required this.onDeleteWatchFolder,
@@ -34,6 +36,15 @@ class SettingsScreen extends StatefulWidget {
     required String exportRoot,
     bool includeModels,
   }) onExportBackup;
+  final Future<BackupRestorePlan> Function({
+    required String exportRoot,
+    required String restoreRoot,
+  }) onPlanRestoreBackup;
+  final Future<BackupRestoreRunResult> Function({
+    required String exportRoot,
+    required String restoreRoot,
+    bool confirmed,
+  }) onRunRestoreBackup;
   final Future<void> Function(LibrarySettingsDraft draft) onSaveSettings;
   final Future<void> Function(WatchFolderDraft draft) onAddWatchFolder;
   final Future<void> Function(String id) onDeleteWatchFolder;
@@ -47,6 +58,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
   late final TextEditingController _libraryRootController;
   late final TextEditingController _watchFolderController;
   late final TextEditingController _backupRootController;
+  late final TextEditingController _restoreRootController;
   late final TextEditingController _modelIdController;
   late final TextEditingController _modelPathController;
   late final TextEditingController _modelHashController;
@@ -59,8 +71,12 @@ class _SettingsScreenState extends State<SettingsScreen> {
   bool _verifyingModel = false;
   bool _verifyingBackup = false;
   bool _exportingBackup = false;
+  bool _planningRestore = false;
+  bool _runningRestore = false;
   BackupVerification? _backupVerification;
   BackupExportResult? _backupExport;
+  BackupRestorePlan? _restorePlan;
+  BackupRestoreRunResult? _restoreRun;
   ModelArtifact? _modelActionResult;
 
   @override
@@ -72,6 +88,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
     _watchFolderController = TextEditingController();
     _backupRootController = TextEditingController(
       text: '${widget.workspace.settings.libraryRoot}/backups',
+    );
+    _restoreRootController = TextEditingController(
+      text: '${widget.workspace.settings.libraryRoot}-restore-stage',
     );
     _modelIdController = TextEditingController(
       text: _firstModelId(widget.workspace.dashboard.models),
@@ -86,6 +105,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     _libraryRootController.dispose();
     _watchFolderController.dispose();
     _backupRootController.dispose();
+    _restoreRootController.dispose();
     _modelIdController.dispose();
     _modelPathController.dispose();
     _modelHashController.dispose();
@@ -316,6 +336,89 @@ class _SettingsScreenState extends State<SettingsScreen> {
     }
   }
 
+  Future<void> _planRestoreBackup() async {
+    final exportRoot = _backupRootController.text.trim();
+    final restoreRoot = _restoreRootController.text.trim();
+    if (exportRoot.isEmpty || restoreRoot.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Enter backup and restore paths first.')),
+      );
+      return;
+    }
+
+    setState(() => _planningRestore = true);
+    try {
+      final result = await widget.onPlanRestoreBackup(
+        exportRoot: exportRoot,
+        restoreRoot: restoreRoot,
+      );
+      if (!mounted) {
+        return;
+      }
+      setState(() => _restorePlan = result);
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(result.ok
+              ? 'Restore plan is ready.'
+              : 'Restore plan found blockers.'),
+        ),
+      );
+    } catch (error) {
+      if (!mounted) {
+        return;
+      }
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('$error')),
+      );
+    } finally {
+      if (mounted) {
+        setState(() => _planningRestore = false);
+      }
+    }
+  }
+
+  Future<void> _runRestoreBackup() async {
+    final exportRoot = _backupRootController.text.trim();
+    final restoreRoot = _restoreRootController.text.trim();
+    if (exportRoot.isEmpty || restoreRoot.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Enter backup and restore paths first.')),
+      );
+      return;
+    }
+
+    setState(() => _runningRestore = true);
+    try {
+      final result = await widget.onRunRestoreBackup(
+        exportRoot: exportRoot,
+        restoreRoot: restoreRoot,
+        confirmed: true,
+      );
+      if (!mounted) {
+        return;
+      }
+      setState(() => _restoreRun = result);
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(result.ok
+              ? 'Restore staged for review.'
+              : 'Restore finished with warnings.'),
+        ),
+      );
+    } catch (error) {
+      if (!mounted) {
+        return;
+      }
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('$error')),
+      );
+    } finally {
+      if (mounted) {
+        setState(() => _runningRestore = false);
+      }
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
@@ -400,7 +503,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     style: theme.textTheme.titleLarge),
                 const SizedBox(height: 12),
                 const Text(
-                  'This verifies the encrypted database, managed originals, and installed model files. Export currently writes a database copy and manifest; full media copy/restore is a later hardening step.',
+                  'This verifies the encrypted database, managed originals, encrypted vault chunks, and installed model files. Export writes a restorable local backup; restore stages into a separate folder without modifying the active library.',
                 ),
                 const SizedBox(height: 16),
                 TextField(
@@ -410,6 +513,16 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     border: OutlineInputBorder(),
                     helperText:
                         'Prefer an external disk or NAS path for real backups.',
+                  ),
+                ),
+                const SizedBox(height: 12),
+                TextField(
+                  controller: _restoreRootController,
+                  decoration: const InputDecoration(
+                    labelText: 'Restore staging path',
+                    border: OutlineInputBorder(),
+                    helperText:
+                        'Use an empty folder outside the active library/runtime.',
                   ),
                 ),
                 const SizedBox(height: 12),
@@ -435,7 +548,30 @@ class _SettingsScreenState extends State<SettingsScreen> {
                               child: CircularProgressIndicator(strokeWidth: 2),
                             )
                           : const Icon(Icons.backup_outlined),
-                      label: const Text('Export DB and manifest'),
+                      label: const Text('Export restorable backup'),
+                    ),
+                    OutlinedButton.icon(
+                      onPressed: _planningRestore ? null : _planRestoreBackup,
+                      icon: _planningRestore
+                          ? const SizedBox.square(
+                              dimension: 18,
+                              child: CircularProgressIndicator(strokeWidth: 2),
+                            )
+                          : const Icon(Icons.manage_search_outlined),
+                      label: const Text('Plan restore'),
+                    ),
+                    FilledButton.tonalIcon(
+                      onPressed: _runningRestore ||
+                              (_restorePlan != null && !_restorePlan!.ok)
+                          ? null
+                          : _runRestoreBackup,
+                      icon: _runningRestore
+                          ? const SizedBox.square(
+                              dimension: 18,
+                              child: CircularProgressIndicator(strokeWidth: 2),
+                            )
+                          : const Icon(Icons.restore_page_outlined),
+                      label: const Text('Stage restore'),
                     ),
                   ],
                 ),
@@ -446,6 +582,14 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 if (_backupExport != null) ...[
                   const SizedBox(height: 16),
                   _BackupExportPanel(result: _backupExport!),
+                ],
+                if (_restorePlan != null) ...[
+                  const SizedBox(height: 16),
+                  _BackupRestorePlanPanel(result: _restorePlan!),
+                ],
+                if (_restoreRun != null) ...[
+                  const SizedBox(height: 16),
+                  _BackupRestoreRunPanel(result: _restoreRun!),
                 ],
               ],
             ),
@@ -801,6 +945,8 @@ class _BackupVerificationPanel extends StatelessWidget {
         'Library: ${result.libraryRoot}',
         'Assets checked: ${result.assetsChecked}',
         'Missing assets: ${result.missingAssetPaths.length}',
+        'Encrypted vault chunks checked: ${result.vaultChunksChecked}',
+        'Missing encrypted chunks: ${result.missingVaultChunkPaths.length}',
         'Model files checked: ${result.modelFilesChecked}',
         'Missing model files: ${result.missingModelPaths.length}',
         if (result.databaseSha256 != null)
@@ -808,6 +954,9 @@ class _BackupVerificationPanel extends StatelessWidget {
         ...result.missingAssetPaths
             .take(5)
             .map((path) => 'Missing asset: $path'),
+        ...result.missingVaultChunkPaths
+            .take(5)
+            .map((path) => 'Missing encrypted chunk: $path'),
         ...result.missingModelPaths
             .take(5)
             .map((path) => 'Missing model: $path'),
@@ -960,11 +1109,64 @@ class _BackupExportPanel extends StatelessWidget {
         'Manifest: ${result.manifestPath}',
         'Database copy: ${result.databaseCopiedTo}',
         'Assets checked: ${result.assetsChecked}',
+        'Media files copied: ${result.mediaFilesCopied}',
+        'Encrypted vault chunks copied: ${result.vaultChunksCopied}',
+        'Bytes copied: ${result.bytesCopied}',
         'Missing assets: ${result.missingAssetPaths.length}',
         'Model files checked: ${result.modelFilesChecked}',
         'Missing model files: ${result.missingModelPaths.length}',
         if (result.databaseSha256 != null)
           'Database SHA-256: ${result.databaseSha256}',
+      ],
+    );
+  }
+}
+
+class _BackupRestorePlanPanel extends StatelessWidget {
+  const _BackupRestorePlanPanel({required this.result});
+
+  final BackupRestorePlan result;
+
+  @override
+  Widget build(BuildContext context) {
+    return _BackupResultCard(
+      ok: result.ok,
+      title: result.ok ? 'Restore plan ready' : 'Restore plan blocked',
+      lines: [
+        result.detail,
+        'Export root: ${result.exportRoot}',
+        'Restore root: ${result.restoreRoot}',
+        'Manifest: ${result.manifestPath}',
+        'Database source: ${result.databaseSourcePath}',
+        'Database target: ${result.databaseTargetPath}',
+        'Media files available: ${result.mediaFilesAvailable}',
+        'Encrypted vault chunks available: ${result.vaultChunksAvailable}',
+        'Missing paths: ${result.missingPaths.length}',
+        'Destination conflicts: ${result.destinationConflicts.length}',
+        ...result.missingPaths.take(5).map((path) => 'Missing: $path'),
+        ...result.destinationConflicts.take(5).map((path) => 'Conflict: $path'),
+      ],
+    );
+  }
+}
+
+class _BackupRestoreRunPanel extends StatelessWidget {
+  const _BackupRestoreRunPanel({required this.result});
+
+  final BackupRestoreRunResult result;
+
+  @override
+  Widget build(BuildContext context) {
+    return _BackupResultCard(
+      ok: result.ok,
+      title: result.ok ? 'Restore staged' : 'Restore warnings found',
+      lines: [
+        result.detail,
+        'Restore root: ${result.restoreRoot}',
+        'Database restored to: ${result.databaseRestoredTo}',
+        'Media files copied: ${result.mediaFilesCopied}',
+        'Encrypted vault chunks copied: ${result.vaultChunksCopied}',
+        'Bytes copied: ${result.bytesCopied}',
       ],
     );
   }

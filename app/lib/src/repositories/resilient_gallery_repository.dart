@@ -108,6 +108,31 @@ class ResilientGalleryRepository implements GalleryRepository {
   }
 
   @override
+  Future<SyncNetworkStatus> fetchSyncNetworkStatus() {
+    return _delegate.fetchSyncNetworkStatus();
+  }
+
+  @override
+  Future<SyncNetworkStatus> startSyncNetwork() {
+    return _delegate.startSyncNetwork();
+  }
+
+  @override
+  Future<SyncNetworkStatus> stopSyncNetwork() {
+    return _delegate.stopSyncNetwork();
+  }
+
+  @override
+  Future<SyncTransfer> retrySyncTransfer(String id) {
+    return _delegate.retrySyncTransfer(id);
+  }
+
+  @override
+  Future<SyncTransfer> cancelSyncTransfer(String id) {
+    return _delegate.cancelSyncTransfer(id);
+  }
+
+  @override
   Future<AssetAvailability> fetchAssetAvailability(String assetId) {
     return _delegate.fetchAssetAvailability(assetId);
   }
@@ -175,6 +200,30 @@ class ResilientGalleryRepository implements GalleryRepository {
     return _delegate.exportBackup(
       exportRoot: exportRoot,
       includeModels: includeModels,
+    );
+  }
+
+  @override
+  Future<BackupRestorePlan> planRestoreBackup({
+    required String exportRoot,
+    required String restoreRoot,
+  }) {
+    return _delegate.planRestoreBackup(
+      exportRoot: exportRoot,
+      restoreRoot: restoreRoot,
+    );
+  }
+
+  @override
+  Future<BackupRestoreRunResult> runRestoreBackup({
+    required String exportRoot,
+    required String restoreRoot,
+    bool confirmed = true,
+  }) {
+    return _delegate.runRestoreBackup(
+      exportRoot: exportRoot,
+      restoreRoot: restoreRoot,
+      confirmed: confirmed,
     );
   }
 

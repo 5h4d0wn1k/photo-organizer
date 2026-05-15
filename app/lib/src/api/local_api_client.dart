@@ -133,6 +133,30 @@ class LocalApiClient {
     return BackupExportResult.fromJson(response);
   }
 
+  Future<BackupRestorePlan> planRestoreBackup({
+    required String exportRoot,
+    required String restoreRoot,
+  }) async {
+    final response = await _postObject('/backup/restore/plan', {
+      'export_root': exportRoot,
+      'restore_root': restoreRoot,
+    });
+    return BackupRestorePlan.fromJson(response);
+  }
+
+  Future<BackupRestoreRunResult> runRestoreBackup({
+    required String exportRoot,
+    required String restoreRoot,
+    bool confirmed = true,
+  }) async {
+    final response = await _postObject('/backup/restore/run', {
+      'export_root': exportRoot,
+      'restore_root': restoreRoot,
+      'confirmed': confirmed,
+    });
+    return BackupRestoreRunResult.fromJson(response);
+  }
+
   Future<LibraryStatus> fetchLibraryStatus() async {
     final response = await _getObject(
       '/library/status',
@@ -258,6 +282,31 @@ class LocalApiClient {
   Future<List<SyncTransfer>> fetchSyncTransfers() async {
     final response = await _getList('/sync/transfers');
     return response.map(SyncTransfer.fromJson).toList();
+  }
+
+  Future<SyncNetworkStatus> fetchSyncNetworkStatus() async {
+    final response = await _getObject('/sync/network/status');
+    return SyncNetworkStatus.fromJson(response);
+  }
+
+  Future<SyncNetworkStatus> startSyncNetwork() async {
+    final response = await _postObject('/sync/network/start', const {});
+    return SyncNetworkStatus.fromJson(response);
+  }
+
+  Future<SyncNetworkStatus> stopSyncNetwork() async {
+    final response = await _postObject('/sync/network/stop', const {});
+    return SyncNetworkStatus.fromJson(response);
+  }
+
+  Future<SyncTransfer> retrySyncTransfer(String id) async {
+    final response = await _postObject('/sync/transfers/$id/retry', const {});
+    return SyncTransfer.fromJson(response);
+  }
+
+  Future<SyncTransfer> cancelSyncTransfer(String id) async {
+    final response = await _postObject('/sync/transfers/$id/cancel', const {});
+    return SyncTransfer.fromJson(response);
   }
 
   Future<AssetAvailability> fetchAssetAvailability(String assetId) async {

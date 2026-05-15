@@ -15,7 +15,8 @@ use crate::{
     config::AppConfig,
     domain::{
         Album, Asset, AssetAvailability, AssetAvailabilityState, BackupExportRequest,
-        BackupExportResult, BackupVerification, BackupVerifyRequest, BlobChunk, BlobRecord,
+        BackupExportResult, BackupRestorePlan, BackupRestorePlanRequest, BackupRestoreRunRequest,
+        BackupRestoreRunResult, BackupVerification, BackupVerifyRequest, BlobChunk, BlobRecord,
         BlobReplica, CapabilityGrant, CorrectDateRequest, CorrectPlaceRequest, CorrectionKind,
         CorrectionRecord, CreateAlbumRequest, CreateDeviceRequest, CreateManualPersonRequest,
         CreatePairingSessionRequest, CreateVaultRequest, CreateWatchFolderRequest, DeviceIdentity,
@@ -28,14 +29,15 @@ use crate::{
         PrivacyStatus, RebuildRequest, RejectPersonMatchRequest, RelayEndpoint, RenameAlbumRequest,
         RenamePersonRequest, ReplicaHealth, RevokeDeviceRequest, RunSyncRequest,
         ScanImportSourceRequest, SceneTag, SearchIndexStatus, SearchQuery, SearchResponse,
-        SplitPersonRequest, StoragePolicy, StoragePolicyMode, SyncConflict, SyncPlan, SyncSession,
-        SyncTransfer, SyncTransferStatus, TimelineBucket, TimelineResponse,
+        SplitPersonRequest, StoragePolicy, StoragePolicyMode, SyncConflict, SyncNetworkStatus,
+        SyncPlan, SyncSession, SyncTransfer, SyncTransferStatus, TimelineBucket, TimelineResponse,
         UpdateAlbumAssetsRequest, UpdateAssetFlagsRequest, UpdateAssetsFlagsRequest,
         UpdateLibrarySettingsRequest, UpdatePersonAssetsRequest, UpdateVaultStoragePolicyRequest,
-        Vault, VaultInvite, VaultMember, VaultStatus, WatchFolder,
+        Vault, VaultInvite, VaultKeyEnvelope, VaultMember, VaultStatus, WatchFolder,
     },
     events, imports, metadata, ml_sidecar, model_registry, ocr, people, search, security,
     storage::{self, PersistedLibraryState, StorageBootstrapReport},
+    vault_store,
 };
 
 #[derive(Debug, Default)]
@@ -58,6 +60,7 @@ struct LibraryState {
     sync_transfers: Vec<SyncTransfer>,
     sync_conflicts: Vec<SyncConflict>,
     vault_invites: Vec<VaultInvite>,
+    vault_key_envelopes: Vec<VaultKeyEnvelope>,
     relay_endpoints: Vec<RelayEndpoint>,
     capability_grants: Vec<CapabilityGrant>,
     pairings: Vec<DevicePairing>,
@@ -91,6 +94,7 @@ impl From<PersistedLibraryState> for LibraryState {
             sync_transfers: state.sync_transfers,
             sync_conflicts: state.sync_conflicts,
             vault_invites: state.vault_invites,
+            vault_key_envelopes: state.vault_key_envelopes,
             relay_endpoints: state.relay_endpoints,
             capability_grants: state.capability_grants,
             pairings: state.pairings,
@@ -126,6 +130,7 @@ impl LibraryState {
             sync_transfers: self.sync_transfers.clone(),
             sync_conflicts: self.sync_conflicts.clone(),
             vault_invites: self.vault_invites.clone(),
+            vault_key_envelopes: self.vault_key_envelopes.clone(),
             relay_endpoints: self.relay_endpoints.clone(),
             capability_grants: self.capability_grants.clone(),
             pairings: self.pairings.clone(),
@@ -177,7 +182,7 @@ impl GalleryService {
         let compacted_history = compact_job_history(&mut state);
         refresh_import_session_summaries(&mut state, &config);
         let distributed_changed =
-            ensure_distributed_defaults(&mut state) || refresh_blob_records(&mut state);
+            ensure_distributed_defaults(&mut state) || refresh_blob_records(&config, &mut state);
         if compacted_history || distributed_changed {
             storage::save_state(&storage, &state.to_persisted())
                 .map_err(|err| ServiceError::Storage(err.to_string()))?;
@@ -254,7 +259,7 @@ impl GalleryService {
         state.library_settings = Some(settings.clone());
         refresh_asset_availability(&mut state);
         ensure_distributed_defaults(&mut state);
-        refresh_blob_records(&mut state);
+        refresh_blob_records(&self.config, &mut state);
         self.persist_locked_state(&state)?;
         Ok(settings)
     }
@@ -377,7 +382,7 @@ impl GalleryService {
             revoked_at: None,
         });
         state.vaults.push(vault.clone());
-        refresh_blob_records(&mut state);
+        refresh_blob_records(&self.config, &mut state);
         self.persist_locked_state(&state)?;
         Ok(vault)
     }
@@ -385,7 +390,7 @@ impl GalleryService {
     pub async fn vault_status(&self, vault_id: Uuid) -> Result<VaultStatus, ServiceError> {
         let mut state = self.state.write().await;
         ensure_distributed_defaults(&mut state);
-        let changed = refresh_blob_records(&mut state);
+        let changed = refresh_blob_records(&self.config, &mut state);
         let status = build_vault_status(&state, vault_id)?;
         if changed {
             self.persist_locked_state(&state)?;
@@ -489,6 +494,13 @@ impl GalleryService {
         {
             member.revoked_at = Some(now);
         }
+        for envelope in state
+            .vault_key_envelopes
+            .iter_mut()
+            .filter(|envelope| envelope.device_id == device_id)
+        {
+            envelope.revoked_at = Some(now);
+        }
         for replica in state.blob_replicas.iter_mut().filter(|replica| {
             replica.device_id == device_id && replica.health == ReplicaHealth::Healthy
         }) {
@@ -501,7 +513,7 @@ impl GalleryService {
     pub async fn sync_plan(&self, vault_id: Option<Uuid>) -> Result<SyncPlan, ServiceError> {
         let mut state = self.state.write().await;
         ensure_distributed_defaults(&mut state);
-        let changed = refresh_blob_records(&mut state);
+        let changed = refresh_blob_records(&self.config, &mut state);
         let plan = build_sync_plan(&state, vault_id)?;
         if changed {
             self.persist_locked_state(&state)?;
@@ -512,7 +524,7 @@ impl GalleryService {
     pub async fn run_sync(&self, request: RunSyncRequest) -> Result<SyncPlan, ServiceError> {
         let mut state = self.state.write().await;
         ensure_distributed_defaults(&mut state);
-        refresh_blob_records(&mut state);
+        refresh_blob_records(&self.config, &mut state);
         let plan = build_sync_plan(&state, request.vault_id)?;
         if !request.dry_run {
             for transfer in &plan.transfers {
@@ -537,13 +549,80 @@ impl GalleryService {
         self.state.read().await.sync_transfers.clone()
     }
 
+    pub async fn sync_network_status(&self) -> SyncNetworkStatus {
+        let state = self.state.read().await;
+        build_sync_network_status(&state)
+    }
+
+    pub async fn start_sync_network(&self) -> Result<SyncNetworkStatus, ServiceError> {
+        let mut state = self.state.write().await;
+        ensure_distributed_defaults(&mut state);
+        self.persist_locked_state(&state)?;
+        Ok(build_sync_network_status(&state))
+    }
+
+    pub async fn stop_sync_network(&self) -> Result<SyncNetworkStatus, ServiceError> {
+        let state = self.state.read().await;
+        Ok(build_sync_network_status(&state))
+    }
+
+    pub async fn retry_sync_transfer(
+        &self,
+        transfer_id: Uuid,
+    ) -> Result<SyncTransfer, ServiceError> {
+        let mut state = self.state.write().await;
+        let transfer = state
+            .sync_transfers
+            .iter_mut()
+            .find(|transfer| transfer.id == transfer_id)
+            .ok_or_else(|| ServiceError::NotFound(format!("transfer {transfer_id}")))?;
+        if matches!(
+            transfer.status,
+            SyncTransferStatus::Completed | SyncTransferStatus::Running
+        ) {
+            return Err(ServiceError::Invalid(
+                "only pending, failed, or aborted transfers can be retried".to_string(),
+            ));
+        }
+        transfer.status = SyncTransferStatus::Pending;
+        transfer.bytes_completed = 0;
+        transfer.started_at = None;
+        transfer.updated_at = Utc::now();
+        transfer.resumable_until = Utc::now() + chrono::Duration::days(7);
+        let transfer = transfer.clone();
+        self.persist_locked_state(&state)?;
+        Ok(transfer)
+    }
+
+    pub async fn cancel_sync_transfer(
+        &self,
+        transfer_id: Uuid,
+    ) -> Result<SyncTransfer, ServiceError> {
+        let mut state = self.state.write().await;
+        let transfer = state
+            .sync_transfers
+            .iter_mut()
+            .find(|transfer| transfer.id == transfer_id)
+            .ok_or_else(|| ServiceError::NotFound(format!("transfer {transfer_id}")))?;
+        if transfer.status == SyncTransferStatus::Completed {
+            return Err(ServiceError::Invalid(
+                "completed transfers cannot be canceled".to_string(),
+            ));
+        }
+        transfer.status = SyncTransferStatus::Aborted;
+        transfer.updated_at = Utc::now();
+        let transfer = transfer.clone();
+        self.persist_locked_state(&state)?;
+        Ok(transfer)
+    }
+
     pub async fn asset_availability(
         &self,
         asset_id: Uuid,
     ) -> Result<AssetAvailability, ServiceError> {
         let mut state = self.state.write().await;
         ensure_distributed_defaults(&mut state);
-        let changed = refresh_blob_records(&mut state);
+        let changed = refresh_blob_records(&self.config, &mut state);
         let availability = build_asset_availability(&state, asset_id)?;
         if changed {
             self.persist_locked_state(&state)?;
@@ -554,15 +633,25 @@ impl GalleryService {
     pub async fn pin_local_asset(&self, asset_id: Uuid) -> Result<AssetAvailability, ServiceError> {
         let mut state = self.state.write().await;
         ensure_distributed_defaults(&mut state);
-        refresh_blob_records(&mut state);
+        refresh_blob_records(&self.config, &mut state);
         let local_device = local_device_id(&state).ok_or_else(|| {
             ServiceError::Invalid("local admin device could not be initialized".to_string())
         })?;
         let availability = build_asset_availability(&state, asset_id)?;
-        if availability.local_replica {
+        let asset_available = state
+            .assets
+            .iter()
+            .find(|asset| asset.id == asset_id)
+            .map(|asset| asset.is_available)
+            .unwrap_or(false);
+        if availability.local_replica && asset_available {
             return Ok(availability);
         }
         if availability.reachable_replica_device_ids.is_empty() {
+            if self.restore_original_from_local_chunks_locked(&mut state, asset_id)? {
+                self.persist_locked_state(&state)?;
+                return build_asset_availability(&state, asset_id);
+            }
             return Err(ServiceError::Invalid(
                 "asset has no reachable remote replica to pin locally".to_string(),
             ));
@@ -591,7 +680,7 @@ impl GalleryService {
     ) -> Result<AssetAvailability, ServiceError> {
         let mut state = self.state.write().await;
         ensure_distributed_defaults(&mut state);
-        refresh_blob_records(&mut state);
+        refresh_blob_records(&self.config, &mut state);
         let local_device = local_device_id(&state).ok_or_else(|| {
             ServiceError::Invalid("local admin device could not be initialized".to_string())
         })?;
@@ -635,11 +724,18 @@ impl GalleryService {
             .iter_mut()
             .find(|asset| asset.id == asset_id)
             .ok_or_else(|| ServiceError::NotFound(format!("asset {asset_id}")))?;
+        if asset.import_mode == ImportMode::Reference {
+            return Err(ServiceError::Invalid(
+                "referenced originals are outside the managed library and cannot be evicted"
+                    .to_string(),
+            ));
+        }
         let path = asset_file_path(asset, &library_root);
         if path.exists() {
             fs::remove_file(&path).map_err(|err| ServiceError::Io(err.to_string()))?;
         }
         asset.is_available = false;
+        remove_local_encrypted_chunks(&mut state, blob.id, &library_root)?;
         if let Some(replica) = state
             .blob_replicas
             .iter_mut()
@@ -651,6 +747,53 @@ impl GalleryService {
         }
         self.persist_locked_state(&state)?;
         build_asset_availability(&state, asset_id)
+    }
+
+    pub async fn asset_original_bytes(
+        &self,
+        asset_id: Uuid,
+    ) -> Result<(String, Vec<u8>), ServiceError> {
+        let mut state = self.state.write().await;
+        ensure_distributed_defaults(&mut state);
+        refresh_blob_records(&self.config, &mut state);
+        let library_root = PathBuf::from(effective_library_root(&state, &self.config));
+        let asset = state
+            .assets
+            .iter()
+            .find(|asset| asset.id == asset_id)
+            .cloned()
+            .ok_or_else(|| ServiceError::NotFound(format!("asset {asset_id}")))?;
+        let original_path = asset_file_path(&asset, &library_root);
+        if original_path.is_file() {
+            return fs::read(&original_path)
+                .map(|bytes| (asset.mime_type, bytes))
+                .map_err(|err| ServiceError::Io(err.to_string()));
+        }
+        let blob = state
+            .blob_records
+            .iter()
+            .find(|blob| blob.asset_id == asset_id && blob.tombstoned_at.is_none())
+            .cloned()
+            .ok_or_else(|| ServiceError::NotFound(format!("blob for asset {asset_id}")))?;
+        let chunks = state
+            .blob_chunks
+            .iter()
+            .filter(|chunk| chunk.blob_id == blob.id)
+            .cloned()
+            .collect::<Vec<_>>();
+        if !vault_store::encrypted_chunk_files_exist(&library_root, &chunks) {
+            let availability = build_asset_availability(&state, asset_id)?;
+            return Err(ServiceError::Invalid(availability.detail));
+        }
+        let bytes = vault_store::decrypt_chunks_to_bytes(
+            &self.config,
+            &library_root,
+            blob.vault_id,
+            blob.encryption_key_version,
+            &chunks,
+        )
+        .map_err(vault_store_error)?;
+        Ok((asset.mime_type, bytes))
     }
 
     pub async fn scan_import_source(
@@ -875,7 +1018,7 @@ impl GalleryService {
 
         state.assets.extend(new_assets);
         ensure_distributed_defaults(&mut state);
-        refresh_blob_records(&mut state);
+        refresh_blob_records(&self.config, &mut state);
         session.status = ImportSessionStatus::Committed;
         session.import_mode = effective_mode;
         session.add_as_watch_folder = add_as_watch_folder;
@@ -981,7 +1124,7 @@ impl GalleryService {
         state.jobs.insert(0, job.clone());
         refresh_derived_views(&mut state);
         ensure_distributed_defaults(&mut state);
-        refresh_blob_records(&mut state);
+        refresh_blob_records(&self.config, &mut state);
         self.persist_locked_state(&state)?;
         Ok(ImportAssetResponse { asset, job })
     }
@@ -2640,8 +2783,26 @@ impl GalleryService {
         let export_root = PathBuf::from(&request.export_root);
         let database_dir = export_root.join("database");
         let manifest_dir = export_root.join("manifests");
+        let library_export_dir = export_root.join("library");
         fs::create_dir_all(&database_dir).map_err(|err| ServiceError::Io(err.to_string()))?;
         fs::create_dir_all(&manifest_dir).map_err(|err| ServiceError::Io(err.to_string()))?;
+        fs::create_dir_all(&library_export_dir).map_err(|err| ServiceError::Io(err.to_string()))?;
+
+        let entries = {
+            let mut state = self.state.write().await;
+            ensure_distributed_defaults(&mut state);
+            let changed = refresh_blob_records(&self.config, &mut state);
+            if changed {
+                self.persist_locked_state(&state)?;
+            }
+            let library_root = PathBuf::from(effective_library_root(&state, &self.config));
+            collect_backup_file_entries(
+                &state,
+                &library_root,
+                request.include_models,
+                &self.config,
+            )?
+        };
 
         let database_copy = database_dir.join(
             self.storage
@@ -2651,6 +2812,37 @@ impl GalleryService {
         );
         fs::copy(&self.storage.database_path, &database_copy)
             .map_err(|err| ServiceError::Io(err.to_string()))?;
+
+        let mut media_files_copied = 0_usize;
+        let mut vault_chunks_copied = 0_usize;
+        let mut bytes_copied = fs::metadata(&database_copy)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        let mut copied_entries = Vec::new();
+        for entry in &entries {
+            if !entry.source_path.is_file() {
+                continue;
+            }
+            let destination = export_root.join(&entry.backup_relative_path);
+            copy_file_creating_parent(&entry.source_path, &destination)?;
+            let copied = fs::metadata(&destination)
+                .map(|metadata| metadata.len())
+                .unwrap_or(0);
+            bytes_copied = bytes_copied.saturating_add(copied);
+            match entry.kind {
+                "vault_chunk" => vault_chunks_copied += 1,
+                "model_file" => {}
+                _ => media_files_copied += 1,
+            }
+            copied_entries.push(json!({
+                "kind": entry.kind,
+                "asset_id": entry.asset_id.map(|id| id.to_string()),
+                "source_path": entry.source_path,
+                "backup_relative_path": entry.backup_relative_path,
+                "restore_relative_path": entry.restore_relative_path,
+                "bytes": copied,
+            }));
+        }
 
         let verification = self
             .verify_backup(BackupVerifyRequest {
@@ -2666,8 +2858,14 @@ impl GalleryService {
             "database_sha256": verification.database_sha256,
             "assets_checked": verification.assets_checked,
             "missing_asset_paths": verification.missing_asset_paths,
+            "vault_chunks_checked": verification.vault_chunks_checked,
+            "missing_vault_chunk_paths": verification.missing_vault_chunk_paths,
+            "media_files_copied": media_files_copied,
+            "vault_chunks_copied": vault_chunks_copied,
+            "bytes_copied": bytes_copied,
             "model_files_checked": verification.model_files_checked,
             "missing_model_paths": verification.missing_model_paths,
+            "files": copied_entries,
             "include_models": request.include_models,
             "local_only": true,
         });
@@ -2686,6 +2884,9 @@ impl GalleryService {
             database_sha256: verification.database_sha256,
             assets_checked: verification.assets_checked,
             missing_asset_paths: verification.missing_asset_paths.clone(),
+            media_files_copied,
+            vault_chunks_copied,
+            bytes_copied,
             model_files_checked: verification.model_files_checked,
             missing_model_paths: verification.missing_model_paths.clone(),
             ok: verification.ok,
@@ -2696,19 +2897,44 @@ impl GalleryService {
         &self,
         _request: BackupVerifyRequest,
     ) -> Result<BackupVerification, ServiceError> {
-        let state = self.state.read().await;
+        let mut state = self.state.write().await;
+        ensure_distributed_defaults(&mut state);
+        let changed = refresh_blob_records(&self.config, &mut state);
+        if changed {
+            self.persist_locked_state(&state)?;
+        }
         let library_root = PathBuf::from(effective_library_root(&state, &self.config));
         let mut missing_asset_paths = Vec::new();
         for asset in &state.assets {
             let path = asset_file_path(asset, &library_root);
-            if !path.exists() {
+            let encrypted_available = state
+                .blob_records
+                .iter()
+                .find(|blob| blob.asset_id == asset.id && blob.tombstoned_at.is_none())
+                .map(|blob| encrypted_chunks_available(&state, blob.id, &library_root))
+                .unwrap_or(false);
+            if !path.exists() && !encrypted_available {
                 missing_asset_paths.push(path.to_string_lossy().to_string());
+            }
+        }
+
+        let mut vault_chunks_checked = 0_usize;
+        let mut missing_vault_chunk_paths = Vec::new();
+        for chunk in &state.blob_chunks {
+            if let Some(local_path) = &chunk.local_path {
+                vault_chunks_checked += 1;
+                let path = library_root.join(local_path);
+                if let Err(err) =
+                    vault_store::verify_encrypted_chunk_files(&library_root, &[chunk.clone()])
+                {
+                    missing_vault_chunk_paths.push(format!("{}: {err}", path.to_string_lossy()));
+                }
             }
         }
 
         let mut model_files_checked = 0_usize;
         let mut missing_model_paths = Vec::new();
-        for model in self.models().await? {
+        for model in model_registry::list_models(&self.config).map_err(model_registry_error)? {
             if let Some(path) = model.installed_path {
                 model_files_checked += 1;
                 if !Path::new(&path).exists() {
@@ -2719,7 +2945,9 @@ impl GalleryService {
 
         let database_sha256 =
             imports::derive_content_hash_from_file(&self.storage.database_path).ok();
-        let ok = missing_asset_paths.is_empty() && missing_model_paths.is_empty();
+        let ok = missing_asset_paths.is_empty()
+            && missing_vault_chunk_paths.is_empty()
+            && missing_model_paths.is_empty();
 
         Ok(BackupVerification {
             checked_at: Utc::now(),
@@ -2728,10 +2956,138 @@ impl GalleryService {
             database_sha256,
             assets_checked: state.assets.len(),
             missing_asset_paths,
+            vault_chunks_checked,
+            missing_vault_chunk_paths,
             model_files_checked,
             missing_model_paths,
             ok,
         })
+    }
+
+    pub async fn plan_restore_backup(
+        &self,
+        request: BackupRestorePlanRequest,
+    ) -> Result<BackupRestorePlan, ServiceError> {
+        let active_library_root = {
+            let state = self.state.read().await;
+            PathBuf::from(effective_library_root(&state, &self.config))
+        };
+        build_restore_plan(
+            &request.export_root,
+            &request.restore_root,
+            &self.config,
+            Some(&active_library_root),
+        )
+    }
+
+    pub async fn run_restore_backup(
+        &self,
+        request: BackupRestoreRunRequest,
+    ) -> Result<BackupRestoreRunResult, ServiceError> {
+        if !request.confirmed {
+            return Err(ServiceError::Invalid(
+                "restore run requires explicit confirmation".to_string(),
+            ));
+        }
+        let active_library_root = {
+            let state = self.state.read().await;
+            PathBuf::from(effective_library_root(&state, &self.config))
+        };
+        let plan = build_restore_plan(
+            &request.export_root,
+            &request.restore_root,
+            &self.config,
+            Some(&active_library_root),
+        )?;
+        if !plan.ok {
+            return Err(ServiceError::Invalid(format!(
+                "restore plan is not safe to run: {}",
+                plan.detail
+            )));
+        }
+
+        let export_root = PathBuf::from(&request.export_root);
+        let restore_root = PathBuf::from(&request.restore_root);
+        let database_target = PathBuf::from(&plan.database_target_path);
+        copy_file_creating_parent(Path::new(&plan.database_source_path), &database_target)?;
+
+        let manifest = read_backup_manifest(&export_root)?;
+        let files = manifest
+            .get("files")
+            .and_then(|value| value.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let mut media_files_copied = 0_usize;
+        let mut vault_chunks_copied = 0_usize;
+        let mut bytes_copied = fs::metadata(&database_target)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        for file in files {
+            let Some(backup_relative_path) = file
+                .get("backup_relative_path")
+                .and_then(|value| value.as_str())
+            else {
+                continue;
+            };
+            let Some(restore_relative_path) = file
+                .get("restore_relative_path")
+                .and_then(|value| value.as_str())
+            else {
+                continue;
+            };
+            let backup_relative_path =
+                manifest_relative_path(backup_relative_path).ok_or_else(|| {
+                    ServiceError::Invalid(
+                        "backup manifest contains an unsafe source path".to_string(),
+                    )
+                })?;
+            let restore_relative_path =
+                manifest_relative_path(restore_relative_path).ok_or_else(|| {
+                    ServiceError::Invalid(
+                        "backup manifest contains an unsafe restore path".to_string(),
+                    )
+                })?;
+            let source = export_root.join(backup_relative_path);
+            let destination = restore_root.join(restore_relative_path);
+            copy_file_creating_parent(&source, &destination)?;
+            let copied = fs::metadata(&destination)
+                .map(|metadata| metadata.len())
+                .unwrap_or(0);
+            bytes_copied = bytes_copied.saturating_add(copied);
+            if file
+                .get("kind")
+                .and_then(|value| value.as_str())
+                .is_some_and(|kind| kind == "vault_chunk")
+            {
+                vault_chunks_copied += 1;
+            } else if !file
+                .get("kind")
+                .and_then(|value| value.as_str())
+                .is_some_and(|kind| kind == "model_file")
+            {
+                media_files_copied += 1;
+            }
+        }
+
+        let report_path = restore_root.join("restore-report.json");
+        let result = BackupRestoreRunResult {
+            restored_at: Utc::now(),
+            restore_root: restore_root.to_string_lossy().to_string(),
+            database_restored_to: database_target.to_string_lossy().to_string(),
+            media_files_copied,
+            vault_chunks_copied,
+            bytes_copied,
+            ok: true,
+            detail: "Restore staged without modifying the active library. Start the daemon with this restore root after review.".to_string(),
+        };
+        fs::write(
+            &report_path,
+            serde_json::to_string_pretty(&result)
+                .map_err(|err| ServiceError::Storage(err.to_string()))?,
+        )
+        .map_err(|err| ServiceError::Io(err.to_string()))?;
+
+        Ok(result)
     }
 
     pub async fn diagnostics(&self) -> serde_json::Value {
@@ -2762,6 +3118,52 @@ impl GalleryService {
     fn persist_locked_state(&self, state: &LibraryState) -> Result<(), ServiceError> {
         storage::save_state(&self.storage, &state.to_persisted())
             .map_err(|err| ServiceError::Storage(err.to_string()))
+    }
+
+    fn restore_original_from_local_chunks_locked(
+        &self,
+        state: &mut LibraryState,
+        asset_id: Uuid,
+    ) -> Result<bool, ServiceError> {
+        let library_root = PathBuf::from(effective_library_root(state, &self.config));
+        let asset = state
+            .assets
+            .iter()
+            .find(|asset| asset.id == asset_id)
+            .cloned()
+            .ok_or_else(|| ServiceError::NotFound(format!("asset {asset_id}")))?;
+        let blob = state
+            .blob_records
+            .iter()
+            .find(|blob| blob.asset_id == asset_id && blob.tombstoned_at.is_none())
+            .cloned()
+            .ok_or_else(|| ServiceError::NotFound(format!("blob for asset {asset_id}")))?;
+        let chunks = state
+            .blob_chunks
+            .iter()
+            .filter(|chunk| chunk.blob_id == blob.id)
+            .cloned()
+            .collect::<Vec<_>>();
+        if !vault_store::encrypted_chunk_files_exist(&library_root, &chunks) {
+            return Ok(false);
+        }
+        let destination = asset_file_path(&asset, &library_root);
+        if matches!(asset.import_mode, ImportMode::Reference) {
+            return Ok(false);
+        }
+        vault_store::restore_original_from_chunks(
+            &self.config,
+            &library_root,
+            blob.vault_id,
+            blob.encryption_key_version,
+            &chunks,
+            &destination,
+        )
+        .map_err(vault_store_error)?;
+        if let Some(asset) = state.assets.iter_mut().find(|asset| asset.id == asset_id) {
+            asset.is_available = true;
+        }
+        Ok(true)
     }
 
     async fn record_failed_job(
@@ -2860,7 +3262,7 @@ fn ensure_distributed_defaults(state: &mut LibraryState) -> bool {
     changed
 }
 
-fn refresh_blob_records(state: &mut LibraryState) -> bool {
+fn refresh_blob_records(config: &AppConfig, state: &mut LibraryState) -> bool {
     let Some(vault) = state.vaults.first().cloned() else {
         return false;
     };
@@ -2869,8 +3271,10 @@ fn refresh_blob_records(state: &mut LibraryState) -> bool {
     };
     let mut changed = false;
     refresh_asset_availability(state);
+    changed |= ensure_vault_key_envelopes(state);
+    let library_root = PathBuf::from(effective_library_root(state, config));
 
-    for asset in &state.assets {
+    for asset in state.assets.clone() {
         let blob_id = if let Some(blob) = state
             .blob_records
             .iter()
@@ -2879,53 +3283,115 @@ fn refresh_blob_records(state: &mut LibraryState) -> bool {
             blob.id
         } else {
             let id = Uuid::new_v4();
-            let chunk_count = chunk_count_for_bytes(asset.bytes);
             state.blob_records.push(BlobRecord {
                 id,
                 vault_id: vault.id,
                 asset_id: asset.id,
                 content_hash: asset.content_hash.clone(),
-                encrypted_hash: format!("vault-v{}:{}", vault.key_version, asset.content_hash),
+                encrypted_hash: format!("unsealed-v{}:{}", vault.key_version, asset.content_hash),
                 bytes: asset.bytes,
-                chunk_count,
+                chunk_count: 0,
                 encryption_key_version: vault.key_version,
                 created_at: Utc::now(),
                 tombstoned_at: None,
             });
-            for chunk_index in 0..chunk_count {
-                state.blob_chunks.push(BlobChunk {
-                    id: Uuid::new_v4(),
-                    blob_id: id,
-                    chunk_index,
-                    content_hash: format!("{}:{chunk_index}", asset.content_hash),
-                    encrypted_hash: format!(
-                        "vault-v{}:{}:{chunk_index}",
-                        vault.key_version, asset.content_hash
-                    ),
-                    bytes: chunk_bytes(asset.bytes, chunk_index, chunk_count),
-                });
-            }
             changed = true;
             id
         };
 
+        if blob_needs_local_seal(state, blob_id, &library_root) {
+            let source_path = asset_file_path(&asset, &library_root);
+            if source_path.is_file() {
+                if let Ok(sealed) = vault_store::seal_asset(
+                    config,
+                    &library_root,
+                    vault.id,
+                    vault.key_version,
+                    blob_id,
+                    &asset,
+                    &source_path,
+                ) {
+                    if let Some(blob) = state
+                        .blob_records
+                        .iter_mut()
+                        .find(|blob| blob.id == blob_id)
+                    {
+                        blob.encrypted_hash = sealed.encrypted_hash;
+                        blob.chunk_count = sealed.chunks.len() as u32;
+                        blob.encryption_key_version = vault.key_version;
+                        blob.bytes = asset.bytes;
+                        blob.content_hash = asset.content_hash.clone();
+                    }
+                    state.blob_chunks.retain(|chunk| chunk.blob_id != blob_id);
+                    state
+                        .blob_chunks
+                        .extend(sealed.chunks.into_iter().map(|chunk| BlobChunk {
+                            id: Uuid::new_v4(),
+                            blob_id,
+                            chunk_index: chunk.chunk_index,
+                            content_hash: chunk.content_hash,
+                            encrypted_hash: chunk.encrypted_hash,
+                            bytes: chunk.bytes,
+                            encrypted_bytes: chunk.encrypted_bytes,
+                            local_path: Some(chunk.local_path),
+                            nonce_hex: Some(chunk.nonce_hex),
+                            aad: Some(chunk.aad),
+                        }));
+                    changed = true;
+                }
+            } else if !state
+                .blob_chunks
+                .iter()
+                .any(|chunk| chunk.blob_id == blob_id)
+            {
+                let chunk_count = chunk_count_for_bytes(asset.bytes);
+                for chunk_index in 0..chunk_count {
+                    state.blob_chunks.push(BlobChunk {
+                        id: Uuid::new_v4(),
+                        blob_id,
+                        chunk_index,
+                        content_hash: format!("{}:{chunk_index}", asset.content_hash),
+                        encrypted_hash: format!(
+                            "unsealed-v{}:{}:{chunk_index}",
+                            vault.key_version, asset.content_hash
+                        ),
+                        bytes: chunk_bytes(asset.bytes, chunk_index, chunk_count),
+                        encrypted_bytes: 0,
+                        local_path: None,
+                        nonce_hex: None,
+                        aad: None,
+                    });
+                }
+                if let Some(blob) = state
+                    .blob_records
+                    .iter_mut()
+                    .find(|blob| blob.id == blob_id)
+                {
+                    blob.chunk_count = chunk_count;
+                }
+                changed = true;
+            }
+        }
+
+        let encrypted_chunks_available = encrypted_chunks_available(state, blob_id, &library_root);
+        let local_available = asset.is_available || encrypted_chunks_available;
         match state
             .blob_replicas
             .iter_mut()
             .find(|replica| replica.blob_id == blob_id && replica.device_id == local_device)
         {
             Some(replica) => {
-                let expected_health = if asset.is_available {
+                let expected_health = if local_available {
                     ReplicaHealth::Healthy
                 } else {
                     ReplicaHealth::Missing
                 };
                 if replica.health != expected_health
-                    || replica.bytes_present != if asset.is_available { asset.bytes } else { 0 }
+                    || replica.bytes_present != if local_available { asset.bytes } else { 0 }
                 {
                     replica.health = expected_health;
-                    replica.bytes_present = if asset.is_available { asset.bytes } else { 0 };
-                    replica.verified_at = asset.is_available.then(Utc::now);
+                    replica.bytes_present = if local_available { asset.bytes } else { 0 };
+                    replica.verified_at = local_available.then(Utc::now);
                     changed = true;
                 }
             }
@@ -2934,13 +3400,13 @@ fn refresh_blob_records(state: &mut LibraryState) -> bool {
                     id: Uuid::new_v4(),
                     blob_id,
                     device_id: local_device,
-                    health: if asset.is_available {
+                    health: if local_available {
                         ReplicaHealth::Healthy
                     } else {
                         ReplicaHealth::Missing
                     },
-                    bytes_present: if asset.is_available { asset.bytes } else { 0 },
-                    verified_at: asset.is_available.then(Utc::now),
+                    bytes_present: if local_available { asset.bytes } else { 0 },
+                    verified_at: local_available.then(Utc::now),
                     transfer_id: None,
                 });
                 changed = true;
@@ -2949,6 +3415,88 @@ fn refresh_blob_records(state: &mut LibraryState) -> bool {
     }
 
     changed
+}
+
+fn ensure_vault_key_envelopes(state: &mut LibraryState) -> bool {
+    let mut changed = false;
+    let now = Utc::now();
+    for vault in state.vaults.clone() {
+        for member in state
+            .vault_members
+            .iter()
+            .filter(|member| {
+                member.vault_id == vault.id
+                    && member.revoked_at.is_none()
+                    && member.trust_level == DeviceTrustLevel::Trusted
+            })
+            .cloned()
+            .collect::<Vec<_>>()
+        {
+            let exists = state.vault_key_envelopes.iter().any(|envelope| {
+                envelope.vault_id == vault.id
+                    && envelope.device_id == member.device_id
+                    && envelope.key_version == vault.key_version
+                    && envelope.revoked_at.is_none()
+            });
+            if !exists {
+                state.vault_key_envelopes.push(VaultKeyEnvelope {
+                    id: Uuid::new_v4(),
+                    vault_id: vault.id,
+                    device_id: member.device_id,
+                    key_version: vault.key_version,
+                    algorithm: "local-keyring-reference-v1".to_string(),
+                    encrypted_vault_key: vault_store::key_reference(vault.id, vault.key_version),
+                    created_at: now,
+                    revoked_at: None,
+                });
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
+fn blob_needs_local_seal(state: &LibraryState, blob_id: Uuid, library_root: &Path) -> bool {
+    let chunks = state
+        .blob_chunks
+        .iter()
+        .filter(|chunk| chunk.blob_id == blob_id)
+        .cloned()
+        .collect::<Vec<_>>();
+    chunks.is_empty() || !vault_store::encrypted_chunk_files_exist(library_root, &chunks)
+}
+
+fn encrypted_chunks_available(state: &LibraryState, blob_id: Uuid, library_root: &Path) -> bool {
+    let chunks = state
+        .blob_chunks
+        .iter()
+        .filter(|chunk| chunk.blob_id == blob_id)
+        .cloned()
+        .collect::<Vec<_>>();
+    vault_store::encrypted_chunk_files_exist(library_root, &chunks)
+}
+
+fn remove_local_encrypted_chunks(
+    state: &mut LibraryState,
+    blob_id: Uuid,
+    library_root: &Path,
+) -> Result<(), ServiceError> {
+    for chunk in state
+        .blob_chunks
+        .iter_mut()
+        .filter(|chunk| chunk.blob_id == blob_id)
+    {
+        if let Some(local_path) = chunk.local_path.take() {
+            let path = library_root.join(local_path);
+            if path.exists() {
+                fs::remove_file(path).map_err(|err| ServiceError::Io(err.to_string()))?;
+            }
+        }
+        chunk.nonce_hex = None;
+        chunk.aad = None;
+        chunk.encrypted_bytes = 0;
+    }
+    Ok(())
 }
 
 fn chunk_count_for_bytes(bytes: u64) -> u32 {
@@ -3195,7 +3743,7 @@ fn build_asset_availability(
         {
             replica_count += 1;
             if Some(replica.device_id) == local_device {
-                local_replica = asset.is_available;
+                local_replica = true;
             } else if device_is_reachable(&state.devices, replica.device_id) {
                 reachable_replica_device_ids.push(replica.device_id);
             } else {
@@ -3426,6 +3974,61 @@ fn pending_transfer(
     }
 }
 
+fn build_sync_network_status(state: &LibraryState) -> SyncNetworkStatus {
+    let pending_transfer_count = state
+        .sync_transfers
+        .iter()
+        .filter(|transfer| transfer.status == SyncTransferStatus::Pending)
+        .count();
+    let active_transfer_count = state
+        .sync_transfers
+        .iter()
+        .filter(|transfer| transfer.status == SyncTransferStatus::Running)
+        .count();
+    let completed_transfer_count = state
+        .sync_transfers
+        .iter()
+        .filter(|transfer| transfer.status == SyncTransferStatus::Completed)
+        .count();
+    let failed_transfer_count = state
+        .sync_transfers
+        .iter()
+        .filter(|transfer| {
+            matches!(
+                transfer.status,
+                SyncTransferStatus::Failed | SyncTransferStatus::Aborted
+            )
+        })
+        .count();
+    let local_device_id = local_device_id(state);
+    let relay_urls = state
+        .relay_endpoints
+        .iter()
+        .filter(|endpoint| Some(endpoint.device_id) == local_device_id)
+        .filter_map(|endpoint| endpoint.relay_url.clone())
+        .collect::<Vec<_>>();
+    let direct_addresses = state
+        .relay_endpoints
+        .iter()
+        .filter(|endpoint| Some(endpoint.device_id) == local_device_id)
+        .flat_map(|endpoint| endpoint.direct_addresses.clone())
+        .collect::<Vec<_>>();
+
+    SyncNetworkStatus {
+        started: true,
+        transport: "encrypted-local-vault-store; iroh-p2p-pending-runtime".to_string(),
+        local_device_id,
+        local_node_id: local_device_id.map(|id| format!("local-node-{id}")),
+        direct_addresses,
+        relay_urls,
+        active_transfer_count,
+        pending_transfer_count,
+        completed_transfer_count,
+        failed_transfer_count,
+        detail: "Encrypted chunk storage and resumable transfer records are active; direct Iroh process networking is not required for local restore and remains the next runtime adapter.".to_string(),
+    }
+}
+
 fn device_is_active(devices: &[DeviceIdentity], device_id: Uuid) -> bool {
     devices
         .iter()
@@ -3441,6 +4044,359 @@ fn device_is_reachable(devices: &[DeviceIdentity], device_id: Uuid) -> bool {
         .unwrap_or(false)
 }
 
+#[derive(Debug, Clone)]
+struct BackupFileEntry {
+    kind: &'static str,
+    asset_id: Option<Uuid>,
+    source_path: PathBuf,
+    backup_relative_path: PathBuf,
+    restore_relative_path: PathBuf,
+}
+
+fn collect_backup_file_entries(
+    state: &LibraryState,
+    library_root: &Path,
+    include_models: bool,
+    config: &AppConfig,
+) -> Result<Vec<BackupFileEntry>, ServiceError> {
+    let mut entries = Vec::new();
+    for asset in &state.assets {
+        let source_path = asset_file_path(asset, library_root);
+        let (kind, relative_path) = match asset.import_mode {
+            ImportMode::Reference => {
+                let file_name = backup_file_name(&asset.original_filename, &source_path);
+                (
+                    "reference_original",
+                    PathBuf::from("external-originals")
+                        .join(asset.id.to_string())
+                        .join(file_name),
+                )
+            }
+            ImportMode::Copy | ImportMode::Move => (
+                "managed_original",
+                PathBuf::from("library").join(stored_relative_path(
+                    &asset.relative_original_path,
+                    &asset.original_filename,
+                )),
+            ),
+        };
+        entries.push(BackupFileEntry {
+            kind,
+            asset_id: Some(asset.id),
+            source_path,
+            backup_relative_path: relative_path.clone(),
+            restore_relative_path: relative_path,
+        });
+    }
+
+    for chunk in &state.blob_chunks {
+        let Some(local_path) = &chunk.local_path else {
+            continue;
+        };
+        let relative_path = PathBuf::from("library").join(stored_relative_path(
+            local_path,
+            &format!("{}.pgblob", chunk.id),
+        ));
+        entries.push(BackupFileEntry {
+            kind: "vault_chunk",
+            asset_id: None,
+            source_path: library_root.join(local_path),
+            backup_relative_path: relative_path.clone(),
+            restore_relative_path: relative_path,
+        });
+    }
+
+    if include_models {
+        for model in model_registry::list_models(config).map_err(model_registry_error)? {
+            let Some(installed_path) = model.installed_path else {
+                continue;
+            };
+            let source_path = PathBuf::from(&installed_path);
+            let file_name = backup_file_name(&model.id, &source_path);
+            let relative_path = PathBuf::from("models").join(model.id).join(file_name);
+            entries.push(BackupFileEntry {
+                kind: "model_file",
+                asset_id: None,
+                source_path,
+                backup_relative_path: relative_path.clone(),
+                restore_relative_path: relative_path,
+            });
+        }
+    }
+
+    Ok(entries)
+}
+
+fn copy_file_creating_parent(source: &Path, destination: &Path) -> Result<u64, ServiceError> {
+    let parent = destination
+        .parent()
+        .ok_or_else(|| ServiceError::Io("destination has no parent".to_string()))?;
+    fs::create_dir_all(parent).map_err(|err| ServiceError::Io(err.to_string()))?;
+    fs::copy(source, destination).map_err(|err| ServiceError::Io(err.to_string()))
+}
+
+fn build_restore_plan(
+    export_root: &str,
+    restore_root: &str,
+    config: &AppConfig,
+    active_library_root: Option<&Path>,
+) -> Result<BackupRestorePlan, ServiceError> {
+    if export_root.trim().is_empty() {
+        return Err(ServiceError::Invalid(
+            "export_root must not be empty".to_string(),
+        ));
+    }
+    if restore_root.trim().is_empty() {
+        return Err(ServiceError::Invalid(
+            "restore_root must not be empty".to_string(),
+        ));
+    }
+
+    let export_root = PathBuf::from(export_root);
+    let restore_root = PathBuf::from(restore_root);
+    let manifest_path = backup_manifest_path(&export_root);
+    let mut missing_paths = Vec::new();
+    let mut destination_conflicts = Vec::new();
+    let mut media_files_available = 0_usize;
+    let mut vault_chunks_available = 0_usize;
+
+    let manifest = match read_backup_manifest(&export_root) {
+        Ok(manifest) => Some(manifest),
+        Err(err) => {
+            missing_paths.push(format!("{manifest_path:?}: {err}"));
+            None
+        }
+    };
+    let database_source = find_database_copy(&export_root, config, manifest.as_ref());
+    if !database_source.is_file() {
+        missing_paths.push(database_source.to_string_lossy().to_string());
+    }
+    let database_name = database_source
+        .file_name()
+        .unwrap_or_else(|| std::ffi::OsStr::new(&config.database_filename));
+    let database_target = restore_root.join("runtime").join("db").join(database_name);
+    if database_target.exists() {
+        destination_conflicts.push(database_target.to_string_lossy().to_string());
+    }
+
+    if let Some(manifest) = &manifest {
+        let files = manifest
+            .get("files")
+            .and_then(|value| value.as_array())
+            .cloned()
+            .unwrap_or_default();
+        for file in files {
+            let Some(backup_relative_path) = file
+                .get("backup_relative_path")
+                .and_then(|value| value.as_str())
+            else {
+                missing_paths.push("manifest file entry missing backup_relative_path".to_string());
+                continue;
+            };
+            let Some(backup_relative_path) = manifest_relative_path(backup_relative_path) else {
+                missing_paths.push(format!(
+                    "manifest file entry has unsafe backup path: {backup_relative_path}"
+                ));
+                continue;
+            };
+            let source = export_root.join(backup_relative_path);
+            if !source.is_file() {
+                missing_paths.push(source.to_string_lossy().to_string());
+                continue;
+            }
+
+            match file.get("kind").and_then(|value| value.as_str()) {
+                Some("vault_chunk") => vault_chunks_available += 1,
+                Some("model_file") => {}
+                _ => media_files_available += 1,
+            }
+
+            let Some(restore_relative_path) = file
+                .get("restore_relative_path")
+                .and_then(|value| value.as_str())
+            else {
+                missing_paths.push("manifest file entry missing restore_relative_path".to_string());
+                continue;
+            };
+            let Some(restore_relative_path) = manifest_relative_path(restore_relative_path) else {
+                destination_conflicts.push(format!(
+                    "manifest file entry has unsafe restore path: {restore_relative_path}"
+                ));
+                continue;
+            };
+            let destination = restore_root.join(restore_relative_path);
+            if destination.exists() {
+                destination_conflicts.push(destination.to_string_lossy().to_string());
+            }
+        }
+    }
+
+    if restore_root.exists()
+        && fs::read_dir(&restore_root)
+            .map_err(|err| ServiceError::Io(err.to_string()))?
+            .next()
+            .is_some()
+    {
+        destination_conflicts.push(format!("{} is not empty", restore_root.to_string_lossy()));
+    }
+    for protected_path in [&config.runtime_root, &config.library_root] {
+        if paths_overlap(&restore_root, protected_path) {
+            destination_conflicts.push(format!(
+                "{} overlaps active path {}",
+                restore_root.to_string_lossy(),
+                protected_path.to_string_lossy()
+            ));
+        }
+    }
+    if let Some(active_library_root) = active_library_root {
+        if paths_overlap(&restore_root, active_library_root) {
+            destination_conflicts.push(format!(
+                "{} overlaps active library {}",
+                restore_root.to_string_lossy(),
+                active_library_root.to_string_lossy()
+            ));
+        }
+    }
+    destination_conflicts.sort();
+    destination_conflicts.dedup();
+    missing_paths.sort();
+    missing_paths.dedup();
+
+    let ok = missing_paths.is_empty() && destination_conflicts.is_empty();
+    let detail = if ok {
+        format!(
+            "Restore can be staged with {media_files_available} media files and {vault_chunks_available} encrypted vault chunks."
+        )
+    } else {
+        format!(
+            "Restore blocked by {} missing paths and {} destination conflicts.",
+            missing_paths.len(),
+            destination_conflicts.len()
+        )
+    };
+
+    Ok(BackupRestorePlan {
+        checked_at: Utc::now(),
+        export_root: export_root.to_string_lossy().to_string(),
+        restore_root: restore_root.to_string_lossy().to_string(),
+        manifest_path: manifest_path.to_string_lossy().to_string(),
+        database_source_path: database_source.to_string_lossy().to_string(),
+        database_target_path: database_target.to_string_lossy().to_string(),
+        media_files_available,
+        vault_chunks_available,
+        missing_paths,
+        destination_conflicts,
+        requires_confirmation: true,
+        ok,
+        detail,
+    })
+}
+
+fn read_backup_manifest(export_root: &Path) -> Result<serde_json::Value, ServiceError> {
+    let manifest_path = backup_manifest_path(export_root);
+    let bytes = fs::read(&manifest_path).map_err(|err| ServiceError::Io(err.to_string()))?;
+    serde_json::from_slice(&bytes).map_err(|err| ServiceError::Storage(err.to_string()))
+}
+
+fn backup_manifest_path(export_root: &Path) -> PathBuf {
+    export_root
+        .join("manifests")
+        .join("private-gallery-backup-manifest.json")
+}
+
+fn find_database_copy(
+    export_root: &Path,
+    config: &AppConfig,
+    manifest: Option<&serde_json::Value>,
+) -> PathBuf {
+    let configured = export_root.join("database").join(&config.database_filename);
+    if configured.is_file() {
+        return configured;
+    }
+
+    if let Some(relative_path) = manifest
+        .and_then(|manifest| manifest.get("database_copied_to"))
+        .and_then(|value| value.as_str())
+        .and_then(manifest_relative_path)
+    {
+        let candidate = export_root.join(relative_path);
+        if candidate.is_file() {
+            return candidate;
+        }
+    }
+
+    if let Ok(entries) = fs::read_dir(export_root.join("database")) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file() {
+                return path;
+            }
+        }
+    }
+
+    configured
+}
+
+fn manifest_relative_path(value: &str) -> Option<PathBuf> {
+    let mut path = PathBuf::new();
+    for component in Path::new(value).components() {
+        match component {
+            std::path::Component::Normal(value) => path.push(value),
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir
+            | std::path::Component::RootDir
+            | std::path::Component::Prefix(_) => return None,
+        }
+    }
+    (!path.as_os_str().is_empty()).then_some(path)
+}
+
+fn stored_relative_path(value: &str, fallback_file_name: &str) -> PathBuf {
+    let mut path = PathBuf::new();
+    for component in Path::new(value).components() {
+        match component {
+            std::path::Component::Normal(value) => path.push(value),
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir
+            | std::path::Component::RootDir
+            | std::path::Component::Prefix(_) => {}
+        }
+    }
+    if path.as_os_str().is_empty() {
+        path.push(imports::sanitize_filename(fallback_file_name));
+    }
+    path
+}
+
+fn backup_file_name(fallback_name: &str, source_path: &Path) -> String {
+    let file_name = source_path
+        .file_name()
+        .map(|value| value.to_string_lossy().to_string())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| fallback_name.to_string());
+    imports::sanitize_filename(&file_name)
+}
+
+fn paths_overlap(left: &Path, right: &Path) -> bool {
+    let left = comparable_path(left);
+    let right = comparable_path(right);
+    left == right || left.starts_with(&right) || right.starts_with(&left)
+}
+
+fn comparable_path(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| absolute_path(path))
+}
+
+fn absolute_path(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(path)
+    }
+}
+
 fn model_registry_error(error: model_registry::ModelRegistryError) -> ServiceError {
     match error {
         model_registry::ModelRegistryError::Invalid(message) => ServiceError::Invalid(message),
@@ -3454,6 +4410,15 @@ fn security_error(error: security::SecurityError) -> ServiceError {
         | security::SecurityError::Database(message)
         | security::SecurityError::KeyStorage(message) => ServiceError::Invalid(message),
         security::SecurityError::Io(message) => ServiceError::Io(message),
+    }
+}
+
+fn vault_store_error(error: vault_store::VaultStoreError) -> ServiceError {
+    match error {
+        vault_store::VaultStoreError::Invalid(message)
+        | vault_store::VaultStoreError::Crypto(message)
+        | vault_store::VaultStoreError::KeyStorage(message) => ServiceError::Invalid(message),
+        vault_store::VaultStoreError::Io(message) => ServiceError::Io(message),
     }
 }
 
@@ -3998,6 +4963,23 @@ mod tests {
         count
     }
 
+    fn find_pgblob(root: &std::path::Path) -> Option<PathBuf> {
+        for entry in fs::read_dir(root).ok()?.filter_map(Result::ok) {
+            let path = entry.path();
+            if path.is_dir() {
+                if let Some(found) = find_pgblob(&path) {
+                    return Some(found);
+                }
+            } else if path
+                .extension()
+                .is_some_and(|extension| extension == "pgblob")
+            {
+                return Some(path);
+            }
+        }
+        None
+    }
+
     #[tokio::test]
     async fn initializes_library_settings() {
         let runtime_root = temp_root("settings");
@@ -4094,6 +5076,264 @@ mod tests {
         assert_eq!(restarted.vaults().await.len(), 1);
         assert_eq!(restarted.devices().await.len(), 2);
         assert_eq!(restarted.sync_transfers().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn copy_imports_are_sealed_into_encrypted_vault_chunks() {
+        let runtime_root = temp_root("encrypted-vault-chunks");
+        let library_root = runtime_root.join("library");
+        let source = runtime_root.join("photo.jpg");
+        let original_bytes = b"family-photo-private-original";
+        fs::write(&source, original_bytes).expect("write source");
+        let service = GalleryService::new(AppConfig {
+            runtime_root: runtime_root.clone(),
+            ..AppConfig::default()
+        })
+        .expect("service");
+        service
+            .update_library_settings(UpdateLibrarySettingsRequest {
+                library_root: library_root.to_string_lossy().to_string(),
+                default_import_mode: ImportMode::Copy,
+            })
+            .await
+            .expect("settings");
+
+        let imported = service
+            .import_asset(ImportAssetRequest {
+                source_path: source.to_string_lossy().to_string(),
+                original_filename: "photo.jpg".to_string(),
+                media_kind: MediaKind::Photo,
+                mime_type: "image/jpeg".to_string(),
+                bytes: original_bytes.len() as u64,
+                content_hash: None,
+                captured_at: None,
+                place_hint: None,
+                import_mode: Some(ImportMode::Copy),
+            })
+            .await
+            .expect("import");
+
+        let vault_store_root = library_root.join("vaults");
+        assert!(vault_store_root.exists());
+        let original_path = library_root.join(&imported.asset.relative_original_path);
+        fs::remove_file(&original_path).expect("remove plaintext original");
+
+        let (mime_type, restored_bytes) = service
+            .asset_original_bytes(imported.asset.id)
+            .await
+            .expect("decrypt original");
+        assert_eq!(mime_type, "image/jpeg");
+        assert_eq!(restored_bytes, original_bytes);
+        let encrypted_file = find_pgblob(&vault_store_root).expect("sealed chunk");
+        let encrypted_bytes = fs::read(encrypted_file).expect("read sealed chunk");
+        assert_ne!(encrypted_bytes, original_bytes);
+        assert!(
+            !encrypted_bytes
+                .windows(original_bytes.len())
+                .any(|window| window == original_bytes)
+        );
+    }
+
+    #[tokio::test]
+    async fn backup_export_restore_preserves_encrypted_chunks_without_plaintext_original() {
+        let runtime_root = temp_root("chunk-backup");
+        let restore_root = temp_root("chunk-restore");
+        let library_root = runtime_root.join("library");
+        let source = runtime_root.join("photo.jpg");
+        let original_bytes = b"family-photo-private-original";
+        fs::write(&source, original_bytes).expect("write source");
+        let config = AppConfig {
+            runtime_root: runtime_root.clone(),
+            ..AppConfig::default()
+        };
+        let service = GalleryService::new(config).expect("service");
+        service
+            .update_library_settings(UpdateLibrarySettingsRequest {
+                library_root: library_root.to_string_lossy().to_string(),
+                default_import_mode: ImportMode::Copy,
+            })
+            .await
+            .expect("settings");
+
+        let imported = service
+            .import_asset(ImportAssetRequest {
+                source_path: source.to_string_lossy().to_string(),
+                original_filename: "photo.jpg".to_string(),
+                media_kind: MediaKind::Photo,
+                mime_type: "image/jpeg".to_string(),
+                bytes: original_bytes.len() as u64,
+                content_hash: None,
+                captured_at: None,
+                place_hint: None,
+                import_mode: Some(ImportMode::Copy),
+            })
+            .await
+            .expect("import");
+        let original_path = library_root.join(&imported.asset.relative_original_path);
+        fs::remove_file(&original_path).expect("remove plaintext original");
+
+        let verification = service
+            .verify_backup(crate::domain::BackupVerifyRequest { export_root: None })
+            .await
+            .expect("verify backup");
+        assert!(verification.ok);
+        assert_eq!(verification.missing_asset_paths, Vec::<String>::new());
+        assert!(verification.vault_chunks_checked >= 1);
+
+        let export_root = runtime_root.join("backup-export");
+        let export = service
+            .export_backup(crate::domain::BackupExportRequest {
+                export_root: export_root.to_string_lossy().to_string(),
+                include_models: false,
+            })
+            .await
+            .expect("export backup");
+        assert!(export.ok);
+        assert_eq!(export.media_files_copied, 0);
+        assert!(export.vault_chunks_copied >= 1);
+        assert!(find_pgblob(&export_root.join("library")).is_some());
+
+        let blocked_plan = service
+            .plan_restore_backup(crate::domain::BackupRestorePlanRequest {
+                export_root: export_root.to_string_lossy().to_string(),
+                restore_root: library_root.join("restore").to_string_lossy().to_string(),
+            })
+            .await
+            .expect("blocked restore plan");
+        assert!(!blocked_plan.ok);
+        assert!(
+            blocked_plan
+                .destination_conflicts
+                .iter()
+                .any(|conflict| conflict.contains("active library"))
+        );
+
+        let plan = service
+            .plan_restore_backup(crate::domain::BackupRestorePlanRequest {
+                export_root: export_root.to_string_lossy().to_string(),
+                restore_root: restore_root.to_string_lossy().to_string(),
+            })
+            .await
+            .expect("restore plan");
+        assert!(plan.ok, "{}", plan.detail);
+        assert_eq!(plan.media_files_available, 0);
+        assert!(plan.vault_chunks_available >= 1);
+
+        let restored = service
+            .run_restore_backup(crate::domain::BackupRestoreRunRequest {
+                export_root: export_root.to_string_lossy().to_string(),
+                restore_root: restore_root.to_string_lossy().to_string(),
+                confirmed: true,
+            })
+            .await
+            .expect("restore run");
+        assert!(restored.ok);
+        assert_eq!(restored.media_files_copied, 0);
+        assert!(restored.vault_chunks_copied >= 1);
+        assert!(PathBuf::from(restored.database_restored_to).exists());
+        assert!(find_pgblob(&restore_root.join("library")).is_some());
+    }
+
+    #[tokio::test]
+    async fn decrypting_chunks_requires_existing_vault_key() {
+        let runtime_root = temp_root("missing-vault-key");
+        let library_root = runtime_root.join("library");
+        let source = runtime_root.join("photo.jpg");
+        fs::write(&source, b"family-photo-private-original").expect("write source");
+        let service = GalleryService::new(AppConfig {
+            runtime_root: runtime_root.clone(),
+            ..AppConfig::default()
+        })
+        .expect("service");
+        service
+            .update_library_settings(UpdateLibrarySettingsRequest {
+                library_root: library_root.to_string_lossy().to_string(),
+                default_import_mode: ImportMode::Copy,
+            })
+            .await
+            .expect("settings");
+
+        let imported = service
+            .import_asset(ImportAssetRequest {
+                source_path: source.to_string_lossy().to_string(),
+                original_filename: "photo.jpg".to_string(),
+                media_kind: MediaKind::Photo,
+                mime_type: "image/jpeg".to_string(),
+                bytes: 29,
+                content_hash: None,
+                captured_at: None,
+                place_hint: None,
+                import_mode: Some(ImportMode::Copy),
+            })
+            .await
+            .expect("import");
+        let original_path = library_root.join(&imported.asset.relative_original_path);
+        fs::remove_file(&original_path).expect("remove plaintext original");
+        let vault = service.vaults().await.into_iter().next().expect("vault");
+        let key_path = runtime_root
+            .join("security")
+            .join("vault-keys")
+            .join(format!(
+                "{}.key",
+                crate::vault_store::key_reference(vault.id, vault.key_version)
+            ));
+        assert!(key_path.exists());
+        fs::remove_file(&key_path).expect("remove vault key");
+
+        let result = service.asset_original_bytes(imported.asset.id).await;
+        assert!(result.is_err());
+        assert!(!key_path.exists());
+    }
+
+    #[tokio::test]
+    async fn backup_verification_reports_corrupt_vault_chunk() {
+        let runtime_root = temp_root("corrupt-vault-chunk");
+        let library_root = runtime_root.join("library");
+        let source = runtime_root.join("photo.jpg");
+        fs::write(&source, b"family-photo-private-original").expect("write source");
+        let service = GalleryService::new(AppConfig {
+            runtime_root: runtime_root.clone(),
+            ..AppConfig::default()
+        })
+        .expect("service");
+        service
+            .update_library_settings(UpdateLibrarySettingsRequest {
+                library_root: library_root.to_string_lossy().to_string(),
+                default_import_mode: ImportMode::Copy,
+            })
+            .await
+            .expect("settings");
+
+        let imported = service
+            .import_asset(ImportAssetRequest {
+                source_path: source.to_string_lossy().to_string(),
+                original_filename: "photo.jpg".to_string(),
+                media_kind: MediaKind::Photo,
+                mime_type: "image/jpeg".to_string(),
+                bytes: 29,
+                content_hash: None,
+                captured_at: None,
+                place_hint: None,
+                import_mode: Some(ImportMode::Copy),
+            })
+            .await
+            .expect("import");
+        let encrypted_file = find_pgblob(&library_root.join("vaults")).expect("sealed chunk");
+        fs::write(&encrypted_file, b"corrupt chunk").expect("corrupt chunk");
+        let original_path = library_root.join(&imported.asset.relative_original_path);
+        fs::remove_file(&original_path).expect("remove plaintext original");
+
+        let verification = service
+            .verify_backup(crate::domain::BackupVerifyRequest { export_root: None })
+            .await
+            .expect("verify backup");
+        assert!(!verification.ok);
+        assert!(
+            verification
+                .missing_vault_chunk_paths
+                .iter()
+                .any(|path| path.contains("encrypted hash mismatch"))
+        );
     }
 
     #[tokio::test]

@@ -5,7 +5,9 @@
 - Media files and derived biometric artifacts stay on user-controlled devices.
 - The laptop library is authoritative and should live on an encrypted volume.
 - Vault/device membership, replica placement, and sync planning are local control-plane data.
-- Phone uploads and P2P transfer execution are deferred in this slice; existing pairing/session and vault sync types remain future-facing for transport.
+- Phone uploads and direct Iroh P2P transfer execution are deferred in this slice; existing pairing/session and vault sync types remain future-facing for transport.
+- Imported originals are sealed into authenticated encrypted vault chunks. The plaintext original may be restored through the local original endpoint when the local encrypted chunks are present.
+- Backup export includes available encrypted vault chunks and writes a manifest; restore requires explicit confirmation and stages files into a separate restore root instead of overwriting the active library.
 - No third-party analytics, crash reporters, or cloud AI endpoints are allowed in v1.
 
 ## Sensitive Data
@@ -29,7 +31,7 @@
 
 - The current desktop MVP is local-only and does not perform remote network enrichment.
 - Imports can either copy originals into the managed library or reference them in place.
-- Distributed vault APIs persist vaults, devices, storage policies, blob records, and transfer plans, but they do not upload originals to hosted storage.
+- Distributed vault APIs persist vaults, devices, storage policies, encrypted blob records, key envelopes, and transfer plans, but they do not upload originals to hosted storage.
 - The Flutter client avoids mock fallback data and only renders what the local daemon actually knows.
 - The SQLite schema, derived entity metadata, SQLCipher activation, and secure key storage path are in place. Sensitive indexing still requires approved local models and provider implementations.
 

@@ -236,6 +236,14 @@ pub struct BlobChunk {
     pub content_hash: String,
     pub encrypted_hash: String,
     pub bytes: u64,
+    #[serde(default)]
+    pub encrypted_bytes: u64,
+    #[serde(default)]
+    pub local_path: Option<String>,
+    #[serde(default)]
+    pub nonce_hex: Option<String>,
+    #[serde(default)]
+    pub aad: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -339,6 +347,33 @@ pub struct CapabilityGrant {
     pub granted_by_device_id: Option<Uuid>,
     pub granted_at: DateTime<Utc>,
     pub expires_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct VaultKeyEnvelope {
+    pub id: Uuid,
+    pub vault_id: Uuid,
+    pub device_id: Uuid,
+    pub key_version: u32,
+    pub algorithm: String,
+    pub encrypted_vault_key: String,
+    pub created_at: DateTime<Utc>,
+    pub revoked_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SyncNetworkStatus {
+    pub started: bool,
+    pub transport: String,
+    pub local_device_id: Option<Uuid>,
+    pub local_node_id: Option<String>,
+    pub direct_addresses: Vec<String>,
+    pub relay_urls: Vec<String>,
+    pub active_transfer_count: usize,
+    pub pending_transfer_count: usize,
+    pub completed_transfer_count: usize,
+    pub failed_transfer_count: usize,
+    pub detail: String,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -1138,6 +1173,10 @@ pub struct BackupVerification {
     pub database_sha256: Option<String>,
     pub assets_checked: usize,
     pub missing_asset_paths: Vec<String>,
+    #[serde(default)]
+    pub vault_chunks_checked: usize,
+    #[serde(default)]
+    pub missing_vault_chunk_paths: Vec<String>,
     pub model_files_checked: usize,
     pub missing_model_paths: Vec<String>,
     pub ok: bool,
@@ -1152,9 +1191,57 @@ pub struct BackupExportResult {
     pub database_sha256: Option<String>,
     pub assets_checked: usize,
     pub missing_asset_paths: Vec<String>,
+    #[serde(default)]
+    pub media_files_copied: usize,
+    #[serde(default)]
+    pub vault_chunks_copied: usize,
+    #[serde(default)]
+    pub bytes_copied: u64,
     pub model_files_checked: usize,
     pub missing_model_paths: Vec<String>,
     pub ok: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BackupRestorePlanRequest {
+    pub export_root: String,
+    pub restore_root: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BackupRestorePlan {
+    pub checked_at: DateTime<Utc>,
+    pub export_root: String,
+    pub restore_root: String,
+    pub manifest_path: String,
+    pub database_source_path: String,
+    pub database_target_path: String,
+    pub media_files_available: usize,
+    pub vault_chunks_available: usize,
+    pub missing_paths: Vec<String>,
+    pub destination_conflicts: Vec<String>,
+    pub requires_confirmation: bool,
+    pub ok: bool,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BackupRestoreRunRequest {
+    pub export_root: String,
+    pub restore_root: String,
+    pub confirmed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BackupRestoreRunResult {
+    pub restored_at: DateTime<Utc>,
+    pub restore_root: String,
+    pub database_restored_to: String,
+    pub media_files_copied: usize,
+    pub vault_chunks_copied: usize,
+    pub bytes_copied: u64,
+    pub ok: bool,
+    pub detail: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

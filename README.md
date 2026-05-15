@@ -12,9 +12,9 @@ This repository now contains a desktop-usable MVP for the first phase of the pro
 - Android runner with mobile pairing and camera-roll permission readiness screens.
 - Real folder and removable-drive scan/commit imports with copy/reference modes and checksum dedupe.
 - Live timeline, places, events, and jobs views backed by persisted API state.
-- Encrypted database activation, local-only OCR indexing/search, model governance, backup verification/export surfaces, and large-library timeline pagination.
+- Encrypted database activation, encrypted vault chunk storage, local-only OCR indexing/search, model governance, chunk-aware backup export/restore staging, and large-library timeline pagination.
 
-The codebase intentionally preserves API surfaces for people, scenes, semantic search, pairing, and distributed vault sync. The vault/device/sync control plane is typed and persisted, while actual P2P media transfer transport still returns honest planned or pending state until a transport provider is implemented.
+The codebase intentionally preserves API surfaces for people, scenes, semantic search, pairing, and distributed vault sync. The vault/device/sync control plane is typed and persisted, originals are sealed into authenticated encrypted chunks, and transfer records remain honest planned or pending state until the direct Iroh transport adapter is enabled.
 
 ## What This Repository Contains
 
@@ -45,8 +45,9 @@ The codebase intentionally preserves API surfaces for people, scenes, semantic s
 - Desktop daemon bootstrap flow from the Flutter client.
 - Paginated timeline loading for large local libraries.
 - Local Tesseract OCR batches after encryption is active.
-- Backup readiness verification and DB/manifest export.
-- Distributed vault control-plane state: vaults, enrolled devices, storage policies, content-addressed blob records, replica health, availability status, and sync transfer planning.
+- Backup readiness verification, restorable local export, and non-destructive restore staging.
+- Distributed vault state: vaults, enrolled devices, storage policies, content-addressed encrypted chunk records, local key envelopes, replica health, availability status, sync transfer planning, and retry/cancel controls.
+- Vaults desktop screen for device status, replica health, network status, and transfer queue actions.
 - Android mobile pairing shell with QR/manual enrollment payload capture, secure local pairing storage, and camera-roll access checks.
 
 ## Intentionally Deferred
@@ -56,7 +57,7 @@ The codebase intentionally preserves API surfaces for people, scenes, semantic s
 - P2P media transfer execution over LAN, internet, or relay.
 - Mobile P2P handshake, camera-roll upload execution, and remote original fetches.
 - File-picker based import selection.
-- Full media-copy backup restore UX.
+- In-place restore over the active library; restore is staged into a separate folder for review.
 - Cloud relay, public sharing, or remote ML.
 
 ## Local Development

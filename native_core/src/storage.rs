@@ -15,12 +15,12 @@ use crate::{
         FaceTemplate, FeedbackEvent, GeoTag, ImportCandidate, ImportMode, ImportSession, JobLog,
         JobRecord, LibrarySettings, MetadataSource, ModelProvenance, OcrBlock, PersonCluster,
         PlaceCluster, RelayEndpoint, SceneTag, SyncConflict, SyncSession, SyncTransfer, Vault,
-        VaultInvite, VaultMember, WatchFolder,
+        VaultInvite, VaultKeyEnvelope, VaultMember, WatchFolder,
     },
     security,
 };
 
-const SCHEMA_VERSION: i64 = 9;
+const SCHEMA_VERSION: i64 = 10;
 
 #[derive(Debug, Clone)]
 pub struct StorageBootstrapReport {
@@ -47,6 +47,7 @@ pub struct PersistedLibraryState {
     pub sync_transfers: Vec<SyncTransfer>,
     pub sync_conflicts: Vec<SyncConflict>,
     pub vault_invites: Vec<VaultInvite>,
+    pub vault_key_envelopes: Vec<VaultKeyEnvelope>,
     pub relay_endpoints: Vec<RelayEndpoint>,
     pub capability_grants: Vec<CapabilityGrant>,
     pub pairings: Vec<DevicePairing>,
@@ -129,6 +130,19 @@ fn migrate_schema(connection: &Connection, from_version: i64) -> Result<(), rusq
         record_migration(connection, 9, "distributed_vault_control_plane")?;
     }
 
+    if from_version < 10 {
+        add_column_if_missing(
+            connection,
+            "blob_chunks",
+            "encrypted_bytes",
+            "encrypted_bytes INTEGER NOT NULL DEFAULT 0",
+        )?;
+        add_column_if_missing(connection, "blob_chunks", "local_path", "local_path TEXT")?;
+        add_column_if_missing(connection, "blob_chunks", "nonce_hex", "nonce_hex TEXT")?;
+        add_column_if_missing(connection, "blob_chunks", "aad", "aad TEXT")?;
+        record_migration(connection, 10, "encrypted_vault_chunks_and_key_envelopes")?;
+    }
+
     connection.pragma_update(None, "user_version", SCHEMA_VERSION)
 }
 
@@ -179,6 +193,7 @@ pub fn ensure_library_layout(root: &Path) -> Result<(), rusqlite::Error> {
         root.join("variants/previews"),
         root.join("variants/thumbs"),
         root.join("indexes"),
+        root.join("vaults"),
     ] {
         fs::create_dir_all(dir)
             .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?;
@@ -210,6 +225,7 @@ pub fn load_state(
     let sync_transfers = load_sync_transfers_v2(&connection)?;
     let sync_conflicts = load_sync_conflicts(&connection)?;
     let vault_invites = load_vault_invites(&connection)?;
+    let vault_key_envelopes = load_vault_key_envelopes(&connection)?;
     let relay_endpoints = load_relay_endpoints(&connection)?;
     let capability_grants = load_capability_grants(&connection)?;
     let pairings = load_pairings(&connection)?;
@@ -240,6 +256,7 @@ pub fn load_state(
         sync_transfers,
         sync_conflicts,
         vault_invites,
+        vault_key_envelopes,
         relay_endpoints,
         capability_grants,
         pairings,
@@ -274,6 +291,7 @@ pub fn save_state(
         DELETE FROM import_candidates;
         DELETE FROM capability_grants;
         DELETE FROM relay_endpoints;
+        DELETE FROM vault_key_envelopes;
         DELETE FROM vault_invites;
         DELETE FROM sync_conflicts;
         DELETE FROM sync_transfers;
@@ -740,8 +758,9 @@ pub fn save_state(
         transaction.execute(
             r#"
             INSERT INTO blob_chunks (
-              id, blob_id, chunk_index, content_hash, encrypted_hash, bytes
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+              id, blob_id, chunk_index, content_hash, encrypted_hash, bytes,
+              encrypted_bytes, local_path, nonce_hex, aad
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
             "#,
             params![
                 chunk.id.to_string(),
@@ -750,6 +769,10 @@ pub fn save_state(
                 chunk.content_hash,
                 chunk.encrypted_hash,
                 chunk.bytes,
+                chunk.encrypted_bytes,
+                chunk.local_path,
+                chunk.nonce_hex,
+                chunk.aad,
             ],
         )?;
     }
@@ -853,6 +876,27 @@ pub fn save_state(
                 string_vec_json(&endpoint.direct_addresses)?,
                 endpoint.last_seen_at.to_rfc3339(),
                 endpoint.expires_at.to_rfc3339(),
+            ],
+        )?;
+    }
+
+    for envelope in &state.vault_key_envelopes {
+        transaction.execute(
+            r#"
+            INSERT INTO vault_key_envelopes (
+              id, vault_id, device_id, key_version, algorithm, encrypted_vault_key,
+              created_at, revoked_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            "#,
+            params![
+                envelope.id.to_string(),
+                envelope.vault_id.to_string(),
+                envelope.device_id.to_string(),
+                envelope.key_version,
+                envelope.algorithm,
+                envelope.encrypted_vault_key,
+                envelope.created_at.to_rfc3339(),
+                envelope.revoked_at.map(|value| value.to_rfc3339()),
             ],
         )?;
     }
@@ -1582,7 +1626,8 @@ fn load_blob_records(connection: &Connection) -> Result<Vec<BlobRecord>, rusqlit
 fn load_blob_chunks(connection: &Connection) -> Result<Vec<BlobChunk>, rusqlite::Error> {
     let mut statement = connection.prepare(
         r#"
-        SELECT id, blob_id, chunk_index, content_hash, encrypted_hash, bytes
+        SELECT id, blob_id, chunk_index, content_hash, encrypted_hash, bytes,
+               encrypted_bytes, local_path, nonce_hex, aad
         FROM blob_chunks
         ORDER BY blob_id ASC, chunk_index ASC
         "#,
@@ -1595,6 +1640,10 @@ fn load_blob_chunks(connection: &Connection) -> Result<Vec<BlobChunk>, rusqlite:
             content_hash: row.get(3)?,
             encrypted_hash: row.get(4)?,
             bytes: row.get(5)?,
+            encrypted_bytes: row.get(6)?,
+            local_path: row.get(7)?,
+            nonce_hex: row.get(8)?,
+            aad: row.get(9)?,
         })
     })?;
     rows.collect()
@@ -1707,6 +1756,35 @@ fn load_vault_invites(connection: &Connection) -> Result<Vec<VaultInvite>, rusql
             expires_at: parse_datetime(&row.get::<_, String>(7)?)?,
             accepted_at: row
                 .get::<_, Option<String>>(8)?
+                .map(|value| parse_datetime(&value))
+                .transpose()?,
+        })
+    })?;
+    rows.collect()
+}
+
+fn load_vault_key_envelopes(
+    connection: &Connection,
+) -> Result<Vec<VaultKeyEnvelope>, rusqlite::Error> {
+    let mut statement = connection.prepare(
+        r#"
+        SELECT id, vault_id, device_id, key_version, algorithm, encrypted_vault_key,
+               created_at, revoked_at
+        FROM vault_key_envelopes
+        ORDER BY created_at ASC
+        "#,
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok(VaultKeyEnvelope {
+            id: parse_uuid(&row.get::<_, String>(0)?)?,
+            vault_id: parse_uuid(&row.get::<_, String>(1)?)?,
+            device_id: parse_uuid(&row.get::<_, String>(2)?)?,
+            key_version: row.get(3)?,
+            algorithm: row.get(4)?,
+            encrypted_vault_key: row.get(5)?,
+            created_at: parse_datetime(&row.get::<_, String>(6)?)?,
+            revoked_at: row
+                .get::<_, Option<String>>(7)?
                 .map(|value| parse_datetime(&value))
                 .transpose()?,
         })

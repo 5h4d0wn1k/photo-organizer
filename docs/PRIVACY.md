@@ -10,6 +10,8 @@ This project is designed for personal/family local organization. The default pro
 - No cloud AI, analytics SDKs, telemetry SDKs, remote geocoding, or model training on the private library are enabled.
 - Model installation is separate from indexing. Models require explicit confirmation, reviewed URL matching, personal/family approval, and SHA-256 verification before being marked installed. OCR may also use an already-installed local Tesseract CLI.
 - SQLCipher support is compiled into the Rust storage dependency. `/security/encryption/activate` backs up the plaintext DB, exports to an encrypted DB, verifies row counts and integrity, stores the library key through OS keychain storage, and then enables sensitive-indexing eligibility.
+- Vault originals are sealed into local ChaCha20-Poly1305 encrypted chunks with per-chunk nonces, associated data, plaintext content hashes, and ciphertext hashes. Hosted services are not part of this path.
+- Backup export copies local database and file material only to the user-selected path. Restore planning/running uses a separate staging root and does not send backup contents to a hosted service.
 - Future face and semantic inference runs through a short-lived local Python sidecar process. `/models/runtime-status` only probes whether that sidecar is callable with offline guards; it does not scan media, open a listener, download models, or enable inference by itself.
 - Scene indexing currently uses a built-in local heuristic image analyzer through the Python sidecar. It reads committed local photo files, writes derived tags into the encrypted DB, and never downloads models or sends labels/photos to a remote service.
 
