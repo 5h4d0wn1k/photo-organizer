@@ -223,9 +223,10 @@ CREATE TABLE IF NOT EXISTS blob_records (
   encryption_key_version INTEGER NOT NULL,
   created_at TEXT NOT NULL,
   tombstoned_at TEXT,
-  UNIQUE(vault_id, asset_id),
-  FOREIGN KEY(vault_id) REFERENCES vaults(id) ON DELETE CASCADE,
-  FOREIGN KEY(asset_id) REFERENCES assets(id) ON DELETE CASCADE
+  -- Storage-only peers may hold opaque encrypted blobs for a remote vault
+  -- without receiving that vault's searchable metadata or asset rows.
+  -- Trusted viewers still resolve these IDs through their local metadata.
+  UNIQUE(vault_id, asset_id)
 );
 
 CREATE TABLE IF NOT EXISTS blob_chunks (
@@ -268,7 +269,6 @@ CREATE TABLE IF NOT EXISTS sync_transfers (
   started_at TEXT,
   updated_at TEXT NOT NULL,
   resumable_until TEXT NOT NULL,
-  FOREIGN KEY(vault_id) REFERENCES vaults(id) ON DELETE CASCADE,
   FOREIGN KEY(blob_id) REFERENCES blob_records(id) ON DELETE CASCADE,
   FOREIGN KEY(from_device_id) REFERENCES device_identities(id) ON DELETE SET NULL,
   FOREIGN KEY(to_device_id) REFERENCES device_identities(id) ON DELETE CASCADE

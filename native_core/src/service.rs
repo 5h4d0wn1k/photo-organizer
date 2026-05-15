@@ -38,7 +38,7 @@ use crate::{
     },
     events, imports, metadata, ml_sidecar, model_registry, ocr, people, search, security,
     storage::{self, PersistedLibraryState, StorageBootstrapReport},
-    sync_transport::{self, OutboundBlobTransfer},
+    sync_transport::{self, OutboundBlobTransfer, TransferDirection},
     vault_store,
 };
 
@@ -438,6 +438,7 @@ impl GalleryService {
         let mut state = self.state.write().await;
         ensure_distributed_defaults(&mut state);
         let device = build_device_identity(
+            None,
             request.display_name,
             request.platform,
             request.public_key,
@@ -470,6 +471,7 @@ impl GalleryService {
 
         let endpoint = request.endpoint.clone();
         let device = build_device_identity(
+            endpoint.as_ref().and_then(|value| value.device_id),
             request.display_name,
             request.platform,
             request
@@ -640,7 +642,8 @@ impl GalleryService {
                 .iter()
                 .filter(|transfer| {
                     transfer.status == SyncTransferStatus::Pending
-                        && transfer.from_device_id == Some(local_device)
+                        && (transfer.from_device_id == Some(local_device)
+                            || transfer.to_device_id == local_device)
                         && vault_id
                             .map(|vault_id| transfer.vault_id == vault_id)
                             .unwrap_or(true)
@@ -659,6 +662,13 @@ impl GalleryService {
                     continue;
                 };
                 let transfer = state.sync_transfers[index].clone();
+                let direction = if transfer.from_device_id == Some(local_device) {
+                    TransferDirection::Push
+                } else if transfer.to_device_id == local_device {
+                    TransferDirection::Pull
+                } else {
+                    continue;
+                };
                 let Some(blob) = state
                     .blob_records
                     .iter()
@@ -681,8 +691,9 @@ impl GalleryService {
                     .filter(|chunk| chunk.blob_id == blob.id)
                     .cloned()
                     .collect::<Vec<_>>();
-                if chunks.is_empty()
-                    || !vault_store::encrypted_chunk_files_exist(&library_root, &chunks)
+                if direction == TransferDirection::Push
+                    && (chunks.is_empty()
+                        || !vault_store::encrypted_chunk_files_exist(&library_root, &chunks))
                 {
                     state.sync_transfers[index].status = SyncTransferStatus::Failed;
                     state.sync_transfers[index].updated_at = now;
@@ -694,13 +705,32 @@ impl GalleryService {
                     ));
                     continue;
                 }
-                let Some(target_device) = state
+                let peer_device_id = match direction {
+                    TransferDirection::Push => transfer.to_device_id,
+                    TransferDirection::Pull => {
+                        if let Some(from_device_id) = transfer.from_device_id {
+                            from_device_id
+                        } else {
+                            state.sync_transfers[index].status = SyncTransferStatus::Failed;
+                            state.sync_transfers[index].updated_at = now;
+                            results.push(execution_result(
+                                &transfer,
+                                SyncTransferExecutionStatus::Failed,
+                                0,
+                                "pull transfer has no source device".to_string(),
+                            ));
+                            continue;
+                        }
+                    }
+                };
+                let Some(peer_device) = state
                     .devices
                     .iter()
                     .find(|device| {
-                        device.id == transfer.to_device_id
+                        device.id == peer_device_id
                             && device.revoked_at.is_none()
-                            && device.storage_profile.accepts_storage
+                            && (direction == TransferDirection::Pull
+                                || device.storage_profile.accepts_storage)
                     })
                     .cloned()
                 else {
@@ -710,14 +740,18 @@ impl GalleryService {
                         &transfer,
                         SyncTransferExecutionStatus::Failed,
                         0,
-                        "target device is not active or does not accept storage".to_string(),
+                        if direction == TransferDirection::Pull {
+                            "source device is not active".to_string()
+                        } else {
+                            "target device is not active or does not accept storage".to_string()
+                        },
                     ));
                     continue;
                 };
                 let Some(relay_endpoint) = state
                     .relay_endpoints
                     .iter()
-                    .find(|endpoint| endpoint.device_id == target_device.id)
+                    .find(|endpoint| endpoint.device_id == peer_device.id)
                     .cloned()
                 else {
                     state.sync_transfers[index].status = SyncTransferStatus::Failed;
@@ -726,8 +760,13 @@ impl GalleryService {
                         &transfer,
                         SyncTransferExecutionStatus::Skipped,
                         0,
-                        "target device has no known P2P endpoint; paste its endpoint first"
-                            .to_string(),
+                        if direction == TransferDirection::Pull {
+                            "source device has no known P2P endpoint; paste its endpoint first"
+                                .to_string()
+                        } else {
+                            "target device has no known P2P endpoint; paste its endpoint first"
+                                .to_string()
+                        },
                     ));
                     continue;
                 };
@@ -738,7 +777,11 @@ impl GalleryService {
                         &transfer,
                         SyncTransferExecutionStatus::Skipped,
                         0,
-                        "target device endpoint expired; paste a fresh endpoint".to_string(),
+                        if direction == TransferDirection::Pull {
+                            "source device endpoint expired; paste a fresh endpoint".to_string()
+                        } else {
+                            "target device endpoint expired; paste a fresh endpoint".to_string()
+                        },
                     ));
                     continue;
                 }
@@ -747,11 +790,12 @@ impl GalleryService {
                 state.sync_transfers[index].started_at = Some(now);
                 state.sync_transfers[index].updated_at = now;
                 jobs.push(OutboundBlobTransfer {
+                    direction,
                     transfer,
                     blob,
                     chunks,
                     target: sync_transport::peer_descriptor_for_device(
-                        &target_device,
+                        &peer_device,
                         Some(&relay_endpoint),
                     ),
                 });
@@ -787,7 +831,12 @@ impl GalleryService {
         }
 
         for job in jobs {
-            let result = self.sync_runtime.send_blob(&job, &library_root).await;
+            let result = match job.direction {
+                TransferDirection::Push => self.sync_runtime.send_blob(&job, &library_root).await,
+                TransferDirection::Pull => {
+                    self.sync_runtime.request_blob(&job, &library_root).await
+                }
+            };
             let mut state = self.state.write().await;
             let now = Utc::now();
             let transfer_index = state
@@ -812,7 +861,11 @@ impl GalleryService {
                         &job.transfer,
                         SyncTransferExecutionStatus::Completed,
                         bytes_transferred,
-                        "encrypted chunks verified by remote peer".to_string(),
+                        if job.direction == TransferDirection::Pull {
+                            "encrypted chunks fetched and verified from remote peer".to_string()
+                        } else {
+                            "encrypted chunks verified by remote peer".to_string()
+                        },
                     ));
                 }
                 Err(err) => {
@@ -3801,6 +3854,7 @@ fn local_device_name(state: &LibraryState) -> Option<String> {
 }
 
 fn build_device_identity(
+    device_id: Option<Uuid>,
     display_name: String,
     platform: String,
     public_key: Option<String>,
@@ -3812,7 +3866,7 @@ fn build_device_identity(
             "display_name and platform must not be empty".to_string(),
         ));
     }
-    let id = Uuid::new_v4();
+    let id = device_id.unwrap_or_else(Uuid::new_v4);
     let trust_level = trust_level.unwrap_or(DeviceTrustLevel::Trusted);
     let mut storage_profile = storage_profile.unwrap_or_default();
     storage_profile.device_id = Some(id);
@@ -3848,6 +3902,15 @@ fn add_device_to_state(
     role: DeviceRole,
     vault_id: Option<Uuid>,
 ) -> Result<DeviceIdentity, ServiceError> {
+    if state
+        .devices
+        .iter()
+        .any(|existing| existing.id == device.id)
+    {
+        return Err(ServiceError::Invalid(
+            "device id is already enrolled".to_string(),
+        ));
+    }
     if state
         .devices
         .iter()
@@ -5230,13 +5293,14 @@ mod tests {
         domain::{
             AssetAvailabilityState, BlobReplica, CorrectDateRequest, CorrectPlaceRequest,
             CreateAlbumRequest, CreateDeviceRequest, CreateManualPersonRequest, DeviceRole,
-            DeviceTrustLevel, EncryptionActivationRequest, ImportAssetRequest, ImportMode,
-            ImportSourceKind, MediaKind, MetadataSource, ModelImportRequest, ModelInstallRequest,
-            NetworkPolicy, RebuildRequest, RenameAlbumRequest, ReplicaHealth, RunSyncRequest,
-            ScanImportSourceRequest, SearchQuery, StoragePolicy, StoragePolicyMode, SyncTransfer,
-            SyncTransferStatus, UpdateAlbumAssetsRequest, UpdateAssetFlagsRequest,
-            UpdateAssetsFlagsRequest, UpdateLibrarySettingsRequest, UpdatePersonAssetsRequest,
-            UpdateVaultStoragePolicyRequest,
+            DeviceStorageProfile, DeviceTrustLevel, EncryptionActivationRequest,
+            EnrollDeviceRequest, ImportAssetRequest, ImportMode, ImportSourceKind, MediaKind,
+            MetadataSource, ModelImportRequest, ModelInstallRequest, NetworkPolicy, RebuildRequest,
+            RenameAlbumRequest, ReplicaHealth, RunSyncRequest, ScanImportSourceRequest,
+            SearchQuery, StoragePolicy, StoragePolicyMode, SyncTransfer,
+            SyncTransferExecutionStatus, SyncTransferStatus, UpdateAlbumAssetsRequest,
+            UpdateAssetFlagsRequest, UpdateAssetsFlagsRequest, UpdateLibrarySettingsRequest,
+            UpdatePersonAssetsRequest, UpdateVaultStoragePolicyRequest,
         },
         imports,
     };
@@ -5588,6 +5652,198 @@ mod tests {
             .await
             .expect("evict after proof");
         assert!(!availability.local_replica);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn p2p_sync_pushes_remote_replica_and_pulls_after_eviction() {
+        let runtime_a = temp_root("p2p-device-a");
+        let runtime_b = temp_root("p2p-device-b");
+        let library_a = runtime_a.join("library");
+        let library_b = runtime_b.join("library");
+        let source = runtime_a.join("photo.jpg");
+        let original_bytes = b"private-gallery-p2p-original-round-trip";
+        fs::write(&source, original_bytes).expect("write source");
+
+        let service_a = GalleryService::new(AppConfig {
+            runtime_root: runtime_a.clone(),
+            network_policy: NetworkPolicy::OfflineOnly,
+            ..AppConfig::default()
+        })
+        .expect("service a");
+        let service_b = GalleryService::new(AppConfig {
+            runtime_root: runtime_b.clone(),
+            network_policy: NetworkPolicy::OfflineOnly,
+            ..AppConfig::default()
+        })
+        .expect("service b");
+        service_a
+            .update_library_settings(UpdateLibrarySettingsRequest {
+                library_root: library_a.to_string_lossy().to_string(),
+                default_import_mode: ImportMode::Copy,
+            })
+            .await
+            .expect("settings a");
+        service_b
+            .update_library_settings(UpdateLibrarySettingsRequest {
+                library_root: library_b.to_string_lossy().to_string(),
+                default_import_mode: ImportMode::Copy,
+            })
+            .await
+            .expect("settings b");
+
+        let imported = service_a
+            .import_asset(ImportAssetRequest {
+                source_path: source.to_string_lossy().to_string(),
+                original_filename: "photo.jpg".to_string(),
+                media_kind: MediaKind::Photo,
+                mime_type: "image/jpeg".to_string(),
+                bytes: original_bytes.len() as u64,
+                content_hash: None,
+                captured_at: None,
+                place_hint: None,
+                import_mode: Some(ImportMode::Copy),
+            })
+            .await
+            .expect("import");
+
+        let endpoint_b = service_b
+            .sync_network_local_endpoint()
+            .await
+            .expect("endpoint b");
+        let endpoint_a = service_a
+            .sync_network_local_endpoint()
+            .await
+            .expect("endpoint a");
+        let storage_profile = DeviceStorageProfile {
+            reserved_bytes: 0,
+            ..DeviceStorageProfile::default()
+        };
+        let device_b = service_a
+            .enroll_device(EnrollDeviceRequest {
+                display_name: endpoint_b.descriptor.device_name.clone(),
+                platform: endpoint_b.descriptor.platform.clone(),
+                public_key: Some(endpoint_b.descriptor.node_id.clone()),
+                vault_id: None,
+                role: Some(DeviceRole::Contributor),
+                trust_level: Some(DeviceTrustLevel::Trusted),
+                storage_profile: Some(storage_profile.clone()),
+                endpoint: Some(endpoint_b.descriptor.clone()),
+            })
+            .await
+            .expect("enroll b on a");
+        service_b
+            .enroll_device(EnrollDeviceRequest {
+                display_name: endpoint_a.descriptor.device_name.clone(),
+                platform: endpoint_a.descriptor.platform.clone(),
+                public_key: Some(endpoint_a.descriptor.node_id.clone()),
+                vault_id: None,
+                role: Some(DeviceRole::Contributor),
+                trust_level: Some(DeviceTrustLevel::Trusted),
+                storage_profile: Some(storage_profile),
+                endpoint: Some(endpoint_a.descriptor.clone()),
+            })
+            .await
+            .expect("enroll a on b");
+        assert_eq!(endpoint_b.descriptor.device_id, Some(device_b.id));
+
+        let push_plan = service_a
+            .run_sync(RunSyncRequest {
+                vault_id: None,
+                dry_run: false,
+            })
+            .await
+            .expect("push sync");
+        assert_eq!(
+            push_plan
+                .execution_results
+                .iter()
+                .filter(|result| result.status == SyncTransferExecutionStatus::Completed)
+                .count(),
+            1,
+            "{:?}",
+            push_plan.execution_results
+        );
+        {
+            let state_b = service_b.state.read().await;
+            let local_b = local_device_id(&state_b).expect("local b");
+            assert_eq!(state_b.blob_records.len(), 1);
+            assert_eq!(state_b.blob_records[0].bytes, original_bytes.len() as u64);
+            assert!(
+                state_b
+                    .blob_chunks
+                    .iter()
+                    .all(|chunk| chunk.local_path.is_some()),
+                "remote encrypted chunks should be stored locally on device b"
+            );
+            assert!(state_b.blob_replicas.iter().any(|replica| {
+                replica.blob_id == state_b.blob_records[0].id
+                    && replica.device_id == local_b
+                    && replica.health == ReplicaHealth::Healthy
+            }));
+        }
+        assert!(find_pgblob(&library_b.join("vaults")).is_some());
+
+        let vault = service_a.vaults().await[0].clone();
+        service_a
+            .update_vault_storage_policy(
+                vault.id,
+                UpdateVaultStoragePolicyRequest {
+                    policy: StoragePolicy {
+                        mode: StoragePolicyMode::Custom,
+                        min_replicas: 1,
+                        preferred_device_ids: Vec::new(),
+                        excluded_device_ids: Vec::new(),
+                        min_free_space_bytes: 0,
+                        allow_metered_network: true,
+                        pause_on_low_battery: false,
+                    },
+                },
+            )
+            .await
+            .expect("single remote replica policy");
+        let evicted = service_a
+            .evict_local_asset(imported.asset.id)
+            .await
+            .expect("evict local");
+        assert_eq!(evicted.state, AssetAvailabilityState::RemoteAvailable);
+        assert!(!evicted.local_replica);
+
+        let pinning = service_a
+            .pin_local_asset(imported.asset.id)
+            .await
+            .expect("queue pin");
+        assert_eq!(pinning.state, AssetAvailabilityState::TransferPending);
+        let pull_plan = service_a
+            .run_sync(RunSyncRequest {
+                vault_id: None,
+                dry_run: false,
+            })
+            .await
+            .expect("pull sync");
+        assert_eq!(
+            pull_plan
+                .execution_results
+                .iter()
+                .filter(|result| result.status == SyncTransferExecutionStatus::Completed)
+                .count(),
+            1,
+            "{:?}",
+            pull_plan.execution_results
+        );
+        let availability = service_a
+            .asset_availability(imported.asset.id)
+            .await
+            .expect("availability after pull");
+        assert_eq!(availability.state, AssetAvailabilityState::LocalAvailable);
+        let (mime_type, restored_bytes) = service_a
+            .asset_original_bytes(imported.asset.id)
+            .await
+            .expect("restored original");
+        assert_eq!(mime_type, "image/jpeg");
+        assert_eq!(restored_bytes, original_bytes);
+
+        let _ = service_a.stop_sync_network().await;
+        let _ = service_b.stop_sync_network().await;
     }
 
     #[tokio::test]

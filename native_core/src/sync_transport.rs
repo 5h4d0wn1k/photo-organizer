@@ -75,10 +75,17 @@ impl RuntimeStatus {
 
 #[derive(Debug, Clone)]
 pub(crate) struct OutboundBlobTransfer {
+    pub direction: TransferDirection,
     pub transfer: SyncTransfer,
     pub blob: BlobRecord,
     pub chunks: Vec<BlobChunk>,
     pub target: PeerEndpointDescriptor,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TransferDirection {
+    Push,
+    Pull,
 }
 
 pub struct SyncRuntime {
@@ -112,6 +119,23 @@ struct TransferEnvelope {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+struct PullRequest {
+    protocol_version: u16,
+    transfer_id: Uuid,
+    from_device_id: Uuid,
+    to_device_id: Uuid,
+    vault_id: Uuid,
+    blob_id: Uuid,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum WireRequest {
+    Push { envelope: TransferEnvelope },
+    Pull { request: PullRequest },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct TransferResponse {
     ok: bool,
     bytes_received: u64,
@@ -142,10 +166,16 @@ impl SyncRuntime {
         let local_node_id = secret_key.public().to_string();
         let relay_mode = relay_mode_for_config(&self.config);
         let relay_enabled = !matches!(relay_mode, RelayMode::Disabled);
-        let endpoint = Endpoint::builder(presets::N0)
+        let builder = Endpoint::builder(presets::N0)
             .secret_key(secret_key)
             .alpns(vec![ALPN.to_vec()])
-            .relay_mode(relay_mode)
+            .relay_mode(relay_mode);
+        #[cfg(test)]
+        let builder = builder
+            .clear_ip_transports()
+            .bind_addr("127.0.0.1:0")
+            .map_err(|err| SyncTransportError::Transport(err.to_string()))?;
+        let endpoint = builder
             .bind()
             .await
             .map_err(|err| SyncTransportError::Transport(err.to_string()))?;
@@ -234,7 +264,7 @@ impl SyncRuntime {
             blob: job.blob.clone(),
             chunks: job.chunks.clone(),
         };
-        let metadata = serde_json::to_vec(&envelope)
+        let metadata = serde_json::to_vec(&WireRequest::Push { envelope })
             .map_err(|err| SyncTransportError::Invalid(err.to_string()))?;
         write_frame(&mut send, &metadata).await?;
 
@@ -269,6 +299,61 @@ impl SyncRuntime {
         } else {
             Err(SyncTransportError::Transport(response.detail))
         }
+    }
+
+    pub(crate) async fn request_blob(
+        &self,
+        job: &OutboundBlobTransfer,
+        library_root: &Path,
+    ) -> Result<u64, SyncTransportError> {
+        let active = self.active.lock().await;
+        let Some(active) = active.as_ref() else {
+            return Err(SyncTransportError::NotStarted);
+        };
+        let from_device_id = job.transfer.from_device_id.ok_or_else(|| {
+            SyncTransportError::Invalid("pull transfer has no source device".to_string())
+        })?;
+        let endpoint_addr = endpoint_addr_from_descriptor(&job.target)?;
+        let conn = active
+            .router
+            .endpoint()
+            .connect(endpoint_addr, ALPN)
+            .await
+            .map_err(|err| SyncTransportError::Transport(err.to_string()))?;
+        let (mut send, mut recv) = conn
+            .open_bi()
+            .await
+            .map_err(|err| SyncTransportError::Transport(err.to_string()))?;
+        let request = PullRequest {
+            protocol_version: PROTOCOL_VERSION,
+            transfer_id: job.transfer.id,
+            from_device_id,
+            to_device_id: job.transfer.to_device_id,
+            vault_id: job.blob.vault_id,
+            blob_id: job.blob.id,
+        };
+        let metadata = serde_json::to_vec(&WireRequest::Pull { request })
+            .map_err(|err| SyncTransportError::Invalid(err.to_string()))?;
+        write_frame(&mut send, &metadata).await?;
+        send.finish()
+            .map_err(|err| SyncTransportError::Transport(err.to_string()))?;
+
+        let response_metadata = read_frame(&mut recv, MAX_METADATA_FRAME_BYTES).await?;
+        let envelope: TransferEnvelope = serde_json::from_slice(&response_metadata)
+            .map_err(|err| SyncTransportError::Invalid(err.to_string()))?;
+        let local_node_id = active.payload.descriptor.node_id.clone();
+        let bytes_received = receive_envelope(
+            &self.storage,
+            &self.state,
+            &mut recv,
+            &envelope,
+            &job.target.node_id,
+            &local_node_id,
+            library_root,
+        )
+        .await?;
+        conn.close(0_u32.into(), b"done");
+        Ok(bytes_received)
     }
 
     async fn refresh_local_endpoint_payload(
@@ -360,26 +445,93 @@ impl VaultSyncHandler {
             .await
             .map_err(|err| SyncTransportError::Transport(err.to_string()))?;
         let metadata = read_frame(&mut recv, MAX_METADATA_FRAME_BYTES).await?;
-        let envelope: TransferEnvelope = serde_json::from_slice(&metadata)
-            .map_err(|err| SyncTransportError::Invalid(err.to_string()))?;
         let library_root = {
             let state = self.state.read().await;
             PathBuf::from(effective_library_root(&state, &self.config))
         };
-        let bytes_received = self
-            .receive_envelope(&mut recv, &envelope, &remote_node_id, &library_root)
-            .await?;
-        let response = TransferResponse {
-            ok: true,
-            bytes_received,
-            detail: "transfer committed".to_string(),
-        };
-        let response = serde_json::to_vec(&response)
+        let request = serde_json::from_slice::<WireRequest>(&metadata)
+            .or_else(|_| {
+                serde_json::from_slice::<TransferEnvelope>(&metadata)
+                    .map(|envelope| WireRequest::Push { envelope })
+            })
             .map_err(|err| SyncTransportError::Invalid(err.to_string()))?;
-        write_frame(&mut send, &response).await?;
-        send.finish()
-            .map_err(|err| SyncTransportError::Transport(err.to_string()))?;
+        match request {
+            WireRequest::Push { envelope } => {
+                let response = match self
+                    .receive_envelope(&mut recv, &envelope, &remote_node_id, &library_root)
+                    .await
+                {
+                    Ok(bytes_received) => TransferResponse {
+                        ok: true,
+                        bytes_received,
+                        detail: "transfer committed".to_string(),
+                    },
+                    Err(err) => TransferResponse {
+                        ok: false,
+                        bytes_received: 0,
+                        detail: err.to_string(),
+                    },
+                };
+                let response = serde_json::to_vec(&response)
+                    .map_err(|err| SyncTransportError::Invalid(err.to_string()))?;
+                write_frame(&mut send, &response).await?;
+                send.finish()
+                    .map_err(|err| SyncTransportError::Transport(err.to_string()))?;
+            }
+            WireRequest::Pull { request } => {
+                self.send_requested_blob(&mut send, request, &remote_node_id, &library_root)
+                    .await?;
+                send.finish()
+                    .map_err(|err| SyncTransportError::Transport(err.to_string()))?;
+            }
+        }
         Ok(())
+    }
+
+    async fn send_requested_blob<W>(
+        &self,
+        send: &mut W,
+        request: PullRequest,
+        remote_node_id: &str,
+        library_root: &Path,
+    ) -> Result<u64, SyncTransportError>
+    where
+        W: AsyncWrite + Unpin,
+    {
+        let (envelope, chunks) = {
+            let state = self.state.read().await;
+            build_pull_envelope(
+                &state,
+                request,
+                remote_node_id,
+                &self.local_node_id,
+                library_root,
+            )?
+        };
+        let metadata = serde_json::to_vec(&envelope)
+            .map_err(|err| SyncTransportError::Invalid(err.to_string()))?;
+        write_frame(send, &metadata).await?;
+
+        let mut bytes_sent = 0_u64;
+        for chunk in chunks {
+            let local_path = chunk.local_path.as_deref().ok_or_else(|| {
+                SyncTransportError::Invalid(format!("chunk {} has no local path", chunk.id))
+            })?;
+            let path = library_root.join(safe_relative_path(local_path).ok_or_else(|| {
+                SyncTransportError::Invalid(format!("chunk {} has an unsafe local path", chunk.id))
+            })?);
+            let ciphertext = fs::read(&path).map_err(io_error)?;
+            let encrypted_hash = sha256_hex(&ciphertext);
+            if encrypted_hash != chunk.encrypted_hash {
+                return Err(SyncTransportError::Invalid(format!(
+                    "encrypted hash mismatch before serving chunk {}",
+                    chunk.id
+                )));
+            }
+            write_frame(send, &ciphertext).await?;
+            bytes_sent = bytes_sent.saturating_add(chunk.bytes);
+        }
+        Ok(bytes_sent)
     }
 
     async fn receive_envelope<R>(
@@ -392,53 +544,16 @@ impl VaultSyncHandler {
     where
         R: AsyncRead + Unpin,
     {
-        if envelope.protocol_version != PROTOCOL_VERSION {
-            return Err(SyncTransportError::Invalid(format!(
-                "unsupported sync protocol version {}",
-                envelope.protocol_version
-            )));
-        }
-        if envelope.blob.id != envelope.transfer_blob_id() {
-            return Err(SyncTransportError::Invalid(
-                "transfer envelope blob id mismatch".to_string(),
-            ));
-        }
-        {
-            let state = self.state.read().await;
-            validate_envelope_authorization(&state, envelope, remote_node_id, &self.local_node_id)?;
-        }
-
-        let mut received_chunks = Vec::with_capacity(envelope.chunks.len());
-        let mut bytes_received = 0_u64;
-        for chunk in &envelope.chunks {
-            let ciphertext = read_frame(recv, MAX_CHUNK_FRAME_BYTES).await?;
-            let encrypted_hash = sha256_hex(&ciphertext);
-            if encrypted_hash != chunk.encrypted_hash {
-                return Err(SyncTransportError::Invalid(format!(
-                    "encrypted hash mismatch for incoming chunk {}",
-                    chunk.id
-                )));
-            }
-            if ciphertext.len() as u64 != chunk.encrypted_bytes {
-                return Err(SyncTransportError::Invalid(format!(
-                    "incoming chunk {} byte count mismatch",
-                    chunk.id
-                )));
-            }
-            let relative_path = incoming_chunk_path(&envelope.blob, chunk)?;
-            let destination = library_root.join(&relative_path);
-            write_atomic(&destination, &ciphertext)?;
-            let mut received = chunk.clone();
-            received.local_path = Some(path_to_storage_string(&relative_path));
-            received_chunks.push(received);
-            bytes_received = bytes_received.saturating_add(chunk.bytes);
-        }
-
-        let mut state = self.state.write().await;
-        commit_received_blob(&mut state, envelope, received_chunks, bytes_received)?;
-        storage::save_state(&self.storage, &state.to_persisted())
-            .map_err(|err| SyncTransportError::Storage(err.to_string()))?;
-        Ok(bytes_received)
+        receive_envelope(
+            &self.storage,
+            &self.state,
+            recv,
+            envelope,
+            remote_node_id,
+            &self.local_node_id,
+            library_root,
+        )
+        .await
     }
 }
 
@@ -446,6 +561,124 @@ impl TransferEnvelope {
     fn transfer_blob_id(&self) -> Uuid {
         self.blob.id
     }
+}
+
+async fn receive_envelope<R>(
+    storage_report: &StorageBootstrapReport,
+    state_lock: &Arc<RwLock<LibraryState>>,
+    recv: &mut R,
+    envelope: &TransferEnvelope,
+    remote_node_id: &str,
+    local_node_id: &str,
+    library_root: &Path,
+) -> Result<u64, SyncTransportError>
+where
+    R: AsyncRead + Unpin,
+{
+    if envelope.protocol_version != PROTOCOL_VERSION {
+        return Err(SyncTransportError::Invalid(format!(
+            "unsupported sync protocol version {}",
+            envelope.protocol_version
+        )));
+    }
+    if envelope.blob.id != envelope.transfer_blob_id() {
+        return Err(SyncTransportError::Invalid(
+            "transfer envelope blob id mismatch".to_string(),
+        ));
+    }
+    {
+        let state = state_lock.read().await;
+        validate_envelope_authorization(&state, envelope, remote_node_id, local_node_id)?;
+    }
+
+    let mut received_chunks = Vec::with_capacity(envelope.chunks.len());
+    let mut bytes_received = 0_u64;
+    for chunk in &envelope.chunks {
+        let ciphertext = read_frame(recv, MAX_CHUNK_FRAME_BYTES).await?;
+        let encrypted_hash = sha256_hex(&ciphertext);
+        if encrypted_hash != chunk.encrypted_hash {
+            return Err(SyncTransportError::Invalid(format!(
+                "encrypted hash mismatch for incoming chunk {}",
+                chunk.id
+            )));
+        }
+        if ciphertext.len() as u64 != chunk.encrypted_bytes {
+            return Err(SyncTransportError::Invalid(format!(
+                "incoming chunk {} byte count mismatch",
+                chunk.id
+            )));
+        }
+        let relative_path = incoming_chunk_path(&envelope.blob, chunk)?;
+        let destination = library_root.join(&relative_path);
+        write_atomic(&destination, &ciphertext)?;
+        let mut received = chunk.clone();
+        received.local_path = Some(path_to_storage_string(&relative_path));
+        received_chunks.push(received);
+        bytes_received = bytes_received.saturating_add(chunk.bytes);
+    }
+
+    let mut state = state_lock.write().await;
+    commit_received_blob(&mut state, envelope, received_chunks, bytes_received)?;
+    storage::save_state(storage_report, &state.to_persisted())
+        .map_err(|err| SyncTransportError::Storage(err.to_string()))?;
+    Ok(bytes_received)
+}
+
+fn build_pull_envelope(
+    state: &LibraryState,
+    request: PullRequest,
+    remote_node_id: &str,
+    local_node_id: &str,
+    library_root: &Path,
+) -> Result<(TransferEnvelope, Vec<BlobChunk>), SyncTransportError> {
+    validate_pull_authorization(state, &request, remote_node_id, local_node_id)?;
+    let blob = state
+        .blob_records
+        .iter()
+        .find(|blob| {
+            blob.id == request.blob_id
+                && blob.vault_id == request.vault_id
+                && blob.tombstoned_at.is_none()
+        })
+        .cloned()
+        .ok_or_else(|| {
+            SyncTransportError::Invalid("requested blob is not available on this device".into())
+        })?;
+    let mut chunks = state
+        .blob_chunks
+        .iter()
+        .filter(|chunk| chunk.blob_id == blob.id)
+        .cloned()
+        .collect::<Vec<_>>();
+    chunks.sort_by_key(|chunk| chunk.chunk_index);
+    if chunks.is_empty() {
+        return Err(SyncTransportError::Invalid(
+            "requested blob has no encrypted chunks".to_string(),
+        ));
+    }
+    for chunk in &chunks {
+        let local_path = chunk.local_path.as_deref().ok_or_else(|| {
+            SyncTransportError::Invalid(format!("requested chunk {} has no local path", chunk.id))
+        })?;
+        let relative_path = safe_relative_path(local_path).ok_or_else(|| {
+            SyncTransportError::Invalid(format!("requested chunk {} has an unsafe path", chunk.id))
+        })?;
+        if !library_root.join(relative_path).is_file() {
+            return Err(SyncTransportError::Invalid(format!(
+                "requested chunk {} is missing from local storage",
+                chunk.id
+            )));
+        }
+    }
+    let envelope = TransferEnvelope {
+        protocol_version: PROTOCOL_VERSION,
+        transfer_id: request.transfer_id,
+        from_device_id: request.from_device_id,
+        to_device_id: request.to_device_id,
+        blob,
+        chunks: chunks.clone(),
+    };
+    Ok((envelope, chunks))
 }
 
 fn validate_envelope_authorization(
@@ -470,7 +703,7 @@ fn validate_envelope_authorization(
             "this device is not configured to accept vault storage".to_string(),
         ));
     }
-    let from_device = state
+    let _from_device = state
         .devices
         .iter()
         .find(|device| {
@@ -483,21 +716,47 @@ fn validate_envelope_authorization(
                 "incoming transfer source does not match the authenticated Iroh peer".into(),
             )
         })?;
-    let from_is_member = state.vault_members.iter().any(|member| {
-        member.vault_id == envelope.blob.vault_id
-            && member.device_id == from_device.id
-            && member.revoked_at.is_none()
-    });
-    let to_is_member = state.vault_members.iter().any(|member| {
-        member.vault_id == envelope.blob.vault_id
-            && member.device_id == local_device.id
-            && member.revoked_at.is_none()
-    });
-    if !from_is_member || !to_is_member {
-        return Err(SyncTransportError::Invalid(
-            "incoming transfer devices are not active members of the vault".to_string(),
-        ));
+    Ok(())
+}
+
+fn validate_pull_authorization(
+    state: &LibraryState,
+    request: &PullRequest,
+    remote_node_id: &str,
+    local_node_id: &str,
+) -> Result<(), SyncTransportError> {
+    if request.protocol_version != PROTOCOL_VERSION {
+        return Err(SyncTransportError::Invalid(format!(
+            "unsupported sync protocol version {}",
+            request.protocol_version
+        )));
     }
+    state
+        .devices
+        .iter()
+        .find(|device| {
+            device.id == request.from_device_id
+                && device.revoked_at.is_none()
+                && device.public_key == local_node_id
+        })
+        .ok_or_else(|| {
+            SyncTransportError::Invalid(
+                "pull request is not addressed to this source device".into(),
+            )
+        })?;
+    state
+        .devices
+        .iter()
+        .find(|device| {
+            device.id == request.to_device_id
+                && device.revoked_at.is_none()
+                && device.public_key == remote_node_id
+        })
+        .ok_or_else(|| {
+            SyncTransportError::Invalid(
+                "pull requester does not match the authenticated Iroh peer".into(),
+            )
+        })?;
     Ok(())
 }
 

@@ -20,7 +20,7 @@ use crate::{
     security,
 };
 
-const SCHEMA_VERSION: i64 = 10;
+const SCHEMA_VERSION: i64 = 11;
 
 #[derive(Debug, Clone)]
 pub struct StorageBootstrapReport {
@@ -143,6 +143,11 @@ fn migrate_schema(connection: &Connection, from_version: i64) -> Result<(), rusq
         record_migration(connection, 10, "encrypted_vault_chunks_and_key_envelopes")?;
     }
 
+    if from_version < 11 {
+        relax_remote_storage_foreign_keys(connection)?;
+        record_migration(connection, 11, "opaque_remote_blob_storage")?;
+    }
+
     connection.pragma_update(None, "user_version", SCHEMA_VERSION)
 }
 
@@ -183,6 +188,66 @@ fn record_migration(
         params![version, name, chrono::Utc::now().to_rfc3339()],
     )?;
     Ok(())
+}
+
+fn relax_remote_storage_foreign_keys(connection: &Connection) -> Result<(), rusqlite::Error> {
+    connection.execute_batch(
+        r#"
+        PRAGMA foreign_keys = OFF;
+        DROP TABLE IF EXISTS blob_records_new;
+        CREATE TABLE blob_records_new (
+          id TEXT PRIMARY KEY,
+          vault_id TEXT NOT NULL,
+          asset_id TEXT NOT NULL,
+          content_hash TEXT NOT NULL,
+          encrypted_hash TEXT NOT NULL,
+          bytes INTEGER NOT NULL,
+          chunk_count INTEGER NOT NULL,
+          encryption_key_version INTEGER NOT NULL,
+          created_at TEXT NOT NULL,
+          tombstoned_at TEXT,
+          UNIQUE(vault_id, asset_id)
+        );
+        INSERT INTO blob_records_new (
+          id, vault_id, asset_id, content_hash, encrypted_hash, bytes, chunk_count,
+          encryption_key_version, created_at, tombstoned_at
+        )
+        SELECT
+          id, vault_id, asset_id, content_hash, encrypted_hash, bytes, chunk_count,
+          encryption_key_version, created_at, tombstoned_at
+        FROM blob_records;
+        DROP TABLE blob_records;
+        ALTER TABLE blob_records_new RENAME TO blob_records;
+        DROP TABLE IF EXISTS sync_transfers_new;
+        CREATE TABLE sync_transfers_new (
+          id TEXT PRIMARY KEY,
+          vault_id TEXT NOT NULL,
+          blob_id TEXT NOT NULL,
+          from_device_id TEXT,
+          to_device_id TEXT NOT NULL,
+          status TEXT NOT NULL,
+          bytes_total INTEGER NOT NULL,
+          bytes_completed INTEGER NOT NULL,
+          started_at TEXT,
+          updated_at TEXT NOT NULL,
+          resumable_until TEXT NOT NULL,
+          FOREIGN KEY(blob_id) REFERENCES blob_records(id) ON DELETE CASCADE,
+          FOREIGN KEY(from_device_id) REFERENCES device_identities(id) ON DELETE SET NULL,
+          FOREIGN KEY(to_device_id) REFERENCES device_identities(id) ON DELETE CASCADE
+        );
+        INSERT INTO sync_transfers_new (
+          id, vault_id, blob_id, from_device_id, to_device_id, status, bytes_total,
+          bytes_completed, started_at, updated_at, resumable_until
+        )
+        SELECT
+          id, vault_id, blob_id, from_device_id, to_device_id, status, bytes_total,
+          bytes_completed, started_at, updated_at, resumable_until
+        FROM sync_transfers;
+        DROP TABLE sync_transfers;
+        ALTER TABLE sync_transfers_new RENAME TO sync_transfers;
+        PRAGMA foreign_keys = ON;
+        "#,
+    )
 }
 
 pub fn ensure_library_layout(root: &Path) -> Result<(), rusqlite::Error> {
@@ -2312,6 +2377,97 @@ mod tests {
         );
 
         let connection = Connection::open(&migrated.database_path).expect("open migrated db");
+        let version: i64 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("user version");
+        assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn migration_allows_opaque_blob_records_without_local_asset_metadata() {
+        let runtime_root = temp_runtime_root();
+        let config = AppConfig {
+            runtime_root: runtime_root.clone(),
+            ..AppConfig::default()
+        };
+        let db_dir = runtime_root.join("db");
+        std::fs::create_dir_all(&db_dir).expect("create db dir");
+        let connection = Connection::open(config.database_path()).expect("open legacy db");
+        connection
+            .execute_batch(
+                r#"
+                PRAGMA foreign_keys = ON;
+                CREATE TABLE assets (id TEXT PRIMARY KEY);
+                CREATE TABLE vaults (id TEXT PRIMARY KEY);
+                CREATE TABLE device_identities (id TEXT PRIMARY KEY);
+                CREATE TABLE blob_records (
+                  id TEXT PRIMARY KEY,
+                  vault_id TEXT NOT NULL,
+                  asset_id TEXT NOT NULL,
+                  content_hash TEXT NOT NULL,
+                  encrypted_hash TEXT NOT NULL,
+                  bytes INTEGER NOT NULL,
+                  chunk_count INTEGER NOT NULL,
+                  encryption_key_version INTEGER NOT NULL,
+                  created_at TEXT NOT NULL,
+                  tombstoned_at TEXT,
+                  UNIQUE(vault_id, asset_id),
+                  FOREIGN KEY(vault_id) REFERENCES vaults(id) ON DELETE CASCADE,
+                  FOREIGN KEY(asset_id) REFERENCES assets(id) ON DELETE CASCADE
+                );
+                CREATE TABLE sync_transfers (
+                  id TEXT PRIMARY KEY,
+                  vault_id TEXT NOT NULL,
+                  blob_id TEXT NOT NULL,
+                  from_device_id TEXT,
+                  to_device_id TEXT NOT NULL,
+                  status TEXT NOT NULL,
+                  bytes_total INTEGER NOT NULL,
+                  bytes_completed INTEGER NOT NULL,
+                  started_at TEXT,
+                  updated_at TEXT NOT NULL,
+                  resumable_until TEXT NOT NULL,
+                  FOREIGN KEY(vault_id) REFERENCES vaults(id) ON DELETE CASCADE,
+                  FOREIGN KEY(blob_id) REFERENCES blob_records(id) ON DELETE CASCADE,
+                  FOREIGN KEY(from_device_id) REFERENCES device_identities(id) ON DELETE SET NULL,
+                  FOREIGN KEY(to_device_id) REFERENCES device_identities(id) ON DELETE CASCADE
+                );
+                PRAGMA user_version = 10;
+                "#,
+            )
+            .expect("create legacy schema");
+        drop(connection);
+
+        let report = bootstrap_storage(&config).expect("migrate storage");
+        let connection = Connection::open(&report.database_path).expect("open migrated db");
+        let mut statement = connection
+            .prepare("PRAGMA foreign_key_list(blob_records)")
+            .expect("foreign key list");
+        let foreign_tables = statement
+            .query_map([], |row| row.get::<_, String>(2))
+            .expect("foreign key rows")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("foreign key tables");
+        assert!(
+            !foreign_tables
+                .iter()
+                .any(|table| table == "assets" || table == "vaults"),
+            "{foreign_tables:?}"
+        );
+        let mut statement = connection
+            .prepare("PRAGMA foreign_key_list(sync_transfers)")
+            .expect("sync transfer foreign key list");
+        let transfer_foreign_tables = statement
+            .query_map([], |row| row.get::<_, String>(2))
+            .expect("sync transfer foreign key rows")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("sync transfer foreign key tables");
+        assert!(
+            !transfer_foreign_tables
+                .iter()
+                .any(|table| table == "vaults"),
+            "{transfer_foreign_tables:?}"
+        );
         let version: i64 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("user version");
