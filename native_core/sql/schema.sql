@@ -358,6 +358,45 @@ CREATE TABLE IF NOT EXISTS sync_sessions (
   FOREIGN KEY(pairing_id) REFERENCES device_pairings(id) ON DELETE CASCADE
 );
 
+CREATE TABLE IF NOT EXISTS mobile_sessions (
+  id TEXT PRIMARY KEY,
+  device_id TEXT NOT NULL,
+  vault_id TEXT NOT NULL,
+  token_hash TEXT NOT NULL UNIQUE,
+  display_name TEXT NOT NULL,
+  platform TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  last_seen_at TEXT,
+  revoked_at TEXT,
+  FOREIGN KEY(device_id) REFERENCES device_identities(id) ON DELETE CASCADE,
+  FOREIGN KEY(vault_id) REFERENCES vaults(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS mobile_uploads (
+  id TEXT PRIMARY KEY,
+  session_id TEXT NOT NULL,
+  device_id TEXT NOT NULL,
+  vault_id TEXT NOT NULL,
+  asset_id TEXT,
+  original_filename TEXT NOT NULL,
+  media_kind TEXT NOT NULL,
+  mime_type TEXT NOT NULL,
+  bytes_total INTEGER NOT NULL,
+  bytes_received INTEGER NOT NULL,
+  content_hash TEXT,
+  captured_at TEXT,
+  place_hint TEXT,
+  status TEXT NOT NULL,
+  error_detail TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY(session_id) REFERENCES mobile_sessions(id) ON DELETE CASCADE,
+  FOREIGN KEY(device_id) REFERENCES device_identities(id) ON DELETE CASCADE,
+  FOREIGN KEY(vault_id) REFERENCES vaults(id) ON DELETE CASCADE,
+  FOREIGN KEY(asset_id) REFERENCES assets(id) ON DELETE SET NULL
+);
+
 CREATE TABLE IF NOT EXISTS import_sessions (
   id TEXT PRIMARY KEY,
   source_kind TEXT NOT NULL,

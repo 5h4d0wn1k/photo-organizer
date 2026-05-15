@@ -41,6 +41,7 @@ pub fn privacy_status(config: &AppConfig) -> Result<PrivacyStatus, ModelRegistry
         daemon_bind_address: config.bind_address(),
         loopback_only: is_loopback_host(&config.bind_host),
         developer_mode: config.developer_mode,
+        remote_mobile_access_enabled: config.allow_remote_mobile,
         photo_processing_network_allowed: false,
         model_download_requires_confirmation: true,
         telemetry_enabled: false,

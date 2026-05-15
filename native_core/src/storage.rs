@@ -13,14 +13,15 @@ use crate::{
         Album, Asset, AssetMetadata, AssetVariant, BlobChunk, BlobRecord, BlobReplica, CameraInfo,
         CapabilityGrant, CorrectionRecord, DeviceIdentity, DevicePairing, EventCluster,
         FaceTemplate, FeedbackEvent, GeoTag, ImportCandidate, ImportMode, ImportSession, JobLog,
-        JobRecord, LibrarySettings, MetadataSource, ModelProvenance, OcrBlock, PersonCluster,
-        PlaceCluster, RelayEndpoint, SceneTag, SyncConflict, SyncSession, SyncTransfer, Vault,
-        VaultInvite, VaultKeyEnvelope, VaultMember, WatchFolder,
+        JobRecord, LibrarySettings, MediaKind, MetadataSource, MobileSession, MobileUpload,
+        MobileUploadStatus, ModelProvenance, OcrBlock, PersonCluster, PlaceCluster, RelayEndpoint,
+        SceneTag, SyncConflict, SyncSession, SyncTransfer, Vault, VaultInvite, VaultKeyEnvelope,
+        VaultMember, WatchFolder,
     },
     security,
 };
 
-const SCHEMA_VERSION: i64 = 11;
+const SCHEMA_VERSION: i64 = 12;
 
 #[derive(Debug, Clone)]
 pub struct StorageBootstrapReport {
@@ -52,6 +53,8 @@ pub struct PersistedLibraryState {
     pub capability_grants: Vec<CapabilityGrant>,
     pub pairings: Vec<DevicePairing>,
     pub sync_sessions: Vec<SyncSession>,
+    pub mobile_sessions: Vec<MobileSession>,
+    pub mobile_uploads: Vec<MobileUpload>,
     pub import_sessions: Vec<ImportSession>,
     pub jobs: Vec<JobRecord>,
     pub job_logs: Vec<JobLog>,
@@ -146,6 +149,10 @@ fn migrate_schema(connection: &Connection, from_version: i64) -> Result<(), rusq
     if from_version < 11 {
         relax_remote_storage_foreign_keys(connection)?;
         record_migration(connection, 11, "opaque_remote_blob_storage")?;
+    }
+
+    if from_version < 12 {
+        record_migration(connection, 12, "mobile_lan_sync_sessions_and_uploads")?;
     }
 
     connection.pragma_update(None, "user_version", SCHEMA_VERSION)
@@ -295,6 +302,8 @@ pub fn load_state(
     let capability_grants = load_capability_grants(&connection)?;
     let pairings = load_pairings(&connection)?;
     let sync_sessions = load_sync_sessions(&connection)?;
+    let mobile_sessions = load_mobile_sessions(&connection)?;
+    let mobile_uploads = load_mobile_uploads(&connection)?;
     let import_sessions = load_import_sessions(&connection)?;
     let jobs = load_jobs(&connection)?;
     let job_logs = load_job_logs(&connection)?;
@@ -326,6 +335,8 @@ pub fn load_state(
         capability_grants,
         pairings,
         sync_sessions,
+        mobile_sessions,
+        mobile_uploads,
         import_sessions,
         jobs,
         job_logs,
@@ -364,6 +375,8 @@ pub fn save_state(
         DELETE FROM blob_chunks;
         DELETE FROM blob_records;
         DELETE FROM vault_members;
+        DELETE FROM mobile_uploads;
+        DELETE FROM mobile_sessions;
         DELETE FROM device_identities;
         DELETE FROM vaults;
         DELETE FROM sync_sessions;
@@ -1020,6 +1033,60 @@ pub fn save_state(
                 sync.last_seen_at.map(|value| value.to_rfc3339()),
                 uuid_vec_json(&sync.uploaded_asset_ids)?,
                 uuid_vec_json(&sync.rejected_asset_ids)?,
+            ],
+        )?;
+    }
+
+    for session in &state.mobile_sessions {
+        transaction.execute(
+            r#"
+            INSERT INTO mobile_sessions (
+              id, device_id, vault_id, token_hash, display_name, platform,
+              created_at, expires_at, last_seen_at, revoked_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+            "#,
+            params![
+                session.id.to_string(),
+                session.device_id.to_string(),
+                session.vault_id.to_string(),
+                session.token_hash,
+                session.display_name,
+                session.platform,
+                session.created_at.to_rfc3339(),
+                session.expires_at.to_rfc3339(),
+                session.last_seen_at.map(|value| value.to_rfc3339()),
+                session.revoked_at.map(|value| value.to_rfc3339()),
+            ],
+        )?;
+    }
+
+    for upload in &state.mobile_uploads {
+        transaction.execute(
+            r#"
+            INSERT INTO mobile_uploads (
+              id, session_id, device_id, vault_id, asset_id, original_filename, media_kind,
+              mime_type, bytes_total, bytes_received, content_hash, captured_at, place_hint,
+              status, error_detail, created_at, updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+            "#,
+            params![
+                upload.id.to_string(),
+                upload.session_id.to_string(),
+                upload.device_id.to_string(),
+                upload.vault_id.to_string(),
+                upload.asset_id.map(|value| value.to_string()),
+                upload.original_filename,
+                enum_string(&upload.media_kind)?,
+                upload.mime_type,
+                upload.bytes_total,
+                upload.bytes_received,
+                upload.content_hash,
+                upload.captured_at.map(|value| value.to_rfc3339()),
+                upload.place_hint,
+                enum_string(&upload.status)?,
+                upload.error_detail,
+                upload.created_at.to_rfc3339(),
+                upload.updated_at.to_rfc3339(),
             ],
         )?;
     }
@@ -1950,6 +2017,78 @@ fn load_sync_sessions(connection: &Connection) -> Result<Vec<SyncSession>, rusql
                 .transpose()?,
             uploaded_asset_ids: parse_uuid_vec(&row.get::<_, String>(5)?)?,
             rejected_asset_ids: parse_uuid_vec(&row.get::<_, String>(6)?)?,
+        })
+    })?;
+    rows.collect()
+}
+
+fn load_mobile_sessions(connection: &Connection) -> Result<Vec<MobileSession>, rusqlite::Error> {
+    let mut statement = connection.prepare(
+        r#"
+        SELECT id, device_id, vault_id, token_hash, display_name, platform,
+               created_at, expires_at, last_seen_at, revoked_at
+        FROM mobile_sessions
+        ORDER BY created_at DESC
+        "#,
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok(MobileSession {
+            id: parse_uuid(&row.get::<_, String>(0)?)?,
+            device_id: parse_uuid(&row.get::<_, String>(1)?)?,
+            vault_id: parse_uuid(&row.get::<_, String>(2)?)?,
+            token_hash: row.get(3)?,
+            display_name: row.get(4)?,
+            platform: row.get(5)?,
+            created_at: parse_datetime(&row.get::<_, String>(6)?)?,
+            expires_at: parse_datetime(&row.get::<_, String>(7)?)?,
+            last_seen_at: row
+                .get::<_, Option<String>>(8)?
+                .map(|value| parse_datetime(&value))
+                .transpose()?,
+            revoked_at: row
+                .get::<_, Option<String>>(9)?
+                .map(|value| parse_datetime(&value))
+                .transpose()?,
+        })
+    })?;
+    rows.collect()
+}
+
+fn load_mobile_uploads(connection: &Connection) -> Result<Vec<MobileUpload>, rusqlite::Error> {
+    let mut statement = connection.prepare(
+        r#"
+        SELECT id, session_id, device_id, vault_id, asset_id, original_filename, media_kind,
+               mime_type, bytes_total, bytes_received, content_hash, captured_at, place_hint,
+               status, error_detail, created_at, updated_at
+        FROM mobile_uploads
+        ORDER BY created_at DESC
+        "#,
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok(MobileUpload {
+            id: parse_uuid(&row.get::<_, String>(0)?)?,
+            session_id: parse_uuid(&row.get::<_, String>(1)?)?,
+            device_id: parse_uuid(&row.get::<_, String>(2)?)?,
+            vault_id: parse_uuid(&row.get::<_, String>(3)?)?,
+            asset_id: row
+                .get::<_, Option<String>>(4)?
+                .map(|value| parse_uuid(&value))
+                .transpose()?,
+            original_filename: row.get(5)?,
+            media_kind: parse_enum::<MediaKind>(&row.get::<_, String>(6)?)?,
+            mime_type: row.get(7)?,
+            bytes_total: row.get(8)?,
+            bytes_received: row.get(9)?,
+            content_hash: row.get(10)?,
+            captured_at: row
+                .get::<_, Option<String>>(11)?
+                .map(|value| parse_datetime(&value))
+                .transpose()?,
+            place_hint: row.get(12)?,
+            status: parse_enum::<MobileUploadStatus>(&row.get::<_, String>(13)?)?,
+            error_detail: row.get(14)?,
+            created_at: parse_datetime(&row.get::<_, String>(15)?)?,
+            updated_at: parse_datetime(&row.get::<_, String>(16)?)?,
         })
     })?;
     rows.collect()

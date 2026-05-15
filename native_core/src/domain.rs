@@ -787,6 +787,72 @@ pub struct SyncSession {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MobileSession {
+    pub id: Uuid,
+    pub device_id: Uuid,
+    pub vault_id: Uuid,
+    #[serde(skip_serializing)]
+    pub token_hash: String,
+    pub display_name: String,
+    pub platform: String,
+    pub created_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+    pub last_seen_at: Option<DateTime<Utc>>,
+    pub revoked_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MobileUploadStatus {
+    Pending,
+    Running,
+    Completed,
+    Failed,
+    Canceled,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MobileUpload {
+    pub id: Uuid,
+    pub session_id: Uuid,
+    pub device_id: Uuid,
+    pub vault_id: Uuid,
+    pub asset_id: Option<Uuid>,
+    pub original_filename: String,
+    pub media_kind: MediaKind,
+    pub mime_type: String,
+    pub bytes_total: u64,
+    pub bytes_received: u64,
+    pub content_hash: Option<String>,
+    pub captured_at: Option<DateTime<Utc>>,
+    pub place_hint: Option<String>,
+    pub status: MobileUploadStatus,
+    pub error_detail: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MobilePairResponse {
+    pub session: MobileSession,
+    pub device: DeviceIdentity,
+    pub bearer_token: String,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MobileAssetSummary {
+    pub asset_id: Uuid,
+    pub original_filename: String,
+    pub media_kind: MediaKind,
+    pub mime_type: String,
+    pub bytes: u64,
+    pub content_hash: String,
+    pub captured_at: DateTime<Utc>,
+    pub available: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ImportCandidate {
     pub id: Uuid,
     pub session_id: Uuid,
@@ -1080,6 +1146,7 @@ pub struct PrivacyStatus {
     pub daemon_bind_address: String,
     pub loopback_only: bool,
     pub developer_mode: bool,
+    pub remote_mobile_access_enabled: bool,
     pub photo_processing_network_allowed: bool,
     pub model_download_requires_confirmation: bool,
     pub telemetry_enabled: bool,
@@ -1291,6 +1358,25 @@ pub struct BackupRestoreRunResult {
 pub struct CreatePairingSessionRequest {
     pub device_name: String,
     pub platform: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MobilePairRequest {
+    pub pairing_token: String,
+    pub device_name: String,
+    pub platform: String,
+    pub vault_id: Option<Uuid>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MobileUploadRequest {
+    pub original_filename: String,
+    pub media_kind: MediaKind,
+    pub mime_type: String,
+    pub bytes: u64,
+    pub content_hash: Option<String>,
+    pub captured_at: Option<DateTime<Utc>>,
+    pub place_hint: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

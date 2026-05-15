@@ -7,6 +7,7 @@ use std::{
 
 use chrono::Utc;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::sync::RwLock;
 use uuid::Uuid;
@@ -24,17 +25,19 @@ use crate::{
         EncryptionActivationRequest, EncryptionActivationResult, EnrollDeviceRequest, EventCluster,
         FeedbackEvent, HidePersonRequest, ImportAssetRequest, ImportAssetResponse, ImportMode,
         ImportSession, ImportSessionStatus, JobKind, JobLog, JobRecord, JobStatus, LibrarySettings,
-        LibraryStatusResponse, MergePersonRequest, MetadataSource, ModelArtifact,
-        ModelImportRequest, ModelInstallRequest, ModelTask, OcrBlock, PersonCluster, PlaceCluster,
-        PrivacyStatus, RebuildRequest, RejectPersonMatchRequest, RelayEndpoint, RenameAlbumRequest,
-        RenamePersonRequest, ReplicaHealth, RevokeDeviceRequest, RunSyncRequest,
-        ScanImportSourceRequest, SceneTag, SearchIndexStatus, SearchQuery, SearchResponse,
-        SplitPersonRequest, StoragePolicy, StoragePolicyMode, SyncConflict, SyncNetworkStatus,
-        SyncPlan, SyncSession, SyncTransfer, SyncTransferExecutionResult,
-        SyncTransferExecutionStatus, SyncTransferStatus, TimelineBucket, TimelineResponse,
-        UpdateAlbumAssetsRequest, UpdateAssetFlagsRequest, UpdateAssetsFlagsRequest,
-        UpdateLibrarySettingsRequest, UpdatePersonAssetsRequest, UpdateVaultStoragePolicyRequest,
-        Vault, VaultInvite, VaultKeyEnvelope, VaultMember, VaultStatus, WatchFolder,
+        LibraryStatusResponse, MergePersonRequest, MetadataSource, MobileAssetSummary,
+        MobilePairRequest, MobilePairResponse, MobileSession, MobileUpload, MobileUploadRequest,
+        MobileUploadStatus, ModelArtifact, ModelImportRequest, ModelInstallRequest, ModelTask,
+        OcrBlock, PersonCluster, PlaceCluster, PrivacyStatus, RebuildRequest,
+        RejectPersonMatchRequest, RelayEndpoint, RenameAlbumRequest, RenamePersonRequest,
+        ReplicaHealth, RevokeDeviceRequest, RunSyncRequest, ScanImportSourceRequest, SceneTag,
+        SearchIndexStatus, SearchQuery, SearchResponse, SplitPersonRequest, StoragePolicy,
+        StoragePolicyMode, SyncConflict, SyncNetworkStatus, SyncPlan, SyncSession, SyncTransfer,
+        SyncTransferExecutionResult, SyncTransferExecutionStatus, SyncTransferStatus,
+        TimelineBucket, TimelineResponse, UpdateAlbumAssetsRequest, UpdateAssetFlagsRequest,
+        UpdateAssetsFlagsRequest, UpdateLibrarySettingsRequest, UpdatePersonAssetsRequest,
+        UpdateVaultStoragePolicyRequest, Vault, VaultInvite, VaultKeyEnvelope, VaultMember,
+        VaultStatus, WatchFolder,
     },
     events, imports, metadata, ml_sidecar, model_registry, ocr, people, search, security,
     storage::{self, PersistedLibraryState, StorageBootstrapReport},
@@ -67,6 +70,8 @@ pub(crate) struct LibraryState {
     pub(crate) capability_grants: Vec<CapabilityGrant>,
     pub(crate) pairings: Vec<DevicePairing>,
     pub(crate) sync_sessions: Vec<SyncSession>,
+    pub(crate) mobile_sessions: Vec<MobileSession>,
+    pub(crate) mobile_uploads: Vec<MobileUpload>,
     pub(crate) import_sessions: Vec<ImportSession>,
     pub(crate) jobs: Vec<JobRecord>,
     pub(crate) job_logs: Vec<JobLog>,
@@ -101,6 +106,8 @@ impl From<PersistedLibraryState> for LibraryState {
             capability_grants: state.capability_grants,
             pairings: state.pairings,
             sync_sessions: state.sync_sessions,
+            mobile_sessions: state.mobile_sessions,
+            mobile_uploads: state.mobile_uploads,
             import_sessions: state.import_sessions,
             jobs: state.jobs,
             job_logs: state.job_logs,
@@ -137,6 +144,8 @@ impl LibraryState {
             capability_grants: self.capability_grants.clone(),
             pairings: self.pairings.clone(),
             sync_sessions: self.sync_sessions.clone(),
+            mobile_sessions: self.mobile_sessions.clone(),
+            mobile_uploads: self.mobile_uploads.clone(),
             import_sessions: self.import_sessions.clone(),
             jobs: self.jobs.clone(),
             job_logs: self.job_logs.clone(),
@@ -169,9 +178,12 @@ pub struct GalleryService {
 
 impl GalleryService {
     pub fn new(config: AppConfig) -> Result<Self, ServiceError> {
-        if !config.developer_mode && !model_registry::is_loopback_host(&config.bind_host) {
+        if !config.developer_mode
+            && !config.allow_remote_mobile
+            && !model_registry::is_loopback_host(&config.bind_host)
+        {
             return Err(ServiceError::Invalid(format!(
-                "refusing to bind daemon to non-loopback host {} without explicit developer mode",
+                "refusing to bind daemon to non-loopback host {} without explicit developer mode or PRIVATE_GALLERY_ALLOW_REMOTE_MOBILE=1",
                 config.bind_host
             )));
         }
@@ -352,6 +364,353 @@ impl GalleryService {
         state.pairings.push(pairing.clone());
         self.persist_locked_state(&state)?;
         Ok(pairing)
+    }
+
+    pub async fn pair_mobile_device(
+        &self,
+        request: MobilePairRequest,
+    ) -> Result<MobilePairResponse, ServiceError> {
+        let pairing_token = request.pairing_token.trim();
+        let display_name = request.device_name.trim();
+        let platform = request.platform.trim();
+        if pairing_token.is_empty() || display_name.is_empty() || platform.is_empty() {
+            return Err(ServiceError::Invalid(
+                "pairing_token, device_name, and platform are required".to_string(),
+            ));
+        }
+
+        let mut state = self.state.write().await;
+        ensure_distributed_defaults(&mut state);
+        let now = Utc::now();
+        let pairing_index = state
+            .pairings
+            .iter()
+            .position(|pairing| pairing.pairing_token == pairing_token)
+            .ok_or_else(|| ServiceError::Invalid("pairing token was not found".to_string()))?;
+        if state.pairings[pairing_index].expires_at < now {
+            return Err(ServiceError::Invalid(
+                "pairing token has expired".to_string(),
+            ));
+        }
+        if state.pairings[pairing_index].approved_at.is_some() {
+            return Err(ServiceError::Invalid(
+                "pairing token has already been used".to_string(),
+            ));
+        }
+
+        let vault_id = request
+            .vault_id
+            .or_else(|| state.vaults.first().map(|vault| vault.id))
+            .ok_or_else(|| ServiceError::NotFound("vault".to_string()))?;
+        if !state.vaults.iter().any(|vault| vault.id == vault_id) {
+            return Err(ServiceError::NotFound(format!("vault {vault_id}")));
+        }
+
+        let mut storage_profile = DeviceStorageProfile {
+            battery_powered: true,
+            reserved_bytes: 2 * 1024 * 1024 * 1024,
+            ..DeviceStorageProfile::default()
+        };
+        storage_profile.accepts_storage = true;
+        let device = build_device_identity(
+            None,
+            display_name.to_string(),
+            platform.to_string(),
+            Some(format!("mobile-device-key-{}", Uuid::new_v4())),
+            Some(DeviceTrustLevel::Trusted),
+            Some(storage_profile),
+        )?;
+        let device =
+            add_device_to_state(&mut state, device, DeviceRole::Contributor, Some(vault_id))?;
+        state.pairings[pairing_index].approved_at = Some(now);
+
+        let bearer_token = new_mobile_bearer_token();
+        let session = MobileSession {
+            id: Uuid::new_v4(),
+            device_id: device.id,
+            vault_id,
+            token_hash: hash_mobile_token(&bearer_token),
+            display_name: device.display_name.clone(),
+            platform: device.platform.clone(),
+            created_at: now,
+            expires_at: now + chrono::Duration::days(365),
+            last_seen_at: Some(now),
+            revoked_at: None,
+        };
+        state.mobile_sessions.push(session.clone());
+        self.persist_locked_state(&state)?;
+
+        Ok(MobilePairResponse {
+            session,
+            device,
+            bearer_token,
+            detail: "mobile device paired for local vault sync".to_string(),
+        })
+    }
+
+    pub async fn mobile_session_status(
+        &self,
+        bearer_token: &str,
+    ) -> Result<MobileSession, ServiceError> {
+        let mut state = self.state.write().await;
+        let session = active_mobile_session_from_state(&mut state, bearer_token)?;
+        self.persist_locked_state(&state)?;
+        Ok(session)
+    }
+
+    pub async fn reserve_mobile_upload(
+        &self,
+        bearer_token: &str,
+        request: MobileUploadRequest,
+    ) -> Result<MobileUpload, ServiceError> {
+        let original_filename = sanitize_mobile_filename(&request.original_filename)?;
+        if request.bytes == 0 {
+            return Err(ServiceError::Invalid(
+                "mobile upload must include at least one byte".to_string(),
+            ));
+        }
+        let mime_type = if request.mime_type.trim().is_empty() {
+            "application/octet-stream".to_string()
+        } else {
+            request.mime_type.trim().to_string()
+        };
+        let content_hash = request
+            .content_hash
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string);
+
+        let mut state = self.state.write().await;
+        let session = active_mobile_session_from_state(&mut state, bearer_token)?;
+        let now = Utc::now();
+        let upload = MobileUpload {
+            id: Uuid::new_v4(),
+            session_id: session.id,
+            device_id: session.device_id,
+            vault_id: session.vault_id,
+            asset_id: None,
+            original_filename,
+            media_kind: request.media_kind,
+            mime_type,
+            bytes_total: request.bytes,
+            bytes_received: 0,
+            content_hash,
+            captured_at: request.captured_at,
+            place_hint: request
+                .place_hint
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string),
+            status: MobileUploadStatus::Pending,
+            error_detail: None,
+            created_at: now,
+            updated_at: now,
+        };
+        state.mobile_uploads.push(upload.clone());
+        self.persist_locked_state(&state)?;
+        Ok(upload)
+    }
+
+    pub async fn receive_mobile_upload(
+        &self,
+        bearer_token: &str,
+        upload_id: Uuid,
+        bytes: Vec<u8>,
+    ) -> Result<MobileUpload, ServiceError> {
+        let mut state = self.state.write().await;
+        let session = active_mobile_session_from_state(&mut state, bearer_token)?;
+        let upload_index = state
+            .mobile_uploads
+            .iter()
+            .position(|upload| upload.id == upload_id)
+            .ok_or_else(|| ServiceError::NotFound(format!("mobile upload {upload_id}")))?;
+        let mut upload = state.mobile_uploads[upload_index].clone();
+        if upload.session_id != session.id {
+            return Err(ServiceError::Invalid(
+                "mobile upload does not belong to this session".to_string(),
+            ));
+        }
+        if upload.status == MobileUploadStatus::Completed {
+            return Ok(upload);
+        }
+        if matches!(
+            upload.status,
+            MobileUploadStatus::Failed | MobileUploadStatus::Canceled
+        ) {
+            return Err(ServiceError::Invalid(
+                "mobile upload is no longer accepting bytes".to_string(),
+            ));
+        }
+        if bytes.len() as u64 != upload.bytes_total {
+            let detail = format!(
+                "upload byte count mismatch: expected {}, received {}",
+                upload.bytes_total,
+                bytes.len()
+            );
+            state.mobile_uploads[upload_index].status = MobileUploadStatus::Failed;
+            state.mobile_uploads[upload_index].error_detail = Some(detail.clone());
+            state.mobile_uploads[upload_index].updated_at = Utc::now();
+            self.persist_locked_state(&state)?;
+            return Err(ServiceError::Invalid(detail));
+        }
+
+        let now = Utc::now();
+        state.mobile_uploads[upload_index].status = MobileUploadStatus::Running;
+        state.mobile_uploads[upload_index].bytes_received = bytes.len() as u64;
+        state.mobile_uploads[upload_index].updated_at = now;
+        upload = state.mobile_uploads[upload_index].clone();
+
+        let upload_dir = self
+            .config
+            .runtime_root
+            .join("mobile_uploads")
+            .join(upload.id.to_string());
+        fs::create_dir_all(&upload_dir).map_err(|err| ServiceError::Io(err.to_string()))?;
+        let upload_path = upload_dir.join(&upload.original_filename);
+        fs::write(&upload_path, &bytes).map_err(|err| {
+            ServiceError::Io(format!("failed to write mobile upload staging file: {err}"))
+        })?;
+        let actual_hash = imports::derive_content_hash_from_file(&upload_path)
+            .map_err(|err| ServiceError::Io(err.to_string()))?;
+        if let Some(expected_hash) = upload.content_hash.as_deref() {
+            if !expected_hash.eq_ignore_ascii_case(&actual_hash) {
+                let detail = "mobile upload content_hash did not match received bytes".to_string();
+                state.mobile_uploads[upload_index].status = MobileUploadStatus::Failed;
+                state.mobile_uploads[upload_index].content_hash = Some(actual_hash);
+                state.mobile_uploads[upload_index].error_detail = Some(detail.clone());
+                state.mobile_uploads[upload_index].updated_at = Utc::now();
+                self.persist_locked_state(&state)?;
+                return Err(ServiceError::Invalid(detail));
+            }
+        }
+
+        if let Some(existing) = state
+            .assets
+            .iter()
+            .find(|asset| asset.content_hash == actual_hash)
+            .cloned()
+        {
+            state.mobile_uploads[upload_index].status = MobileUploadStatus::Completed;
+            state.mobile_uploads[upload_index].asset_id = Some(existing.id);
+            state.mobile_uploads[upload_index].content_hash = Some(actual_hash);
+            state.mobile_uploads[upload_index].error_detail = None;
+            state.mobile_uploads[upload_index].updated_at = Utc::now();
+            let completed = state.mobile_uploads[upload_index].clone();
+            self.persist_locked_state(&state)?;
+            return Ok(completed);
+        }
+
+        let library_root = effective_library_root(&state, &self.config);
+        let library_root_path = PathBuf::from(&library_root);
+        storage::ensure_library_layout(&library_root_path)
+            .map_err(|err| ServiceError::Storage(err.to_string()))?;
+        let captured_at = upload.captured_at.unwrap_or(now);
+        let (mut asset, mut job) = imports::build_imported_asset(ImportAssetRequest {
+            source_path: upload_path.to_string_lossy().to_string(),
+            original_filename: upload.original_filename.clone(),
+            media_kind: upload.media_kind,
+            mime_type: upload.mime_type.clone(),
+            bytes: upload.bytes_total,
+            captured_at: Some(captured_at),
+            place_hint: upload.place_hint.clone(),
+            import_mode: Some(ImportMode::Copy),
+            content_hash: Some(actual_hash.clone()),
+        });
+        let extracted = metadata::extract_media_metadata(&upload_path, &[], asset.captured_at);
+        asset.captured_at = extracted.captured_at;
+        if asset.place_hint.is_none() {
+            asset.place_hint = metadata::coarse_place_label(&extracted);
+        }
+        asset.metadata = Some(extracted.into_asset_metadata(asset.id));
+
+        let destination = library_root_path.join(&asset.relative_original_path);
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent).map_err(|err| ServiceError::Io(err.to_string()))?;
+        }
+        fs::copy(&upload_path, &destination).map_err(|err| ServiceError::Io(err.to_string()))?;
+        asset.is_available = destination.exists();
+
+        job.status = JobStatus::Completed;
+        job.progress = 100;
+        job.started_at = Some(Utc::now());
+        job.completed_at = Some(Utc::now());
+        job.detail = Some(format!(
+            "imported mobile upload {}",
+            asset.original_filename
+        ));
+
+        let asset_id = asset.id;
+        state.assets.push(asset);
+        state.jobs.insert(0, job);
+        state.mobile_uploads[upload_index].status = MobileUploadStatus::Completed;
+        state.mobile_uploads[upload_index].asset_id = Some(asset_id);
+        state.mobile_uploads[upload_index].content_hash = Some(actual_hash);
+        state.mobile_uploads[upload_index].error_detail = None;
+        state.mobile_uploads[upload_index].updated_at = Utc::now();
+        refresh_derived_views(&mut state);
+        ensure_distributed_defaults(&mut state);
+        refresh_blob_records(&self.config, &mut state);
+        let completed = state.mobile_uploads[upload_index].clone();
+        self.persist_locked_state(&state)?;
+        Ok(completed)
+    }
+
+    pub async fn mobile_assets(
+        &self,
+        bearer_token: &str,
+    ) -> Result<Vec<MobileAssetSummary>, ServiceError> {
+        let mut state = self.state.write().await;
+        let session = active_mobile_session_from_state(&mut state, bearer_token)?;
+        ensure_distributed_defaults(&mut state);
+        refresh_blob_records(&self.config, &mut state);
+        let summaries = state
+            .assets
+            .iter()
+            .filter(|asset| {
+                state.blob_records.iter().any(|blob| {
+                    blob.asset_id == asset.id
+                        && blob.vault_id == session.vault_id
+                        && blob.tombstoned_at.is_none()
+                })
+            })
+            .map(|asset| MobileAssetSummary {
+                asset_id: asset.id,
+                original_filename: asset.original_filename.clone(),
+                media_kind: asset.media_kind.clone(),
+                mime_type: asset.mime_type.clone(),
+                bytes: asset.bytes,
+                content_hash: asset.content_hash.clone(),
+                captured_at: asset.captured_at,
+                available: asset.is_available,
+            })
+            .collect::<Vec<_>>();
+        self.persist_locked_state(&state)?;
+        Ok(summaries)
+    }
+
+    pub async fn mobile_original_bytes(
+        &self,
+        bearer_token: &str,
+        asset_id: Uuid,
+    ) -> Result<(String, Vec<u8>), ServiceError> {
+        {
+            let mut state = self.state.write().await;
+            let session = active_mobile_session_from_state(&mut state, bearer_token)?;
+            ensure_distributed_defaults(&mut state);
+            refresh_blob_records(&self.config, &mut state);
+            let belongs_to_session_vault = state.blob_records.iter().any(|blob| {
+                blob.asset_id == asset_id
+                    && blob.vault_id == session.vault_id
+                    && blob.tombstoned_at.is_none()
+            });
+            if !belongs_to_session_vault {
+                return Err(ServiceError::NotFound(format!("asset {asset_id}")));
+            }
+            self.persist_locked_state(&state)?;
+        }
+        self.asset_original_bytes(asset_id).await
     }
 
     pub async fn vaults(&self) -> Vec<Vault> {
@@ -3865,6 +4224,113 @@ fn local_device_name(state: &LibraryState) -> Option<String> {
         .map(|device| device.display_name.clone())
 }
 
+fn active_mobile_session_from_state(
+    state: &mut LibraryState,
+    bearer_token: &str,
+) -> Result<MobileSession, ServiceError> {
+    let token = bearer_token.trim();
+    if token.is_empty() {
+        return Err(ServiceError::Invalid(
+            "mobile authorization bearer token is required".to_string(),
+        ));
+    }
+    let token_hash = hash_mobile_token(token);
+    let now = Utc::now();
+    let session_index = state
+        .mobile_sessions
+        .iter()
+        .position(|session| session.token_hash == token_hash)
+        .ok_or_else(|| ServiceError::Invalid("mobile session was not found".to_string()))?;
+    let session = state.mobile_sessions[session_index].clone();
+    if session.revoked_at.is_some() {
+        return Err(ServiceError::Invalid(
+            "mobile session has been revoked".to_string(),
+        ));
+    }
+    if session.expires_at < now {
+        return Err(ServiceError::Invalid(
+            "mobile session has expired".to_string(),
+        ));
+    }
+    let device = state
+        .devices
+        .iter()
+        .find(|device| device.id == session.device_id)
+        .ok_or_else(|| ServiceError::NotFound(format!("device {}", session.device_id)))?;
+    if device.revoked_at.is_some() {
+        return Err(ServiceError::Invalid(
+            "mobile device has been revoked".to_string(),
+        ));
+    }
+    if !state
+        .vaults
+        .iter()
+        .any(|vault| vault.id == session.vault_id)
+    {
+        return Err(ServiceError::NotFound(format!(
+            "vault {}",
+            session.vault_id
+        )));
+    }
+    state.mobile_sessions[session_index].last_seen_at = Some(now);
+    Ok(state.mobile_sessions[session_index].clone())
+}
+
+fn new_mobile_bearer_token() -> String {
+    format!(
+        "pgm_{}_{}",
+        Uuid::new_v4().simple(),
+        Uuid::new_v4().simple()
+    )
+}
+
+fn hash_mobile_token(token: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(token.trim().as_bytes());
+    hex_string(&hasher.finalize())
+}
+
+fn hex_string(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut value = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        value.push(HEX[(byte >> 4) as usize] as char);
+        value.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    value
+}
+
+fn sanitize_mobile_filename(raw: &str) -> Result<String, ServiceError> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(ServiceError::Invalid(
+            "original_filename is required".to_string(),
+        ));
+    }
+    let name = Path::new(trimmed)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or(trimmed)
+        .trim();
+    let sanitized = name
+        .chars()
+        .map(|value| {
+            if value.is_ascii_alphanumeric() || matches!(value, '.' | '-' | '_' | ' ') {
+                value
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    let sanitized = sanitized.trim_matches([' ', '.']).to_string();
+    if sanitized.is_empty() {
+        return Err(ServiceError::Invalid(
+            "original_filename must include a usable file name".to_string(),
+        ));
+    }
+    Ok(sanitized)
+}
+
 fn build_device_identity(
     device_id: Option<Uuid>,
     display_name: String,
@@ -5304,12 +5770,13 @@ mod tests {
         config::AppConfig,
         domain::{
             AssetAvailabilityState, BlobReplica, CorrectDateRequest, CorrectPlaceRequest,
-            CreateAlbumRequest, CreateDeviceRequest, CreateManualPersonRequest, DeviceRole,
-            DeviceStorageProfile, DeviceTrustLevel, EncryptionActivationRequest,
-            EnrollDeviceRequest, ImportAssetRequest, ImportMode, ImportSourceKind, MediaKind,
-            MetadataSource, ModelImportRequest, ModelInstallRequest, NetworkPolicy, RebuildRequest,
-            RenameAlbumRequest, ReplicaHealth, RunSyncRequest, ScanImportSourceRequest,
-            SearchQuery, StoragePolicy, StoragePolicyMode, SyncTransfer,
+            CreateAlbumRequest, CreateDeviceRequest, CreateManualPersonRequest,
+            CreatePairingSessionRequest, DeviceRole, DeviceStorageProfile, DeviceTrustLevel,
+            EncryptionActivationRequest, EnrollDeviceRequest, ImportAssetRequest, ImportMode,
+            ImportSourceKind, MediaKind, MetadataSource, MobilePairRequest, MobileUploadRequest,
+            MobileUploadStatus, ModelImportRequest, ModelInstallRequest, NetworkPolicy,
+            RebuildRequest, RenameAlbumRequest, ReplicaHealth, RunSyncRequest,
+            ScanImportSourceRequest, SearchQuery, StoragePolicy, StoragePolicyMode, SyncTransfer,
             SyncTransferExecutionStatus, SyncTransferStatus, UpdateAlbumAssetsRequest,
             UpdateAssetFlagsRequest, UpdateAssetsFlagsRequest, UpdateLibrarySettingsRequest,
             UpdatePersonAssetsRequest, UpdateVaultStoragePolicyRequest,
@@ -5410,6 +5877,111 @@ mod tests {
             .expect("settings should save");
 
         assert_eq!(settings.default_import_mode, ImportMode::Copy);
+    }
+
+    #[tokio::test]
+    async fn mobile_pair_upload_download_round_trip_persists() {
+        let runtime_root = temp_root("mobile-sync");
+        let library_root = runtime_root.join("library");
+        let config = AppConfig {
+            runtime_root: runtime_root.clone(),
+            ..AppConfig::default()
+        };
+        let service = GalleryService::new(config.clone()).expect("service");
+        service
+            .update_library_settings(UpdateLibrarySettingsRequest {
+                library_root: library_root.to_string_lossy().to_string(),
+                default_import_mode: ImportMode::Copy,
+            })
+            .await
+            .expect("settings");
+
+        let pairing = service
+            .create_pairing_session(CreatePairingSessionRequest {
+                device_name: "Moto G".to_string(),
+                platform: "android".to_string(),
+            })
+            .await
+            .expect("pairing session");
+        let paired = service
+            .pair_mobile_device(MobilePairRequest {
+                pairing_token: pairing.pairing_token.clone(),
+                device_name: "Moto G".to_string(),
+                platform: "android".to_string(),
+                vault_id: None,
+            })
+            .await
+            .expect("pair mobile");
+        assert!(paired.bearer_token.starts_with("pgm_"));
+        assert!(service.mobile_session_status("wrong-token").await.is_err());
+
+        let bytes = b"mobile original bytes".to_vec();
+        let reserved = service
+            .reserve_mobile_upload(
+                &paired.bearer_token,
+                MobileUploadRequest {
+                    original_filename: "../camera/photo.jpg".to_string(),
+                    media_kind: MediaKind::Photo,
+                    mime_type: "image/jpeg".to_string(),
+                    bytes: bytes.len() as u64,
+                    content_hash: None,
+                    captured_at: Some(Utc::now()),
+                    place_hint: Some("Home".to_string()),
+                },
+            )
+            .await
+            .expect("reserve upload");
+        assert_eq!(reserved.original_filename, "photo.jpg");
+
+        let completed = service
+            .receive_mobile_upload(&paired.bearer_token, reserved.id, bytes.clone())
+            .await
+            .expect("receive upload");
+        assert_eq!(completed.status, MobileUploadStatus::Completed);
+        let asset_id = completed.asset_id.expect("asset id");
+
+        let duplicate_reserved = service
+            .reserve_mobile_upload(
+                &paired.bearer_token,
+                MobileUploadRequest {
+                    original_filename: "duplicate.jpg".to_string(),
+                    media_kind: MediaKind::Photo,
+                    mime_type: "image/jpeg".to_string(),
+                    bytes: bytes.len() as u64,
+                    content_hash: None,
+                    captured_at: None,
+                    place_hint: None,
+                },
+            )
+            .await
+            .expect("reserve duplicate");
+        let duplicate = service
+            .receive_mobile_upload(&paired.bearer_token, duplicate_reserved.id, bytes.clone())
+            .await
+            .expect("receive duplicate");
+        assert_eq!(duplicate.asset_id, Some(asset_id));
+
+        let assets = service
+            .mobile_assets(&paired.bearer_token)
+            .await
+            .expect("mobile assets");
+        assert_eq!(assets.len(), 1);
+        assert_eq!(assets[0].asset_id, asset_id);
+
+        let (mime_type, downloaded) = service
+            .mobile_original_bytes(&paired.bearer_token, asset_id)
+            .await
+            .expect("download original");
+        assert_eq!(mime_type, "image/jpeg");
+        assert_eq!(downloaded, bytes);
+
+        let reopened = GalleryService::new(config).expect("reopen service");
+        let (reopened_mime_type, reopened_downloaded) = reopened
+            .mobile_original_bytes(&paired.bearer_token, asset_id)
+            .await
+            .expect("download after reopen");
+        assert_eq!(reopened_mime_type, "image/jpeg");
+        assert_eq!(reopened_downloaded, bytes);
     }
 
     #[tokio::test]
@@ -6897,6 +7469,7 @@ mod tests {
         assert_eq!(status.network_policy, NetworkPolicy::AskBeforeDownload);
         assert_eq!(status.daemon_bind_address, "127.0.0.1:4821");
         assert!(status.loopback_only);
+        assert!(!status.remote_mobile_access_enabled);
         assert!(!status.photo_processing_network_allowed);
         assert!(!status.telemetry_enabled);
         assert!(!status.analytics_enabled);
@@ -6924,6 +7497,25 @@ mod tests {
 
         let error = result.err().expect("non-loopback bind should be rejected");
         assert!(error.to_string().contains("non-loopback"));
+    }
+
+    #[tokio::test]
+    async fn allows_non_loopback_bind_for_remote_mobile_mode() {
+        let runtime_root = temp_root("remote-mobile-bind");
+        let service = GalleryService::new(AppConfig {
+            runtime_root,
+            bind_host: "100.64.0.10".to_string(),
+            allow_remote_mobile: true,
+            ..AppConfig::default()
+        })
+        .expect("remote mobile bind should be allowed");
+
+        let status = service.privacy_status().await.expect("privacy status");
+        assert_eq!(status.daemon_bind_address, "100.64.0.10:4821");
+        assert!(!status.loopback_only);
+        assert!(status.remote_mobile_access_enabled);
+        assert!(!status.developer_mode);
+        assert!(!status.photo_processing_network_allowed);
     }
 
     #[tokio::test]

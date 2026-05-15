@@ -1,11 +1,16 @@
-use std::sync::Arc;
+use std::{net::SocketAddr, sync::Arc};
 
 use axum::{
     Json, Router,
-    extract::{Path, Query, State},
-    http::{HeaderValue, Method, StatusCode, header::CONTENT_TYPE},
+    body::Bytes,
+    extract::{ConnectInfo, Path, Query, Request, State},
+    http::{
+        HeaderMap, HeaderValue, Method, StatusCode,
+        header::{AUTHORIZATION, CONTENT_TYPE},
+    },
+    middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::{delete, get, post},
+    routing::{delete, get, post, put},
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -20,12 +25,12 @@ use crate::{
         CreateAlbumRequest, CreateDeviceRequest, CreateManualPersonRequest,
         CreatePairingSessionRequest, CreateVaultRequest, CreateWatchFolderRequest,
         EncryptionActivationRequest, EnrollDeviceRequest, FeedbackEvent, HidePersonRequest,
-        MergePersonRequest, ModelImportRequest, ModelInstallRequest, RebuildRequest,
-        RejectPersonMatchRequest, RenameAlbumRequest, RenamePersonRequest, RevokeDeviceRequest,
-        RunSyncRequest, ScanImportSourceRequest, SearchQuery, SplitPersonRequest,
-        TitleEventRequest, UpdateAlbumAssetsRequest, UpdateAssetFlagsRequest,
-        UpdateAssetsFlagsRequest, UpdateLibrarySettingsRequest, UpdatePersonAssetsRequest,
-        UpdateVaultStoragePolicyRequest,
+        MergePersonRequest, MobilePairRequest, MobileUploadRequest, ModelImportRequest,
+        ModelInstallRequest, RebuildRequest, RejectPersonMatchRequest, RenameAlbumRequest,
+        RenamePersonRequest, RevokeDeviceRequest, RunSyncRequest, ScanImportSourceRequest,
+        SearchQuery, SplitPersonRequest, TitleEventRequest, UpdateAlbumAssetsRequest,
+        UpdateAssetFlagsRequest, UpdateAssetsFlagsRequest, UpdateLibrarySettingsRequest,
+        UpdatePersonAssetsRequest, UpdateVaultStoragePolicyRequest,
     },
     service::{GalleryService, ServiceError},
 };
@@ -52,6 +57,15 @@ pub fn router(state: AppState) -> Router {
             delete(delete_watch_folder),
         )
         .route("/pairing/sessions", post(create_pairing_session))
+        .route("/mobile/pair", post(pair_mobile_device))
+        .route("/mobile/session", get(mobile_session_status))
+        .route("/mobile/uploads", post(reserve_mobile_upload))
+        .route("/mobile/uploads/{upload_id}", put(receive_mobile_upload))
+        .route("/mobile/assets", get(list_mobile_assets))
+        .route(
+            "/mobile/assets/{asset_id}/original",
+            get(mobile_asset_original),
+        )
         .route("/vaults", get(list_vaults).post(create_vault))
         .route("/vaults/{vault_id}/status", get(vault_status))
         .route(
@@ -168,6 +182,7 @@ pub fn router(state: AppState) -> Router {
         .route("/models/{model_id}/verify", post(verify_model))
         .route("/diagnostics", get(diagnostics))
         .with_state(state)
+        .layer(middleware::from_fn(enforce_private_api_boundary))
         .layer(private_cors_layer())
         .layer(TraceLayer::new_for_http())
 }
@@ -178,8 +193,50 @@ fn private_cors_layer() -> CorsLayer {
             HeaderValue::from_static("http://127.0.0.1:4821"),
             HeaderValue::from_static("http://localhost:4821"),
         ])
-        .allow_methods([Method::GET, Method::POST, Method::DELETE])
-        .allow_headers([CONTENT_TYPE])
+        .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE])
+        .allow_headers([CONTENT_TYPE, AUTHORIZATION])
+}
+
+async fn enforce_private_api_boundary(request: Request, next: Next) -> Response {
+    let path = request.uri().path().to_string();
+    let remote = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|info| info.0);
+    if is_desktop_api_client(remote, request.headers())
+        || path == "/health"
+        || path.starts_with("/mobile/")
+    {
+        return next.run(request).await;
+    }
+
+    (
+        StatusCode::FORBIDDEN,
+        Json(json!({
+            "error": "desktop API routes are only available to loopback clients; remote clients may use /mobile/* after pairing"
+        })),
+    )
+        .into_response()
+}
+
+fn is_desktop_api_client(remote: Option<SocketAddr>, headers: &HeaderMap) -> bool {
+    if has_tailscale_serve_identity(headers) {
+        return false;
+    }
+    remote
+        .map(|address| address.ip().is_loopback())
+        .unwrap_or(true)
+}
+
+fn has_tailscale_serve_identity(headers: &HeaderMap) -> bool {
+    [
+        "tailscale-user-login",
+        "tailscale-user-name",
+        "tailscale-user-profile-pic",
+        "tailscale-app-capabilities",
+    ]
+    .iter()
+    .any(|name| headers.contains_key(*name))
 }
 
 #[derive(Debug, Error)]
@@ -201,6 +258,26 @@ impl IntoResponse for ApiError {
 
         (status, Json(json!({ "error": message }))).into_response()
     }
+}
+
+fn mobile_bearer_token(headers: &HeaderMap) -> Result<String, ApiError> {
+    let value = headers
+        .get(AUTHORIZATION)
+        .ok_or_else(|| ServiceError::Invalid("authorization header is required".to_string()))?;
+    let raw = value
+        .to_str()
+        .map_err(|_| ServiceError::Invalid("authorization header is not valid UTF-8".to_string()))?
+        .trim();
+    let (scheme, token) = raw.split_once(' ').ok_or_else(|| {
+        ServiceError::Invalid("authorization header must use Bearer token".to_string())
+    })?;
+    if !scheme.eq_ignore_ascii_case("bearer") || token.trim().is_empty() {
+        return Err(ServiceError::Invalid(
+            "authorization header must use Bearer token".to_string(),
+        )
+        .into());
+    }
+    Ok(token.trim().to_string())
 }
 
 async fn health() -> Json<serde_json::Value> {
@@ -252,6 +329,70 @@ async fn create_pairing_session(
     Json(request): Json<CreatePairingSessionRequest>,
 ) -> Result<Json<crate::domain::DevicePairing>, ApiError> {
     Ok(Json(state.service.create_pairing_session(request).await?))
+}
+
+async fn pair_mobile_device(
+    State(state): State<AppState>,
+    Json(request): Json<MobilePairRequest>,
+) -> Result<Json<crate::domain::MobilePairResponse>, ApiError> {
+    Ok(Json(state.service.pair_mobile_device(request).await?))
+}
+
+async fn mobile_session_status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<crate::domain::MobileSession>, ApiError> {
+    let token = mobile_bearer_token(&headers)?;
+    Ok(Json(state.service.mobile_session_status(&token).await?))
+}
+
+async fn reserve_mobile_upload(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<MobileUploadRequest>,
+) -> Result<Json<crate::domain::MobileUpload>, ApiError> {
+    let token = mobile_bearer_token(&headers)?;
+    Ok(Json(
+        state.service.reserve_mobile_upload(&token, request).await?,
+    ))
+}
+
+async fn receive_mobile_upload(
+    State(state): State<AppState>,
+    Path(upload_id): Path<Uuid>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<crate::domain::MobileUpload>, ApiError> {
+    let token = mobile_bearer_token(&headers)?;
+    Ok(Json(
+        state
+            .service
+            .receive_mobile_upload(&token, upload_id, body.to_vec())
+            .await?,
+    ))
+}
+
+async fn list_mobile_assets(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<crate::domain::MobileAssetSummary>>, ApiError> {
+    let token = mobile_bearer_token(&headers)?;
+    Ok(Json(state.service.mobile_assets(&token).await?))
+}
+
+async fn mobile_asset_original(
+    State(state): State<AppState>,
+    Path(asset_id): Path<Uuid>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    let token = mobile_bearer_token(&headers)?;
+    let (mime_type, bytes) = state
+        .service
+        .mobile_original_bytes(&token, asset_id)
+        .await?;
+    let content_type = HeaderValue::from_str(&mime_type)
+        .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream"));
+    Ok(([(CONTENT_TYPE, content_type)], bytes).into_response())
 }
 
 async fn list_vaults(
@@ -948,4 +1089,41 @@ async fn run_restore_backup(
 
 async fn diagnostics(State(state): State<AppState>) -> Result<Json<serde_json::Value>, ApiError> {
     Ok(Json(state.service.diagnostics().await))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    use axum::http::{HeaderMap, HeaderValue};
+
+    use super::is_desktop_api_client;
+
+    #[test]
+    fn loopback_without_tailnet_headers_is_desktop_api_client() {
+        let headers = HeaderMap::new();
+        let remote = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4821);
+
+        assert!(is_desktop_api_client(Some(remote), &headers));
+    }
+
+    #[test]
+    fn non_loopback_without_tailnet_headers_is_not_desktop_api_client() {
+        let headers = HeaderMap::new();
+        let remote = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 20)), 4821);
+
+        assert!(!is_desktop_api_client(Some(remote), &headers));
+    }
+
+    #[test]
+    fn tailscale_serve_identity_header_limits_loopback_proxy_to_mobile_api() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "tailscale-user-login",
+            HeaderValue::from_str("abcmkc153@gmail.com").expect("header"),
+        );
+        let remote = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4821);
+
+        assert!(!is_desktop_api_client(Some(remote), &headers));
+    }
 }

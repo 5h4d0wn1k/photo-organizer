@@ -11,6 +11,7 @@ pub struct AppConfig {
     pub database_filename: String,
     pub network_policy: NetworkPolicy,
     pub developer_mode: bool,
+    pub allow_remote_mobile: bool,
     pub tesseract_path: Option<PathBuf>,
 }
 
@@ -24,6 +25,7 @@ impl Default for AppConfig {
             database_filename: "gallery.sqlite3".to_string(),
             network_policy: NetworkPolicy::AskBeforeDownload,
             developer_mode: false,
+            allow_remote_mobile: false,
             tesseract_path: None,
         }
     }
@@ -67,6 +69,10 @@ impl AppConfig {
         }
         if let Ok(value) = env::var("PRIVATE_GALLERY_DEVELOPER_MODE") {
             config.developer_mode = matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES");
+        }
+        if let Ok(value) = env::var("PRIVATE_GALLERY_ALLOW_REMOTE_MOBILE") {
+            config.allow_remote_mobile =
+                matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES");
         }
         if let Ok(value) = env::var("PRIVATE_GALLERY_TESSERACT_PATH") {
             if !value.trim().is_empty() {
