@@ -62,12 +62,18 @@ void main() {
     });
 
     expect(response.buckets.single.assets.single.originalFilename, 'beach.jpg');
-    expect(response.buckets.single.assets.single.variants.single.kind,
-        'thumbnail');
-    expect(response.buckets.single.assets.single.metadata?.capturedAtSource,
-        'takeout_sidecar');
     expect(
-        response.buckets.single.assets.single.metadata?.geo?.latitude, 15.2993);
+      response.buckets.single.assets.single.variants.single.kind,
+      'thumbnail',
+    );
+    expect(
+      response.buckets.single.assets.single.metadata?.capturedAtSource,
+      'takeout_sidecar',
+    );
+    expect(
+      response.buckets.single.assets.single.metadata?.geo?.latitude,
+      15.2993,
+    );
   });
 
   test('parses import session preflight fields with fallback safety', () {
@@ -97,10 +103,10 @@ void main() {
         {
           'id': 'candidate-2',
           'session_id': 'session-1',
-          'source_path': '/tmp/source/b.jpg',
-          'original_filename': 'b.jpg',
-          'media_kind': 'photo',
-          'mime_type': 'image/jpeg',
+          'source_path': '/tmp/source/b.pdf',
+          'original_filename': 'b.pdf',
+          'media_kind': 'document',
+          'mime_type': 'application/pdf',
           'bytes': 200,
           'content_hash': 'hash-b',
           'duplicate_asset_id': 'asset-1',
@@ -129,6 +135,7 @@ void main() {
     expect(session.sidecarCount, 1);
     expect(session.requiresMoveConfirmation, isTrue);
     expect(session.sourceContainsManagedLibrary, isTrue);
+    expect(session.candidates[1].mediaKind, 'document');
   });
 
   test('parses privacy status and model governance fields', () {
@@ -165,8 +172,10 @@ void main() {
     expect(status.networkPolicy, NetworkPolicy.askBeforeDownload);
     expect(status.installedModels.single.installed, isTrue);
     expect(status.installedModels.single.task, ModelTask.faceDetection);
-    expect(status.installedModels.single.installStatus,
-        ModelInstallStatus.installed);
+    expect(
+      status.installedModels.single.installStatus,
+      ModelInstallStatus.installed,
+    );
   });
 
   test('parses search index OCR coverage fields with safe defaults', () {
@@ -242,7 +251,7 @@ void main() {
           'bytes_completed': 0,
           'updated_at': '2026-05-13T06:00:00Z',
           'resumable_until': '2026-05-20T06:00:00Z',
-        }
+        },
       ],
       'conflicts': [],
       'under_replicated_blob_ids': ['blob-1'],
@@ -269,6 +278,51 @@ void main() {
     expect(plan.underReplicatedBlobIds, ['blob-1']);
     expect(availability.state, AssetAvailabilityState.underReplicated);
     expect(availability.opensLocally, isTrue);
+  });
+
+  test('defaults missing storage capability to browsing-only', () {
+    final profile = DeviceStorageProfile.fromJson(const <String, dynamic>{});
+
+    expect(profile.acceptsStorage, isFalse);
+  });
+
+  test('parses vault file tree entries for file-manager views', () {
+    final tree = VaultFileTreeResponse.fromJson({
+      'vault_id': 'vault-1',
+      'root_entry_ids': ['root-1'],
+      'entries': [
+        {
+          'id': 'root-1',
+          'vault_id': 'vault-1',
+          'name': 'Family vault',
+          'kind': 'folder',
+          'bytes': 0,
+          'created_at': '2026-05-26T06:00:00Z',
+          'updated_at': '2026-05-26T06:00:00Z',
+        },
+        {
+          'id': 'file-1',
+          'vault_id': 'vault-1',
+          'parent_id': 'root-1',
+          'asset_id': 'asset-1',
+          'name': 'tax.pdf',
+          'kind': 'file',
+          'media_kind': 'document',
+          'mime_type': 'application/pdf',
+          'bytes': 4096,
+          'content_hash': 'hash',
+          'created_at': '2026-05-26T06:01:00Z',
+          'updated_at': '2026-05-26T06:01:00Z',
+        },
+      ],
+    });
+
+    expect(tree.vaultId, 'vault-1');
+    expect(tree.roots.single.id, 'root-1');
+    expect(tree.childrenOf('root-1').single.name, 'tax.pdf');
+    expect(tree.childrenOf('root-1').single.kind, VaultFileKind.file);
+    expect(tree.childrenOf('root-1').single.isFile, isTrue);
+    expect(tree.childrenOf('root-1').single.mediaKind, 'document');
   });
 
   test('parses chunk-aware backup and restore fields', () {

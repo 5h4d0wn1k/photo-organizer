@@ -35,30 +35,30 @@ impl AppConfig {
     pub fn from_env() -> Self {
         let mut config = Self::default();
 
-        if let Ok(value) = env::var("PRIVATE_GALLERY_LIBRARY_ROOT") {
-            if !value.trim().is_empty() {
-                config.library_root = PathBuf::from(value);
-            }
+        if let Ok(value) = env::var("PRIVATE_GALLERY_LIBRARY_ROOT")
+            && !value.trim().is_empty()
+        {
+            config.library_root = PathBuf::from(value);
         }
-        if let Ok(value) = env::var("PRIVATE_GALLERY_RUNTIME_ROOT") {
-            if !value.trim().is_empty() {
-                config.runtime_root = PathBuf::from(value);
-            }
+        if let Ok(value) = env::var("PRIVATE_GALLERY_RUNTIME_ROOT")
+            && !value.trim().is_empty()
+        {
+            config.runtime_root = PathBuf::from(value);
         }
-        if let Ok(value) = env::var("PRIVATE_GALLERY_BIND_HOST") {
-            if !value.trim().is_empty() {
-                config.bind_host = value;
-            }
+        if let Ok(value) = env::var("PRIVATE_GALLERY_BIND_HOST")
+            && !value.trim().is_empty()
+        {
+            config.bind_host = value;
         }
-        if let Ok(value) = env::var("PRIVATE_GALLERY_BIND_PORT") {
-            if let Ok(port) = value.parse::<u16>() {
-                config.bind_port = port;
-            }
+        if let Ok(value) = env::var("PRIVATE_GALLERY_BIND_PORT")
+            && let Ok(port) = value.parse::<u16>()
+        {
+            config.bind_port = port;
         }
-        if let Ok(value) = env::var("PRIVATE_GALLERY_DATABASE_FILENAME") {
-            if !value.trim().is_empty() {
-                config.database_filename = value;
-            }
+        if let Ok(value) = env::var("PRIVATE_GALLERY_DATABASE_FILENAME")
+            && !value.trim().is_empty()
+        {
+            config.database_filename = value;
         }
         if let Ok(value) = env::var("PRIVATE_GALLERY_NETWORK_POLICY") {
             config.network_policy = match value.as_str() {
@@ -74,10 +74,10 @@ impl AppConfig {
             config.allow_remote_mobile =
                 matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES");
         }
-        if let Ok(value) = env::var("PRIVATE_GALLERY_TESSERACT_PATH") {
-            if !value.trim().is_empty() {
-                config.tesseract_path = Some(PathBuf::from(value));
-            }
+        if let Ok(value) = env::var("PRIVATE_GALLERY_TESSERACT_PATH")
+            && !value.trim().is_empty()
+        {
+            config.tesseract_path = Some(PathBuf::from(value));
         }
 
         config

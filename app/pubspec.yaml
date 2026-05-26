@@ -4,8 +4,8 @@ publish_to: "none"
 version: 0.1.0+1
 
 environment:
-  sdk: ">=3.4.0 <4.0.0"
-  flutter: ">=3.22.0"
+  sdk: ">=3.10.3 <4.0.0"
+  flutter: ">=3.38.4"
 
 dependencies:
   flutter:
@@ -19,6 +19,12 @@ dependencies:
   flutter_secure_storage: ^10.2.0
   mobile_scanner: ^7.2.0
   qr_flutter: ^4.1.0
+  supabase_flutter: ^2.12.4
+  crypto: ^3.0.7
+  share_plus: ^13.1.0
+  video_player: ^2.11.1
+  video_trimmer: ^5.0.0
+  image: ^4.8.0
 
 dev_dependencies:
   flutter_test:
@@ -27,4 +33,3 @@ dev_dependencies:
 
 flutter:
   uses-material-design: true
-

@@ -2,15 +2,17 @@ use std::{net::SocketAddr, sync::Arc};
 
 use axum::{
     Json, Router,
-    body::Bytes,
-    extract::{ConnectInfo, Path, Query, Request, State},
+    body::{Body, Bytes},
+    extract::{ConnectInfo, DefaultBodyLimit, Path, Query, Request, State},
     http::{
         HeaderMap, HeaderValue, Method, StatusCode,
-        header::{AUTHORIZATION, CONTENT_TYPE},
+        header::{
+            ACCEPT_RANGES, AUTHORIZATION, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, RANGE,
+        },
     },
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::{delete, get, post, put},
+    routing::{delete, get, patch, post, put},
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -22,18 +24,21 @@ use crate::{
     domain::{
         BackupExportRequest, BackupRestorePlanRequest, BackupRestoreRunRequest,
         BackupVerifyRequest, CommitImportSessionRequest, CorrectDateRequest, CorrectPlaceRequest,
-        CreateAlbumRequest, CreateDeviceRequest, CreateManualPersonRequest,
-        CreatePairingSessionRequest, CreateVaultRequest, CreateWatchFolderRequest,
-        EncryptionActivationRequest, EnrollDeviceRequest, FeedbackEvent, HidePersonRequest,
-        MergePersonRequest, MobilePairRequest, MobileUploadRequest, ModelImportRequest,
-        ModelInstallRequest, RebuildRequest, RejectPersonMatchRequest, RenameAlbumRequest,
-        RenamePersonRequest, RevokeDeviceRequest, RunSyncRequest, ScanImportSourceRequest,
-        SearchQuery, SplitPersonRequest, TitleEventRequest, UpdateAlbumAssetsRequest,
-        UpdateAssetFlagsRequest, UpdateAssetsFlagsRequest, UpdateLibrarySettingsRequest,
-        UpdatePersonAssetsRequest, UpdateVaultStoragePolicyRequest,
+        CreateAlbumRequest, CreateDeviceRequest, CreateFileFolderRequest,
+        CreateManualPersonRequest, CreatePairingSessionRequest, CreateVaultRequest,
+        CreateWatchFolderRequest, EncryptionActivationRequest, EnrollDeviceRequest, FeedbackEvent,
+        HidePersonRequest, MergePersonRequest, MobilePairRequest, MobileUploadRequest,
+        ModelImportRequest, ModelInstallRequest, MoveFileEntryRequest, RebuildRequest,
+        RejectPersonMatchRequest, RenameAlbumRequest, RenameFileEntryRequest, RenamePersonRequest,
+        RevokeDeviceRequest, RunSyncRequest, ScanImportSourceRequest, SearchQuery,
+        SplitPersonRequest, TitleEventRequest, UpdateAlbumAssetsRequest, UpdateAssetFlagsRequest,
+        UpdateAssetsFlagsRequest, UpdateLibrarySettingsRequest, UpdatePersonAssetsRequest,
+        UpdateVaultStoragePolicyRequest,
     },
-    service::{GalleryService, ServiceError},
+    service::{ByteRangeRequest, GalleryService, ServiceError},
 };
+
+const MOBILE_UPLOAD_BODY_LIMIT_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -59,12 +64,54 @@ pub fn router(state: AppState) -> Router {
         .route("/pairing/sessions", post(create_pairing_session))
         .route("/mobile/pair", post(pair_mobile_device))
         .route("/mobile/session", get(mobile_session_status))
+        .route("/mobile/session/refresh", post(refresh_mobile_session))
+        .route(
+            "/mobile/session/revoke",
+            post(revoke_current_mobile_session),
+        )
+        .route("/mobile/sessions", get(list_mobile_sessions))
+        .route(
+            "/mobile/devices/{device_id}/sessions/revoke",
+            post(revoke_mobile_device_sessions),
+        )
+        .route("/mobile/workspace", get(mobile_workspace))
+        .route("/mobile/search", get(mobile_search))
         .route("/mobile/uploads", post(reserve_mobile_upload))
-        .route("/mobile/uploads/{upload_id}", put(receive_mobile_upload))
+        .route(
+            "/mobile/uploads/{upload_id}",
+            get(mobile_upload_status)
+                .put(receive_mobile_upload)
+                .delete(cancel_mobile_upload),
+        )
+        .route(
+            "/mobile/uploads/{upload_id}/chunks/{offset}",
+            put(receive_mobile_upload_chunk),
+        )
+        .route(
+            "/mobile/uploads/{upload_id}/complete",
+            post(complete_mobile_upload),
+        )
         .route("/mobile/assets", get(list_mobile_assets))
+        .route(
+            "/mobile/assets/{asset_id}/availability",
+            get(mobile_asset_availability),
+        )
+        .route(
+            "/mobile/assets/{asset_id}/flags",
+            post(update_mobile_asset_flags),
+        )
+        .route(
+            "/mobile/assets/{asset_id}/preview",
+            get(mobile_asset_preview),
+        )
         .route(
             "/mobile/assets/{asset_id}/original",
             get(mobile_asset_original),
+        )
+        .route("/mobile/files/tree", get(mobile_file_tree))
+        .route(
+            "/mobile/files/{entry_id}/original",
+            get(mobile_file_original),
         )
         .route("/vaults", get(list_vaults).post(create_vault))
         .route("/vaults/{vault_id}/status", get(vault_status))
@@ -93,6 +140,13 @@ pub fn router(state: AppState) -> Router {
             "/sync/transfers/{transfer_id}/cancel",
             post(cancel_sync_transfer),
         )
+        .route("/files/tree", get(file_tree))
+        .route("/files/folders", post(create_file_folder))
+        .route("/files/{entry_id}", patch(rename_file_entry))
+        .route("/files/{entry_id}/move", post(move_file_entry))
+        .route("/files/{entry_id}/trash", post(trash_file_entry))
+        .route("/files/{entry_id}/restore", post(restore_file_entry))
+        .route("/files/{entry_id}/original", get(file_original))
         .route("/assets/favorites", get(list_favorite_assets))
         .route("/assets/archived", get(list_archived_assets))
         .route("/assets/flags/bulk", post(update_assets_flags))
@@ -182,6 +236,7 @@ pub fn router(state: AppState) -> Router {
         .route("/models/{model_id}/verify", post(verify_model))
         .route("/diagnostics", get(diagnostics))
         .with_state(state)
+        .layer(DefaultBodyLimit::max(MOBILE_UPLOAD_BODY_LIMIT_BYTES))
         .layer(middleware::from_fn(enforce_private_api_boundary))
         .layer(private_cors_layer())
         .layer(TraceLayer::new_for_http())
@@ -193,7 +248,13 @@ fn private_cors_layer() -> CorsLayer {
             HeaderValue::from_static("http://127.0.0.1:4821"),
             HeaderValue::from_static("http://localhost:4821"),
         ])
-        .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE])
+        .allow_methods([
+            Method::GET,
+            Method::POST,
+            Method::PUT,
+            Method::PATCH,
+            Method::DELETE,
+        ])
         .allow_headers([CONTENT_TYPE, AUTHORIZATION])
 }
 
@@ -243,6 +304,8 @@ fn has_tailscale_serve_identity(headers: &HeaderMap) -> bool {
 enum ApiError {
     #[error("{0}")]
     Service(#[from] ServiceError),
+    #[error("{1}")]
+    Http(StatusCode, String),
 }
 
 impl IntoResponse for ApiError {
@@ -254,6 +317,7 @@ impl IntoResponse for ApiError {
             | Self::Service(ServiceError::Io(message)) => {
                 (StatusCode::INTERNAL_SERVER_ERROR, message)
             }
+            Self::Http(status, message) => (status, message),
         };
 
         (status, Json(json!({ "error": message }))).into_response()
@@ -278,6 +342,103 @@ fn mobile_bearer_token(headers: &HeaderMap) -> Result<String, ApiError> {
         .into());
     }
     Ok(token.trim().to_string())
+}
+
+fn parse_single_byte_range(headers: &HeaderMap) -> Result<Option<ByteRangeRequest>, ApiError> {
+    let Some(value) = headers.get(RANGE) else {
+        return Ok(None);
+    };
+    let raw = value.to_str().map_err(|_| {
+        ApiError::Http(
+            StatusCode::RANGE_NOT_SATISFIABLE,
+            "range header is not valid UTF-8".to_string(),
+        )
+    })?;
+    let Some(spec) = raw.trim().strip_prefix("bytes=") else {
+        return Err(ApiError::Http(
+            StatusCode::RANGE_NOT_SATISFIABLE,
+            "only bytes ranges are supported".to_string(),
+        ));
+    };
+    if spec.contains(',') {
+        return Err(ApiError::Http(
+            StatusCode::RANGE_NOT_SATISFIABLE,
+            "multipart byte ranges are not supported".to_string(),
+        ));
+    }
+    let (start, end) = spec.split_once('-').ok_or_else(|| {
+        ApiError::Http(
+            StatusCode::RANGE_NOT_SATISFIABLE,
+            "range header must use bytes=start-end".to_string(),
+        )
+    })?;
+    if start.is_empty() {
+        let length = end.parse::<u64>().map_err(|_| {
+            ApiError::Http(
+                StatusCode::RANGE_NOT_SATISFIABLE,
+                "suffix byte range length must be numeric".to_string(),
+            )
+        })?;
+        return Ok(Some(ByteRangeRequest::Suffix { length }));
+    }
+    let start = start.parse::<u64>().map_err(|_| {
+        ApiError::Http(
+            StatusCode::RANGE_NOT_SATISFIABLE,
+            "range start must be numeric".to_string(),
+        )
+    })?;
+    let end = if end.is_empty() {
+        None
+    } else {
+        Some(end.parse::<u64>().map_err(|_| {
+            ApiError::Http(
+                StatusCode::RANGE_NOT_SATISFIABLE,
+                "range end must be numeric".to_string(),
+            )
+        })?)
+    };
+    Ok(Some(ByteRangeRequest::Start { start, end }))
+}
+
+fn range_service_error(error: ServiceError) -> ApiError {
+    match error {
+        ServiceError::Invalid(message) => {
+            ApiError::Http(StatusCode::RANGE_NOT_SATISFIABLE, message)
+        }
+        other => ApiError::Service(other),
+    }
+}
+
+fn response_with_body(
+    status: StatusCode,
+    content_type: HeaderValue,
+    content_range: Option<String>,
+    content_length: Option<u64>,
+    bytes: Vec<u8>,
+) -> Result<Response, ApiError> {
+    let mut builder = Response::builder()
+        .status(status)
+        .header(CONTENT_TYPE, content_type)
+        .header(ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+    if let Some(content_range) = content_range {
+        builder = builder.header(
+            CONTENT_RANGE,
+            HeaderValue::from_str(&content_range).map_err(|_| {
+                ServiceError::Invalid("content range could not be encoded".to_string())
+            })?,
+        );
+    }
+    if let Some(content_length) = content_length {
+        builder = builder.header(
+            CONTENT_LENGTH,
+            HeaderValue::from_str(&content_length.to_string()).map_err(|_| {
+                ServiceError::Invalid("content length could not be encoded".to_string())
+            })?,
+        );
+    }
+    builder
+        .body(Body::from(bytes))
+        .map_err(|err| ServiceError::Invalid(err.to_string()).into())
 }
 
 async fn health() -> Json<serde_json::Value> {
@@ -346,6 +507,63 @@ async fn mobile_session_status(
     Ok(Json(state.service.mobile_session_status(&token).await?))
 }
 
+async fn refresh_mobile_session(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<crate::domain::MobileSessionRefreshResponse>, ApiError> {
+    let token = mobile_bearer_token(&headers)?;
+    Ok(Json(state.service.refresh_mobile_session(&token).await?))
+}
+
+async fn list_mobile_sessions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<crate::domain::MobileSession>>, ApiError> {
+    let token = mobile_bearer_token(&headers)?;
+    Ok(Json(state.service.mobile_sessions(&token).await?))
+}
+
+async fn revoke_current_mobile_session(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<crate::domain::MobileSession>, ApiError> {
+    let token = mobile_bearer_token(&headers)?;
+    Ok(Json(
+        state.service.revoke_current_mobile_session(&token).await?,
+    ))
+}
+
+async fn revoke_mobile_device_sessions(
+    State(state): State<AppState>,
+    Path(device_id): Path<Uuid>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<crate::domain::MobileSession>>, ApiError> {
+    let token = mobile_bearer_token(&headers)?;
+    Ok(Json(
+        state
+            .service
+            .revoke_mobile_device_sessions(&token, device_id)
+            .await?,
+    ))
+}
+
+async fn mobile_workspace(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<crate::domain::MobileWorkspaceResponse>, ApiError> {
+    let token = mobile_bearer_token(&headers)?;
+    Ok(Json(state.service.mobile_workspace(&token).await?))
+}
+
+async fn mobile_search(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<SearchQuery>,
+) -> Result<Json<crate::domain::SearchResponse>, ApiError> {
+    let token = mobile_bearer_token(&headers)?;
+    Ok(Json(state.service.mobile_search(&token, query).await?))
+}
+
 async fn reserve_mobile_upload(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -372,6 +590,63 @@ async fn receive_mobile_upload(
     ))
 }
 
+async fn mobile_upload_status(
+    State(state): State<AppState>,
+    Path(upload_id): Path<Uuid>,
+    headers: HeaderMap,
+) -> Result<Json<crate::domain::MobileUpload>, ApiError> {
+    let token = mobile_bearer_token(&headers)?;
+    Ok(Json(
+        state
+            .service
+            .mobile_upload_status(&token, upload_id)
+            .await?,
+    ))
+}
+
+async fn cancel_mobile_upload(
+    State(state): State<AppState>,
+    Path(upload_id): Path<Uuid>,
+    headers: HeaderMap,
+) -> Result<Json<crate::domain::MobileUpload>, ApiError> {
+    let token = mobile_bearer_token(&headers)?;
+    Ok(Json(
+        state
+            .service
+            .cancel_mobile_upload(&token, upload_id)
+            .await?,
+    ))
+}
+
+async fn receive_mobile_upload_chunk(
+    State(state): State<AppState>,
+    Path((upload_id, offset)): Path<(Uuid, u64)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<crate::domain::MobileUpload>, ApiError> {
+    let token = mobile_bearer_token(&headers)?;
+    Ok(Json(
+        state
+            .service
+            .receive_mobile_upload_chunk(&token, upload_id, offset, body.to_vec())
+            .await?,
+    ))
+}
+
+async fn complete_mobile_upload(
+    State(state): State<AppState>,
+    Path(upload_id): Path<Uuid>,
+    headers: HeaderMap,
+) -> Result<Json<crate::domain::MobileUpload>, ApiError> {
+    let token = mobile_bearer_token(&headers)?;
+    Ok(Json(
+        state
+            .service
+            .complete_mobile_upload(&token, upload_id)
+            .await?,
+    ))
+}
+
 async fn list_mobile_assets(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -380,19 +655,147 @@ async fn list_mobile_assets(
     Ok(Json(state.service.mobile_assets(&token).await?))
 }
 
+async fn mobile_asset_availability(
+    State(state): State<AppState>,
+    Path(asset_id): Path<Uuid>,
+    headers: HeaderMap,
+) -> Result<Json<crate::domain::AssetAvailability>, ApiError> {
+    let token = mobile_bearer_token(&headers)?;
+    Ok(Json(
+        state
+            .service
+            .mobile_asset_availability(&token, asset_id)
+            .await?,
+    ))
+}
+
+async fn update_mobile_asset_flags(
+    State(state): State<AppState>,
+    Path(asset_id): Path<Uuid>,
+    headers: HeaderMap,
+    Json(request): Json<UpdateAssetFlagsRequest>,
+) -> Result<Json<crate::domain::Asset>, ApiError> {
+    let token = mobile_bearer_token(&headers)?;
+    Ok(Json(
+        state
+            .service
+            .update_mobile_asset_flags(&token, asset_id, request)
+            .await?,
+    ))
+}
+
 async fn mobile_asset_original(
     State(state): State<AppState>,
     Path(asset_id): Path<Uuid>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     let token = mobile_bearer_token(&headers)?;
+    if let Some(range) = parse_single_byte_range(&headers)? {
+        let ranged = state
+            .service
+            .mobile_original_range_bytes(&token, asset_id, range)
+            .await
+            .map_err(range_service_error)?;
+        let content_type = HeaderValue::from_str(&ranged.mime_type)
+            .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream"));
+        return response_with_body(
+            StatusCode::PARTIAL_CONTENT,
+            content_type,
+            Some(format!(
+                "bytes {}-{}/{}",
+                ranged.start, ranged.end, ranged.total_bytes
+            )),
+            Some(ranged.bytes.len() as u64),
+            ranged.bytes,
+        );
+    }
     let (mime_type, bytes) = state
         .service
         .mobile_original_bytes(&token, asset_id)
         .await?;
     let content_type = HeaderValue::from_str(&mime_type)
         .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream"));
+    response_with_body(
+        StatusCode::OK,
+        content_type,
+        None,
+        Some(bytes.len() as u64),
+        bytes,
+    )
+}
+
+async fn mobile_asset_preview(
+    State(state): State<AppState>,
+    Path(asset_id): Path<Uuid>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    let token = mobile_bearer_token(&headers)?;
+    let (mime_type, bytes) = state.service.mobile_preview_bytes(&token, asset_id).await?;
+    let content_type = HeaderValue::from_str(&mime_type)
+        .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream"));
     Ok(([(CONTENT_TYPE, content_type)], bytes).into_response())
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct FileTreeQuery {
+    #[serde(default)]
+    vault_id: Option<Uuid>,
+    #[serde(default)]
+    include_trashed: Option<bool>,
+}
+
+async fn mobile_file_tree(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<FileTreeQuery>,
+) -> Result<Json<crate::domain::VaultFileTreeResponse>, ApiError> {
+    let token = mobile_bearer_token(&headers)?;
+    Ok(Json(
+        state
+            .service
+            .mobile_file_tree(&token, query.include_trashed.unwrap_or(false))
+            .await?,
+    ))
+}
+
+async fn mobile_file_original(
+    State(state): State<AppState>,
+    Path(entry_id): Path<Uuid>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    let token = mobile_bearer_token(&headers)?;
+    if let Some(range) = parse_single_byte_range(&headers)? {
+        let ranged = state
+            .service
+            .mobile_file_original_range_bytes(&token, entry_id, range)
+            .await
+            .map_err(range_service_error)?;
+        let content_type = HeaderValue::from_str(&ranged.mime_type)
+            .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream"));
+        return response_with_body(
+            StatusCode::PARTIAL_CONTENT,
+            content_type,
+            Some(format!(
+                "bytes {}-{}/{}",
+                ranged.start, ranged.end, ranged.total_bytes
+            )),
+            Some(ranged.bytes.len() as u64),
+            ranged.bytes,
+        );
+    }
+    let (mime_type, bytes) = state
+        .service
+        .mobile_file_original_bytes(&token, entry_id)
+        .await?;
+    let content_type = HeaderValue::from_str(&mime_type)
+        .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream"));
+    response_with_body(
+        StatusCode::OK,
+        content_type,
+        None,
+        Some(bytes.len() as u64),
+        bytes,
+    )
 }
 
 async fn list_vaults(
@@ -520,6 +923,95 @@ async fn cancel_sync_transfer(
     Ok(Json(state.service.cancel_sync_transfer(transfer_id).await?))
 }
 
+async fn file_tree(
+    State(state): State<AppState>,
+    Query(query): Query<FileTreeQuery>,
+) -> Result<Json<crate::domain::VaultFileTreeResponse>, ApiError> {
+    Ok(Json(
+        state
+            .service
+            .file_tree(query.vault_id, query.include_trashed.unwrap_or(false))
+            .await?,
+    ))
+}
+
+async fn create_file_folder(
+    State(state): State<AppState>,
+    Json(request): Json<CreateFileFolderRequest>,
+) -> Result<Json<crate::domain::VaultFileEntry>, ApiError> {
+    Ok(Json(state.service.create_file_folder(request).await?))
+}
+
+async fn rename_file_entry(
+    State(state): State<AppState>,
+    Path(entry_id): Path<Uuid>,
+    Json(request): Json<RenameFileEntryRequest>,
+) -> Result<Json<crate::domain::VaultFileEntry>, ApiError> {
+    Ok(Json(
+        state.service.rename_file_entry(entry_id, request).await?,
+    ))
+}
+
+async fn move_file_entry(
+    State(state): State<AppState>,
+    Path(entry_id): Path<Uuid>,
+    Json(request): Json<MoveFileEntryRequest>,
+) -> Result<Json<crate::domain::VaultFileEntry>, ApiError> {
+    Ok(Json(
+        state.service.move_file_entry(entry_id, request).await?,
+    ))
+}
+
+async fn trash_file_entry(
+    State(state): State<AppState>,
+    Path(entry_id): Path<Uuid>,
+) -> Result<Json<crate::domain::VaultFileEntry>, ApiError> {
+    Ok(Json(state.service.trash_file_entry(entry_id).await?))
+}
+
+async fn restore_file_entry(
+    State(state): State<AppState>,
+    Path(entry_id): Path<Uuid>,
+) -> Result<Json<crate::domain::VaultFileEntry>, ApiError> {
+    Ok(Json(state.service.restore_file_entry(entry_id).await?))
+}
+
+async fn file_original(
+    State(state): State<AppState>,
+    Path(entry_id): Path<Uuid>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    if let Some(range) = parse_single_byte_range(&headers)? {
+        let ranged = state
+            .service
+            .file_original_range_bytes(entry_id, range)
+            .await
+            .map_err(range_service_error)?;
+        let content_type = HeaderValue::from_str(&ranged.mime_type)
+            .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream"));
+        return response_with_body(
+            StatusCode::PARTIAL_CONTENT,
+            content_type,
+            Some(format!(
+                "bytes {}-{}/{}",
+                ranged.start, ranged.end, ranged.total_bytes
+            )),
+            Some(ranged.bytes.len() as u64),
+            ranged.bytes,
+        );
+    }
+    let (mime_type, bytes) = state.service.file_original_bytes(entry_id).await?;
+    let content_type = HeaderValue::from_str(&mime_type)
+        .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream"));
+    response_with_body(
+        StatusCode::OK,
+        content_type,
+        None,
+        Some(bytes.len() as u64),
+        bytes,
+    )
+}
+
 async fn scan_import_source(
     State(state): State<AppState>,
     Json(request): Json<ScanImportSourceRequest>,
@@ -641,11 +1133,37 @@ async fn asset_availability(
 async fn asset_original(
     State(state): State<AppState>,
     Path(asset_id): Path<Uuid>,
+    headers: HeaderMap,
 ) -> Result<Response, ApiError> {
+    if let Some(range) = parse_single_byte_range(&headers)? {
+        let ranged = state
+            .service
+            .asset_original_range_bytes(asset_id, range)
+            .await
+            .map_err(range_service_error)?;
+        let content_type = HeaderValue::from_str(&ranged.mime_type)
+            .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream"));
+        return response_with_body(
+            StatusCode::PARTIAL_CONTENT,
+            content_type,
+            Some(format!(
+                "bytes {}-{}/{}",
+                ranged.start, ranged.end, ranged.total_bytes
+            )),
+            Some(ranged.bytes.len() as u64),
+            ranged.bytes,
+        );
+    }
     let (mime_type, bytes) = state.service.asset_original_bytes(asset_id).await?;
     let content_type = HeaderValue::from_str(&mime_type)
         .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream"));
-    Ok(([(CONTENT_TYPE, content_type)], bytes).into_response())
+    response_with_body(
+        StatusCode::OK,
+        content_type,
+        None,
+        Some(bytes.len() as u64),
+        bytes,
+    )
 }
 
 async fn pin_local_asset(

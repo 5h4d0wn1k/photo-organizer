@@ -14,14 +14,14 @@ use crate::{
         CapabilityGrant, CorrectionRecord, DeviceIdentity, DevicePairing, EventCluster,
         FaceTemplate, FeedbackEvent, GeoTag, ImportCandidate, ImportMode, ImportSession, JobLog,
         JobRecord, LibrarySettings, MediaKind, MetadataSource, MobileSession, MobileUpload,
-        MobileUploadStatus, ModelProvenance, OcrBlock, PersonCluster, PlaceCluster, RelayEndpoint,
-        SceneTag, SyncConflict, SyncSession, SyncTransfer, Vault, VaultInvite, VaultKeyEnvelope,
-        VaultMember, WatchFolder,
+        MobileUploadStatus, ModelProvenance, OcrBlock, OriginalStoragePolicy, PersonCluster,
+        PlaceCluster, RelayEndpoint, SceneTag, SyncConflict, SyncSession, SyncTransfer, Vault,
+        VaultFileEntry, VaultInvite, VaultKeyEnvelope, VaultMember, WatchFolder,
     },
     security,
 };
 
-const SCHEMA_VERSION: i64 = 12;
+const SCHEMA_VERSION: i64 = 15;
 
 #[derive(Debug, Clone)]
 pub struct StorageBootstrapReport {
@@ -33,6 +33,7 @@ pub struct PersistedLibraryState {
     pub library_settings: Option<LibrarySettings>,
     pub watch_folders: Vec<WatchFolder>,
     pub assets: Vec<Asset>,
+    pub file_entries: Vec<VaultFileEntry>,
     pub albums: Vec<Album>,
     pub people: Vec<PersonCluster>,
     pub places: Vec<PlaceCluster>,
@@ -153,6 +154,25 @@ fn migrate_schema(connection: &Connection, from_version: i64) -> Result<(), rusq
 
     if from_version < 12 {
         record_migration(connection, 12, "mobile_lan_sync_sessions_and_uploads")?;
+    }
+
+    if from_version < 13 {
+        add_column_if_missing(connection, "device_pairings", "vault_id", "vault_id TEXT")?;
+        record_migration(connection, 13, "vault_bound_mobile_pairing_tokens")?;
+    }
+
+    if from_version < 14 {
+        add_column_if_missing(
+            connection,
+            "library_settings",
+            "original_storage_policy",
+            "original_storage_policy TEXT NOT NULL DEFAULT 'encrypted_only'",
+        )?;
+        record_migration(connection, 14, "encrypted_only_original_storage_policy")?;
+    }
+
+    if from_version < 15 {
+        record_migration(connection, 15, "vault_file_namespace")?;
     }
 
     connection.pragma_update(None, "user_version", SCHEMA_VERSION)
@@ -282,6 +302,7 @@ pub fn load_state(
     let library_settings = load_library_settings(&connection)?;
     let watch_folders = load_watch_folders(&connection)?;
     let assets = load_assets(&connection, library_settings.as_ref())?;
+    let file_entries = load_file_entries(&connection)?;
     let albums = load_albums(&connection)?;
     let people = load_people(&connection)?;
     let places = load_places(&connection)?;
@@ -315,6 +336,7 @@ pub fn load_state(
         library_settings,
         watch_folders,
         assets,
+        file_entries,
         albums,
         people,
         places,
@@ -374,6 +396,7 @@ pub fn save_state(
         DELETE FROM blob_replicas;
         DELETE FROM blob_chunks;
         DELETE FROM blob_records;
+        DELETE FROM vault_file_entries;
         DELETE FROM vault_members;
         DELETE FROM mobile_uploads;
         DELETE FROM mobile_sessions;
@@ -403,14 +426,16 @@ pub fn save_state(
               id,
               library_root,
               default_import_mode,
+              original_storage_policy,
               initialized_at,
               updated_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5)
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
             "#,
             params![
                 1_i64,
                 settings.library_root,
                 enum_string(&settings.default_import_mode)?,
+                enum_string(&settings.original_storage_policy)?,
                 settings.initialized_at.to_rfc3339(),
                 settings.updated_at.to_rfc3339(),
             ],
@@ -789,6 +814,33 @@ pub fn save_state(
         )?;
     }
 
+    for entry in &state.file_entries {
+        transaction.execute(
+            r#"
+            INSERT INTO vault_file_entries (
+              id, vault_id, parent_id, asset_id, name, kind, media_kind, mime_type, bytes,
+              content_hash, origin_device_id, created_at, updated_at, trashed_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+            "#,
+            params![
+                entry.id.to_string(),
+                entry.vault_id.to_string(),
+                entry.parent_id.map(|value| value.to_string()),
+                entry.asset_id.map(|value| value.to_string()),
+                entry.name,
+                enum_string(&entry.kind)?,
+                entry.media_kind.as_ref().map(enum_string).transpose()?,
+                entry.mime_type,
+                entry.bytes,
+                entry.content_hash,
+                entry.origin_device_id.map(|value| value.to_string()),
+                entry.created_at.to_rfc3339(),
+                entry.updated_at.to_rfc3339(),
+                entry.trashed_at.map(|value| value.to_rfc3339()),
+            ],
+        )?;
+    }
+
     for member in &state.vault_members {
         transaction.execute(
             r#"
@@ -1002,13 +1054,14 @@ pub fn save_state(
         transaction.execute(
             r#"
             INSERT INTO device_pairings (
-              id, device_name, platform, pairing_token, created_at, expires_at, approved_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+              id, device_name, platform, vault_id, pairing_token, created_at, expires_at, approved_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
             "#,
             params![
                 pairing.id.to_string(),
                 pairing.device_name,
                 pairing.platform,
+                pairing.vault_id.map(|value| value.to_string()),
                 pairing.pairing_token,
                 pairing.created_at.to_rfc3339(),
                 pairing.expires_at.to_rfc3339(),
@@ -1224,7 +1277,7 @@ fn load_library_settings(
     connection
         .query_row(
             r#"
-            SELECT library_root, default_import_mode, initialized_at, updated_at
+            SELECT library_root, default_import_mode, original_storage_policy, initialized_at, updated_at
             FROM library_settings WHERE id = 1
             "#,
             [],
@@ -1232,8 +1285,11 @@ fn load_library_settings(
                 Ok(LibrarySettings {
                     library_root: row.get(0)?,
                     default_import_mode: parse_enum(&row.get::<_, String>(1)?)?,
-                    initialized_at: parse_datetime(&row.get::<_, String>(2)?)?,
-                    updated_at: parse_datetime(&row.get::<_, String>(3)?)?,
+                    original_storage_policy: parse_enum::<OriginalStoragePolicy>(
+                        &row.get::<_, String>(2)?,
+                    )?,
+                    initialized_at: parse_datetime(&row.get::<_, String>(3)?)?,
+                    updated_at: parse_datetime(&row.get::<_, String>(4)?)?,
                 })
             },
         )
@@ -1336,6 +1392,57 @@ fn load_assets(
         };
         asset.is_available = asset_exists(&asset, settings);
         Ok(asset)
+    })?;
+    rows.collect()
+}
+
+fn load_file_entries(connection: &Connection) -> Result<Vec<VaultFileEntry>, rusqlite::Error> {
+    let mut statement = connection.prepare(
+        r#"
+        SELECT id, vault_id, parent_id, asset_id, name, kind, media_kind, mime_type, bytes,
+               content_hash, origin_device_id, created_at, updated_at, trashed_at
+        FROM vault_file_entries
+        ORDER BY parent_id IS NOT NULL ASC, kind ASC, name COLLATE NOCASE ASC
+        "#,
+    )?;
+    let rows = statement.query_map([], |row| {
+        let parent_id = row
+            .get::<_, Option<String>>(2)?
+            .map(|value| parse_uuid(&value))
+            .transpose()?;
+        let asset_id = row
+            .get::<_, Option<String>>(3)?
+            .map(|value| parse_uuid(&value))
+            .transpose()?;
+        let media_kind = row
+            .get::<_, Option<String>>(6)?
+            .map(|value| parse_enum(&value))
+            .transpose()?;
+        let origin_device_id = row
+            .get::<_, Option<String>>(10)?
+            .map(|value| parse_uuid(&value))
+            .transpose()?;
+        let trashed_at = row
+            .get::<_, Option<String>>(13)?
+            .map(|value| parse_datetime(&value))
+            .transpose()?;
+
+        Ok(VaultFileEntry {
+            id: parse_uuid(&row.get::<_, String>(0)?)?,
+            vault_id: parse_uuid(&row.get::<_, String>(1)?)?,
+            parent_id,
+            asset_id,
+            name: row.get(4)?,
+            kind: parse_enum(&row.get::<_, String>(5)?)?,
+            media_kind,
+            mime_type: row.get(7)?,
+            bytes: row.get(8)?,
+            content_hash: row.get(9)?,
+            origin_device_id,
+            created_at: parse_datetime(&row.get::<_, String>(11)?)?,
+            updated_at: parse_datetime(&row.get::<_, String>(12)?)?,
+            trashed_at,
+        })
     })?;
     rows.collect()
 }
@@ -1978,18 +2085,22 @@ fn load_capability_grants(
 
 fn load_pairings(connection: &Connection) -> Result<Vec<DevicePairing>, rusqlite::Error> {
     let mut statement = connection.prepare(
-        "SELECT id, device_name, platform, pairing_token, created_at, expires_at, approved_at FROM device_pairings ORDER BY created_at DESC",
+        "SELECT id, device_name, platform, vault_id, pairing_token, created_at, expires_at, approved_at FROM device_pairings ORDER BY created_at DESC",
     )?;
     let rows = statement.query_map([], |row| {
         Ok(DevicePairing {
             id: parse_uuid(&row.get::<_, String>(0)?)?,
             device_name: row.get(1)?,
             platform: row.get(2)?,
-            pairing_token: row.get(3)?,
-            created_at: parse_datetime(&row.get::<_, String>(4)?)?,
-            expires_at: parse_datetime(&row.get::<_, String>(5)?)?,
+            vault_id: row
+                .get::<_, Option<String>>(3)?
+                .map(|value| parse_uuid(&value))
+                .transpose()?,
+            pairing_token: row.get(4)?,
+            created_at: parse_datetime(&row.get::<_, String>(5)?)?,
+            expires_at: parse_datetime(&row.get::<_, String>(6)?)?,
             approved_at: row
-                .get::<_, Option<String>>(6)?
+                .get::<_, Option<String>>(7)?
                 .map(|value| parse_datetime(&value))
                 .transpose()?,
         })
@@ -2436,7 +2547,7 @@ mod tests {
 
     use crate::{
         config::AppConfig,
-        domain::{ImportMode, LibrarySettings},
+        domain::{ImportMode, LibrarySettings, OriginalStoragePolicy},
     };
 
     use super::{PersistedLibraryState, SCHEMA_VERSION, bootstrap_storage, load_state, save_state};
@@ -2462,6 +2573,7 @@ mod tests {
             library_settings: Some(LibrarySettings {
                 library_root: runtime_root.join("library").to_string_lossy().to_string(),
                 default_import_mode: ImportMode::Copy,
+                original_storage_policy: OriginalStoragePolicy::EncryptedOnly,
                 initialized_at: Utc::now(),
                 updated_at: Utc::now(),
             }),
@@ -2492,6 +2604,7 @@ mod tests {
             library_settings: Some(LibrarySettings {
                 library_root: runtime_root.join("library").to_string_lossy().to_string(),
                 default_import_mode: ImportMode::Move,
+                original_storage_policy: OriginalStoragePolicy::EncryptedOnly,
                 initialized_at: Utc::now(),
                 updated_at: Utc::now(),
             }),
@@ -2610,6 +2723,52 @@ mod tests {
         let version: i64 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("user version");
+        assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn migration_adds_vault_id_to_legacy_device_pairings() {
+        let runtime_root = temp_runtime_root();
+        let config = AppConfig {
+            runtime_root: runtime_root.clone(),
+            ..AppConfig::default()
+        };
+        let db_dir = runtime_root.join("db");
+        std::fs::create_dir_all(&db_dir).expect("create db dir");
+        let connection = Connection::open(config.database_path()).expect("open legacy db");
+        connection
+            .execute_batch(
+                r#"
+                CREATE TABLE device_pairings (
+                  id TEXT PRIMARY KEY,
+                  device_name TEXT NOT NULL,
+                  platform TEXT NOT NULL,
+                  pairing_token TEXT NOT NULL,
+                  created_at TEXT NOT NULL,
+                  expires_at TEXT NOT NULL,
+                  approved_at TEXT
+                );
+                PRAGMA user_version = 12;
+                "#,
+            )
+            .expect("create legacy pairing schema");
+        drop(connection);
+
+        let report = bootstrap_storage(&config).expect("migrate storage");
+        let connection = Connection::open(&report.database_path).expect("open migrated db");
+        let mut statement = connection
+            .prepare("PRAGMA table_info(device_pairings)")
+            .expect("device_pairings columns");
+        let columns = statement
+            .query_map([], |row| row.get::<_, String>(1))
+            .expect("column rows")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("columns");
+        let version: i64 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("user version");
+
+        assert!(columns.iter().any(|column| column == "vault_id"));
         assert_eq!(version, SCHEMA_VERSION);
     }
 }

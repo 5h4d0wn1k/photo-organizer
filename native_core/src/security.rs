@@ -408,10 +408,8 @@ fn key_file_path(runtime_root: &Path, key_id: &str) -> PathBuf {
 fn key_id_for_path(database_path: &Path) -> String {
     let mut hasher = Sha256::new();
     hasher.update(database_path.to_string_lossy().as_bytes());
-    format!(
-        "library-{}",
-        hex_string(&hasher.finalize())[..24].to_string()
-    )
+    let digest = hex_string(hasher.finalize());
+    format!("library-{}", &digest[..24])
 }
 
 fn generate_key_hex() -> String {

@@ -1,7 +1,10 @@
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 
+import '../api/local_api_client.dart';
+import '../features/archive/archive_screen.dart';
 import '../features/albums/albums_screen.dart';
+import '../features/files/files_screen.dart';
 import '../features/import/import_screen.dart';
 import '../features/events/events_screen.dart';
 import '../features/jobs/jobs_screen.dart';
@@ -19,16 +22,10 @@ import '../repositories/gallery_repository.dart';
 import '../repositories/resilient_gallery_repository.dart';
 import '../theme/app_theme.dart';
 
-enum GalleryClientMode {
-  desktop,
-  mobile,
-}
+enum GalleryClientMode { desktop, mobile }
 
 class PrivateGalleryApp extends StatelessWidget {
-  const PrivateGalleryApp({
-    super.key,
-    this.mode,
-  });
+  const PrivateGalleryApp({super.key, this.mode});
 
   final GalleryClientMode? mode;
 
@@ -55,8 +52,7 @@ GalleryClientMode defaultGalleryClientMode() {
     TargetPlatform.fuchsia ||
     TargetPlatform.linux ||
     TargetPlatform.macOS ||
-    TargetPlatform.windows =>
-      GalleryClientMode.desktop,
+    TargetPlatform.windows => GalleryClientMode.desktop,
   };
 }
 
@@ -360,30 +356,34 @@ class _GalleryBootstrapPageState extends State<GalleryBootstrapPage> {
     if (!mounted) {
       return;
     }
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text(message)),
-    );
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(SnackBar(content: Text(message)));
   }
 
   String _pageTitle(int index) {
     switch (index) {
       case 0:
-        return 'Library';
+        return 'Gallery';
       case 1:
-        return 'Albums';
+        return 'Files';
       case 2:
-        return 'People';
+        return 'Albums';
       case 3:
-        return 'Places';
+        return 'People';
       case 4:
-        return 'Events';
+        return 'Places';
       case 5:
-        return 'Search';
+        return 'Events';
       case 6:
-        return 'Vaults';
+        return 'Search';
       case 7:
-        return 'Jobs';
+        return 'Archive';
       case 8:
+        return 'My Devices';
+      case 9:
+        return 'Sync & Activity';
+      case 10:
         return 'Settings';
       default:
         return 'Private Gallery';
@@ -393,9 +393,7 @@ class _GalleryBootstrapPageState extends State<GalleryBootstrapPage> {
   @override
   Widget build(BuildContext context) {
     if (_loading && _launchResult == null) {
-      return const Scaffold(
-        body: Center(child: CircularProgressIndicator()),
-      );
+      return const Scaffold(body: Center(child: CircularProgressIndicator()));
     }
 
     final launchResult = _launchResult;
@@ -422,7 +420,8 @@ class _GalleryBootstrapPageState extends State<GalleryBootstrapPage> {
           title: launchResult.status == AppLaunchStatus.error
               ? 'Unable to load the local workspace'
               : 'Local daemon unavailable',
-          message: launchResult.message ??
+          message:
+              launchResult.message ??
               'The desktop client could not reach the local library daemon.',
           launchResult: launchResult.launchResult,
           onRetry: _loadWorkspace,
@@ -506,7 +505,8 @@ class _GalleryWorkspaceShell extends StatelessWidget {
     required String localPath,
     String? expectedSha256,
     required bool confirmed,
-  }) onImportLocalModel;
+  })
+  onImportLocalModel;
   final Future<ModelArtifact> Function(String id) onVerifyModel;
   final Future<void> Function(LibrarySettingsDraft draft) onSaveSettings;
   final Future<void> Function(WatchFolderDraft draft) onAddWatchFolder;
@@ -518,12 +518,13 @@ class _GalleryWorkspaceShell extends StatelessWidget {
   final Future<void> Function(String id, bool hidden) onHidePerson;
   final Future<void> Function(String id) onRejectPersonMatch;
   final Future<void> Function(String targetId, List<String> sourceIds)
-      onMergePerson;
+  onMergePerson;
   final Future<void> Function(
     String id, {
     required List<String> faceTemplateIds,
     String? newDisplayName,
-  }) onSplitPerson;
+  })
+  onSplitPerson;
   final Future<void> Function() onRebuildPlaces;
   final Future<void> Function(
     String id, {
@@ -531,7 +532,8 @@ class _GalleryWorkspaceShell extends StatelessWidget {
     double? latitude,
     double? longitude,
     bool? hideExactGps,
-  }) onCorrectPlace;
+  })
+  onCorrectPlace;
   final Future<void> Function() onRebuildEvents;
   final Future<void> Function(String id, String title) onTitleEvent;
   final String pageTitle;
@@ -547,6 +549,7 @@ class _GalleryWorkspaceShell extends StatelessWidget {
         },
         onLibraryChanged: onRefresh,
       ),
+      FilesScreen(apiClient: LocalApiClient(), onLibraryChanged: onRefresh),
       AlbumsScreen(
         albums: workspace.dashboard.albums,
         libraryRoot: workspace.settings.libraryRoot,
@@ -592,6 +595,11 @@ class _GalleryWorkspaceShell extends StatelessWidget {
         onTitleEvent: onTitleEvent,
       ),
       SearchScreen(repository: repository),
+      ArchiveScreen(
+        repository: repository,
+        libraryRoot: workspace.settings.libraryRoot,
+        onLibraryChanged: onRefresh,
+      ),
       VaultsScreen(repository: repository),
       JobsScreen(
         jobs: workspace.dashboard.jobs,
@@ -624,7 +632,11 @@ class _GalleryWorkspaceShell extends StatelessWidget {
     final destinations = const [
       NavigationRailDestination(
         icon: Icon(Icons.photo_library_outlined),
-        label: Text('Timeline'),
+        label: Text('Gallery'),
+      ),
+      NavigationRailDestination(
+        icon: Icon(Icons.folder_outlined),
+        label: Text('Files'),
       ),
       NavigationRailDestination(
         icon: Icon(Icons.photo_album_outlined),
@@ -647,12 +659,16 @@ class _GalleryWorkspaceShell extends StatelessWidget {
         label: Text('Search'),
       ),
       NavigationRailDestination(
-        icon: Icon(Icons.hub_outlined),
-        label: Text('Vaults'),
+        icon: Icon(Icons.archive_outlined),
+        label: Text('Archive'),
+      ),
+      NavigationRailDestination(
+        icon: Icon(Icons.devices_outlined),
+        label: Text('My Devices'),
       ),
       NavigationRailDestination(
         icon: Icon(Icons.sync_outlined),
-        label: Text('Jobs'),
+        label: Text('Activity'),
       ),
       NavigationRailDestination(
         icon: Icon(Icons.settings_outlined),
@@ -665,6 +681,26 @@ class _GalleryWorkspaceShell extends StatelessWidget {
         final wide = constraints.maxWidth >= 980;
 
         return Scaffold(
+          drawer: wide
+              ? null
+              : NavigationDrawer(
+                  selectedIndex: selectedIndex,
+                  onDestinationSelected: (value) {
+                    onSelectIndex(value);
+                    Navigator.of(context).maybePop();
+                  },
+                  children: [
+                    const Padding(
+                      padding: EdgeInsets.fromLTRB(24, 24, 24, 12),
+                      child: Text('Private Gallery'),
+                    ),
+                    for (final destination in destinations)
+                      NavigationDrawerDestination(
+                        icon: destination.icon,
+                        label: destination.label,
+                      ),
+                  ],
+                ),
           appBar: AppBar(
             title: Text(pageTitle),
             actions: [
@@ -700,20 +736,6 @@ class _GalleryWorkspaceShell extends StatelessWidget {
                   ],
                 )
               : IndexedStack(index: selectedIndex, children: pages),
-          bottomNavigationBar: wide
-              ? null
-              : NavigationBar(
-                  selectedIndex: selectedIndex,
-                  destinations: destinations
-                      .map(
-                        (destination) => NavigationDestination(
-                          icon: destination.icon,
-                          label: (destination.label as Text).data ?? '',
-                        ),
-                      )
-                      .toList(),
-                  onDestinationSelected: onSelectIndex,
-                ),
         );
       },
     );

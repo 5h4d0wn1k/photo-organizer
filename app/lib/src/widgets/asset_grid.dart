@@ -35,8 +35,8 @@ class AssetGrid extends StatelessWidget {
         final crossAxisCount = width >= 1100
             ? 4
             : width >= 760
-                ? 3
-                : 2;
+            ? 3
+            : 2;
 
         return GridView.builder(
           shrinkWrap: true,
@@ -54,12 +54,13 @@ class AssetGrid extends StatelessWidget {
                 asset.metadata?.capturedAtSource ?? 'filesystem';
             final dimensions =
                 asset.metadata?.width != null && asset.metadata?.height != null
-                    ? '${asset.metadata!.width}x${asset.metadata!.height}'
-                    : null;
+                ? '${asset.metadata!.width}x${asset.metadata!.height}'
+                : null;
             final previewPath = _previewPath(asset);
             final selected = selectedAssetIds.contains(asset.id);
             final canSelect =
                 selectionEnabled && onAssetSelectionToggled != null;
+            final kindIcon = _assetKindIcon(asset.mediaKind, asset.mimeType);
             return MouseRegion(
               cursor: onAssetSelected == null && !canSelect
                   ? MouseCursor.defer
@@ -71,21 +72,22 @@ class AssetGrid extends StatelessWidget {
                 onTap: canSelect
                     ? () => onAssetSelectionToggled!(asset)
                     : onAssetSelected == null
-                        ? null
-                        : () => onAssetSelected!(asset),
+                    ? null
+                    : () => onAssetSelected!(asset),
                 child: DecoratedBox(
                   decoration: BoxDecoration(
-                    borderRadius: BorderRadius.circular(24),
+                    borderRadius: BorderRadius.circular(12),
+                    border: Border.all(
+                      color: Theme.of(context).colorScheme.outlineVariant,
+                    ),
                     gradient: LinearGradient(
-                      colors: asset.mediaKind == 'video'
-                          ? const [Color(0xFF1D4ED8), Color(0xFF0F172A)]
-                          : const [Color(0xFF0F766E), Color(0xFF99F6E4)],
+                      colors: _assetKindGradient(asset.mediaKind),
                       begin: Alignment.topLeft,
                       end: Alignment.bottomRight,
                     ),
                   ),
                   child: ClipRRect(
-                    borderRadius: BorderRadius.circular(24),
+                    borderRadius: BorderRadius.circular(12),
                     child: Stack(
                       fit: StackFit.expand,
                       children: [
@@ -100,9 +102,9 @@ class AssetGrid extends StatelessWidget {
                           decoration: BoxDecoration(
                             gradient: LinearGradient(
                               colors: [
-                                Colors.black.withValues(alpha: 0.18),
-                                Colors.black.withValues(alpha: 0.08),
-                                Colors.black.withValues(alpha: 0.72),
+                                Colors.black.withValues(alpha: 0.02),
+                                Colors.black.withValues(alpha: 0.04),
+                                Colors.black.withValues(alpha: 0.62),
                               ],
                               begin: Alignment.topCenter,
                               end: Alignment.bottomCenter,
@@ -120,10 +122,8 @@ class AssetGrid extends StatelessWidget {
                                   asset.archived
                                       ? Icons.archive_outlined
                                       : asset.favorite
-                                          ? Icons.star_rounded
-                                          : asset.mediaKind == 'video'
-                                              ? Icons.videocam_outlined
-                                              : Icons.image_outlined,
+                                      ? Icons.star_rounded
+                                      : kindIcon,
                                   color: Colors.white,
                                 ),
                               ),
@@ -154,11 +154,15 @@ class AssetGrid extends StatelessWidget {
                                     const _AssetBadge(label: 'archived'),
                                   if (!asset.isAvailable)
                                     const _AssetBadge(
-                                        label: 'stored elsewhere'),
+                                      label: 'stored elsewhere',
+                                    ),
                                   if (asset.metadata?.geo != null)
                                     const _AssetBadge(label: 'GPS'),
                                   if (dimensions != null)
                                     _AssetBadge(label: dimensions),
+                                  _AssetBadge(
+                                    label: _assetKindLabel(asset.mediaKind),
+                                  ),
                                   if (previewPath != null)
                                     const _AssetBadge(label: 'local preview'),
                                 ],
@@ -191,14 +195,16 @@ class AssetGrid extends StatelessWidget {
                                 side: const BorderSide(color: Colors.white),
                                 checkColor: Colors.black,
                                 fillColor:
-                                    WidgetStateProperty.resolveWith<Color>(
-                                  (states) {
-                                    if (states.contains(WidgetState.selected)) {
-                                      return Colors.white;
-                                    }
-                                    return Colors.transparent;
-                                  },
-                                ),
+                                    WidgetStateProperty.resolveWith<Color>((
+                                      states,
+                                    ) {
+                                      if (states.contains(
+                                        WidgetState.selected,
+                                      )) {
+                                        return Colors.white;
+                                      }
+                                      return Colors.transparent;
+                                    }),
                               ),
                             ),
                           ),
@@ -225,14 +231,64 @@ class AssetGrid extends StatelessWidget {
     if (root == null || root.isEmpty || asset.relativeOriginalPath.isEmpty) {
       return null;
     }
-    final separator =
-        root.endsWith('/') || root.endsWith('\\') ? '' : Platform.pathSeparator;
+    final separator = root.endsWith('/') || root.endsWith('\\')
+        ? ''
+        : Platform.pathSeparator;
     final relative = asset.relativeOriginalPath.replaceFirst(
       RegExp(r'^[\\/]+'),
       '',
     );
     return '$root$separator$relative';
   }
+}
+
+IconData _assetKindIcon(String mediaKind, String mimeType) {
+  final kind = mediaKind.toLowerCase();
+  final mime = mimeType.toLowerCase();
+  if (kind == 'video' || mime.startsWith('video/')) {
+    return Icons.videocam_outlined;
+  }
+  if (kind == 'document' || mime == 'application/pdf') {
+    return Icons.description_outlined;
+  }
+  if (kind == 'audio' || mime.startsWith('audio/')) {
+    return Icons.audiotrack_outlined;
+  }
+  if (kind == 'archive') {
+    return Icons.folder_zip_outlined;
+  }
+  if (kind == 'text' || mime.startsWith('text/')) {
+    return Icons.article_outlined;
+  }
+  if (kind == 'other') {
+    return Icons.insert_drive_file_outlined;
+  }
+  return Icons.image_outlined;
+}
+
+String _assetKindLabel(String mediaKind) {
+  return switch (mediaKind.toLowerCase()) {
+    'photo' => 'photo',
+    'video' => 'video',
+    'document' => 'document',
+    'audio' => 'audio',
+    'archive' => 'archive',
+    'text' => 'text',
+    'other' => 'file',
+    _ => mediaKind,
+  };
+}
+
+List<Color> _assetKindGradient(String mediaKind) {
+  return switch (mediaKind.toLowerCase()) {
+    'video' => const [Color(0xFF334155), Color(0xFF0F172A)],
+    'document' => const [Color(0xFF1D4ED8), Color(0xFF0F172A)],
+    'audio' => const [Color(0xFF0F766E), Color(0xFF042F2E)],
+    'archive' => const [Color(0xFF854D0E), Color(0xFF1C1917)],
+    'text' => const [Color(0xFF475569), Color(0xFF111827)],
+    'other' => const [Color(0xFF52525B), Color(0xFF18181B)],
+    _ => const [Color(0xFFE4E2E4), Color(0xFFFFFFFF)],
+  };
 }
 
 class _AssetBadge extends StatelessWidget {

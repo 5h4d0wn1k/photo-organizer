@@ -3,6 +3,24 @@
 .vscode/
 .fleet/
 
+# Secrets and local environment files
+.env
+.env.*
+env
+*.pem
+*.key
+*.p12
+*.pfx
+*.mobileprovision
+*secret*
+*secrets*
+credentials*.json
+service-account*.json
+supabase/.branches/
+supabase/.temp/
+!.env.example
+!**/.env.example
+
 # Flutter / Dart
 .dart_tool/
 .packages
@@ -25,6 +43,7 @@ tmp/
 *.sqlite3
 *.db
 *.zip
+.~lock.*#
 
 # Python generated files
 __pycache__/

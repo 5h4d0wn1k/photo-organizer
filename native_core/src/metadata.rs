@@ -286,10 +286,10 @@ fn takeout_timestamp(json: &Value) -> Option<DateTime<Utc>> {
         for key in path {
             cursor = cursor.get(*key)?;
         }
-        if let Some(timestamp) = cursor.as_str().and_then(|value| value.parse::<i64>().ok()) {
-            if let Some(value) = Utc.timestamp_opt(timestamp, 0).single() {
-                return Some(value);
-            }
+        if let Some(timestamp) = cursor.as_str().and_then(|value| value.parse::<i64>().ok())
+            && let Some(value) = Utc.timestamp_opt(timestamp, 0).single()
+        {
+            return Some(value);
         }
         if let Some(timestamp) = cursor.as_i64()
             && let Some(value) = Utc.timestamp_opt(timestamp, 0).single()

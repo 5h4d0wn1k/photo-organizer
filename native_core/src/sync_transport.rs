@@ -425,12 +425,11 @@ impl SyncRuntime {
 impl ProtocolHandler for VaultSyncHandler {
     async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
         let remote_node_id = connection.remote_id().to_string();
-        let result = self
-            .accept_inner(&connection, remote_node_id)
+        self.accept_inner(&connection, remote_node_id)
             .await
             .map_err(AcceptError::from_err)?;
         connection.closed().await;
-        Ok(result)
+        Ok(())
     }
 }
 
@@ -716,6 +715,25 @@ fn validate_envelope_authorization(
                 "incoming transfer source does not match the authenticated Iroh peer".into(),
             )
         })?;
+    validate_active_vault_membership(state, envelope.blob.vault_id, envelope.from_device_id)?;
+    validate_active_vault_membership(state, envelope.blob.vault_id, envelope.to_device_id)?;
+    validate_transfer_state_if_present(
+        state,
+        envelope.transfer_id,
+        envelope.blob.vault_id,
+        envelope.blob.id,
+        envelope.from_device_id,
+        envelope.to_device_id,
+    )?;
+    if envelope
+        .chunks
+        .iter()
+        .any(|chunk| chunk.blob_id != envelope.blob.id)
+    {
+        return Err(SyncTransportError::Invalid(
+            "incoming transfer chunk does not belong to envelope blob".into(),
+        ));
+    }
     Ok(())
 }
 
@@ -757,6 +775,63 @@ fn validate_pull_authorization(
                 "pull requester does not match the authenticated Iroh peer".into(),
             )
         })?;
+    validate_active_vault_membership(state, request.vault_id, request.from_device_id)?;
+    validate_active_vault_membership(state, request.vault_id, request.to_device_id)?;
+    validate_transfer_state_if_present(
+        state,
+        request.transfer_id,
+        request.vault_id,
+        request.blob_id,
+        request.from_device_id,
+        request.to_device_id,
+    )?;
+    Ok(())
+}
+
+fn validate_active_vault_membership(
+    state: &LibraryState,
+    vault_id: Uuid,
+    device_id: Uuid,
+) -> Result<(), SyncTransportError> {
+    if !state.vaults.iter().any(|vault| vault.id == vault_id) {
+        return Err(SyncTransportError::Invalid(format!(
+            "vault {vault_id} is not enrolled on this device"
+        )));
+    }
+    if !state.vault_members.iter().any(|member| {
+        member.vault_id == vault_id && member.device_id == device_id && member.revoked_at.is_none()
+    }) {
+        return Err(SyncTransportError::Invalid(format!(
+            "device {device_id} is not an active member of vault {vault_id}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_transfer_state_if_present(
+    state: &LibraryState,
+    transfer_id: Uuid,
+    vault_id: Uuid,
+    blob_id: Uuid,
+    from_device_id: Uuid,
+    to_device_id: Uuid,
+) -> Result<(), SyncTransportError> {
+    let Some(transfer) = state
+        .sync_transfers
+        .iter()
+        .find(|transfer| transfer.id == transfer_id)
+    else {
+        return Ok(());
+    };
+    if transfer.vault_id != vault_id
+        || transfer.blob_id != blob_id
+        || transfer.from_device_id != Some(from_device_id)
+        || transfer.to_device_id != to_device_id
+    {
+        return Err(SyncTransportError::Invalid(
+            "transfer envelope does not match persisted transfer state".into(),
+        ));
+    }
     Ok(())
 }
 

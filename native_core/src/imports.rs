@@ -28,6 +28,12 @@ pub fn infer_media_kind(path: &Path) -> Option<MediaKind> {
         "jpg" | "jpeg" | "jfif" | "png" | "webp" | "gif" | "heic" | "heif" | "bmp" | "tif"
         | "tiff" | "dng" | "jxr" => Some(MediaKind::Photo),
         "mp4" | "mov" | "m4v" | "avi" | "mkv" | "webm" => Some(MediaKind::Video),
+        "pdf" | "doc" | "docx" | "xls" | "xlsx" | "ppt" | "pptx" | "odt" | "ods" | "odp"
+        | "rtf" | "pages" | "numbers" | "key" => Some(MediaKind::Document),
+        "mp3" | "m4a" | "aac" | "wav" | "flac" | "ogg" | "opus" => Some(MediaKind::Audio),
+        "zip" | "tar" | "gz" | "tgz" | "bz2" | "xz" | "7z" | "rar" => Some(MediaKind::Archive),
+        "txt" | "md" | "csv" | "tsv" | "yaml" | "yml" | "log" => Some(MediaKind::Text),
+        "bin" | "dat" => Some(MediaKind::Other),
         _ => None,
     }
 }
@@ -59,7 +65,48 @@ pub fn infer_mime_type(path: &Path, media_kind: &MediaKind) -> String {
         (MediaKind::Video, "mkv") => "video/x-matroska".to_string(),
         (MediaKind::Video, "avi") => "video/x-msvideo".to_string(),
         (MediaKind::Video, _) => "video/mp4".to_string(),
-        _ => "image/jpeg".to_string(),
+        (MediaKind::Document, "pdf") => "application/pdf".to_string(),
+        (MediaKind::Document, "doc") => "application/msword".to_string(),
+        (MediaKind::Document, "docx") => {
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document".to_string()
+        }
+        (MediaKind::Document, "xls") => "application/vnd.ms-excel".to_string(),
+        (MediaKind::Document, "xlsx") => {
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet".to_string()
+        }
+        (MediaKind::Document, "ppt") => "application/vnd.ms-powerpoint".to_string(),
+        (MediaKind::Document, "pptx") => {
+            "application/vnd.openxmlformats-officedocument.presentationml.presentation".to_string()
+        }
+        (MediaKind::Document, "odt") => "application/vnd.oasis.opendocument.text".to_string(),
+        (MediaKind::Document, "ods") => {
+            "application/vnd.oasis.opendocument.spreadsheet".to_string()
+        }
+        (MediaKind::Document, "odp") => {
+            "application/vnd.oasis.opendocument.presentation".to_string()
+        }
+        (MediaKind::Document, "rtf") => "application/rtf".to_string(),
+        (MediaKind::Audio, "mp3") => "audio/mpeg".to_string(),
+        (MediaKind::Audio, "m4a") => "audio/mp4".to_string(),
+        (MediaKind::Audio, "aac") => "audio/aac".to_string(),
+        (MediaKind::Audio, "wav") => "audio/wav".to_string(),
+        (MediaKind::Audio, "flac") => "audio/flac".to_string(),
+        (MediaKind::Audio, "ogg") => "audio/ogg".to_string(),
+        (MediaKind::Audio, "opus") => "audio/opus".to_string(),
+        (MediaKind::Archive, "zip") => "application/zip".to_string(),
+        (MediaKind::Archive, "tar") => "application/x-tar".to_string(),
+        (MediaKind::Archive, "gz") | (MediaKind::Archive, "tgz") => "application/gzip".to_string(),
+        (MediaKind::Archive, "bz2") => "application/x-bzip2".to_string(),
+        (MediaKind::Archive, "xz") => "application/x-xz".to_string(),
+        (MediaKind::Archive, "7z") => "application/x-7z-compressed".to_string(),
+        (MediaKind::Archive, "rar") => "application/vnd.rar".to_string(),
+        (MediaKind::Text, "md") => "text/markdown".to_string(),
+        (MediaKind::Text, "csv") => "text/csv".to_string(),
+        (MediaKind::Text, "tsv") => "text/tab-separated-values".to_string(),
+        (MediaKind::Text, "json") => "application/json".to_string(),
+        (MediaKind::Text, "yaml") | (MediaKind::Text, "yml") => "application/yaml".to_string(),
+        (MediaKind::Text, _) => "text/plain".to_string(),
+        _ => "application/octet-stream".to_string(),
     }
 }
 
@@ -528,12 +575,9 @@ where
                 &sidecar_paths,
                 filesystem_captured_at.unwrap_or_else(Utc::now),
             );
-            let captured_at = Some(extracted_metadata.captured_at);
-            let relative_destination = derive_managed_original_path(
-                &content_hash,
-                &original_filename,
-                captured_at.unwrap_or_else(Utc::now),
-            );
+            let captured_at = extracted_metadata.captured_at;
+            let relative_destination =
+                derive_managed_original_path(&content_hash, &original_filename, captured_at);
             let destination_path = library_root.map(|root| {
                 root.join(&relative_destination)
                     .to_string_lossy()
@@ -555,7 +599,7 @@ where
                 media_kind: media_kind.clone(),
                 mime_type: infer_mime_type(&path, &media_kind),
                 bytes: file_metadata.len(),
-                captured_at,
+                captured_at: Some(captured_at),
                 place_hint: request
                     .place_hint
                     .clone()
@@ -669,10 +713,11 @@ mod tests {
     use chrono::Utc;
     use uuid::Uuid;
 
-    use crate::domain::{ImportMode, ImportSourceKind, ScanImportSourceRequest};
+    use crate::domain::{ImportMode, ImportSourceKind, MediaKind, ScanImportSourceRequest};
 
     use super::{
-        collect_media_files, collect_unsupported_files, derive_asset_storage_path, scan_source,
+        collect_media_files, collect_unsupported_files, derive_asset_storage_path,
+        infer_media_kind, infer_mime_type, scan_source,
     };
 
     fn temp_dir(name: &str) -> PathBuf {
@@ -708,6 +753,45 @@ mod tests {
 
         let files = collect_media_files(&root, true, &[]).expect("scan should succeed");
         assert_eq!(files.len(), 6);
+    }
+
+    #[test]
+    fn collects_general_vault_files_recursively() {
+        let root = temp_dir("collect-general");
+        let nested = root.join("nested");
+        fs::create_dir_all(&nested).expect("nested dir");
+        fs::write(root.join("report.pdf"), b"pdf").expect("write pdf");
+        fs::write(root.join("notes.md"), b"notes").expect("write markdown");
+        fs::write(root.join("voice.mp3"), b"audio").expect("write audio");
+        fs::write(root.join("bundle.zip"), b"zip").expect("write archive");
+        fs::write(nested.join("payload.bin"), b"bin").expect("write binary");
+
+        let files = collect_media_files(&root, true, &[]).expect("scan should succeed");
+        assert_eq!(files.len(), 5);
+        assert_eq!(
+            infer_media_kind(&root.join("report.pdf")),
+            Some(MediaKind::Document)
+        );
+        assert_eq!(
+            infer_mime_type(&root.join("report.pdf"), &MediaKind::Document),
+            "application/pdf"
+        );
+        assert_eq!(
+            infer_media_kind(&root.join("voice.mp3")),
+            Some(MediaKind::Audio)
+        );
+        assert_eq!(
+            infer_media_kind(&root.join("bundle.zip")),
+            Some(MediaKind::Archive)
+        );
+        assert_eq!(
+            infer_media_kind(&root.join("notes.md")),
+            Some(MediaKind::Text)
+        );
+        assert_eq!(
+            infer_media_kind(&nested.join("payload.bin")),
+            Some(MediaKind::Other)
+        );
     }
 
     #[test]

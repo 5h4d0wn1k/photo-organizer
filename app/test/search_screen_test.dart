@@ -17,9 +17,7 @@ void main() {
 
     await tester.pumpWidget(
       MaterialApp(
-        home: Scaffold(
-          body: SearchScreen(repository: repository),
-        ),
+        home: Scaffold(body: SearchScreen(repository: repository)),
       ),
     );
     await tester.pumpAndSettle();
@@ -32,10 +30,70 @@ void main() {
     expect(find.textContaining('OCR processed 1 asset'), findsOneWidget);
     expect(find.textContaining('OCR coverage is partial'), findsOneWidget);
   });
+
+  testWidgets('submits organization filters to search API', (
+    WidgetTester tester,
+  ) async {
+    tester.view.physicalSize = const Size(1200, 1000);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(() {
+      tester.view.resetPhysicalSize();
+      tester.view.resetDevicePixelRatio();
+    });
+
+    final repository = _FakeSearchRepository();
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(body: SearchScreen(repository: repository)),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    await tester.enterText(
+      find.widgetWithText(
+        TextField,
+        'Try “Goa”, “family dinner”, or a filename',
+      ),
+      'birthday',
+    );
+    await tester.enterText(find.widgetWithText(TextField, 'Person'), 'Mom');
+    await tester.enterText(find.widgetWithText(TextField, 'Place'), 'Goa');
+    await tester.enterText(
+      find.widgetWithText(TextField, 'Event'),
+      'Birthday dinner',
+    );
+    await tester.enterText(
+      find.widgetWithText(TextField, 'From'),
+      '2026-01-01',
+    );
+    await tester.enterText(find.widgetWithText(TextField, 'To'), '2026-01-31');
+    await tester.tap(find.text('Videos'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Favorites'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Archived'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Find'));
+    await tester.pumpAndSettle();
+
+    final query = repository.searchQueries.last;
+    expect(query.text, 'birthday');
+    expect(query.people, 'Mom');
+    expect(query.places, 'Goa');
+    expect(query.events, 'Birthday dinner');
+    expect(query.mediaKind, 'video');
+    expect(query.favorite, isTrue);
+    expect(query.fromDate, '2026-01-01');
+    expect(query.toDate, '2026-01-31');
+    expect(query.includeArchived, isTrue);
+    expect(query.limit, 80);
+  });
 }
 
 class _FakeSearchRepository implements GalleryRepository {
   final List<int?> ocrLimits = [];
+  final List<SearchQuery> searchQueries = [];
 
   @override
   Future<SearchIndexStatus?> fetchSearchStatus() async {
@@ -141,8 +199,15 @@ class _FakeSearchRepository implements GalleryRepository {
   }
 
   @override
-  Future<SearchResponse> search(String query) {
-    throw UnimplementedError();
+  Future<SearchResponse> search(SearchQuery query) async {
+    searchQueries.add(query);
+    return SearchResponse(
+      query: query,
+      assets: const [],
+      people: const [],
+      places: const [],
+      events: const [],
+    );
   }
 
   @override
@@ -407,8 +472,18 @@ class _FakeSearchRepository implements GalleryRepository {
 
   @override
   Future<Vault> createVault({
+    String? id,
     required String name,
     StoragePolicy? storagePolicy,
+  }) {
+    throw UnimplementedError();
+  }
+
+  @override
+  Future<DevicePairing> createPairingSession({
+    required String deviceName,
+    required String platform,
+    String? vaultId,
   }) {
     throw UnimplementedError();
   }

@@ -8,7 +8,8 @@
 - `Vault/device sync control plane` tracks authorized devices, storage policy, encrypted blob placement, availability, and planned transfers.
 - `Encrypted vault store` seals originals into authenticated chunks under the library root so local restore and storage-only replication can operate on ciphertext.
 - `Iroh P2P sync runtime` moves encrypted vault chunks between enrolled desktop peers with direct addresses and relay descriptors.
-- `Mobile clients` pair to a desktop daemon with a one-time token and use bearer-authenticated local API calls for LAN upload/download in this slice.
+- `Mobile clients` create or join a device group, pair to a desktop daemon with a vault-bound one-time token, and use bearer-authenticated local API calls for LAN upload/download in this slice.
+- `Optional cloud bootstrap` can hold metadata-only group membership, device capabilities, endpoint hints, and hashed invite secrets for phone-created groups; it is not a media, thumbnail, key, or bearer-token store.
 
 ## Data Flow
 
@@ -23,8 +24,9 @@
 7. The daemon persists assets, sessions, jobs, and derived place/event groupings to SQLite.
 8. The daemon materializes imported originals as content-addressed encrypted vault chunks with a local replica record.
 9. Desktop peers exchange encrypted chunks through the Iroh sync runtime and update replica health as transfers complete.
-10. Android clients pair with a desktop daemon, reserve uploads, send original bytes, and fetch available originals through mobile-only bearer-authenticated endpoints.
-11. Flutter reads timeline, places, events, people, search, jobs, vault status, and asset availability from the live local API.
+10. Android clients scan a desktop invite QR, pair with the daemon, reserve uploads, send original chunks, and fetch available originals with bounded `Range` requests through mobile-only bearer-authenticated endpoints.
+11. Android clients may create a metadata-only group when a Supabase bootstrap is explicitly configured; private media sync still begins only after a local desktop/storage device joins.
+12. Flutter reads timeline, places, events, people, search, jobs, vault status, and asset availability from the live local API.
 
 ## Core Domain Entities
 
@@ -76,10 +78,14 @@ All derived entities carry:
 - `POST /pairing/sessions`
 - `POST /mobile/pair`
 - `GET /mobile/session`
+- `GET /mobile/uploads/:id`
 - `POST /mobile/uploads`
-- `PUT /mobile/uploads/:id`
+- `PUT /mobile/uploads/:id` (legacy one-shot upload)
+- `DELETE /mobile/uploads/:id`
+- `PUT /mobile/uploads/:id/chunks/:offset`
+- `POST /mobile/uploads/:id/complete`
 - `GET /mobile/assets`
-- `GET /mobile/assets/:id/original`
+- `GET /mobile/assets/:id/original` with `Range: bytes=start-end` support
 - `POST /imports/assets`
 - `POST /imports/scan`
 - `POST /imports/commit`
@@ -114,7 +120,7 @@ All derived entities carry:
 - `POST /backup/export`
 - `POST /backup/restore/plan`
 - `POST /backup/restore/run`
-- `GET /assets/:id/original`
+- `GET /assets/:id/original` with `Range: bytes=start-end` support
 - `GET /assets/:id/availability`
 - `POST /assets/:id/pin-local`
 - `POST /assets/:id/evict-local`
@@ -129,8 +135,12 @@ All derived entities carry:
 - Default vault policy is `protected_min_2`; imported originals are immediately marked `under_replicated` until another healthy replica exists.
 - Local chunk encryption uses ChaCha20-Poly1305 with per-chunk nonces, authenticated associated data, plaintext SHA-256 content IDs, and ciphertext hash verification before decrypt/restore.
 - Mobile sessions store only a SHA-256 bearer-token hash in SQLite; the bearer token is returned once to the Android client and then kept in Android secure storage.
-- Mobile upload receives are content-hash verified, duplicate-aware, copied into the managed library, and immediately sealed into encrypted vault chunks.
+- Mobile upload receives are reservation-based and support resumable offset chunks. Completion verifies size and optional content hash, dedupes by checksum, copies into the managed library, and immediately seals encrypted vault chunks.
+- Abandoned or user-canceled mobile uploads can be canceled explicitly; the daemon marks the receipt canceled, removes staged chunk files, and rejects later chunks for that upload id.
+- Original downloads advertise `Accept-Ranges: bytes`; mobile clients use bounded range requests so encrypted-only originals can be served by decrypting only the intersecting vault chunk instead of materializing the entire original.
 - Daily-driver v1 mobile sync uses a trusted hotspot/LAN URL such as `http://<laptop-hotspot-ip>:4821`. `scripts/private_gallery_mobile_lan_daemon.sh` binds `0.0.0.0:4821` only when `PRIVATE_GALLERY_ALLOW_REMOTE_MOBILE=1` is set.
+- Desktop invites are QR-first and include the current LAN URL, vault id, and one-time pairing token. The token is stored server-side only for pairing and sessions persist bearer-token hashes.
+- Optional Supabase bootstrap is configured through Flutter `--dart-define` values and `supabase/device_group_bootstrap.sql`; it uses anonymous Auth, RLS-protected tables, and a Postgres RPC for invite claim. It stores only group names, anonymous membership records, client device ids, optional public keys/capabilities/endpoint hints, invite hashes, and timestamps.
 - The daemon injects remote socket information at serve time and blocks non-loopback clients from desktop control routes. It also treats Tailscale Serve identity headers as remote, so path-limited Serve exposure for `/mobile` and `/health` does not expose desktop APIs through the loopback proxy.
 - Hosted services are modeled only as discovery/relay fallback; hosted photo, thumbnail, OCR, face, embedding, metadata, and key storage remain out of scope.
 - No remote ML, analytics, or geocoding by default.
@@ -139,5 +149,5 @@ All derived entities carry:
 
 - `People` and `search` are preserved as live API surfaces. OCR and heuristic scene tags can run locally after encryption; face and semantic providers still require approved local model imports plus provider commands.
 - File selection is manual-path-based in the desktop client.
-- Desktop P2P networking is implemented through the Iroh runtime. Native Android Iroh transport, background sync scheduling, resumable chunk-level mobile uploads, and hosted discovery/relay deployment remain future hardening work.
+- Desktop P2P networking is implemented through the Iroh runtime. Mobile LAN media uploads support resumable offset chunks; native Android Iroh transport, background sync scheduling, native vault chunk sync, and hosted discovery/relay deployment remain future hardening work.
 - Desktop shells are generated for Linux, macOS, and Windows, but native platform build prerequisites must still be installed on the host machine.

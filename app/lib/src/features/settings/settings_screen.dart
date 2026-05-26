@@ -63,6 +63,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
   late final TextEditingController _modelPathController;
   late final TextEditingController _modelHashController;
   late ImportMode _defaultImportMode;
+  late OriginalStoragePolicy _originalStoragePolicy;
   bool _watchRecursive = true;
   bool _savingSettings = false;
   bool _savingWatchFolder = false;
@@ -98,6 +99,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     _modelPathController = TextEditingController();
     _modelHashController = TextEditingController();
     _defaultImportMode = widget.workspace.settings.defaultImportMode;
+    _originalStoragePolicy = widget.workspace.settings.originalStoragePolicy;
   }
 
   @override
@@ -119,6 +121,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
         LibrarySettingsDraft(
           libraryRoot: _libraryRootController.text.trim(),
           defaultImportMode: _defaultImportMode,
+          originalStoragePolicy: _originalStoragePolicy,
         ),
       );
       if (!mounted) {
@@ -467,6 +470,28 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       return;
                     }
                     setState(() => _defaultImportMode = value);
+                  },
+                ),
+                const SizedBox(height: 16),
+                DropdownButtonFormField<OriginalStoragePolicy>(
+                  initialValue: _originalStoragePolicy,
+                  decoration: const InputDecoration(
+                    labelText: 'Managed originals',
+                    border: OutlineInputBorder(),
+                  ),
+                  items: OriginalStoragePolicy.values
+                      .map(
+                        (policy) => DropdownMenuItem<OriginalStoragePolicy>(
+                          value: policy,
+                          child: Text(policy.label),
+                        ),
+                      )
+                      .toList(),
+                  onChanged: (value) {
+                    if (value == null) {
+                      return;
+                    }
+                    setState(() => _originalStoragePolicy = value);
                   },
                 ),
                 const SizedBox(height: 12),

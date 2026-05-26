@@ -35,18 +35,20 @@ class PeopleScreen extends StatelessWidget {
   final Future<PersonCluster> Function(
     String id, {
     required List<String> assetIds,
-  }) onRemovePersonAssets;
+  })
+  onRemovePersonAssets;
   final Future<void> Function() onPeopleChanged;
   final Future<void> Function(String id, String displayName) onRenamePerson;
   final Future<void> Function(String id, bool hidden) onHidePerson;
   final Future<void> Function(String id) onRejectPersonMatch;
   final Future<void> Function(String targetId, List<String> sourceIds)
-      onMergePerson;
+  onMergePerson;
   final Future<void> Function(
     String id, {
     required List<String> faceTemplateIds,
     String? newDisplayName,
-  }) onSplitPerson;
+  })
+  onSplitPerson;
 
   @override
   Widget build(BuildContext context) {
@@ -83,6 +85,7 @@ class PeopleScreen extends StatelessWidget {
           onIndexPeople: onIndexPeople,
           onResetPeople: onResetPeople,
           onCreateManualPerson: onCreateManualPerson,
+          onPeopleChanged: onPeopleChanged,
         ),
         const SizedBox(height: 16),
         if (people.isEmpty)
@@ -146,6 +149,7 @@ class PeopleScreen extends StatelessWidget {
     );
     if (name != null && name.trim().isNotEmpty) {
       await onCreateManualPerson(name.trim());
+      await onPeopleChanged();
     }
   }
 }
@@ -158,6 +162,7 @@ class _FaceGateCard extends StatelessWidget {
     required this.onIndexPeople,
     required this.onResetPeople,
     required this.onCreateManualPerson,
+    required this.onPeopleChanged,
   });
 
   final bool encrypted;
@@ -166,6 +171,7 @@ class _FaceGateCard extends StatelessWidget {
   final Future<void> Function() onIndexPeople;
   final Future<void> Function() onResetPeople;
   final Future<void> Function(String displayName) onCreateManualPerson;
+  final Future<void> Function() onPeopleChanged;
 
   @override
   Widget build(BuildContext context) {
@@ -205,9 +211,11 @@ class _FaceGateCard extends StatelessWidget {
               runSpacing: 8,
               children: [
                 Chip(
-                  label: Text(encrypted
-                      ? 'Encrypted DB active'
-                      : 'Encryption unavailable'),
+                  label: Text(
+                    encrypted
+                        ? 'Encrypted DB active'
+                        : 'Encryption unavailable',
+                  ),
                 ),
                 for (final model in faceModels)
                   Chip(
@@ -232,7 +240,7 @@ class _FaceGateCard extends StatelessWidget {
                   ),
                 ),
                 OutlinedButton.icon(
-                  onPressed: onResetPeople,
+                  onPressed: () => _confirmResetPeople(context),
                   icon: const Icon(Icons.delete_sweep_outlined),
                   label: const Text('Reset people data'),
                 ),
@@ -280,6 +288,50 @@ class _FaceGateCard extends StatelessWidget {
     );
     if (name != null && name.trim().isNotEmpty) {
       await onCreateManualPerson(name.trim());
+      await onPeopleChanged();
+    }
+  }
+
+  Future<void> _confirmResetPeople(BuildContext context) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) {
+        return AlertDialog(
+          title: const Text('Reset people data?'),
+          content: const Text(
+            'This removes local people labels and face template assignments. Media files stay in the library.',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(false),
+              child: const Text('Cancel'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.of(context).pop(true),
+              child: const Text('Reset people data'),
+            ),
+          ],
+        );
+      },
+    );
+    if (confirmed != true) {
+      return;
+    }
+    try {
+      await onResetPeople();
+      if (!context.mounted) {
+        return;
+      }
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('People data reset.')));
+    } catch (error) {
+      if (!context.mounted) {
+        return;
+      }
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('$error')));
     }
   }
 }
@@ -306,18 +358,20 @@ class _PersonCard extends StatelessWidget {
   final Future<PersonCluster> Function(
     String id, {
     required List<String> assetIds,
-  }) onRemovePersonAssets;
+  })
+  onRemovePersonAssets;
   final Future<void> Function() onPeopleChanged;
   final Future<void> Function(String id, String displayName) onRenamePerson;
   final Future<void> Function(String id, bool hidden) onHidePerson;
   final Future<void> Function(String id) onRejectPersonMatch;
   final Future<void> Function(String targetId, List<String> sourceIds)
-      onMergePerson;
+  onMergePerson;
   final Future<void> Function(
     String id, {
     required List<String> faceTemplateIds,
     String? newDisplayName,
-  }) onSplitPerson;
+  })
+  onSplitPerson;
 
   @override
   Widget build(BuildContext context) {
@@ -391,7 +445,8 @@ class _PersonCard extends StatelessWidget {
                 }
                 if (snapshot.hasError) {
                   return Text(
-                      'Unable to load assigned assets: ${snapshot.error}');
+                    'Unable to load assigned assets: ${snapshot.error}',
+                  );
                 }
 
                 final assets = snapshot.data ?? const [];
@@ -473,10 +528,7 @@ class _PersonCard extends StatelessWidget {
     }
   }
 
-  Future<void> _handleAction(
-    BuildContext context,
-    _PeopleAction action,
-  ) async {
+  Future<void> _handleAction(BuildContext context, _PeopleAction action) async {
     switch (action) {
       case _PeopleAction.rename:
         final name = await _askForText(
@@ -484,29 +536,79 @@ class _PersonCard extends StatelessWidget {
           title: 'Rename person',
           initialValue: person.displayName,
         );
+        if (!context.mounted) {
+          return;
+        }
         if (name != null && name.trim().isNotEmpty) {
-          await onRenamePerson(person.id, name.trim());
+          await _runPersonMutation(
+            context,
+            () => onRenamePerson(person.id, name.trim()),
+            'Person renamed.',
+          );
         }
         return;
       case _PeopleAction.hide:
-        await onHidePerson(person.id, !person.hidden);
+        await _runPersonMutation(
+          context,
+          () => onHidePerson(person.id, !person.hidden),
+          person.hidden ? 'Person unhidden.' : 'Person hidden.',
+        );
         return;
       case _PeopleAction.reject:
-        await onRejectPersonMatch(person.id);
+        await _runPersonMutation(
+          context,
+          () => onRejectPersonMatch(person.id),
+          'Face match rejected.',
+        );
         return;
       case _PeopleAction.merge:
         final sourceId = await _choosePersonToMerge(context);
+        if (!context.mounted) {
+          return;
+        }
         if (sourceId != null) {
-          await onMergePerson(person.id, [sourceId]);
+          await _runPersonMutation(
+            context,
+            () => onMergePerson(person.id, [sourceId]),
+            'People merged.',
+          );
         }
         return;
       case _PeopleAction.split:
-        await onSplitPerson(
-          person.id,
-          faceTemplateIds: [person.faceTemplateIds.first],
-          newDisplayName: 'Split from ${person.displayName}',
+        await _runPersonMutation(
+          context,
+          () => onSplitPerson(
+            person.id,
+            faceTemplateIds: [person.faceTemplateIds.first],
+            newDisplayName: 'Split from ${person.displayName}',
+          ),
+          'Face template split into a new person.',
         );
         return;
+    }
+  }
+
+  Future<void> _runPersonMutation(
+    BuildContext context,
+    Future<void> Function() mutation,
+    String successMessage,
+  ) async {
+    try {
+      await mutation();
+      await onPeopleChanged();
+      if (!context.mounted) {
+        return;
+      }
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text(successMessage)));
+    } catch (error) {
+      if (!context.mounted) {
+        return;
+      }
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('$error')));
     }
   }
 
@@ -535,17 +637,18 @@ class _PersonCard extends StatelessWidget {
     BuildContext context, {
     required String title,
     required String initialValue,
-  }) {
-    final controller = TextEditingController(text: initialValue);
+  }) async {
+    var value = initialValue;
     return showDialog<String>(
       context: context,
       builder: (context) => AlertDialog(
         title: Text(title),
-        content: TextField(
-          controller: controller,
+        content: TextFormField(
+          initialValue: initialValue,
           autofocus: true,
           decoration: const InputDecoration(border: OutlineInputBorder()),
-          onSubmitted: (value) => Navigator.of(context).pop(value),
+          onChanged: (text) => value = text,
+          onFieldSubmitted: (text) => Navigator.of(context).pop(text),
         ),
         actions: [
           TextButton(
@@ -553,19 +656,13 @@ class _PersonCard extends StatelessWidget {
             child: const Text('Cancel'),
           ),
           FilledButton(
-            onPressed: () => Navigator.of(context).pop(controller.text),
+            onPressed: () => Navigator.of(context).pop(value),
             child: const Text('Save'),
           ),
         ],
       ),
-    ).whenComplete(controller.dispose);
+    );
   }
 }
 
-enum _PeopleAction {
-  rename,
-  hide,
-  reject,
-  merge,
-  split,
-}
+enum _PeopleAction { rename, hide, reject, merge, split }

@@ -44,10 +44,12 @@ This audit tracks whether current production dependencies perform network I/O or
 | `flutter_secure_storage` | Mobile secret storage | No network expected | Stores pending pairing payloads/session material in platform secure storage. |
 | `mobile_scanner` | QR pairing scanner | No network expected | Uses the device camera only after camera permission is granted. |
 | `qr_flutter` | Local QR rendering | No | Renders device enrollment claim previews without external services. |
+| `supabase_flutter` | Optional metadata-only group bootstrap | Yes, only when explicitly configured | Uses anonymous Auth plus RLS-protected Postgres tables/RPC for membership bootstrap; must not store photos, thumbnails, vault keys, LAN pairing tokens, or bearer tokens. |
+| `crypto` | Invite secret hashing | No | Hashes cloud invite secrets before persistence. |
 
 ## Policy Notes
 
-- No remote analytics, telemetry, crash reporting, cloud AI, or geocoding dependencies are installed.
+- No remote analytics, telemetry, crash reporting, cloud AI, or geocoding dependencies are installed. Supabase is allowed only for optional metadata-only device group bootstrap.
 - Model download support exists only behind `/models/install`, explicit confirmation, reviewed URL matching, personal/family approval, and SHA-256 verification.
 - Indexing jobs must remain isolated from downloader code paths and run from installed local model files only.
 - Any future dependency that can perform network I/O must be added to this document before use.

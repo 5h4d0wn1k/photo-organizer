@@ -49,7 +49,7 @@ The codebase intentionally preserves API surfaces for people, scenes, semantic s
 - Distributed vault state: vaults, enrolled devices, storage policies, content-addressed encrypted chunk records, local key envelopes, replica health, availability status, sync transfer planning, and retry/cancel controls.
 - Vaults desktop screen for device status, replica health, network status, and transfer queue actions.
 - Iroh-backed encrypted desktop P2P vault sync with durable transfer records, local endpoint payloads, storage-only replica support, and remote pull after local eviction.
-- Android mobile pairing with QR/manual token capture, secure session storage, camera-roll access checks, upload of the newest local item to the paired vault, and download of an available vault original.
+- Android mobile onboarding with create/join group choices, QR/manual invite capture, secure session storage, camera-roll access checks, upload of the newest local item to the paired vault, and download of an available vault original.
 
 ## Intentionally Deferred
 
@@ -69,33 +69,47 @@ Start the Rust daemon for desktop-only local development:
 cargo run --manifest-path native_core/Cargo.toml --bin galleryd
 ```
 
-For the daily-driver hotspot/LAN workflow, intentionally enable remote mobile
-mode and use the dedicated launcher. It binds `0.0.0.0:4821` only when
-`PRIVATE_GALLERY_ALLOW_REMOTE_MOBILE=1` is set:
+For private beta mobile sync, prefer a Tailscale/HTTPS path that exposes only
+`/health` and `/mobile/*` while the daemon stays loopback-bound. Desktop control
+routes remain loopback-only, and the daemon treats Tailscale Serve identity
+headers as remote clients even when the proxy forwards to `127.0.0.1`.
+
+Plain hotspot/LAN HTTP is development mode. To use it, intentionally enable
+remote mobile mode and use the dedicated launcher. It binds `0.0.0.0:4821` only
+when `PRIVATE_GALLERY_ALLOW_REMOTE_MOBILE=1` is set:
 
 ```bash
 PRIVATE_GALLERY_ALLOW_REMOTE_MOBILE=1 scripts/private_gallery_mobile_lan_daemon.sh
 ```
 
-Connect each Android phone to the laptop hotspot or the same trusted LAN, then
-enter `http://<laptop-hotspot-ip>:4821` as the desktop daemon URL in the
-Android app. Create the pairing token from the local desktop app or local API,
-pair the phone, upload the newest camera item, then use "Download first
-original" to verify a vault original can round trip. The hotspot IP can change;
-when it does, update the URL in the Android app and in smoke-test environment
-variables.
+For LAN development, connect each Android phone to the laptop hotspot or the
+same trusted LAN, then open the desktop app's Vaults screen. Create a device
+group if one does not exist, choose "Add Device", confirm the
+`http://<laptop-hotspot-ip>:4821` URL, and scan the generated QR from the
+Android app's "Join group" flow. Pair the phone, upload the newest camera item,
+then use "Download first original" to verify a vault original can round trip.
+The hotspot IP can change; when it does, create a fresh invite QR with the
+current URL.
 
-Before pairing phones, the expected remote boundary is:
+Flutter builds may optionally enable metadata-only group bootstrap with
+Supabase by passing `PRIVATE_GALLERY_SUPABASE_URL` and
+`PRIVATE_GALLERY_SUPABASE_ANON_KEY` as Flutter `--dart-define` values and
+installing `supabase/device_group_bootstrap.sql`. This uses anonymous Auth plus
+RLS-protected Postgres tables/RPC only, so it fits the free-tier feature set
+without Edge Functions. It stores group membership metadata only; originals,
+thumbnails, vault keys, desktop pairing tokens, and mobile bearer tokens remain
+local. Desktop "Join Group" accepts pasted cloud or hybrid invite JSON.
+
+Before pairing phones over LAN development mode, the expected remote boundary is:
 
 ```bash
 curl -fsS http://<laptop-hotspot-ip>:4821/health
 curl -i http://<laptop-hotspot-ip>:4821/library/status # 403
 ```
 
-Tailscale Serve remains optional/future for v1. When it is available, keep the
-daemon on loopback and expose only `/mobile` and `/health`; the daemon treats
-Tailscale Serve identity headers as remote clients, so desktop control routes
-remain blocked even though Serve forwards over loopback.
+When using Tailscale Serve, keep the daemon on loopback and expose only
+`/mobile` and `/health`; desktop control routes should return `403` to
+tailnet-proxied clients.
 
 Run the Flutter desktop client once Flutter is installed and the host toolchain is available:
 
@@ -119,11 +133,14 @@ cd app && flutter analyze && flutter test
 ```
 
 When Android phones are attached over USB and a daemon is already running, run
-the real-device mobile smoke. For hotspot/LAN mode, pass the URL that phones
-should use:
+the deterministic real-device mobile API smoke. For hotspot/LAN mode, pass the
+URL that phones should use and require two authorized phones for final
+acceptance:
 
 ```bash
-PRIVATE_GALLERY_SMOKE_DEVICE_BASE_URL=http://<laptop-hotspot-ip>:4821 scripts/android_mobile_smoke.sh
+PRIVATE_GALLERY_SMOKE_DEVICE_BASE_URL=http://<laptop-hotspot-ip>:4821 \
+PRIVATE_GALLERY_SMOKE_REQUIRE_DEVICE_COUNT=2 \
+scripts/android_mobile_smoke.sh
 ```
 
 For USB-only development against loopback, the default command still works with
@@ -133,9 +150,32 @@ For USB-only development against loopback, the default command still works with
 scripts/android_mobile_smoke.sh
 ```
 
-The smoke installs a temporary Dex HTTP helper on each authorized phone, pairs
-the phone, uploads a tiny test original, lists mobile assets, downloads the
-original back, and checks the SHA-256 hash.
+The API smoke installs a temporary Dex HTTP helper on each authorized phone,
+pairs all phones first, checks remote `/health` and desktop-route blocking for
+LAN URLs, uploads synthetic originals larger than Axum's historical default
+body limit through resumable chunks, proves duplicate/cancel handling, verifies
+cross-device visibility before revocation, downloads ranged originals/previews,
+checks SHA-256 hashes, verifies bearer refresh rejects the previous token, and
+verifies session/device revocation. Use
+`PRIVATE_GALLERY_SMOKE_DEVICE_SERIALS="serial1 serial2"` to pin the exact phones.
+
+For a Flutter app-level pairing smoke, build/install the debug APK and load a
+debug-only local group session into each installed app:
+
+```bash
+PRIVATE_GALLERY_SMOKE_DEVICE_BASE_URL=http://<laptop-hotspot-ip>:4821 \
+PRIVATE_GALLERY_SMOKE_DEVICE_SERIALS="serial1 serial2" \
+scripts/android_mobile_app_smoke.sh
+```
+
+The app smoke defaults to `PRIVATE_GALLERY_APP_SMOKE_PAIR_MODE=direct`, which is
+debug-only and not compiled into release behavior. Use
+`PRIVATE_GALLERY_APP_SMOKE_PAIR_MODE=ui` to exercise the visible pairing flow,
+`PRIVATE_GALLERY_APP_SMOKE_PAIR_MODE=manual` for a manual checklist, or
+`PRIVATE_GALLERY_APP_SMOKE_UPLOAD_NEWEST=1` to attempt the real camera-roll
+upload button after pairing. See
+[docs/android-mobile-smoke.md](docs/android-mobile-smoke.md) for the full
+laptop-plus-two-phones runbook.
 
 Linux desktop builds require native host tools such as `cmake`, `ninja`, `g++`, and `gtk+-3.0` development headers. See [docs/desktop-development.md](/mnt/windows/transfer/Work/Projects/Personal%20Use%20Projects/photos%20and%20videos%20organizer/docs/desktop-development.md).
 

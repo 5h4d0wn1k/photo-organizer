@@ -1,11 +1,11 @@
 import 'package:flutter/material.dart';
-import 'package:intl/intl.dart';
 
+import '../media/media_viewer.dart';
 import '../../models/gallery_models.dart';
 import '../../repositories/gallery_repository.dart';
+import '../../widgets/app_ui.dart';
 import '../../widgets/asset_grid.dart';
 import '../../widgets/empty_state_panel.dart';
-import '../../widgets/summary_card.dart';
 
 class TimelineScreen extends StatefulWidget {
   const TimelineScreen({
@@ -326,129 +326,25 @@ class _TimelineScreenState extends State<TimelineScreen> {
   }
 
   Future<void> _showAssetDetails(Asset asset) {
-    final metadata = asset.metadata;
-    final geo = metadata?.geo;
-    final dimensions = metadata?.width != null && metadata?.height != null
-        ? '${metadata!.width}x${metadata.height}'
-        : 'Unknown';
-
-    return showDialog<void>(
-      context: context,
-      builder: (context) {
-        return AlertDialog(
-          title: Text(asset.originalFilename),
-          content: SizedBox(
-            width: 720,
-            child: SingleChildScrollView(
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  _DetailRow(label: 'Kind', value: asset.mediaKind),
-                  _DetailRow(label: 'MIME type', value: asset.mimeType),
-                  _DetailRow(
-                    label: 'Captured',
-                    value: DateFormat.yMMMd()
-                        .add_jm()
-                        .format(asset.capturedAt.toLocal()),
-                  ),
-                  _DetailRow(
-                    label: 'Date source',
-                    value: metadata?.capturedAtSource ?? 'filesystem',
-                  ),
-                  _DetailRow(label: 'Dimensions', value: dimensions),
-                  _DetailRow(
-                    label: 'Place',
-                    value: asset.placeHint ?? metadata?.folderHint ?? 'Unknown',
-                  ),
-                  if (geo != null)
-                    _DetailRow(
-                      label: 'GPS',
-                      value:
-                          '${geo.latitude.toStringAsFixed(5)}, ${geo.longitude.toStringAsFixed(5)}',
-                    ),
-                  _DetailRow(
-                    label: 'Import mode',
-                    value: asset.importMode.label,
-                  ),
-                  _DetailRow(
-                    label: 'Available',
-                    value: asset.isAvailable ? 'Yes' : 'Missing source',
-                  ),
-                  _DetailRow(
-                    label: 'Favorite',
-                    value: asset.favorite ? 'Yes' : 'No',
-                  ),
-                  _DetailRow(
-                    label: 'Archived',
-                    value: asset.archived ? 'Yes' : 'No',
-                  ),
-                  _DetailRow(label: 'Bytes', value: '${asset.bytes}'),
-                  _DetailRow(label: 'Content hash', value: asset.contentHash),
-                  _DetailRow(
-                    label: 'Library path',
-                    value: asset.relativeOriginalPath,
-                  ),
-                  _DetailRow(label: 'Source path', value: asset.sourcePath),
-                  if (metadata?.sidecarTitle != null)
-                    _DetailRow(
-                      label: 'Sidecar title',
-                      value: metadata!.sidecarTitle!,
-                    ),
-                  if (metadata?.sidecarDescription != null)
-                    _DetailRow(
-                      label: 'Sidecar description',
-                      value: metadata!.sidecarDescription!,
-                    ),
-                ],
-              ),
-            ),
-          ),
-          actions: [
-            TextButton.icon(
-              onPressed: () {
-                Navigator.of(context).pop();
-                _updateAssetFlags(asset, favorite: !asset.favorite);
-              },
-              icon: Icon(
-                asset.favorite ? Icons.star_border_rounded : Icons.star_rounded,
-              ),
-              label: Text(asset.favorite ? 'Unfavorite' : 'Favorite'),
-            ),
-            TextButton.icon(
-              onPressed: () {
-                Navigator.of(context).pop();
-                _updateAssetFlags(asset, archived: !asset.archived);
-              },
-              icon: Icon(
-                asset.archived
-                    ? Icons.unarchive_outlined
-                    : Icons.archive_outlined,
-              ),
-              label: Text(asset.archived ? 'Unarchive' : 'Archive'),
-            ),
-            TextButton.icon(
-              onPressed: () {
-                Navigator.of(context).pop();
-                _assignAssetToPerson(asset);
-              },
-              icon: const Icon(Icons.person_add_alt_1_outlined),
-              label: const Text('Assign person'),
-            ),
-            TextButton.icon(
-              onPressed: () {
-                Navigator.of(context).pop();
-                _addAssetToAlbum(asset);
-              },
-              icon: const Icon(Icons.photo_album_outlined),
-              label: const Text('Add to album'),
-            ),
-            TextButton(
-              onPressed: () => Navigator.of(context).pop(),
-              child: const Text('Close'),
-            ),
-          ],
-        );
+    return MediaViewer.show(
+      context,
+      asset: asset,
+      libraryRoot: widget.workspace.settings.libraryRoot,
+      onToggleFavorite: () {
+        Navigator.of(context).maybePop();
+        _updateAssetFlags(asset, favorite: !asset.favorite);
+      },
+      onToggleArchived: () {
+        Navigator.of(context).maybePop();
+        _updateAssetFlags(asset, archived: !asset.archived);
+      },
+      onAssignPerson: () {
+        Navigator.of(context).maybePop();
+        _assignAssetToPerson(asset);
+      },
+      onAddToAlbum: () {
+        Navigator.of(context).maybePop();
+        _addAssetToAlbum(asset);
       },
     );
   }
@@ -733,55 +629,47 @@ class _TimelineScreenState extends State<TimelineScreen> {
     return ListView(
       padding: const EdgeInsets.all(24),
       children: [
-        const Text(
-          'Library',
-          style: TextStyle(fontSize: 32, fontWeight: FontWeight.w700),
+        AppSectionHeader(
+          title: 'Gallery',
+          subtitle:
+              'Your local-first photo and video library, organized without sending originals to cloud storage.',
+          trailing: FilledButton.icon(
+            onPressed: widget.onImportNow,
+            icon: const Icon(Icons.file_upload_outlined),
+            label: const Text('Import'),
+          ),
         ),
         const SizedBox(height: 16),
         Wrap(
-          spacing: 12,
-          runSpacing: 12,
+          spacing: 10,
+          runSpacing: 10,
           children: [
-            SizedBox(
-              width: 260,
-              child: SummaryCard(
-                label: 'Assets',
-                value: '$allAssetCount',
-                caption:
-                    'Photos and videos indexed in the local master library.',
-                icon: Icons.photo_library_outlined,
-              ),
+            AppMetricChip(
+              icon: Icons.photo_library_outlined,
+              label: 'Media',
+              value: '$allAssetCount',
             ),
-            SizedBox(
-              width: 260,
-              child: SummaryCard(
-                label: 'Watch folders',
-                value: '${widget.workspace.watchFolders.length}',
-                caption:
-                    'Stable folders that can feed future background imports.',
-                icon: Icons.folder_copy_outlined,
-              ),
+            AppMetricChip(
+              icon: Icons.folder_copy_outlined,
+              label: 'Watch folders',
+              value: '${widget.workspace.watchFolders.length}',
             ),
-            SizedBox(
-              width: 260,
-              child: SummaryCard(
-                label: 'Default mode',
-                value: widget.workspace.settings.defaultImportMode ==
-                        ImportMode.copy
-                    ? 'Copy'
-                    : widget.workspace.settings.defaultImportMode ==
-                            ImportMode.move
-                        ? 'Move'
-                        : 'Reference',
-                caption:
-                    'The desktop import default you can change in Settings.',
-                icon: Icons.compare_arrows_outlined,
-              ),
+            AppMetricChip(
+              icon: Icons.compare_arrows_outlined,
+              label: 'Import mode',
+              value:
+                  widget.workspace.settings.defaultImportMode == ImportMode.copy
+                      ? 'Copy'
+                      : widget.workspace.settings.defaultImportMode ==
+                              ImportMode.move
+                          ? 'Move'
+                          : 'Reference',
             ),
           ],
         ),
         const SizedBox(height: 24),
-        Card(
+        AppSurface(
+          padding: EdgeInsets.zero,
           child: SwitchListTile(
             value: _showArchived,
             onChanged: _reloadingTimeline
@@ -803,115 +691,108 @@ class _TimelineScreenState extends State<TimelineScreen> {
         ),
         const SizedBox(height: 16),
         if (_timeline.buckets.isNotEmpty) ...[
-          Card(
-            child: Padding(
-              padding: const EdgeInsets.all(16),
-              child: Wrap(
-                spacing: 12,
-                runSpacing: 12,
-                crossAxisAlignment: WrapCrossAlignment.center,
-                children: [
-                  Text(
-                    _selectedAssetIds.isEmpty
-                        ? 'Bulk organize loaded assets'
-                        : '${_selectedAssetIds.length} assets selected',
-                    style: Theme.of(context).textTheme.titleMedium,
+          AppSurface(
+            child: Wrap(
+              spacing: 12,
+              runSpacing: 12,
+              crossAxisAlignment: WrapCrossAlignment.center,
+              children: [
+                Text(
+                  _selectedAssetIds.isEmpty
+                      ? 'Organize loaded media'
+                      : '${_selectedAssetIds.length} selected',
+                  style: Theme.of(context).textTheme.titleMedium,
+                ),
+                OutlinedButton.icon(
+                  onPressed: () {
+                    setState(() {
+                      _selectionMode = !_selectionMode;
+                      if (!_selectionMode) {
+                        _selectedAssetIds.clear();
+                      }
+                    });
+                  },
+                  icon: Icon(
+                    _selectionMode
+                        ? Icons.check_box_outlined
+                        : Icons.check_box_outline_blank,
                   ),
-                  OutlinedButton.icon(
-                    onPressed: () {
-                      setState(() {
-                        _selectionMode = !_selectionMode;
-                        if (!_selectionMode) {
-                          _selectedAssetIds.clear();
-                        }
-                      });
-                    },
-                    icon: Icon(
-                      _selectionMode
-                          ? Icons.check_box_outlined
-                          : Icons.check_box_outline_blank,
-                    ),
-                    label: Text(_selectionMode ? 'Selection on' : 'Select'),
-                  ),
-                  OutlinedButton.icon(
-                    onPressed:
-                        _visibleAssets.isEmpty ? null : _selectVisibleAssets,
-                    icon: const Icon(Icons.select_all),
-                    label: const Text('Select visible'),
-                  ),
-                  OutlinedButton.icon(
-                    onPressed:
-                        _selectedAssetIds.isEmpty ? null : _clearSelection,
-                    icon: const Icon(Icons.clear),
-                    label: const Text('Clear'),
-                  ),
-                  FilledButton.icon(
-                    onPressed: _selectedAssetIds.isEmpty
-                        ? null
-                        : () => _bulkUpdateAssetFlags(favorite: true),
-                    icon: const Icon(Icons.star_rounded),
-                    label: const Text('Favorite'),
-                  ),
-                  FilledButton.icon(
-                    onPressed: _selectedAssetIds.isEmpty
-                        ? null
-                        : () => _bulkUpdateAssetFlags(archived: true),
-                    icon: const Icon(Icons.archive_outlined),
-                    label: const Text('Archive'),
-                  ),
-                  FilledButton.icon(
-                    onPressed: _selectedAssetIds.isEmpty
-                        ? null
-                        : _bulkAddSelectedToAlbum,
-                    icon: const Icon(Icons.photo_album_outlined),
-                    label: const Text('Add to album'),
-                  ),
-                ],
-              ),
+                  label: Text(_selectionMode ? 'Selection on' : 'Select'),
+                ),
+                OutlinedButton.icon(
+                  onPressed:
+                      _visibleAssets.isEmpty ? null : _selectVisibleAssets,
+                  icon: const Icon(Icons.select_all),
+                  label: const Text('Select visible'),
+                ),
+                OutlinedButton.icon(
+                  onPressed: _selectedAssetIds.isEmpty ? null : _clearSelection,
+                  icon: const Icon(Icons.clear),
+                  label: const Text('Clear'),
+                ),
+                FilledButton.icon(
+                  onPressed: _selectedAssetIds.isEmpty
+                      ? null
+                      : () => _bulkUpdateAssetFlags(favorite: true),
+                  icon: const Icon(Icons.star_rounded),
+                  label: const Text('Favorite'),
+                ),
+                FilledButton.icon(
+                  onPressed: _selectedAssetIds.isEmpty
+                      ? null
+                      : () => _bulkUpdateAssetFlags(archived: true),
+                  icon: const Icon(Icons.archive_outlined),
+                  label: const Text('Archive'),
+                ),
+                FilledButton.icon(
+                  onPressed: _selectedAssetIds.isEmpty
+                      ? null
+                      : _bulkAddSelectedToAlbum,
+                  icon: const Icon(Icons.photo_album_outlined),
+                  label: const Text('Add to album'),
+                ),
+              ],
             ),
           ),
           const SizedBox(height: 16),
         ],
         if (visibleAssetCount < totalAssetCount) ...[
-          Card(
-            child: Padding(
-              padding: const EdgeInsets.all(16),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
+          AppSurface(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  'Showing $visibleAssetCount of $totalAssetCount assets.',
+                  style: Theme.of(context).textTheme.titleMedium,
+                ),
+                const SizedBox(height: 6),
+                Text(
+                  'Gallery pages are loaded locally in batches so large libraries open quickly.',
+                  style: Theme.of(context).textTheme.bodyMedium,
+                ),
+                if (_loadMoreError != null) ...[
+                  const SizedBox(height: 8),
                   Text(
-                    'Showing $visibleAssetCount of $totalAssetCount assets.',
-                    style: Theme.of(context).textTheme.titleMedium,
-                  ),
-                  const SizedBox(height: 6),
-                  Text(
-                    'Timeline pages are loaded locally in batches so large libraries open quickly.',
-                    style: Theme.of(context).textTheme.bodyMedium,
-                  ),
-                  if (_loadMoreError != null) ...[
-                    const SizedBox(height: 8),
-                    Text(
-                      _loadMoreError!,
-                      style: TextStyle(
-                        color: Theme.of(context).colorScheme.error,
-                      ),
+                    _loadMoreError!,
+                    style: TextStyle(
+                      color: Theme.of(context).colorScheme.error,
                     ),
-                  ],
-                  const SizedBox(height: 12),
-                  FilledButton.icon(
-                    onPressed: _timeline.nextCursor == null || _loadingMore
-                        ? null
-                        : _loadMore,
-                    icon: _loadingMore
-                        ? const SizedBox.square(
-                            dimension: 16,
-                            child: CircularProgressIndicator(strokeWidth: 2),
-                          )
-                        : const Icon(Icons.expand_more),
-                    label: Text(_loadingMore ? 'Loading...' : 'Load more'),
                   ),
                 ],
-              ),
+                const SizedBox(height: 12),
+                FilledButton.icon(
+                  onPressed: _timeline.nextCursor == null || _loadingMore
+                      ? null
+                      : _loadMore,
+                  icon: _loadingMore
+                      ? const SizedBox.square(
+                          dimension: 16,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
+                      : const Icon(Icons.expand_more),
+                  label: Text(_loadingMore ? 'Loading...' : 'Load more'),
+                ),
+              ],
             ),
           ),
           const SizedBox(height: 16),
@@ -995,29 +876,4 @@ class _AlbumAssignment {
 
   final String? albumId;
   final String? createTitle;
-}
-
-class _DetailRow extends StatelessWidget {
-  const _DetailRow({
-    required this.label,
-    required this.value,
-  });
-
-  final String label;
-  final String value;
-
-  @override
-  Widget build(BuildContext context) {
-    return Padding(
-      padding: const EdgeInsets.only(bottom: 10),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Text(label, style: Theme.of(context).textTheme.labelLarge),
-          const SizedBox(height: 2),
-          SelectableText(value),
-        ],
-      ),
-    );
-  }
 }

@@ -5,8 +5,9 @@ import 'package:private_gallery_app/src/models/gallery_models.dart';
 import 'package:private_gallery_app/src/repositories/gallery_repository.dart';
 
 void main() {
-  testWidgets('requires move confirmation before committing',
-      (WidgetTester tester) async {
+  testWidgets('requires move confirmation before committing', (
+    WidgetTester tester,
+  ) async {
     tester.view.physicalSize = const Size(1200, 1800);
     tester.view.devicePixelRatio = 1;
     addTearDown(() {
@@ -70,8 +71,9 @@ void main() {
     expect(find.textContaining('1 imported'), findsOneWidget);
   });
 
-  testWidgets('organized archive preset indexes photos by reference',
-      (WidgetTester tester) async {
+  testWidgets('organized archive preset indexes photos by reference', (
+    WidgetTester tester,
+  ) async {
     tester.view.physicalSize = const Size(1200, 1800);
     tester.view.devicePixelRatio = 1;
     addTearDown(() {
@@ -99,13 +101,16 @@ void main() {
 
     await tester.tap(find.text('Index organized photos'));
     await tester.pumpAndSettle();
-    await tester
-        .ensureVisible(find.widgetWithText(FilledButton, 'Scan source'));
+    await tester.ensureVisible(
+      find.widgetWithText(FilledButton, 'Scan source'),
+    );
     await tester.tap(find.widgetWithText(FilledButton, 'Scan source'));
     await tester.pumpAndSettle();
 
-    expect(repository.scanRequests.single.sourcePath,
-        '/mnt/windows/transfer/Ok/Photos/Unfiltered');
+    expect(
+      repository.scanRequests.single.sourcePath,
+      '/mnt/windows/transfer/Ok/Photos/Unfiltered',
+    );
     expect(repository.scanRequests.single.importMode, ImportMode.reference);
     expect(repository.scanRequests.single.addAsWatchFolder, isTrue);
     expect(repository.scanRequests.single.placeHint, 'Local organized photos');
@@ -297,7 +302,7 @@ class _FakeGalleryRepository implements GalleryRepository {
   }
 
   @override
-  Future<SearchResponse> search(String query) {
+  Future<SearchResponse> search(SearchQuery query) {
     throw UnimplementedError();
   }
 
@@ -457,8 +462,18 @@ class _FakeGalleryRepository implements GalleryRepository {
 
   @override
   Future<Vault> createVault({
+    String? id,
     required String name,
     StoragePolicy? storagePolicy,
+  }) {
+    throw UnimplementedError();
+  }
+
+  @override
+  Future<DevicePairing> createPairingSession({
+    required String deviceName,
+    required String platform,
+    String? vaultId,
   }) {
     throw UnimplementedError();
   }

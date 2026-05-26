@@ -474,6 +474,7 @@ fn audit_path(config: &AppConfig) -> PathBuf {
         .join("install_audit.json")
 }
 
+#[allow(clippy::too_many_arguments)]
 fn append_audit(
     config: &AppConfig,
     model_id: &str,

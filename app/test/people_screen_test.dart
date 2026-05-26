@@ -4,8 +4,9 @@ import 'package:private_gallery_app/src/features/people/people_screen.dart';
 import 'package:private_gallery_app/src/models/gallery_models.dart';
 
 void main() {
-  testWidgets('shows face indexing gate and calls index action',
-      (WidgetTester tester) async {
+  testWidgets('shows face indexing gate and calls index action', (
+    WidgetTester tester,
+  ) async {
     var indexCalls = 0;
     var resetCalls = 0;
     var createCalls = 0;
@@ -50,8 +51,8 @@ void main() {
             onHidePerson: (_, __) async {},
             onRejectPersonMatch: (_) async {},
             onMergePerson: (_, __) async {},
-            onSplitPerson: (_,
-                {required faceTemplateIds, newDisplayName}) async {},
+            onSplitPerson:
+                (_, {required faceTemplateIds, newDisplayName}) async {},
           ),
         ),
       ),
@@ -62,7 +63,10 @@ void main() {
 
     await tester.tap(find.text('Check face indexing gate'));
     await tester.pumpAndSettle();
-    await tester.tap(find.text('Reset people data'));
+    await tester.tap(find.widgetWithText(OutlinedButton, 'Reset people data'));
+    await tester.pumpAndSettle();
+    expect(resetCalls, 0);
+    await tester.tap(find.widgetWithText(FilledButton, 'Reset people data'));
     await tester.pumpAndSettle();
 
     expect(indexCalls, 1);
@@ -70,9 +74,11 @@ void main() {
     expect(createCalls, 0);
   });
 
-  testWidgets('creates a manual person without face indexing',
-      (WidgetTester tester) async {
+  testWidgets('creates a manual person without face indexing', (
+    WidgetTester tester,
+  ) async {
     final createdNames = <String>[];
+    var changedCalls = 0;
 
     await tester.pumpWidget(
       MaterialApp(
@@ -90,13 +96,15 @@ void main() {
             onFetchPersonAssets: (_) async => const [],
             onRemovePersonAssets: (_, {required List<String> assetIds}) async =>
                 _person(),
-            onPeopleChanged: () async {},
+            onPeopleChanged: () async {
+              changedCalls += 1;
+            },
             onRenamePerson: (_, __) async {},
             onHidePerson: (_, __) async {},
             onRejectPersonMatch: (_) async {},
             onMergePerson: (_, __) async {},
-            onSplitPerson: (_,
-                {required faceTemplateIds, newDisplayName}) async {},
+            onSplitPerson:
+                (_, {required faceTemplateIds, newDisplayName}) async {},
           ),
         ),
       ),
@@ -112,6 +120,7 @@ void main() {
     await tester.pumpAndSettle();
 
     expect(createdNames, ['Mom']);
+    expect(changedCalls, 1);
   });
 
   testWidgets('opens assigned person assets', (WidgetTester tester) async {
@@ -122,7 +131,7 @@ void main() {
         home: Scaffold(
           body: PeopleScreen(
             people: [
-              _person(assetIds: const ['asset-1'])
+              _person(assetIds: const ['asset-1']),
             ],
             models: const [],
             libraryRoot: '/tmp/library',
@@ -141,8 +150,8 @@ void main() {
             onHidePerson: (_, __) async {},
             onRejectPersonMatch: (_) async {},
             onMergePerson: (_, __) async {},
-            onSplitPerson: (_,
-                {required faceTemplateIds, newDisplayName}) async {},
+            onSplitPerson:
+                (_, {required faceTemplateIds, newDisplayName}) async {},
           ),
         ),
       ),
@@ -154,6 +163,57 @@ void main() {
     expect(fetchCalls, 1);
     expect(find.text('a.jpg'), findsOneWidget);
     expect(find.textContaining('Select one to remove'), findsOneWidget);
+  });
+
+  testWidgets('renaming a person refreshes organization state', (
+    WidgetTester tester,
+  ) async {
+    String? renamed;
+    var changedCalls = 0;
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: PeopleScreen(
+            people: [
+              _person(assetIds: const ['asset-1']),
+            ],
+            models: const [],
+            libraryRoot: '/tmp/library',
+            privacyStatus: _privacyStatus(),
+            onIndexPeople: () async {},
+            onResetPeople: () async {},
+            onCreateManualPerson: (_) async {},
+            onFetchPersonAssets: (_) async => const [],
+            onRemovePersonAssets: (_, {required List<String> assetIds}) async =>
+                _person(),
+            onPeopleChanged: () async {
+              changedCalls += 1;
+            },
+            onRenamePerson: (id, name) async {
+              renamed = '$id:$name';
+            },
+            onHidePerson: (_, __) async {},
+            onRejectPersonMatch: (_) async {},
+            onMergePerson: (_, __) async {},
+            onSplitPerson:
+                (_, {required faceTemplateIds, newDisplayName}) async {},
+          ),
+        ),
+      ),
+    );
+
+    await tester.tap(find.byIcon(Icons.more_vert));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Rename'));
+    await tester.pumpAndSettle();
+    await tester.enterText(find.byType(TextField), 'Mom edited');
+    await tester.tap(find.widgetWithText(FilledButton, 'Save'));
+    await tester.pumpAndSettle();
+
+    expect(renamed, 'person-1:Mom edited');
+    expect(changedCalls, 1);
+    expect(find.text('Person renamed.'), findsOneWidget);
   });
 }
 

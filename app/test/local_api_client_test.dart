@@ -33,10 +33,7 @@ void main() {
       heavyReadTimeout: const Duration(milliseconds: 100),
     );
 
-    expect(
-      client.fetchHealth(),
-      throwsA(isA<SocketException>()),
-    );
+    expect(client.fetchHealth(), throwsA(isA<SocketException>()));
   });
 
   test('uses explicit job detail, log, cancel, and retry endpoints', () async {
@@ -129,10 +126,10 @@ void main() {
       favorite: true,
       archived: true,
     );
-    final bulkUpdated = await client.updateAssetsFlags(
-      const ['asset-1', 'asset-2'],
-      favorite: true,
-    );
+    final bulkUpdated = await client.updateAssetsFlags(const [
+      'asset-1',
+      'asset-2',
+    ], favorite: true);
     final favorites = await client.fetchFavoriteAssets();
     final archived = await client.fetchArchivedAssets();
 
@@ -190,11 +187,19 @@ void main() {
       pauseOnLowBattery: true,
     );
 
-    final vault =
-        await client.createVault(name: 'Family', storagePolicy: policy);
+    final vault = await client.createVault(
+      id: 'cloud-group-id',
+      name: 'Family',
+      storagePolicy: policy,
+    );
     final vaults = await client.fetchVaults();
     final status = await client.fetchVaultStatus('vault-1');
     final updated = await client.updateVaultStoragePolicy('vault-1', policy);
+    final pairing = await client.createPairingSession(
+      deviceName: 'Moto G',
+      platform: 'android',
+      vaultId: 'vault-1',
+    );
     final device = await client.enrollDevice(
       displayName: 'NAS',
       platform: 'linux',
@@ -221,6 +226,7 @@ void main() {
     expect(vaults.single.id, 'vault-1');
     expect(status.underReplicatedBlobs, 1);
     expect(updated.storagePolicy.minReplicas, 2);
+    expect(pairing.vaultId, 'vault-1');
     expect(device.trustLevel, DeviceTrustLevel.storageOnly);
     expect(devices, hasLength(2));
     expect(plan.transfers.single.status, SyncTransferStatus.pending);
@@ -252,6 +258,12 @@ void main() {
     final session = await client.fetchMobileSession(
       bearerToken: paired.bearerToken,
     );
+    final sessions = await client.fetchMobileSessions(
+      bearerToken: paired.bearerToken,
+    );
+    final refreshed = await client.refreshMobileSession(
+      bearerToken: paired.bearerToken,
+    );
     final reserved = await client.reserveMobileUpload(
       bearerToken: paired.bearerToken,
       originalFilename: 'photo.jpg',
@@ -265,29 +277,194 @@ void main() {
       uploadId: reserved.id,
       bytes: const [1, 2, 3],
     );
+    final uploadStatus = await client.fetchMobileUpload(
+      bearerToken: paired.bearerToken,
+      uploadId: reserved.id,
+    );
+    final canceledUpload = await client.cancelMobileUpload(
+      bearerToken: paired.bearerToken,
+      uploadId: reserved.id,
+    );
+    final chunked = await client.uploadMobileOriginalChunk(
+      bearerToken: paired.bearerToken,
+      uploadId: reserved.id,
+      offset: 0,
+      bytes: const [1, 2],
+    );
+    final chunkedComplete = await client.completeMobileUpload(
+      bearerToken: paired.bearerToken,
+      uploadId: reserved.id,
+    );
+    final tempDir = await Directory.systemTemp.createTemp('pg-mobile-client-');
+    addTearDown(() => tempDir.delete(recursive: true));
+    final sourceFile = File('${tempDir.path}/chunked.jpg');
+    await sourceFile.writeAsBytes(const [1, 2, 3], flush: true);
+    final fileCompleted = await client.uploadMobileOriginalFile(
+      bearerToken: paired.bearerToken,
+      uploadId: reserved.id,
+      file: sourceFile,
+      chunkSize: 2,
+    );
     final assets = await client.fetchMobileAssets(
       bearerToken: paired.bearerToken,
+    );
+    final workspace = await client.fetchMobileWorkspace(
+      bearerToken: paired.bearerToken,
+    );
+    final search = await client.searchMobile(
+      bearerToken: paired.bearerToken,
+      query: const SearchQuery(text: 'photo', limit: 25),
+    );
+    final availability = await client.fetchMobileAssetAvailability(
+      bearerToken: paired.bearerToken,
+      assetId: assets.single.assetId,
+    );
+    final flagged = await client.updateMobileAssetFlags(
+      bearerToken: paired.bearerToken,
+      assetId: assets.single.assetId,
+      favorite: true,
     );
     final original = await client.downloadMobileOriginal(
       bearerToken: paired.bearerToken,
       assetId: assets.single.assetId,
     );
+    final streamedOriginal = await client.downloadMobileOriginalToFile(
+      bearerToken: paired.bearerToken,
+      assetId: assets.single.assetId,
+      destination: File('${tempDir.path}/downloaded.jpg'),
+    );
+    final preview = await client.downloadMobilePreview(
+      bearerToken: paired.bearerToken,
+      assetId: assets.single.assetId,
+    );
+    final revokedDeviceSessions = await client.revokeMobileDeviceSessions(
+      bearerToken: paired.bearerToken,
+      deviceId: session.deviceId,
+    );
+    final revokedCurrent = await client.revokeCurrentMobileSession(
+      bearerToken: paired.bearerToken,
+    );
 
     expect(paired.device.displayName, 'Moto G');
     expect(session.deviceId, 'device-mobile');
+    expect(sessions.single.deviceId, 'device-mobile');
+    expect(refreshed.bearerToken, 'mobile-token-rotated');
+    expect(refreshed.previousSessionId, 'session-1');
     expect(reserved.status, MobileUploadStatus.pending);
     expect(completed.status, MobileUploadStatus.completed);
     expect(completed.assetId, 'asset-1');
+    expect(uploadStatus.status, MobileUploadStatus.pending);
+    expect(canceledUpload.status, MobileUploadStatus.canceled);
+    expect(chunked.status, MobileUploadStatus.running);
+    expect(chunked.bytesReceived, 2);
+    expect(chunkedComplete.status, MobileUploadStatus.completed);
+    expect(fileCompleted.status, MobileUploadStatus.completed);
     expect(assets.single.originalFilename, 'photo.jpg');
+    expect(workspace.timeline.totalAssets, 1);
+    expect(workspace.vaultStatus.vault.name, 'Personal vault');
+    expect(workspace.capabilities.canSearch, isTrue);
+    expect(search.assets.single.id, 'asset-1');
+    expect(availability.state, AssetAvailabilityState.underReplicated);
+    expect(flagged.favorite, isTrue);
     expect(original, [1, 2, 3]);
+    expect(await streamedOriginal.readAsBytes(), [1, 2, 3]);
+    expect(preview, [4, 5, 6]);
+    expect(revokedDeviceSessions.single.revokedAt, isNotNull);
+    expect(revokedCurrent.revokedAt, isNotNull);
+  });
+
+  test(
+    'resumes mobile original downloads from an existing partial file',
+    () async {
+      final httpClient = _ResumeDownloadClient();
+      final client = LocalApiClient(
+        httpClient: httpClient,
+        baseUri: Uri.parse('http://127.0.0.1:4821'),
+      );
+      final tempDir = await Directory.systemTemp.createTemp(
+        'pg-mobile-resume-',
+      );
+      addTearDown(() => tempDir.delete(recursive: true));
+      final destination = File('${tempDir.path}/original.jpg');
+      await File('${destination.path}.part').writeAsBytes(const [1, 2]);
+
+      final file = await client.downloadMobileOriginalToFile(
+        bearerToken: 'mobile-token',
+        assetId: 'asset-1',
+        destination: destination,
+      );
+
+      expect(await file.readAsBytes(), [1, 2, 3, 4]);
+      expect(httpClient.ranges, ['bytes=2-4194305']);
+      expect(await File('${destination.path}.part').exists(), isFalse);
+    },
+  );
+
+  test('cancels resumable mobile file uploads between chunks', () async {
+    final httpClient = _CancelUploadClient();
+    final client = LocalApiClient(
+      httpClient: httpClient,
+      baseUri: Uri.parse('http://127.0.0.1:4821'),
+    );
+    final tempDir = await Directory.systemTemp.createTemp('pg-mobile-cancel-');
+    addTearDown(() => tempDir.delete(recursive: true));
+    final sourceFile = File('${tempDir.path}/cancel.jpg');
+    await sourceFile.writeAsBytes(const [1, 2, 3, 4], flush: true);
+    final progress = <MobileUpload>[];
+
+    final result = await client.uploadMobileOriginalFile(
+      bearerToken: 'mobile-token',
+      uploadId: 'upload-1',
+      file: sourceFile,
+      chunkSize: 2,
+      onProgress: progress.add,
+      shouldCancel: (upload) => upload.bytesReceived >= 2,
+    );
+
+    expect(result.status, MobileUploadStatus.canceled);
+    expect(result.bytesReceived, 2);
+    expect(httpClient.chunkOffsets, [0]);
+    expect(httpClient.cancelRequests, 1);
+    expect(progress.map((upload) => upload.status), [
+      MobileUploadStatus.pending,
+      MobileUploadStatus.running,
+      MobileUploadStatus.canceled,
+    ]);
+  });
+
+  test('treats in-flight chunk rejection as canceled when requested', () async {
+    final httpClient = _RejectingCancelUploadClient();
+    final client = LocalApiClient(
+      httpClient: httpClient,
+      baseUri: Uri.parse('http://127.0.0.1:4821'),
+    );
+    final tempDir = await Directory.systemTemp.createTemp(
+      'pg-mobile-cancel-race-',
+    );
+    addTearDown(() => tempDir.delete(recursive: true));
+    final sourceFile = File('${tempDir.path}/cancel-race.jpg');
+    await sourceFile.writeAsBytes(const [1, 2], flush: true);
+    var cancelChecks = 0;
+
+    final result = await client.uploadMobileOriginalFile(
+      bearerToken: 'mobile-token',
+      uploadId: 'upload-1',
+      file: sourceFile,
+      chunkSize: 2,
+      shouldCancel: (_) {
+        cancelChecks += 1;
+        return cancelChecks >= 3;
+      },
+    );
+
+    expect(result.status, MobileUploadStatus.canceled);
+    expect(httpClient.rejectedChunks, 1);
+    expect(httpClient.cancelRequests, 1);
   });
 }
 
 class _DelayedJsonClient extends http.BaseClient {
-  _DelayedJsonClient({
-    required this.delay,
-    required this.bodyForPath,
-  });
+  _DelayedJsonClient({required this.delay, required this.bodyForPath});
 
   final Duration delay;
   final Map<String, Object?> Function(String path) bodyForPath;
@@ -311,22 +488,24 @@ class _JobJsonClient extends http.BaseClient {
     final body = switch ((request.method, path)) {
       ('GET', '/jobs/job-1') => _jobJson(status: 'failed'),
       ('GET', '/jobs/job-1/logs') => [
-          {
-            'id': 'log-1',
-            'job_id': 'job-1',
-            'level': 'info',
-            'message': 'job started',
-            'created_at': '2026-05-13T06:00:00Z',
-          }
-        ],
+        {
+          'id': 'log-1',
+          'job_id': 'job-1',
+          'level': 'info',
+          'message': 'job started',
+          'created_at': '2026-05-13T06:00:00Z',
+        },
+      ],
       ('POST', '/jobs/job-1/cancel') => _jobJson(status: 'canceled'),
       ('POST', '/jobs/job-1/retry') => _jobJson(
-          id: 'job-2',
-          status: 'queued',
-          retryOfJobId: 'job-1',
-        ),
-      ('POST', '/scenes/rebuild') =>
-        _jobJson(status: 'completed', kind: 'scene_index'),
+        id: 'job-2',
+        status: 'queued',
+        retryOfJobId: 'job-1',
+      ),
+      ('POST', '/scenes/rebuild') => _jobJson(
+        status: 'completed',
+        kind: 'scene_index',
+      ),
       _ => throw StateError('Unexpected ${request.method} $path'),
     };
     final bytes = utf8.encode(jsonEncode(body));
@@ -380,9 +559,9 @@ class _PeopleJsonClient extends http.BaseClient {
       ('POST', '/people/manual') => _personJson(['asset-1']),
       ('GET', '/people/person-1/assets') => [_assetJson()],
       ('POST', '/people/person-1/assets') => _personJson([
-          'asset-1',
-          'asset-2',
-        ]),
+        'asset-1',
+        'asset-2',
+      ]),
       ('POST', '/people/person-1/assets/remove') => _personJson(['asset-2']),
       _ => throw StateError('Unexpected ${request.method} $path'),
     };
@@ -451,19 +630,15 @@ class _AlbumJsonClient extends http.BaseClient {
     final path = request.url.path;
     final body = switch ((request.method, path)) {
       ('GET', '/albums') => [
-          _albumJson(['asset-1'])
-        ],
+        _albumJson(['asset-1']),
+      ],
       ('POST', '/albums') => _albumJson(['asset-1']),
       ('GET', '/albums/album-1/assets') => [_assetJson()],
-      ('POST', '/albums/album-1/assets') => _albumJson([
-          'asset-1',
-          'asset-2',
-        ]),
+      ('POST', '/albums/album-1/assets') => _albumJson(['asset-1', 'asset-2']),
       ('POST', '/albums/album-1/assets/remove') => _albumJson(['asset-2']),
-      ('POST', '/albums/album-1/rename') => _albumJson(
-          ['asset-1'],
-          title: 'Family trip',
-        ),
+      ('POST', '/albums/album-1/rename') => _albumJson([
+        'asset-1',
+      ], title: 'Family trip'),
       ('DELETE', '/albums/album-1') => null,
       _ => throw StateError('Unexpected ${request.method} $path'),
     };
@@ -485,18 +660,19 @@ class _VaultSyncJsonClient extends http.BaseClient {
       ('POST', '/vaults') => _vaultJson(name: 'Family'),
       ('GET', '/vaults/vault-1/status') => _vaultStatusJson(),
       ('POST', '/vaults/vault-1/storage-policy') => _vaultJson(),
+      ('POST', '/pairing/sessions') => _devicePairingJson(),
       ('GET', '/devices') => [_deviceJson(), _deviceJson(id: 'device-2')],
       ('POST', '/devices/enroll') => _deviceJson(
-          id: 'device-2',
-          displayName: 'NAS',
-          trustLevel: 'storage_only',
-        ),
+        id: 'device-2',
+        displayName: 'NAS',
+        trustLevel: 'storage_only',
+      ),
       ('POST', '/devices/device-2/revoke') => _deviceJson(
-          id: 'device-2',
-          displayName: 'NAS',
-          trustLevel: 'storage_only',
-          revoked: true,
-        ),
+        id: 'device-2',
+        displayName: 'NAS',
+        trustLevel: 'storage_only',
+        revoked: true,
+      ),
       ('GET', '/sync/plan') => _syncPlanJson(),
       ('POST', '/sync/run') => _syncPlanJson(),
       ('GET', '/sync/transfers') => [_transferJson()],
@@ -505,16 +681,18 @@ class _VaultSyncJsonClient extends http.BaseClient {
       ('POST', '/sync/network/stop') => _networkStatusJson(),
       ('GET', '/sync/network/local-endpoint') => _localEndpointJson(),
       ('POST', '/sync/transfers/transfer-1/retry') => _transferJson(),
-      ('POST', '/sync/transfers/transfer-1/cancel') =>
-        _transferJson(status: 'aborted'),
+      ('POST', '/sync/transfers/transfer-1/cancel') => _transferJson(
+        status: 'aborted',
+      ),
       ('GET', '/assets/asset-1/availability') => _availabilityJson(),
-      ('POST', '/assets/asset-1/pin-local') =>
-        _availabilityJson(state: 'transfer_pending'),
+      ('POST', '/assets/asset-1/pin-local') => _availabilityJson(
+        state: 'transfer_pending',
+      ),
       ('POST', '/assets/asset-1/evict-local') => _availabilityJson(
-          state: 'remote_available',
-          localReplica: false,
-          replicaCount: 2,
-        ),
+        state: 'remote_available',
+        localReplica: false,
+        replicaCount: 2,
+      ),
       _ => throw StateError('Unexpected ${request.method} $path'),
     };
 
@@ -526,6 +704,19 @@ class _VaultSyncJsonClient extends http.BaseClient {
       final payload = jsonDecode(streamed.body) as Map<String, Object?>;
       expect(payload['vault_id'], 'vault-1');
       expect(payload['dry_run'], isFalse);
+    }
+    if (request.method == 'POST' && path == '/vaults') {
+      final streamed = request as http.Request;
+      final payload = jsonDecode(streamed.body) as Map<String, Object?>;
+      expect(payload['id'], 'cloud-group-id');
+      expect(payload['name'], 'Family');
+    }
+    if (request.method == 'POST' && path == '/pairing/sessions') {
+      final streamed = request as http.Request;
+      final payload = jsonDecode(streamed.body) as Map<String, Object?>;
+      expect(payload['device_name'], 'Moto G');
+      expect(payload['platform'], 'android');
+      expect(payload['vault_id'], 'vault-1');
     }
 
     final bytes = utf8.encode(jsonEncode(body));
@@ -545,20 +736,86 @@ class _MobileSyncJsonClient extends http.BaseClient {
       expect(request.headers['authorization'], 'Bearer mobile-token');
     }
     if (request.method == 'GET' && path == '/mobile/assets/asset-1/original') {
+      final range = request.headers['range'];
+      if (range != null) {
+        expect(range, 'bytes=0-4194303');
+        return http.StreamedResponse(
+          Stream<List<int>>.value(const [1, 2, 3]),
+          HttpStatus.partialContent,
+          headers: const {
+            'content-type': 'image/jpeg',
+            'content-range': 'bytes 0-2/3',
+            'content-length': '3',
+          },
+          contentLength: 3,
+        );
+      }
       return http.StreamedResponse(
         Stream<List<int>>.value(const [1, 2, 3]),
         HttpStatus.ok,
+        headers: const {'content-type': 'image/jpeg', 'content-length': '3'},
+        contentLength: 3,
+      );
+    }
+    if (request.method == 'GET' && path == '/mobile/assets/asset-1/preview') {
+      return http.StreamedResponse(
+        Stream<List<int>>.value(const [4, 5, 6]),
+        HttpStatus.ok,
         headers: const {'content-type': 'image/jpeg'},
+      );
+    }
+    if (request.method == 'PUT' &&
+        path.startsWith('/mobile/uploads/upload-1/chunks/')) {
+      final streamed = request as http.Request;
+      final offset = int.parse(
+        path.substring('/mobile/uploads/upload-1/chunks/'.length),
+      );
+      return http.StreamedResponse(
+        Stream<List<int>>.value(
+          utf8.encode(
+            jsonEncode(
+              _mobileUploadJson(
+                status: 'running',
+                bytesReceived: offset + streamed.bodyBytes.length,
+              ),
+            ),
+          ),
+        ),
+        HttpStatus.ok,
+        headers: const {'content-type': 'application/json'},
       );
     }
 
     final body = switch ((request.method, path)) {
       ('POST', '/mobile/pair') => _mobilePairJson(),
       ('GET', '/mobile/session') => _mobileSessionJson(),
+      ('GET', '/mobile/sessions') => [_mobileSessionJson()],
+      ('POST', '/mobile/session/refresh') => _mobileSessionRefreshJson(),
+      ('POST', '/mobile/session/revoke') => _mobileSessionJson(revoked: true),
+      ('POST', '/mobile/devices/device-mobile/sessions/revoke') => [
+        _mobileSessionJson(revoked: true),
+      ],
+      ('GET', '/mobile/workspace') => _mobileWorkspaceJson(),
+      ('GET', '/mobile/search') => _mobileSearchJson(),
       ('POST', '/mobile/uploads') => _mobileUploadJson(status: 'pending'),
-      ('PUT', '/mobile/uploads/upload-1') =>
-        _mobileUploadJson(status: 'completed', assetId: 'asset-1'),
+      ('GET', '/mobile/uploads/upload-1') => _mobileUploadJson(
+        status: 'pending',
+      ),
+      ('DELETE', '/mobile/uploads/upload-1') => _mobileUploadJson(
+        status: 'canceled',
+      ),
+      ('PUT', '/mobile/uploads/upload-1') => _mobileUploadJson(
+        status: 'completed',
+        assetId: 'asset-1',
+      ),
+      ('POST', '/mobile/uploads/upload-1/complete') => _mobileUploadJson(
+        status: 'completed',
+        assetId: 'asset-1',
+      ),
       ('GET', '/mobile/assets') => [_mobileAssetJson()],
+      ('GET', '/mobile/assets/asset-1/availability') => _availabilityJson(),
+      ('POST', '/mobile/assets/asset-1/flags') =>
+        _assetJson()..['favorite'] = true,
       _ => throw StateError('Unexpected ${request.method} $path'),
     };
 
@@ -568,9 +825,18 @@ class _MobileSyncJsonClient extends http.BaseClient {
       expect(payload['original_filename'], 'photo.jpg');
       expect(payload['bytes'], 3);
     }
-    if (request.method == 'PUT') {
+    if (request.method == 'PUT' && path == '/mobile/uploads/upload-1') {
       final streamed = request as http.Request;
       expect(streamed.bodyBytes, [1, 2, 3]);
+    }
+    if (request.method == 'GET' && path == '/mobile/search') {
+      expect(request.url.queryParameters['text'], 'photo');
+      expect(request.url.queryParameters['limit'], '25');
+    }
+    if (request.method == 'POST' && path == '/mobile/assets/asset-1/flags') {
+      final streamed = request as http.Request;
+      final payload = jsonDecode(streamed.body) as Map<String, Object?>;
+      expect(payload['favorite'], isTrue);
     }
 
     return http.StreamedResponse(
@@ -579,6 +845,116 @@ class _MobileSyncJsonClient extends http.BaseClient {
       headers: const {'content-type': 'application/json'},
     );
   }
+}
+
+class _ResumeDownloadClient extends http.BaseClient {
+  final ranges = <String>[];
+
+  @override
+  Future<http.StreamedResponse> send(http.BaseRequest request) async {
+    expect(request.method, 'GET');
+    expect(request.url.path, '/mobile/assets/asset-1/original');
+    expect(request.headers['authorization'], 'Bearer mobile-token');
+    ranges.add(request.headers['range'] ?? '');
+    return http.StreamedResponse(
+      Stream<List<int>>.value(const [3, 4]),
+      HttpStatus.partialContent,
+      headers: const {
+        'content-type': 'image/jpeg',
+        'content-range': 'bytes 2-3/4',
+        'content-length': '2',
+      },
+      contentLength: 2,
+    );
+  }
+}
+
+class _CancelUploadClient extends http.BaseClient {
+  final chunkOffsets = <int>[];
+  var bytesReceived = 0;
+  var cancelRequests = 0;
+
+  @override
+  Future<http.StreamedResponse> send(http.BaseRequest request) async {
+    expect(request.headers['authorization'], 'Bearer mobile-token');
+    final path = request.url.path;
+    if (request.method == 'GET' && path == '/mobile/uploads/upload-1') {
+      return _jsonResponse(
+        _mobileUploadJson(
+          status: 'pending',
+          bytesTotal: 4,
+          bytesReceived: bytesReceived,
+        ),
+      );
+    }
+    if (request.method == 'PUT' &&
+        path.startsWith('/mobile/uploads/upload-1/chunks/')) {
+      final streamed = request as http.Request;
+      final offset = int.parse(
+        path.substring('/mobile/uploads/upload-1/chunks/'.length),
+      );
+      chunkOffsets.add(offset);
+      bytesReceived = offset + streamed.bodyBytes.length;
+      return _jsonResponse(
+        _mobileUploadJson(
+          status: 'running',
+          bytesTotal: 4,
+          bytesReceived: bytesReceived,
+        ),
+      );
+    }
+    if (request.method == 'DELETE' && path == '/mobile/uploads/upload-1') {
+      cancelRequests += 1;
+      return _jsonResponse(
+        _mobileUploadJson(
+          status: 'canceled',
+          bytesTotal: 4,
+          bytesReceived: bytesReceived,
+        ),
+      );
+    }
+    throw StateError('Unexpected ${request.method} $path');
+  }
+}
+
+class _RejectingCancelUploadClient extends http.BaseClient {
+  var rejectedChunks = 0;
+  var cancelRequests = 0;
+
+  @override
+  Future<http.StreamedResponse> send(http.BaseRequest request) async {
+    expect(request.headers['authorization'], 'Bearer mobile-token');
+    final path = request.url.path;
+    if (request.method == 'GET' && path == '/mobile/uploads/upload-1') {
+      return _jsonResponse(_mobileUploadJson(status: 'pending', bytesTotal: 2));
+    }
+    if (request.method == 'PUT' &&
+        path.startsWith('/mobile/uploads/upload-1/chunks/')) {
+      rejectedChunks += 1;
+      return http.StreamedResponse(
+        Stream<List<int>>.value(
+          utf8.encode('mobile upload is already canceled'),
+        ),
+        HttpStatus.conflict,
+        headers: const {'content-type': 'text/plain'},
+      );
+    }
+    if (request.method == 'DELETE' && path == '/mobile/uploads/upload-1') {
+      cancelRequests += 1;
+      return _jsonResponse(
+        _mobileUploadJson(status: 'canceled', bytesTotal: 2),
+      );
+    }
+    throw StateError('Unexpected ${request.method} $path');
+  }
+}
+
+http.StreamedResponse _jsonResponse(Object? body) {
+  return http.StreamedResponse(
+    Stream<List<int>>.value(utf8.encode(jsonEncode(body))),
+    HttpStatus.ok,
+    headers: const {'content-type': 'application/json'},
+  );
 }
 
 Map<String, Object?> _storagePolicyJson() {
@@ -633,7 +1009,7 @@ Map<String, Object?> _deviceJson({
   };
 }
 
-Map<String, Object?> _mobileSessionJson() {
+Map<String, Object?> _mobileSessionJson({bool revoked = false}) {
   return {
     'id': 'session-1',
     'device_id': 'device-mobile',
@@ -641,27 +1017,48 @@ Map<String, Object?> _mobileSessionJson() {
     'display_name': 'Moto G',
     'platform': 'android',
     'created_at': '2026-05-13T06:00:00Z',
-    'expires_at': '2027-05-13T06:00:00Z',
+    'expires_at': '2026-06-12T06:00:00Z',
     'last_seen_at': '2026-05-13T06:01:00Z',
-    'revoked_at': null,
+    'revoked_at': revoked ? '2026-05-13T06:05:00Z' : null,
   };
 }
 
 Map<String, Object?> _mobilePairJson() {
   return {
     'session': _mobileSessionJson(),
-    'device': _deviceJson(
-      id: 'device-mobile',
-      displayName: 'Moto G',
-    ),
+    'device': _deviceJson(id: 'device-mobile', displayName: 'Moto G'),
     'bearer_token': 'mobile-token',
     'detail': 'mobile device paired',
+  };
+}
+
+Map<String, Object?> _mobileSessionRefreshJson() {
+  return {
+    'session': _mobileSessionJson()..['id'] = 'session-2',
+    'bearer_token': 'mobile-token-rotated',
+    'previous_session_id': 'session-1',
+    'detail': 'mobile session refreshed',
+  };
+}
+
+Map<String, Object?> _devicePairingJson() {
+  return {
+    'id': 'pairing-1',
+    'device_name': 'Moto G',
+    'platform': 'android',
+    'vault_id': 'vault-1',
+    'pairing_token': 'pair-token',
+    'created_at': '2026-05-13T06:00:00Z',
+    'expires_at': '2026-05-13T06:10:00Z',
+    'approved_at': null,
   };
 }
 
 Map<String, Object?> _mobileUploadJson({
   required String status,
   String? assetId,
+  int? bytesReceived,
+  int bytesTotal = 3,
 }) {
   return {
     'id': 'upload-1',
@@ -672,8 +1069,8 @@ Map<String, Object?> _mobileUploadJson({
     'original_filename': 'photo.jpg',
     'media_kind': 'photo',
     'mime_type': 'image/jpeg',
-    'bytes_total': 3,
-    'bytes_received': status == 'completed' ? 3 : 0,
+    'bytes_total': bytesTotal,
+    'bytes_received': bytesReceived ?? (status == 'completed' ? bytesTotal : 0),
     'content_hash': 'hash-a',
     'captured_at': '2026-05-13T06:00:00Z',
     'place_hint': null,
@@ -697,6 +1094,71 @@ Map<String, Object?> _mobileAssetJson() {
   };
 }
 
+Map<String, Object?> _mobileWorkspaceJson() {
+  return {
+    'session': _mobileSessionJson(),
+    'sessions': [_mobileSessionJson()],
+    'timeline': {
+      'buckets': [
+        {
+          'label': 'May 2026',
+          'asset_ids': ['asset-1'],
+          'assets': [_assetJson()],
+          'total_assets': 1,
+        },
+      ],
+      'next_cursor': null,
+      'total_assets': 1,
+      'returned_assets': 1,
+    },
+    'albums': [
+      _albumJson(['asset-1']),
+    ],
+    'people': [
+      _personJson(['asset-1']),
+    ],
+    'places': [
+      _placeJson(['asset-1']),
+    ],
+    'events': [
+      _eventJson(['asset-1']),
+    ],
+    'jobs': [_jobJson(status: 'completed')],
+    'vault_status': _vaultStatusJson(),
+    'devices': [
+      _deviceJson(),
+      _deviceJson(id: 'device-mobile', displayName: 'Moto G'),
+    ],
+    'sync_network': _networkStatusJson(),
+    'capabilities': {
+      'can_browse_library': true,
+      'can_search': true,
+      'can_upload_camera_roll': true,
+      'can_download_originals': true,
+      'can_manage_storage': false,
+      'can_import_desktop_folders': false,
+      'can_run_models': false,
+      'role_detail': 'mobile contributor',
+    },
+  };
+}
+
+Map<String, Object?> _mobileSearchJson() {
+  return {
+    'query': {'text': 'photo', 'include_archived': false, 'limit': 25},
+    'assets': [_assetJson()],
+    'people': [
+      _personJson(['asset-1']),
+    ],
+    'places': [
+      _placeJson(['asset-1']),
+    ],
+    'events': [
+      _eventJson(['asset-1']),
+    ],
+  };
+}
+
 Map<String, Object?> _vaultStatusJson() {
   return {
     'vault': _vaultJson(),
@@ -710,7 +1172,7 @@ Map<String, Object?> _vaultStatusJson() {
         'display_name': 'Laptop',
         'added_at': '2026-05-13T06:00:00Z',
         'revoked_at': null,
-      }
+      },
     ],
     'devices': [_deviceJson()],
     'assets_total': 1,
@@ -889,6 +1351,41 @@ Map<String, Object?> _personJson(List<String> assetIds) {
     'representative_asset_id': assetIds.isEmpty ? null : assetIds.first,
     'hidden': false,
     'model_name': 'manual-person',
+    'model_version': 'v1',
+    'model_hash': null,
+    'created_at': '2026-05-13T06:00:00Z',
+    'rebuildable': true,
+  };
+}
+
+Map<String, Object?> _placeJson(List<String> assetIds) {
+  return {
+    'id': 'place-1',
+    'label': 'Home',
+    'country_code': null,
+    'region': null,
+    'asset_ids': assetIds,
+    'centroid_latitude': null,
+    'centroid_longitude': null,
+    'model_name': 'local-place-cluster',
+    'model_version': 'v1',
+    'model_hash': null,
+    'created_at': '2026-05-13T06:00:00Z',
+    'rebuildable': true,
+  };
+}
+
+Map<String, Object?> _eventJson(List<String> assetIds) {
+  return {
+    'id': 'event-1',
+    'title': 'May 2026',
+    'title_source': 'generated',
+    'asset_ids': assetIds,
+    'start_at': '2026-05-13T06:00:00Z',
+    'end_at': '2026-05-13T06:00:00Z',
+    'place_id': 'place-1',
+    'people_ids': ['person-1'],
+    'model_name': 'local-event-cluster',
     'model_version': 'v1',
     'model_hash': null,
     'created_at': '2026-05-13T06:00:00Z',

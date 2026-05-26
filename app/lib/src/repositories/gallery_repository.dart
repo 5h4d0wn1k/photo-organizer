@@ -33,8 +33,14 @@ abstract class GalleryRepository {
   Future<LibrarySettings> saveLibrarySettings(LibrarySettingsDraft draft);
   Future<List<Vault>> fetchVaults();
   Future<Vault> createVault({
+    String? id,
     required String name,
     StoragePolicy? storagePolicy,
+  });
+  Future<DevicePairing> createPairingSession({
+    required String deviceName,
+    required String platform,
+    String? vaultId,
   });
   Future<VaultStatus> fetchVaultStatus(String id);
   Future<Vault> updateVaultStoragePolicy(String id, StoragePolicy policy);
@@ -93,22 +99,13 @@ abstract class GalleryRepository {
   });
   Future<List<Asset>> fetchFavoriteAssets();
   Future<List<Asset>> fetchArchivedAssets();
-  Future<Album> createAlbum({
-    required String title,
-    List<String> assetIds,
-  });
+  Future<Album> createAlbum({required String title, List<String> assetIds});
   Future<List<Asset>> fetchAlbumAssets(String id);
-  Future<Album> addAlbumAssets(
-    String id, {
-    required List<String> assetIds,
-  });
-  Future<Album> removeAlbumAssets(
-    String id, {
-    required List<String> assetIds,
-  });
+  Future<Album> addAlbumAssets(String id, {required List<String> assetIds});
+  Future<Album> removeAlbumAssets(String id, {required List<String> assetIds});
   Future<Album> renameAlbum(String id, String title);
   Future<void> deleteAlbum(String id);
-  Future<SearchResponse> search(String query);
+  Future<SearchResponse> search(SearchQuery query);
   Future<SearchIndexStatus?> fetchSearchStatus();
   Future<JobRecord> rebuildOcr({int? limit});
   Future<JobRecord> rebuildScenes({int? limit});

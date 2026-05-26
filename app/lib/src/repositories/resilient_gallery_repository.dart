@@ -5,7 +5,7 @@ import 'local_gallery_repository.dart';
 
 class ResilientGalleryRepository implements GalleryRepository {
   ResilientGalleryRepository({LocalApiClient? apiClient})
-      : _delegate = LocalGalleryRepository(apiClient ?? LocalApiClient());
+    : _delegate = LocalGalleryRepository(apiClient ?? LocalApiClient());
 
   final LocalGalleryRepository _delegate;
 
@@ -26,10 +26,28 @@ class ResilientGalleryRepository implements GalleryRepository {
 
   @override
   Future<Vault> createVault({
+    String? id,
     required String name,
     StoragePolicy? storagePolicy,
   }) {
-    return _delegate.createVault(name: name, storagePolicy: storagePolicy);
+    return _delegate.createVault(
+      id: id,
+      name: name,
+      storagePolicy: storagePolicy,
+    );
+  }
+
+  @override
+  Future<DevicePairing> createPairingSession({
+    required String deviceName,
+    required String platform,
+    String? vaultId,
+  }) {
+    return _delegate.createPairingSession(
+      deviceName: deviceName,
+      platform: platform,
+      vaultId: vaultId,
+    );
   }
 
   @override
@@ -327,18 +345,12 @@ class ResilientGalleryRepository implements GalleryRepository {
   }
 
   @override
-  Future<Album> addAlbumAssets(
-    String id, {
-    required List<String> assetIds,
-  }) {
+  Future<Album> addAlbumAssets(String id, {required List<String> assetIds}) {
     return _delegate.addAlbumAssets(id, assetIds: assetIds);
   }
 
   @override
-  Future<Album> removeAlbumAssets(
-    String id, {
-    required List<String> assetIds,
-  }) {
+  Future<Album> removeAlbumAssets(String id, {required List<String> assetIds}) {
     return _delegate.removeAlbumAssets(id, assetIds: assetIds);
   }
 
@@ -353,7 +365,7 @@ class ResilientGalleryRepository implements GalleryRepository {
   }
 
   @override
-  Future<SearchResponse> search(String query) {
+  Future<SearchResponse> search(SearchQuery query) {
     return _delegate.search(query);
   }
 

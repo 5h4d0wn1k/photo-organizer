@@ -6,10 +6,8 @@ import '../services/local_daemon_launcher.dart';
 import 'gallery_repository.dart';
 
 class LocalGalleryRepository implements GalleryRepository {
-  LocalGalleryRepository(
-    this._apiClient, {
-    LocalDaemonLauncher? daemonLauncher,
-  }) : _daemonLauncher = daemonLauncher ?? const LocalDaemonLauncher();
+  LocalGalleryRepository(this._apiClient, {LocalDaemonLauncher? daemonLauncher})
+    : _daemonLauncher = daemonLauncher ?? const LocalDaemonLauncher();
 
   final LocalApiClient _apiClient;
   final LocalDaemonLauncher _daemonLauncher;
@@ -99,10 +97,28 @@ class LocalGalleryRepository implements GalleryRepository {
 
   @override
   Future<Vault> createVault({
+    String? id,
     required String name,
     StoragePolicy? storagePolicy,
   }) {
-    return _apiClient.createVault(name: name, storagePolicy: storagePolicy);
+    return _apiClient.createVault(
+      id: id,
+      name: name,
+      storagePolicy: storagePolicy,
+    );
+  }
+
+  @override
+  Future<DevicePairing> createPairingSession({
+    required String deviceName,
+    required String platform,
+    String? vaultId,
+  }) {
+    return _apiClient.createPairingSession(
+      deviceName: deviceName,
+      platform: platform,
+      vaultId: vaultId,
+    );
   }
 
   @override
@@ -400,18 +416,12 @@ class LocalGalleryRepository implements GalleryRepository {
   }
 
   @override
-  Future<Album> addAlbumAssets(
-    String id, {
-    required List<String> assetIds,
-  }) {
+  Future<Album> addAlbumAssets(String id, {required List<String> assetIds}) {
     return _apiClient.addAlbumAssets(id, assetIds: assetIds);
   }
 
   @override
-  Future<Album> removeAlbumAssets(
-    String id, {
-    required List<String> assetIds,
-  }) {
+  Future<Album> removeAlbumAssets(String id, {required List<String> assetIds}) {
     return _apiClient.removeAlbumAssets(id, assetIds: assetIds);
   }
 
@@ -426,8 +436,8 @@ class LocalGalleryRepository implements GalleryRepository {
   }
 
   @override
-  Future<SearchResponse> search(String query) {
-    return _apiClient.search(SearchQuery(text: query));
+  Future<SearchResponse> search(SearchQuery query) {
+    return _apiClient.search(query);
   }
 
   @override

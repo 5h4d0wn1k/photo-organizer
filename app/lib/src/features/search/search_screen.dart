@@ -6,10 +6,7 @@ import '../../widgets/asset_grid.dart';
 import '../../widgets/empty_state_panel.dart';
 
 class SearchScreen extends StatefulWidget {
-  const SearchScreen({
-    super.key,
-    required this.repository,
-  });
+  const SearchScreen({super.key, required this.repository});
 
   final GalleryRepository repository;
 
@@ -21,6 +18,11 @@ class _SearchScreenState extends State<SearchScreen> {
   static const int _safeOcrBatchLimit = 10;
 
   final TextEditingController _controller = TextEditingController();
+  final TextEditingController _personController = TextEditingController();
+  final TextEditingController _placeController = TextEditingController();
+  final TextEditingController _eventController = TextEditingController();
+  final TextEditingController _fromDateController = TextEditingController();
+  final TextEditingController _toDateController = TextEditingController();
   Future<SearchResponse>? _searchFuture;
   late Future<SearchIndexStatus?> _statusFuture;
   String? _submittedQuery;
@@ -30,6 +32,9 @@ class _SearchScreenState extends State<SearchScreen> {
   String? _sceneError;
   bool _ocrRunning = false;
   bool _sceneRunning = false;
+  bool _includeArchived = false;
+  bool _favoritesOnly = false;
+  String? _mediaKind;
 
   @override
   void initState() {
@@ -40,12 +45,36 @@ class _SearchScreenState extends State<SearchScreen> {
   @override
   void dispose() {
     _controller.dispose();
+    _personController.dispose();
+    _placeController.dispose();
+    _eventController.dispose();
+    _fromDateController.dispose();
+    _toDateController.dispose();
     super.dispose();
   }
 
   void _runSearch() {
-    final query = _controller.text.trim();
-    if (query.isEmpty) {
+    final query = SearchQuery(
+      text: _controller.text.trim(),
+      people: _emptyToNull(_personController.text),
+      places: _emptyToNull(_placeController.text),
+      events: _emptyToNull(_eventController.text),
+      mediaKind: _mediaKind,
+      favorite: _favoritesOnly ? true : null,
+      fromDate: _emptyToNull(_fromDateController.text),
+      toDate: _emptyToNull(_toDateController.text),
+      includeArchived: _includeArchived,
+      limit: 80,
+    );
+    if (query.text.isEmpty &&
+        query.people == null &&
+        query.places == null &&
+        query.events == null &&
+        query.mediaKind == null &&
+        query.favorite == null &&
+        query.fromDate == null &&
+        query.toDate == null &&
+        !query.includeArchived) {
       setState(() {
         _submittedQuery = null;
         _searchFuture = null;
@@ -54,9 +83,29 @@ class _SearchScreenState extends State<SearchScreen> {
     }
 
     setState(() {
-      _submittedQuery = query;
+      _submittedQuery = _queryLabel(query);
       _searchFuture = widget.repository.search(query);
     });
+  }
+
+  String? _emptyToNull(String value) {
+    final trimmed = value.trim();
+    return trimmed.isEmpty ? null : trimmed;
+  }
+
+  String _queryLabel(SearchQuery query) {
+    final parts = <String>[
+      if (query.text.isNotEmpty) query.text,
+      if (query.people != null) 'person:${query.people}',
+      if (query.places != null) 'place:${query.places}',
+      if (query.events != null) 'event:${query.events}',
+      if (query.mediaKind != null) 'kind:${query.mediaKind}',
+      if (query.favorite == true) 'favorites',
+      if (query.fromDate != null) 'from:${query.fromDate}',
+      if (query.toDate != null) 'to:${query.toDate}',
+      if (query.includeArchived) 'archived included',
+    ];
+    return parts.join(' ');
   }
 
   Future<void> _runOcrBatch() async {
@@ -97,8 +146,9 @@ class _SearchScreenState extends State<SearchScreen> {
     });
 
     try {
-      final job =
-          await widget.repository.rebuildScenes(limit: _safeOcrBatchLimit);
+      final job = await widget.repository.rebuildScenes(
+        limit: _safeOcrBatchLimit,
+      );
       if (!mounted) {
         return;
       }
@@ -177,7 +227,7 @@ class _SearchScreenState extends State<SearchScreen> {
                             value: status.ocrTotalPhotoCount == 0
                                 ? null
                                 : status.ocrIndexedAssetCount /
-                                    status.ocrTotalPhotoCount,
+                                      status.ocrTotalPhotoCount,
                             minHeight: 8,
                           ),
                         ),
@@ -229,7 +279,8 @@ class _SearchScreenState extends State<SearchScreen> {
                                       ),
                                     )
                                   : const Icon(
-                                      Icons.auto_awesome_mosaic_outlined),
+                                      Icons.auto_awesome_mosaic_outlined,
+                                    ),
                               label: Text(
                                 _sceneRunning
                                     ? 'Indexing scenes locally...'
@@ -285,19 +336,149 @@ class _SearchScreenState extends State<SearchScreen> {
             ),
           ],
           const SizedBox(height: 20),
-          Row(
+          TextField(
+            controller: _controller,
+            decoration: const InputDecoration(
+              hintText: 'Try “Goa”, “family dinner”, or a filename',
+              border: OutlineInputBorder(),
+            ),
+            onSubmitted: (_) => _runSearch(),
+          ),
+          const SizedBox(height: 12),
+          Wrap(
+            spacing: 12,
+            runSpacing: 12,
+            crossAxisAlignment: WrapCrossAlignment.center,
             children: [
-              Expanded(
+              SizedBox(
+                width: 220,
                 child: TextField(
-                  controller: _controller,
+                  controller: _personController,
                   decoration: const InputDecoration(
-                    hintText: 'Try “Goa”, “family dinner”, or a filename',
+                    labelText: 'Person',
                     border: OutlineInputBorder(),
                   ),
                   onSubmitted: (_) => _runSearch(),
                 ),
               ),
-              const SizedBox(width: 12),
+              SizedBox(
+                width: 220,
+                child: TextField(
+                  controller: _placeController,
+                  decoration: const InputDecoration(
+                    labelText: 'Place',
+                    border: OutlineInputBorder(),
+                  ),
+                  onSubmitted: (_) => _runSearch(),
+                ),
+              ),
+              SizedBox(
+                width: 220,
+                child: TextField(
+                  controller: _eventController,
+                  decoration: const InputDecoration(
+                    labelText: 'Event',
+                    border: OutlineInputBorder(),
+                  ),
+                  onSubmitted: (_) => _runSearch(),
+                ),
+              ),
+              SizedBox(
+                width: 170,
+                child: TextField(
+                  controller: _fromDateController,
+                  decoration: const InputDecoration(
+                    labelText: 'From',
+                    hintText: 'YYYY-MM-DD',
+                    border: OutlineInputBorder(),
+                  ),
+                  onSubmitted: (_) => _runSearch(),
+                ),
+              ),
+              SizedBox(
+                width: 170,
+                child: TextField(
+                  controller: _toDateController,
+                  decoration: const InputDecoration(
+                    labelText: 'To',
+                    hintText: 'YYYY-MM-DD',
+                    border: OutlineInputBorder(),
+                  ),
+                  onSubmitted: (_) => _runSearch(),
+                ),
+              ),
+              FilterChip(
+                avatar: const Icon(Icons.image_outlined, size: 18),
+                label: const Text('Photos'),
+                selected: _mediaKind == 'photo',
+                onSelected: (value) {
+                  setState(() => _mediaKind = value ? 'photo' : null);
+                  _runSearch();
+                },
+              ),
+              FilterChip(
+                avatar: const Icon(Icons.movie_outlined, size: 18),
+                label: const Text('Videos'),
+                selected: _mediaKind == 'video',
+                onSelected: (value) {
+                  setState(() => _mediaKind = value ? 'video' : null);
+                  _runSearch();
+                },
+              ),
+              FilterChip(
+                avatar: const Icon(Icons.description_outlined, size: 18),
+                label: const Text('Docs'),
+                selected: _mediaKind == 'document',
+                onSelected: (value) {
+                  setState(() => _mediaKind = value ? 'document' : null);
+                  _runSearch();
+                },
+              ),
+              FilterChip(
+                avatar: const Icon(Icons.audiotrack_outlined, size: 18),
+                label: const Text('Audio'),
+                selected: _mediaKind == 'audio',
+                onSelected: (value) {
+                  setState(() => _mediaKind = value ? 'audio' : null);
+                  _runSearch();
+                },
+              ),
+              FilterChip(
+                avatar: const Icon(Icons.folder_zip_outlined, size: 18),
+                label: const Text('Archives'),
+                selected: _mediaKind == 'archive',
+                onSelected: (value) {
+                  setState(() => _mediaKind = value ? 'archive' : null);
+                  _runSearch();
+                },
+              ),
+              FilterChip(
+                avatar: const Icon(Icons.article_outlined, size: 18),
+                label: const Text('Text'),
+                selected: _mediaKind == 'text',
+                onSelected: (value) {
+                  setState(() => _mediaKind = value ? 'text' : null);
+                  _runSearch();
+                },
+              ),
+              FilterChip(
+                avatar: const Icon(Icons.star_border, size: 18),
+                label: const Text('Favorites'),
+                selected: _favoritesOnly,
+                onSelected: (value) {
+                  setState(() => _favoritesOnly = value);
+                  _runSearch();
+                },
+              ),
+              FilterChip(
+                avatar: const Icon(Icons.inventory_2_outlined, size: 18),
+                label: const Text('Archived'),
+                selected: _includeArchived,
+                onSelected: (value) {
+                  setState(() => _includeArchived = value);
+                  _runSearch();
+                },
+              ),
               FilledButton.icon(
                 onPressed: _runSearch,
                 icon: const Icon(Icons.search),
@@ -346,10 +527,7 @@ class _SearchScreenState extends State<SearchScreen> {
 
                       return ListView(
                         children: [
-                          Text(
-                            'Assets',
-                            style: theme.textTheme.titleLarge,
-                          ),
+                          Text('Assets', style: theme.textTheme.titleLarge),
                           const SizedBox(height: 12),
                           AssetGrid(assets: data.assets),
                           const SizedBox(height: 24),
@@ -362,8 +540,8 @@ class _SearchScreenState extends State<SearchScreen> {
                             data.people.isEmpty
                                 ? 'None'
                                 : data.people
-                                    .map((item) => item.displayName)
-                                    .join(', '),
+                                      .map((item) => item.displayName)
+                                      .join(', '),
                           ),
                           const SizedBox(height: 16),
                           Text(
@@ -375,8 +553,8 @@ class _SearchScreenState extends State<SearchScreen> {
                             data.places.isEmpty
                                 ? 'None'
                                 : data.places
-                                    .map((item) => item.label)
-                                    .join(', '),
+                                      .map((item) => item.label)
+                                      .join(', '),
                           ),
                           const SizedBox(height: 16),
                           Text(
@@ -388,8 +566,8 @@ class _SearchScreenState extends State<SearchScreen> {
                             data.events.isEmpty
                                 ? 'None'
                                 : data.events
-                                    .map((item) => item.title)
-                                    .join(', '),
+                                      .map((item) => item.title)
+                                      .join(', '),
                           ),
                         ],
                       );

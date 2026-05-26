@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
 
 import '../../models/gallery_models.dart';
+import '../../widgets/app_ui.dart';
 import '../../widgets/empty_state_panel.dart';
 
 typedef JobLogsFetcher = Future<List<JobLog>> Function(String id);
@@ -49,9 +50,9 @@ class _JobsScreenState extends State<JobsScreen> {
             const SizedBox(height: 16),
             const EmptyStatePanel(
               icon: Icons.sync_outlined,
-              title: 'No background jobs right now',
+              title: 'No sync or activity yet',
               message:
-                  'Import, metadata extraction, OCR, and clustering jobs will appear here once the local daemon starts doing real work for this library.',
+                  'Imports, metadata extraction, OCR, clustering, and sync work will appear here when the local daemon starts real work.',
             ),
           ],
         ),
@@ -166,33 +167,22 @@ class _JobsHeader extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Card(
-      child: Padding(
-        padding: const EdgeInsets.all(20),
-        child: Row(
-          children: [
-            const Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    'Local job control',
-                    style: TextStyle(fontSize: 20, fontWeight: FontWeight.w700),
-                  ),
-                  SizedBox(height: 6),
-                  Text(
-                    'Review daemon work, inspect logs, retry failed work, or cancel queued/running local jobs.',
-                  ),
-                ],
-              ),
+    return AppSurface(
+      child: Row(
+        children: [
+          const Expanded(
+            child: AppSectionHeader(
+              title: 'Sync & Activity',
+              subtitle:
+                  'Review local daemon work, inspect logs, retry failed work, or cancel queued/running jobs.',
             ),
-            OutlinedButton.icon(
-              onPressed: onRefresh,
-              icon: const Icon(Icons.refresh),
-              label: const Text('Refresh'),
-            ),
-          ],
-        ),
+          ),
+          OutlinedButton.icon(
+            onPressed: onRefresh,
+            icon: const Icon(Icons.refresh),
+            label: const Text('Refresh'),
+          ),
+        ],
       ),
     );
   }

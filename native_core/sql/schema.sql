@@ -2,6 +2,7 @@ CREATE TABLE IF NOT EXISTS library_settings (
   id INTEGER PRIMARY KEY CHECK (id = 1),
   library_root TEXT NOT NULL,
   default_import_mode TEXT NOT NULL,
+  original_storage_policy TEXT NOT NULL DEFAULT 'encrypted_only',
   initialized_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
@@ -32,6 +33,30 @@ CREATE TABLE IF NOT EXISTS assets (
   is_available INTEGER NOT NULL DEFAULT 1,
   place_hint TEXT
 );
+
+CREATE TABLE IF NOT EXISTS vault_file_entries (
+  id TEXT PRIMARY KEY,
+  vault_id TEXT NOT NULL,
+  parent_id TEXT,
+  asset_id TEXT,
+  name TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  media_kind TEXT,
+  mime_type TEXT,
+  bytes INTEGER NOT NULL DEFAULT 0,
+  content_hash TEXT,
+  origin_device_id TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  trashed_at TEXT,
+  UNIQUE(vault_id, asset_id),
+  FOREIGN KEY(vault_id) REFERENCES vaults(id) ON DELETE CASCADE,
+  FOREIGN KEY(asset_id) REFERENCES assets(id) ON DELETE SET NULL,
+  FOREIGN KEY(origin_device_id) REFERENCES device_identities(id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_vault_file_entries_parent
+  ON vault_file_entries(vault_id, parent_id);
 
 CREATE TABLE IF NOT EXISTS asset_variants (
   id TEXT PRIMARY KEY,
@@ -341,10 +366,12 @@ CREATE TABLE IF NOT EXISTS device_pairings (
   id TEXT PRIMARY KEY,
   device_name TEXT NOT NULL,
   platform TEXT NOT NULL,
+  vault_id TEXT,
   pairing_token TEXT NOT NULL,
   created_at TEXT NOT NULL,
   expires_at TEXT NOT NULL,
-  approved_at TEXT
+  approved_at TEXT,
+  FOREIGN KEY(vault_id) REFERENCES vaults(id) ON DELETE CASCADE
 );
 
 CREATE TABLE IF NOT EXISTS sync_sessions (

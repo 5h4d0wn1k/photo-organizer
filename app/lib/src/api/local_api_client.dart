@@ -26,17 +26,19 @@ class ApiException implements Exception {
 }
 
 class LocalApiClient {
+  static const _mobileDownloadChunkBytes = 4 * 1024 * 1024;
+
   LocalApiClient({
     http.Client? httpClient,
     Uri? baseUri,
     Duration defaultTimeout = const Duration(seconds: 3),
     Duration startupTimeout = const Duration(seconds: 15),
     Duration heavyReadTimeout = const Duration(seconds: 45),
-  })  : _httpClient = httpClient ?? http.Client(),
-        _baseUri = baseUri ?? Uri.parse('http://127.0.0.1:4821'),
-        _defaultTimeout = defaultTimeout,
-        _startupTimeout = startupTimeout,
-        _heavyReadTimeout = heavyReadTimeout;
+  }) : _httpClient = httpClient ?? http.Client(),
+       _baseUri = baseUri ?? Uri.parse('http://127.0.0.1:4821'),
+       _defaultTimeout = defaultTimeout,
+       _startupTimeout = startupTimeout,
+       _heavyReadTimeout = heavyReadTimeout;
 
   final http.Client _httpClient;
   final Uri _baseUri;
@@ -46,6 +48,19 @@ class LocalApiClient {
 
   Future<void> fetchHealth() async {
     await _getObject('/health');
+  }
+
+  Future<DevicePairing> createPairingSession({
+    required String deviceName,
+    required String platform,
+    String? vaultId,
+  }) async {
+    final response = await _postObject('/pairing/sessions', {
+      'device_name': deviceName,
+      'platform': platform,
+      if (vaultId != null && vaultId.trim().isNotEmpty) 'vault_id': vaultId,
+    });
+    return DevicePairing.fromJson(response);
   }
 
   Future<MobilePairResponse> pairMobileDevice({
@@ -71,6 +86,50 @@ class LocalApiClient {
       headers: _mobileHeaders(bearerToken),
     );
     return MobileSession.fromJson(response);
+  }
+
+  Future<List<MobileSession>> fetchMobileSessions({
+    required String bearerToken,
+  }) async {
+    final response = await _getList(
+      '/mobile/sessions',
+      headers: _mobileHeaders(bearerToken),
+    );
+    return response.map(MobileSession.fromJson).toList();
+  }
+
+  Future<MobileSessionRefreshResponse> refreshMobileSession({
+    required String bearerToken,
+  }) async {
+    final response = await _postObject(
+      '/mobile/session/refresh',
+      const {},
+      headers: _mobileHeaders(bearerToken),
+    );
+    return MobileSessionRefreshResponse.fromJson(response);
+  }
+
+  Future<MobileSession> revokeCurrentMobileSession({
+    required String bearerToken,
+  }) async {
+    final response = await _postObject(
+      '/mobile/session/revoke',
+      const {},
+      headers: _mobileHeaders(bearerToken),
+    );
+    return MobileSession.fromJson(response);
+  }
+
+  Future<List<MobileSession>> revokeMobileDeviceSessions({
+    required String bearerToken,
+    required String deviceId,
+  }) async {
+    final response = await _postList(
+      '/mobile/devices/$deviceId/sessions/revoke',
+      const {},
+      headers: _mobileHeaders(bearerToken),
+    );
+    return response.map(MobileSession.fromJson).toList();
   }
 
   Future<MobileUpload> reserveMobileUpload({
@@ -117,6 +176,181 @@ class LocalApiClient {
     return MobileUpload.fromJson(response);
   }
 
+  Future<MobileUpload> fetchMobileUpload({
+    required String bearerToken,
+    required String uploadId,
+  }) async {
+    final response = await _getObject(
+      '/mobile/uploads/$uploadId',
+      headers: _mobileHeaders(bearerToken),
+      timeout: _heavyReadTimeout,
+    );
+    return MobileUpload.fromJson(response);
+  }
+
+  Future<MobileUpload> cancelMobileUpload({
+    required String bearerToken,
+    required String uploadId,
+  }) async {
+    final response = await _request(
+      () => _httpClient.delete(
+        _resolve('/mobile/uploads/$uploadId'),
+        headers: _mobileHeaders(bearerToken),
+      ),
+      '/mobile/uploads/$uploadId',
+      timeout: _heavyReadTimeout,
+    );
+    return MobileUpload.fromJson(_decodeObject(response));
+  }
+
+  Future<MobileUpload> uploadMobileOriginalChunk({
+    required String bearerToken,
+    required String uploadId,
+    required int offset,
+    required List<int> bytes,
+  }) async {
+    final response = await _putBytes(
+      '/mobile/uploads/$uploadId/chunks/$offset',
+      bytes,
+      headers: _mobileHeaders(bearerToken),
+      timeout: _heavyReadTimeout,
+    );
+    return MobileUpload.fromJson(response);
+  }
+
+  Future<MobileUpload> completeMobileUpload({
+    required String bearerToken,
+    required String uploadId,
+  }) async {
+    final response = await _postObject(
+      '/mobile/uploads/$uploadId/complete',
+      const {},
+      headers: _mobileHeaders(bearerToken),
+      timeout: _heavyReadTimeout,
+    );
+    return MobileUpload.fromJson(response);
+  }
+
+  Future<MobileUpload> uploadMobileOriginalFile({
+    required String bearerToken,
+    required String uploadId,
+    required File file,
+    int chunkSize = 4 * 1024 * 1024,
+    void Function(MobileUpload upload)? onProgress,
+    FutureOr<bool> Function(MobileUpload upload)? shouldCancel,
+  }) async {
+    if (chunkSize <= 0) {
+      throw ArgumentError.value(chunkSize, 'chunkSize', 'must be positive');
+    }
+    final totalBytes = await file.length();
+    var upload = await fetchMobileUpload(
+      bearerToken: bearerToken,
+      uploadId: uploadId,
+    );
+    if (upload.bytesTotal != totalBytes) {
+      throw StateError(
+        'Reserved upload size ${upload.bytesTotal} does not match file size $totalBytes',
+      );
+    }
+    onProgress?.call(upload);
+    if (_isTerminalMobileUpload(upload)) {
+      return upload;
+    }
+    if (await _mobileUploadCancelRequested(shouldCancel, upload)) {
+      final canceled = await cancelMobileUpload(
+        bearerToken: bearerToken,
+        uploadId: uploadId,
+      );
+      onProgress?.call(canceled);
+      return canceled;
+    }
+
+    var offset = upload.bytesReceived;
+    final handle = await file.open();
+    try {
+      while (offset < totalBytes) {
+        if (await _mobileUploadCancelRequested(shouldCancel, upload)) {
+          final canceled = await cancelMobileUpload(
+            bearerToken: bearerToken,
+            uploadId: uploadId,
+          );
+          onProgress?.call(canceled);
+          return canceled;
+        }
+        await handle.setPosition(offset);
+        final remaining = totalBytes - offset;
+        final readLength = remaining < chunkSize ? remaining : chunkSize;
+        final chunk = await handle.read(readLength);
+        if (chunk.isEmpty) {
+          throw StateError(
+            'File ended before reserved mobile upload completed',
+          );
+        }
+        try {
+          upload = await uploadMobileOriginalChunk(
+            bearerToken: bearerToken,
+            uploadId: uploadId,
+            offset: offset,
+            bytes: chunk,
+          );
+        } on ApiException {
+          if (await _mobileUploadCancelRequested(shouldCancel, upload)) {
+            final canceled = await cancelMobileUpload(
+              bearerToken: bearerToken,
+              uploadId: uploadId,
+            );
+            onProgress?.call(canceled);
+            return canceled;
+          }
+          rethrow;
+        }
+        onProgress?.call(upload);
+        if (_isTerminalMobileUpload(upload)) {
+          return upload;
+        }
+        if (await _mobileUploadCancelRequested(shouldCancel, upload)) {
+          final canceled = await cancelMobileUpload(
+            bearerToken: bearerToken,
+            uploadId: uploadId,
+          );
+          onProgress?.call(canceled);
+          return canceled;
+        }
+        if (upload.bytesReceived <= offset) {
+          throw StateError(
+            'Mobile upload did not advance past byte offset $offset',
+          );
+        }
+        offset = upload.bytesReceived;
+      }
+    } finally {
+      await handle.close();
+    }
+
+    final completed = await completeMobileUpload(
+      bearerToken: bearerToken,
+      uploadId: uploadId,
+    );
+    onProgress?.call(completed);
+    return completed;
+  }
+
+  bool _isTerminalMobileUpload(MobileUpload upload) {
+    return upload.status == MobileUploadStatus.completed ||
+        upload.status == MobileUploadStatus.failed ||
+        upload.status == MobileUploadStatus.canceled;
+  }
+
+  Future<bool> _mobileUploadCancelRequested(
+    FutureOr<bool> Function(MobileUpload upload)? shouldCancel,
+    MobileUpload upload,
+  ) async {
+    if (shouldCancel == null) {
+      return false;
+    }
+    return await Future<bool>.value(shouldCancel(upload));
+  }
+
   Future<List<MobileAssetSummary>> fetchMobileAssets({
     required String bearerToken,
   }) async {
@@ -126,6 +360,73 @@ class LocalApiClient {
       timeout: _heavyReadTimeout,
     );
     return response.map(MobileAssetSummary.fromJson).toList();
+  }
+
+  Future<VaultFileTreeResponse> fetchMobileFileTree({
+    required String bearerToken,
+    bool includeTrashed = false,
+  }) async {
+    final response = await _getObject(
+      '/mobile/files/tree',
+      queryParameters: {if (includeTrashed) 'include_trashed': 'true'},
+      headers: _mobileHeaders(bearerToken),
+      timeout: _heavyReadTimeout,
+    );
+    return VaultFileTreeResponse.fromJson(response);
+  }
+
+  Future<MobileWorkspaceSnapshot> fetchMobileWorkspace({
+    required String bearerToken,
+  }) async {
+    final response = await _getObject(
+      '/mobile/workspace',
+      headers: _mobileHeaders(bearerToken),
+      timeout: _heavyReadTimeout,
+    );
+    return MobileWorkspaceSnapshot.fromJson(response);
+  }
+
+  Future<SearchResponse> searchMobile({
+    required String bearerToken,
+    required SearchQuery query,
+  }) async {
+    final response = await _getObject(
+      '/mobile/search',
+      queryParameters: query.toQueryParameters(),
+      headers: _mobileHeaders(bearerToken),
+      timeout: _heavyReadTimeout,
+    );
+    return SearchResponse.fromJson(response);
+  }
+
+  Future<AssetAvailability> fetchMobileAssetAvailability({
+    required String bearerToken,
+    required String assetId,
+  }) async {
+    final response = await _getObject(
+      '/mobile/assets/$assetId/availability',
+      headers: _mobileHeaders(bearerToken),
+      timeout: _heavyReadTimeout,
+    );
+    return AssetAvailability.fromJson(response);
+  }
+
+  Future<Asset> updateMobileAssetFlags({
+    required String bearerToken,
+    required String assetId,
+    bool? favorite,
+    bool? archived,
+  }) async {
+    final response = await _postObject(
+      '/mobile/assets/$assetId/flags',
+      {
+        if (favorite != null) 'favorite': favorite,
+        if (archived != null) 'archived': archived,
+      },
+      headers: _mobileHeaders(bearerToken),
+      timeout: _heavyReadTimeout,
+    );
+    return Asset.fromJson(response);
   }
 
   Future<List<int>> downloadMobileOriginal({
@@ -141,6 +442,138 @@ class LocalApiClient {
       timeout: _heavyReadTimeout,
     );
     return response.bodyBytes;
+  }
+
+  Future<List<int>> downloadMobileFileOriginal({
+    required String bearerToken,
+    required String entryId,
+  }) async {
+    final response = await _request(
+      () => _httpClient.get(
+        _resolve('/mobile/files/$entryId/original'),
+        headers: _mobileHeaders(bearerToken),
+      ),
+      '/mobile/files/$entryId/original',
+      timeout: _heavyReadTimeout,
+    );
+    return response.bodyBytes;
+  }
+
+  Future<File> downloadMobileOriginalToFile({
+    required String bearerToken,
+    required String assetId,
+    required File destination,
+  }) async {
+    await destination.parent.create(recursive: true);
+    final path = '/mobile/assets/$assetId/original';
+    final temp = File('${destination.path}.part');
+    var offset = await temp.exists() ? await temp.length() : 0;
+    int? expectedTotal;
+    var restarted = false;
+
+    try {
+      while (expectedTotal == null || offset < expectedTotal) {
+        final rangeEnd = offset + _mobileDownloadChunkBytes - 1;
+        final request = http.Request('GET', _resolve(path))
+          ..headers.addAll(_mobileHeaders(bearerToken))
+          ..headers['range'] = 'bytes=$offset-$rangeEnd';
+        late final http.StreamedResponse response;
+        try {
+          response = await _httpClient.send(request).timeout(_heavyReadTimeout);
+        } on TimeoutException {
+          throw SocketException('Timed out while reaching ${_resolve(path)}');
+        }
+
+        if (response.statusCode == HttpStatus.ok && offset == 0) {
+          await _writeStreamToFile(
+            response.stream,
+            temp,
+            mode: FileMode.write,
+            expectedBytes: response.contentLength,
+          );
+          expectedTotal = await temp.length();
+          offset = expectedTotal;
+          break;
+        }
+        if (response.statusCode == HttpStatus.ok && offset > 0 && !restarted) {
+          await response.stream.drain<List<int>>();
+          await temp.delete();
+          offset = 0;
+          expectedTotal = null;
+          restarted = true;
+          continue;
+        }
+        if (response.statusCode == HttpStatus.requestedRangeNotSatisfiable &&
+            offset > 0 &&
+            !restarted) {
+          await response.stream.drain<List<int>>();
+          await temp.delete();
+          offset = 0;
+          expectedTotal = null;
+          restarted = true;
+          continue;
+        }
+        if (response.statusCode != HttpStatus.partialContent) {
+          throw ApiException(
+            path: path,
+            statusCode: response.statusCode,
+            body: await response.stream.bytesToString(),
+          );
+        }
+
+        final contentRange = _parseContentRange(
+          response.headers['content-range'],
+        );
+        if (contentRange == null || contentRange.start != offset) {
+          throw SocketException(
+            'Unexpected content-range for $path: ${response.headers['content-range']}',
+          );
+        }
+        final received = await _writeStreamToFile(
+          response.stream,
+          temp,
+          mode: offset == 0 ? FileMode.write : FileMode.append,
+          expectedBytes: response.contentLength,
+        );
+        final expectedRangeBytes = contentRange.end - contentRange.start + 1;
+        if (received != expectedRangeBytes) {
+          throw SocketException(
+            'Downloaded $received bytes for $path, expected $expectedRangeBytes',
+          );
+        }
+        expectedTotal = contentRange.total;
+        offset = contentRange.end + 1;
+      }
+    } catch (_) {
+      rethrow;
+    }
+    if (await destination.exists()) {
+      await destination.delete();
+    }
+    return temp.rename(destination.path);
+  }
+
+  Future<List<int>> downloadMobilePreview({
+    required String bearerToken,
+    required String assetId,
+  }) async {
+    final response = await _request(
+      () => _httpClient.get(
+        mobileAssetPreviewUri(assetId),
+        headers: mobileAuthorizationHeaders(bearerToken),
+      ),
+      '/mobile/assets/$assetId/preview',
+      timeout: _heavyReadTimeout,
+    );
+    return response.bodyBytes;
+  }
+
+  Uri mobileAssetPreviewUri(String assetId) {
+    return _resolve('/mobile/assets/$assetId/preview');
+  }
+
+  Map<String, String> mobileAuthorizationHeaders(String bearerToken) {
+    return _mobileHeaders(bearerToken);
   }
 
   Future<DaemonDiagnostics> fetchDiagnostics() async {
@@ -202,10 +635,9 @@ class LocalApiClient {
   }
 
   Future<EncryptionActivationResult> activateEncryption() async {
-    final response = await _postObject(
-      '/security/encryption/activate',
-      const {'confirmed': true},
-    );
+    final response = await _postObject('/security/encryption/activate', const {
+      'confirmed': true,
+    });
     return EncryptionActivationResult.fromJson(response);
   }
 
@@ -266,7 +698,8 @@ class LocalApiClient {
   }
 
   Future<LibrarySettings> saveLibrarySettings(
-      LibrarySettingsDraft draft) async {
+    LibrarySettingsDraft draft,
+  ) async {
     final response = await _postObject('/library/settings', draft.toJson());
     return LibrarySettings.fromJson(response);
   }
@@ -277,10 +710,12 @@ class LocalApiClient {
   }
 
   Future<Vault> createVault({
+    String? id,
     required String name,
     StoragePolicy? storagePolicy,
   }) async {
     final response = await _postObject('/vaults', {
+      if (id != null && id.trim().isNotEmpty) 'id': id.trim(),
       'name': name,
       if (storagePolicy != null) 'storage_policy': storagePolicy.toJson(),
     });
@@ -361,9 +796,7 @@ class LocalApiClient {
   Future<SyncPlan> fetchSyncPlan({String? vaultId}) async {
     final response = await _getObject(
       '/sync/plan',
-      queryParameters: {
-        if (vaultId != null) 'vault_id': vaultId,
-      },
+      queryParameters: {if (vaultId != null) 'vault_id': vaultId},
     );
     return SyncPlan.fromJson(response);
   }
@@ -411,6 +844,71 @@ class LocalApiClient {
     return SyncTransfer.fromJson(response);
   }
 
+  Future<VaultFileTreeResponse> fetchFileTree({
+    String? vaultId,
+    bool includeTrashed = false,
+  }) async {
+    final response = await _getObject(
+      '/files/tree',
+      queryParameters: {
+        if (vaultId != null) 'vault_id': vaultId,
+        if (includeTrashed) 'include_trashed': 'true',
+      },
+      timeout: _heavyReadTimeout,
+    );
+    return VaultFileTreeResponse.fromJson(response);
+  }
+
+  Future<VaultFileEntry> createFileFolder({
+    String? vaultId,
+    String? parentId,
+    required String name,
+  }) async {
+    final response = await _postObject('/files/folders', {
+      if (vaultId != null) 'vault_id': vaultId,
+      if (parentId != null) 'parent_id': parentId,
+      'name': name,
+    });
+    return VaultFileEntry.fromJson(response);
+  }
+
+  Future<VaultFileEntry> renameFileEntry({
+    required String entryId,
+    required String name,
+  }) async {
+    final response = await _patchObject('/files/$entryId', {'name': name});
+    return VaultFileEntry.fromJson(response);
+  }
+
+  Future<VaultFileEntry> moveFileEntry({
+    required String entryId,
+    String? parentId,
+  }) async {
+    final response = await _postObject('/files/$entryId/move', {
+      if (parentId != null) 'parent_id': parentId,
+    });
+    return VaultFileEntry.fromJson(response);
+  }
+
+  Future<VaultFileEntry> trashFileEntry(String entryId) async {
+    final response = await _postObject('/files/$entryId/trash', const {});
+    return VaultFileEntry.fromJson(response);
+  }
+
+  Future<VaultFileEntry> restoreFileEntry(String entryId) async {
+    final response = await _postObject('/files/$entryId/restore', const {});
+    return VaultFileEntry.fromJson(response);
+  }
+
+  Future<List<int>> downloadFileOriginal({required String entryId}) async {
+    final response = await _request(
+      () => _httpClient.get(_resolve('/files/$entryId/original')),
+      '/files/$entryId/original',
+      timeout: _heavyReadTimeout,
+    );
+    return response.bodyBytes;
+  }
+
   Future<AssetAvailability> fetchAssetAvailability(String assetId) async {
     final response = await _getObject('/assets/$assetId/availability');
     return AssetAvailability.fromJson(response);
@@ -422,8 +920,10 @@ class LocalApiClient {
   }
 
   Future<AssetAvailability> evictLocalAsset(String assetId) async {
-    final response =
-        await _postObject('/assets/$assetId/evict-local', const {});
+    final response = await _postObject(
+      '/assets/$assetId/evict-local',
+      const {},
+    );
     return AssetAvailability.fromJson(response);
   }
 
@@ -532,9 +1032,7 @@ class LocalApiClient {
   }
 
   Future<Album> renameAlbum(String id, String title) async {
-    final response = await _postObject('/albums/$id/rename', {
-      'title': title,
-    });
+    final response = await _postObject('/albums/$id/rename', {'title': title});
     return Album.fromJson(response);
   }
 
@@ -599,10 +1097,9 @@ class LocalApiClient {
   }
 
   Future<PersonCluster> renamePerson(String id, String displayName) async {
-    final response = await _postObject(
-      '/people/$id/rename',
-      {'display_name': displayName},
-    );
+    final response = await _postObject('/people/$id/rename', {
+      'display_name': displayName,
+    });
     return PersonCluster.fromJson(response);
   }
 
@@ -611,10 +1108,10 @@ class LocalApiClient {
     required bool hidden,
     String? reason,
   }) async {
-    final response = await _postObject(
-      '/people/$id/hide',
-      {'hidden': hidden, if (reason != null) 'reason': reason},
-    );
+    final response = await _postObject('/people/$id/hide', {
+      'hidden': hidden,
+      if (reason != null) 'reason': reason,
+    });
     return PersonCluster.fromJson(response);
   }
 
@@ -624,14 +1121,11 @@ class LocalApiClient {
     String? assetId,
     String? reason,
   }) async {
-    final response = await _postObject(
-      '/people/$id/reject-match',
-      {
-        if (faceTemplateId != null) 'face_template_id': faceTemplateId,
-        if (assetId != null) 'asset_id': assetId,
-        if (reason != null) 'reason': reason,
-      },
-    );
+    final response = await _postObject('/people/$id/reject-match', {
+      if (faceTemplateId != null) 'face_template_id': faceTemplateId,
+      if (assetId != null) 'asset_id': assetId,
+      if (reason != null) 'reason': reason,
+    });
     return PersonCluster.fromJson(response);
   }
 
@@ -659,10 +1153,9 @@ class LocalApiClient {
     String targetId,
     List<String> sourcePersonIds,
   ) async {
-    final response = await _postObject(
-      '/people/$targetId/merge',
-      {'source_person_ids': sourcePersonIds},
-    );
+    final response = await _postObject('/people/$targetId/merge', {
+      'source_person_ids': sourcePersonIds,
+    });
     return PersonCluster.fromJson(response);
   }
 
@@ -671,13 +1164,10 @@ class LocalApiClient {
     required List<String> faceTemplateIds,
     String? newDisplayName,
   }) async {
-    final response = await _postObject(
-      '/people/$id/split',
-      {
-        'face_template_ids': faceTemplateIds,
-        if (newDisplayName != null) 'new_display_name': newDisplayName,
-      },
-    );
+    final response = await _postObject('/people/$id/split', {
+      'face_template_ids': faceTemplateIds,
+      if (newDisplayName != null) 'new_display_name': newDisplayName,
+    });
     return PersonCluster.fromJson(response);
   }
 
@@ -858,6 +1348,27 @@ class LocalApiClient {
     return _decodeObject(response);
   }
 
+  Future<Map<String, dynamic>> _patchObject(
+    String path,
+    Map<String, dynamic> payload, {
+    Map<String, String>? headers,
+    Duration? timeout,
+  }) async {
+    final response = await _request(
+      () => _httpClient.patch(
+        _resolve(path),
+        headers: {
+          'content-type': 'application/json',
+          if (headers != null) ...headers,
+        },
+        body: jsonEncode(payload),
+      ),
+      path,
+      timeout: timeout,
+    );
+    return _decodeObject(response);
+  }
+
   Future<List<Map<String, dynamic>>> _postList(
     String path,
     Map<String, dynamic> payload, {
@@ -900,11 +1411,49 @@ class LocalApiClient {
     return _decodeObject(response);
   }
 
+  Future<int> _writeStreamToFile(
+    Stream<List<int>> stream,
+    File file, {
+    required FileMode mode,
+    int? expectedBytes,
+  }) async {
+    var received = 0;
+    final sink = file.openWrite(mode: mode);
+    try {
+      await for (final chunk in stream.timeout(_heavyReadTimeout)) {
+        received += chunk.length;
+        sink.add(chunk);
+      }
+    } finally {
+      await sink.close();
+    }
+    if (expectedBytes != null && received != expectedBytes) {
+      throw SocketException(
+        'Downloaded $received bytes, expected $expectedBytes',
+      );
+    }
+    return received;
+  }
+
+  _ContentRange? _parseContentRange(String? value) {
+    if (value == null) {
+      return null;
+    }
+    final match = RegExp(r'^bytes (\d+)-(\d+)/(\d+)$').firstMatch(value);
+    if (match == null) {
+      return null;
+    }
+    final start = int.parse(match.group(1)!);
+    final end = int.parse(match.group(2)!);
+    final total = int.parse(match.group(3)!);
+    if (end < start || total <= end) {
+      return null;
+    }
+    return _ContentRange(start: start, end: end, total: total);
+  }
+
   Future<void> _delete(String path) async {
-    await _request(
-      () => _httpClient.delete(_resolve(path)),
-      path,
-    );
+    await _request(() => _httpClient.delete(_resolve(path)), path);
   }
 
   Future<http.Response> _request(
@@ -944,9 +1493,7 @@ class LocalApiClient {
       throw const FormatException('Expected a JSON object response');
     }
 
-    return raw.map(
-      (key, value) => MapEntry(key.toString(), value),
-    );
+    return raw.map((key, value) => MapEntry(key.toString(), value));
   }
 
   List<Map<String, dynamic>> _decodeList(http.Response response) {
@@ -958,9 +1505,7 @@ class LocalApiClient {
     return raw
         .whereType<Map>()
         .map(
-          (item) => item.map(
-            (key, value) => MapEntry(key.toString(), value),
-          ),
+          (item) => item.map((key, value) => MapEntry(key.toString(), value)),
         )
         .toList();
   }
@@ -968,4 +1513,16 @@ class LocalApiClient {
   Map<String, String> _mobileHeaders(String bearerToken) {
     return {'authorization': 'Bearer ${bearerToken.trim()}'};
   }
+}
+
+class _ContentRange {
+  const _ContentRange({
+    required this.start,
+    required this.end,
+    required this.total,
+  });
+
+  final int start;
+  final int end;
+  final int total;
 }

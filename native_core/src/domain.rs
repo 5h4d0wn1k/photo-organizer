@@ -8,6 +8,18 @@ use uuid::Uuid;
 pub enum MediaKind {
     Photo,
     Video,
+    Document,
+    Audio,
+    Archive,
+    Text,
+    Other,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum VaultFileKind {
+    Folder,
+    File,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -527,18 +539,13 @@ pub enum MetadataSource {
     Unknown,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum NetworkPolicy {
     OfflineOnly,
+    #[default]
     AskBeforeDownload,
     DeveloperFetch,
-}
-
-impl Default for NetworkPolicy {
-    fn default() -> Self {
-        Self::AskBeforeDownload
-    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -595,8 +602,18 @@ impl ModelProvenance {
 pub struct LibrarySettings {
     pub library_root: String,
     pub default_import_mode: ImportMode,
+    #[serde(default)]
+    pub original_storage_policy: OriginalStoragePolicy,
     pub initialized_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum OriginalStoragePolicy {
+    #[default]
+    EncryptedOnly,
+    KeepPlaintextCopy,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -641,6 +658,31 @@ pub struct Asset {
     pub place_hint: Option<String>,
     pub metadata: Option<AssetMetadata>,
     pub variants: Vec<AssetVariant>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct VaultFileEntry {
+    pub id: Uuid,
+    pub vault_id: Uuid,
+    pub parent_id: Option<Uuid>,
+    pub asset_id: Option<Uuid>,
+    pub name: String,
+    pub kind: VaultFileKind,
+    pub media_kind: Option<MediaKind>,
+    pub mime_type: Option<String>,
+    pub bytes: u64,
+    pub content_hash: Option<String>,
+    pub origin_device_id: Option<Uuid>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub trashed_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct VaultFileTreeResponse {
+    pub vault_id: Option<Uuid>,
+    pub root_entry_ids: Vec<Uuid>,
+    pub entries: Vec<VaultFileEntry>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -769,6 +811,7 @@ pub struct DevicePairing {
     pub id: Uuid,
     pub device_name: String,
     pub platform: String,
+    pub vault_id: Option<Uuid>,
     pub pairing_token: String,
     pub created_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
@@ -799,6 +842,14 @@ pub struct MobileSession {
     pub expires_at: DateTime<Utc>,
     pub last_seen_at: Option<DateTime<Utc>>,
     pub revoked_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MobileSessionRefreshResponse {
+    pub session: MobileSession,
+    pub bearer_token: String,
+    pub previous_session_id: Uuid,
+    pub detail: String,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -850,6 +901,35 @@ pub struct MobileAssetSummary {
     pub content_hash: String,
     pub captured_at: DateTime<Utc>,
     pub available: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MobileWorkspaceCapabilities {
+    pub can_browse_library: bool,
+    pub can_search: bool,
+    pub can_upload_camera_roll: bool,
+    pub can_download_originals: bool,
+    pub can_manage_storage: bool,
+    pub can_import_desktop_folders: bool,
+    pub can_run_models: bool,
+    pub role_detail: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MobileWorkspaceResponse {
+    pub session: MobileSession,
+    #[serde(default)]
+    pub sessions: Vec<MobileSession>,
+    pub timeline: TimelineResponse,
+    pub albums: Vec<Album>,
+    pub people: Vec<PersonCluster>,
+    pub places: Vec<PlaceCluster>,
+    pub events: Vec<EventCluster>,
+    pub jobs: Vec<JobRecord>,
+    pub vault_status: VaultStatus,
+    pub devices: Vec<DeviceIdentity>,
+    pub sync_network: SyncNetworkStatus,
+    pub capabilities: MobileWorkspaceCapabilities,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -916,6 +996,12 @@ pub struct SearchQuery {
     pub text: Option<String>,
     pub people: Option<String>,
     pub places: Option<String>,
+    #[serde(default)]
+    pub events: Option<String>,
+    #[serde(default)]
+    pub media_kind: Option<String>,
+    #[serde(default)]
+    pub favorite: Option<bool>,
     pub from_date: Option<String>,
     pub to_date: Option<String>,
     pub include_archived: bool,
@@ -1358,6 +1444,7 @@ pub struct BackupRestoreRunResult {
 pub struct CreatePairingSessionRequest {
     pub device_name: String,
     pub platform: String,
+    pub vault_id: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1380,7 +1467,25 @@ pub struct MobileUploadRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CreateFileFolderRequest {
+    pub vault_id: Option<Uuid>,
+    pub parent_id: Option<Uuid>,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RenameFileEntryRequest {
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MoveFileEntryRequest {
+    pub parent_id: Option<Uuid>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CreateVaultRequest {
+    pub id: Option<Uuid>,
     pub name: String,
     pub storage_policy: Option<StoragePolicy>,
 }
@@ -1428,6 +1533,8 @@ pub struct RunSyncRequest {
 pub struct UpdateLibrarySettingsRequest {
     pub library_root: String,
     pub default_import_mode: ImportMode,
+    #[serde(default)]
+    pub original_storage_policy: Option<OriginalStoragePolicy>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

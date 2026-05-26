@@ -1,7 +1,26 @@
-enum ImportMode {
-  copy,
-  reference,
-  move,
+enum ImportMode { copy, reference, move }
+
+enum VaultFileKind { folder, file }
+
+extension VaultFileKindX on VaultFileKind {
+  String get wireValue {
+    switch (this) {
+      case VaultFileKind.folder:
+        return 'folder';
+      case VaultFileKind.file:
+        return 'file';
+    }
+  }
+
+  static VaultFileKind fromJson(String? value) {
+    switch (value) {
+      case 'file':
+        return VaultFileKind.file;
+      case 'folder':
+      default:
+        return VaultFileKind.folder;
+    }
+  }
 }
 
 extension ImportModeX on ImportMode {
@@ -40,10 +59,39 @@ extension ImportModeX on ImportMode {
   }
 }
 
-enum ImportSourceKind {
-  folder,
-  removableDrive,
+enum OriginalStoragePolicy { encryptedOnly, keepPlaintextCopy }
+
+extension OriginalStoragePolicyX on OriginalStoragePolicy {
+  String get wireValue {
+    switch (this) {
+      case OriginalStoragePolicy.encryptedOnly:
+        return 'encrypted_only';
+      case OriginalStoragePolicy.keepPlaintextCopy:
+        return 'keep_plaintext_copy';
+    }
+  }
+
+  String get label {
+    switch (this) {
+      case OriginalStoragePolicy.encryptedOnly:
+        return 'Encrypted vault only';
+      case OriginalStoragePolicy.keepPlaintextCopy:
+        return 'Keep plaintext copy';
+    }
+  }
+
+  static OriginalStoragePolicy fromJson(String? value) {
+    switch (value) {
+      case 'keep_plaintext_copy':
+        return OriginalStoragePolicy.keepPlaintextCopy;
+      case 'encrypted_only':
+      default:
+        return OriginalStoragePolicy.encryptedOnly;
+    }
+  }
 }
+
+enum ImportSourceKind { folder, removableDrive }
 
 extension ImportSourceKindX on ImportSourceKind {
   String get wireValue {
@@ -75,11 +123,7 @@ extension ImportSourceKindX on ImportSourceKind {
   }
 }
 
-enum ImportSessionStatus {
-  scanned,
-  committed,
-  failed,
-}
+enum ImportSessionStatus { scanned, committed, failed }
 
 extension ImportSessionStatusX on ImportSessionStatus {
   String get wireValue {
@@ -117,19 +161,9 @@ extension ImportSessionStatusX on ImportSessionStatus {
   }
 }
 
-enum AppLaunchStatus {
-  ready,
-  setupRequired,
-  daemonUnavailable,
-  error,
-}
+enum AppLaunchStatus { ready, setupRequired, daemonUnavailable, error }
 
-enum DeviceRole {
-  admin,
-  contributor,
-  viewer,
-  storageOnly,
-}
+enum DeviceRole { admin, contributor, viewer, storageOnly }
 
 extension DeviceRoleX on DeviceRole {
   String get wireValue {
@@ -160,10 +194,7 @@ extension DeviceRoleX on DeviceRole {
   }
 }
 
-enum DeviceTrustLevel {
-  trusted,
-  storageOnly,
-}
+enum DeviceTrustLevel { trusted, storageOnly }
 
 extension DeviceTrustLevelX on DeviceTrustLevel {
   String get wireValue {
@@ -186,11 +217,7 @@ extension DeviceTrustLevelX on DeviceTrustLevel {
   }
 }
 
-enum StoragePolicyMode {
-  maxPoolSingleCopy,
-  protectedMin2,
-  custom,
-}
+enum StoragePolicyMode { maxPoolSingleCopy, protectedMin2, custom }
 
 extension StoragePolicyModeX on StoragePolicyMode {
   String get wireValue {
@@ -217,13 +244,7 @@ extension StoragePolicyModeX on StoragePolicyMode {
   }
 }
 
-enum ReplicaHealth {
-  healthy,
-  unverified,
-  offline,
-  corrupt,
-  missing,
-}
+enum ReplicaHealth { healthy, unverified, offline, corrupt, missing }
 
 extension ReplicaHealthX on ReplicaHealth {
   static ReplicaHealth fromJson(String? value) {
@@ -243,13 +264,7 @@ extension ReplicaHealthX on ReplicaHealth {
   }
 }
 
-enum SyncTransferStatus {
-  pending,
-  running,
-  completed,
-  failed,
-  aborted,
-}
+enum SyncTransferStatus { pending, running, completed, failed, aborted }
 
 extension SyncTransferStatusX on SyncTransferStatus {
   static SyncTransferStatus fromJson(String? value) {
@@ -269,13 +284,7 @@ extension SyncTransferStatusX on SyncTransferStatus {
   }
 }
 
-enum MobileUploadStatus {
-  pending,
-  running,
-  completed,
-  failed,
-  canceled,
-}
+enum MobileUploadStatus { pending, running, completed, failed, canceled }
 
 extension MobileUploadStatusX on MobileUploadStatus {
   static MobileUploadStatus fromJson(String? value) {
@@ -295,11 +304,7 @@ extension MobileUploadStatusX on MobileUploadStatus {
   }
 }
 
-enum SyncTransferExecutionStatus {
-  completed,
-  failed,
-  skipped,
-}
+enum SyncTransferExecutionStatus { completed, failed, skipped }
 
 extension SyncTransferExecutionStatusX on SyncTransferExecutionStatus {
   String get wireValue {
@@ -358,11 +363,7 @@ extension AssetAvailabilityStateX on AssetAvailabilityState {
   }
 }
 
-enum NetworkPolicy {
-  offlineOnly,
-  askBeforeDownload,
-  developerFetch,
-}
+enum NetworkPolicy { offlineOnly, askBeforeDownload, developerFetch }
 
 extension NetworkPolicyX on NetworkPolicy {
   String get label {
@@ -513,8 +514,9 @@ class ModelArtifact {
       expectedSha256: json['expected_sha256'] as String?,
       installedPath: json['installed_path'] as String?,
       installedSha256: json['installed_sha256'] as String?,
-      installStatus:
-          ModelInstallStatusX.fromJson(json['install_status'] as String?),
+      installStatus: ModelInstallStatusX.fromJson(
+        json['install_status'] as String?,
+      ),
       reviewNotes: json['review_notes'] as String? ?? '',
       approvedForPersonalFamilyUse:
           json['approved_for_personal_family_use'] as bool? ?? false,
@@ -571,9 +573,9 @@ class ModelRuntimeStatus {
       pythonExecutable: json['python_executable'] as String? ?? 'python3',
       pythonVersion: json['python_version'] as String?,
       offlineReady: json['offline_ready'] as bool? ?? false,
-      dependencies: _readList(json['dependencies'])
-          .map((item) => ModelRuntimeDependency.fromJson(item))
-          .toList(),
+      dependencies: _readList(
+        json['dependencies'],
+      ).map((item) => ModelRuntimeDependency.fromJson(item)).toList(),
       detail: json['detail'] as String? ?? 'Runtime status unavailable.',
     );
   }
@@ -632,15 +634,17 @@ class PrivacyStatus {
       telemetryEnabled: json['telemetry_enabled'] as bool? ?? false,
       analyticsEnabled: json['analytics_enabled'] as bool? ?? false,
       cloudAiEnabled: json['cloud_ai_enabled'] as bool? ?? false,
-      installedModels: _readList(json['installed_models'])
-          .map((item) => ModelArtifact.fromJson(item))
-          .toList(),
-      localOnlyDisclosure: json['local_only_disclosure'] as String? ??
+      installedModels: _readList(
+        json['installed_models'],
+      ).map((item) => ModelArtifact.fromJson(item)).toList(),
+      localOnlyDisclosure:
+          json['local_only_disclosure'] as String? ??
           'Photos and generated intelligence stay local.',
       encryption: json['encryption'] is Map
           ? EncryptionStatus.fromJson(
-              (json['encryption'] as Map)
-                  .map((key, value) => MapEntry(key.toString(), value)),
+              (json['encryption'] as Map).map(
+                (key, value) => MapEntry(key.toString(), value),
+              ),
             )
           : const EncryptionStatus.unavailable(),
     );
@@ -663,11 +667,11 @@ class EncryptionStatus {
   final String warning;
 
   const EncryptionStatus.unavailable()
-      : databaseEncrypted = false,
-        derivedDataEncrypted = false,
-        keyStorage = null,
-        sensitiveIndexingAllowed = false,
-        warning = 'Encryption status unavailable.';
+    : databaseEncrypted = false,
+      derivedDataEncrypted = false,
+      keyStorage = null,
+      sensitiveIndexingAllowed = false,
+      warning = 'Encryption status unavailable.';
 
   factory EncryptionStatus.fromJson(Map<String, dynamic> json) {
     return EncryptionStatus(
@@ -748,8 +752,9 @@ class BackupVerification {
       assetsChecked: (json['assets_checked'] as num?)?.toInt() ?? 0,
       missingAssetPaths: _readStringList(json['missing_asset_paths']),
       vaultChunksChecked: (json['vault_chunks_checked'] as num?)?.toInt() ?? 0,
-      missingVaultChunkPaths:
-          _readStringList(json['missing_vault_chunk_paths']),
+      missingVaultChunkPaths: _readStringList(
+        json['missing_vault_chunk_paths'],
+      ),
       modelFilesChecked: (json['model_files_checked'] as num?)?.toInt() ?? 0,
       missingModelPaths: _readStringList(json['missing_model_paths']),
       ok: json['ok'] as bool? ?? false,
@@ -978,7 +983,7 @@ class DeviceStorageProfile {
       totalBytes: (json['total_bytes'] as num?)?.toInt(),
       availableBytes: (json['available_bytes'] as num?)?.toInt(),
       reservedBytes: (json['reserved_bytes'] as num?)?.toInt() ?? 0,
-      acceptsStorage: json['accepts_storage'] as bool? ?? true,
+      acceptsStorage: json['accepts_storage'] as bool? ?? false,
       batteryPowered: json['battery_powered'] as bool? ?? false,
       meteredNetwork: json['metered_network'] as bool? ?? false,
       lowBattery: json['low_battery'] as bool? ?? false,
@@ -1363,6 +1368,32 @@ class MobileUpload {
   }
 }
 
+class MobileSessionRefreshResponse {
+  const MobileSessionRefreshResponse({
+    required this.session,
+    required this.bearerToken,
+    required this.previousSessionId,
+    required this.detail,
+  });
+
+  final MobileSession session;
+  final String bearerToken;
+  final String previousSessionId;
+  final String detail;
+
+  factory MobileSessionRefreshResponse.fromJson(Map<String, dynamic> json) {
+    final sessionJson = json['session'] as Map? ?? const <String, dynamic>{};
+    return MobileSessionRefreshResponse(
+      session: MobileSession.fromJson(
+        sessionJson.map((key, value) => MapEntry(key.toString(), value)),
+      ),
+      bearerToken: json['bearer_token'] as String? ?? '',
+      previousSessionId: json['previous_session_id'] as String? ?? '',
+      detail: json['detail'] as String? ?? '',
+    );
+  }
+}
+
 class MobilePairResponse {
   const MobilePairResponse({
     required this.session,
@@ -1379,15 +1410,52 @@ class MobilePairResponse {
   factory MobilePairResponse.fromJson(Map<String, dynamic> json) {
     return MobilePairResponse(
       session: MobileSession.fromJson(
-        (json['session'] as Map? ?? const <String, dynamic>{})
-            .map((key, value) => MapEntry(key.toString(), value)),
+        (json['session'] as Map? ?? const <String, dynamic>{}).map(
+          (key, value) => MapEntry(key.toString(), value),
+        ),
       ),
       device: DeviceIdentity.fromJson(
-        (json['device'] as Map? ?? const <String, dynamic>{})
-            .map((key, value) => MapEntry(key.toString(), value)),
+        (json['device'] as Map? ?? const <String, dynamic>{}).map(
+          (key, value) => MapEntry(key.toString(), value),
+        ),
       ),
       bearerToken: json['bearer_token'] as String? ?? '',
       detail: json['detail'] as String? ?? '',
+    );
+  }
+}
+
+class DevicePairing {
+  const DevicePairing({
+    required this.id,
+    required this.deviceName,
+    required this.platform,
+    required this.pairingToken,
+    required this.createdAt,
+    required this.expiresAt,
+    required this.approvedAt,
+    this.vaultId,
+  });
+
+  final String id;
+  final String deviceName;
+  final String platform;
+  final String? vaultId;
+  final String pairingToken;
+  final DateTime createdAt;
+  final DateTime expiresAt;
+  final DateTime? approvedAt;
+
+  factory DevicePairing.fromJson(Map<String, dynamic> json) {
+    return DevicePairing(
+      id: json['id'].toString(),
+      deviceName: json['device_name'] as String? ?? 'Mobile device',
+      platform: json['platform'] as String? ?? 'android',
+      vaultId: json['vault_id']?.toString(),
+      pairingToken: json['pairing_token'] as String? ?? '',
+      createdAt: _readDateTime(json['created_at']) ?? DateTime.now().toUtc(),
+      expiresAt: _readDateTime(json['expires_at']) ?? DateTime.now().toUtc(),
+      approvedAt: _readDateTime(json['approved_at']),
     );
   }
 }
@@ -1423,6 +1491,139 @@ class MobileAssetSummary {
       contentHash: json['content_hash'] as String? ?? '',
       capturedAt: _readDateTime(json['captured_at']) ?? DateTime.now().toUtc(),
       available: json['available'] as bool? ?? false,
+    );
+  }
+}
+
+class MobileWorkspaceCapabilities {
+  const MobileWorkspaceCapabilities({
+    required this.canBrowseLibrary,
+    required this.canSearch,
+    required this.canUploadCameraRoll,
+    required this.canDownloadOriginals,
+    required this.canManageStorage,
+    required this.canImportDesktopFolders,
+    required this.canRunModels,
+    required this.roleDetail,
+  });
+
+  final bool canBrowseLibrary;
+  final bool canSearch;
+  final bool canUploadCameraRoll;
+  final bool canDownloadOriginals;
+  final bool canManageStorage;
+  final bool canImportDesktopFolders;
+  final bool canRunModels;
+  final String roleDetail;
+
+  factory MobileWorkspaceCapabilities.fromJson(Map<String, dynamic> json) {
+    return MobileWorkspaceCapabilities(
+      canBrowseLibrary: json['can_browse_library'] as bool? ?? false,
+      canSearch: json['can_search'] as bool? ?? false,
+      canUploadCameraRoll: json['can_upload_camera_roll'] as bool? ?? false,
+      canDownloadOriginals: json['can_download_originals'] as bool? ?? false,
+      canManageStorage: json['can_manage_storage'] as bool? ?? false,
+      canImportDesktopFolders:
+          json['can_import_desktop_folders'] as bool? ?? false,
+      canRunModels: json['can_run_models'] as bool? ?? false,
+      roleDetail: json['role_detail'] as String? ?? '',
+    );
+  }
+}
+
+class MobileWorkspaceSnapshot {
+  const MobileWorkspaceSnapshot({
+    required this.session,
+    required this.sessions,
+    required this.timeline,
+    required this.albums,
+    required this.people,
+    required this.places,
+    required this.events,
+    required this.jobs,
+    required this.vaultStatus,
+    required this.devices,
+    required this.syncNetwork,
+    required this.capabilities,
+  });
+
+  final MobileSession session;
+  final List<MobileSession> sessions;
+  final TimelineResponse timeline;
+  final List<Album> albums;
+  final List<PersonCluster> people;
+  final List<PlaceCluster> places;
+  final List<EventCluster> events;
+  final List<JobRecord> jobs;
+  final VaultStatus vaultStatus;
+  final List<DeviceIdentity> devices;
+  final SyncNetworkStatus syncNetwork;
+  final MobileWorkspaceCapabilities capabilities;
+
+  List<Asset> get visibleAssets {
+    return timeline.buckets.expand((bucket) => bucket.assets).toList();
+  }
+
+  factory MobileWorkspaceSnapshot.fromJson(Map<String, dynamic> json) {
+    final rawSession = json['session'];
+    final rawTimeline = json['timeline'];
+    final rawVaultStatus = json['vault_status'];
+    final rawSyncNetwork = json['sync_network'];
+    final rawCapabilities = json['capabilities'];
+
+    return MobileWorkspaceSnapshot(
+      session: rawSession is Map
+          ? MobileSession.fromJson(
+              rawSession.map((key, value) => MapEntry(key.toString(), value)),
+            )
+          : MobileSession.fromJson(const <String, dynamic>{}),
+      sessions: _readList(
+        json['sessions'],
+      ).map((item) => MobileSession.fromJson(item)).toList(),
+      timeline: rawTimeline is Map
+          ? TimelineResponse.fromJson(
+              rawTimeline.map((key, value) => MapEntry(key.toString(), value)),
+            )
+          : TimelineResponse.fromJson(const <String, dynamic>{}),
+      albums: _readList(
+        json['albums'],
+      ).map((item) => Album.fromJson(item)).toList(),
+      people: _readList(
+        json['people'],
+      ).map((item) => PersonCluster.fromJson(item)).toList(),
+      places: _readList(
+        json['places'],
+      ).map((item) => PlaceCluster.fromJson(item)).toList(),
+      events: _readList(
+        json['events'],
+      ).map((item) => EventCluster.fromJson(item)).toList(),
+      jobs: _readList(
+        json['jobs'],
+      ).map((item) => JobRecord.fromJson(item)).toList(),
+      vaultStatus: rawVaultStatus is Map
+          ? VaultStatus.fromJson(
+              rawVaultStatus.map(
+                (key, value) => MapEntry(key.toString(), value),
+              ),
+            )
+          : VaultStatus.fromJson(const <String, dynamic>{}),
+      devices: _readList(
+        json['devices'],
+      ).map((item) => DeviceIdentity.fromJson(item)).toList(),
+      syncNetwork: rawSyncNetwork is Map
+          ? SyncNetworkStatus.fromJson(
+              rawSyncNetwork.map(
+                (key, value) => MapEntry(key.toString(), value),
+              ),
+            )
+          : SyncNetworkStatus.fromJson(const <String, dynamic>{}),
+      capabilities: rawCapabilities is Map
+          ? MobileWorkspaceCapabilities.fromJson(
+              rawCapabilities.map(
+                (key, value) => MapEntry(key.toString(), value),
+              ),
+            )
+          : MobileWorkspaceCapabilities.fromJson(const <String, dynamic>{}),
     );
   }
 }
@@ -1592,19 +1793,20 @@ class SyncPlan {
       generatedAt:
           _readDateTime(json['generated_at']) ?? DateTime.now().toUtc(),
       vaultIds: _readStringList(json['vault_ids']),
-      transfers: _readList(json['transfers'])
-          .map((item) => SyncTransfer.fromJson(item))
-          .toList(),
-      conflicts: _readList(json['conflicts'])
-          .map((item) => SyncConflict.fromJson(item))
-          .toList(),
-      underReplicatedBlobIds:
-          _readStringList(json['under_replicated_blob_ids']),
+      transfers: _readList(
+        json['transfers'],
+      ).map((item) => SyncTransfer.fromJson(item)).toList(),
+      conflicts: _readList(
+        json['conflicts'],
+      ).map((item) => SyncConflict.fromJson(item)).toList(),
+      underReplicatedBlobIds: _readStringList(
+        json['under_replicated_blob_ids'],
+      ),
       policySatisfied: json['policy_satisfied'] as bool? ?? false,
       detail: json['detail'] as String? ?? '',
-      executionResults: _readList(json['execution_results'])
-          .map((item) => SyncTransferExecutionResult.fromJson(item))
-          .toList(),
+      executionResults: _readList(
+        json['execution_results'],
+      ).map((item) => SyncTransferExecutionResult.fromJson(item)).toList(),
     );
   }
 }
@@ -1688,10 +1890,12 @@ class AssetAvailability {
       vaultId: json['vault_id']?.toString(),
       state: AssetAvailabilityStateX.fromJson(json['state'] as String?),
       localReplica: json['local_replica'] as bool? ?? false,
-      reachableReplicaDeviceIds:
-          _readStringList(json['reachable_replica_device_ids']),
-      offlineReplicaDeviceIds:
-          _readStringList(json['offline_replica_device_ids']),
+      reachableReplicaDeviceIds: _readStringList(
+        json['reachable_replica_device_ids'],
+      ),
+      offlineReplicaDeviceIds: _readStringList(
+        json['offline_replica_device_ids'],
+      ),
       replicaCount: (json['replica_count'] as num?)?.toInt() ?? 0,
       requiredReplicaCount:
           (json['required_replica_count'] as num?)?.toInt() ?? 1,
@@ -1735,12 +1939,12 @@ class VaultStatus {
               rawVault.map((key, value) => MapEntry(key.toString(), value)),
             )
           : Vault.fromJson(const <String, dynamic>{}),
-      members: _readList(json['members'])
-          .map((item) => VaultMember.fromJson(item))
-          .toList(),
-      devices: _readList(json['devices'])
-          .map((item) => DeviceIdentity.fromJson(item))
-          .toList(),
+      members: _readList(
+        json['members'],
+      ).map((item) => VaultMember.fromJson(item)).toList(),
+      devices: _readList(
+        json['devices'],
+      ).map((item) => DeviceIdentity.fromJson(item)).toList(),
       assetsTotal: (json['assets_total'] as num?)?.toInt() ?? 0,
       blobsTotal: (json['blobs_total'] as num?)?.toInt() ?? 0,
       localAvailableAssets:
@@ -1752,6 +1956,94 @@ class VaultStatus {
       missingBlobs: (json['missing_blobs'] as num?)?.toInt() ?? 0,
       policySatisfied: json['policy_satisfied'] as bool? ?? false,
       detail: json['detail'] as String? ?? '',
+    );
+  }
+}
+
+class VaultFileEntry {
+  const VaultFileEntry({
+    required this.id,
+    required this.vaultId,
+    required this.parentId,
+    required this.assetId,
+    required this.name,
+    required this.kind,
+    required this.mediaKind,
+    required this.mimeType,
+    required this.bytes,
+    required this.contentHash,
+    required this.originDeviceId,
+    required this.createdAt,
+    required this.updatedAt,
+    required this.trashedAt,
+  });
+
+  final String id;
+  final String vaultId;
+  final String? parentId;
+  final String? assetId;
+  final String name;
+  final VaultFileKind kind;
+  final String? mediaKind;
+  final String? mimeType;
+  final int bytes;
+  final String? contentHash;
+  final String? originDeviceId;
+  final DateTime createdAt;
+  final DateTime updatedAt;
+  final DateTime? trashedAt;
+
+  bool get isFolder => kind == VaultFileKind.folder;
+  bool get isFile => kind == VaultFileKind.file;
+  bool get isTrashed => trashedAt != null;
+
+  factory VaultFileEntry.fromJson(Map<String, dynamic> json) {
+    return VaultFileEntry(
+      id: json['id'].toString(),
+      vaultId: json['vault_id'].toString(),
+      parentId: json['parent_id']?.toString(),
+      assetId: json['asset_id']?.toString(),
+      name: json['name'] as String? ?? '',
+      kind: VaultFileKindX.fromJson(json['kind'] as String?),
+      mediaKind: json['media_kind'] as String?,
+      mimeType: json['mime_type'] as String?,
+      bytes: (json['bytes'] as num?)?.toInt() ?? 0,
+      contentHash: json['content_hash'] as String?,
+      originDeviceId: json['origin_device_id']?.toString(),
+      createdAt: _readDateTime(json['created_at']) ?? DateTime.now().toUtc(),
+      updatedAt: _readDateTime(json['updated_at']) ?? DateTime.now().toUtc(),
+      trashedAt: _readDateTime(json['trashed_at']),
+    );
+  }
+}
+
+class VaultFileTreeResponse {
+  const VaultFileTreeResponse({
+    required this.vaultId,
+    required this.rootEntryIds,
+    required this.entries,
+  });
+
+  final String? vaultId;
+  final List<String> rootEntryIds;
+  final List<VaultFileEntry> entries;
+
+  List<VaultFileEntry> get roots {
+    final rootIds = rootEntryIds.toSet();
+    return entries.where((entry) => rootIds.contains(entry.id)).toList();
+  }
+
+  List<VaultFileEntry> childrenOf(String parentId) {
+    return entries.where((entry) => entry.parentId == parentId).toList();
+  }
+
+  factory VaultFileTreeResponse.fromJson(Map<String, dynamic> json) {
+    return VaultFileTreeResponse(
+      vaultId: json['vault_id']?.toString(),
+      rootEntryIds: _readStringList(json['root_entry_ids']),
+      entries: _readList(
+        json['entries'],
+      ).map((item) => VaultFileEntry.fromJson(item)).toList(),
     );
   }
 }
@@ -2080,13 +2372,14 @@ class Asset {
       placeHint: json['place_hint'] as String?,
       metadata: json['metadata'] is Map
           ? AssetMetadata.fromJson(
-              (json['metadata'] as Map)
-                  .map((key, value) => MapEntry(key.toString(), value)),
+              (json['metadata'] as Map).map(
+                (key, value) => MapEntry(key.toString(), value),
+              ),
             )
           : null,
-      variants: _readList(json['variants'])
-          .map((item) => AssetVariant.fromJson(item))
-          .toList(),
+      variants: _readList(
+        json['variants'],
+      ).map((item) => AssetVariant.fromJson(item)).toList(),
     );
   }
 }
@@ -2303,8 +2596,9 @@ class TimelineBucket {
   final int totalAssets;
 
   factory TimelineBucket.fromJson(Map<String, dynamic> json) {
-    final assets =
-        _readList(json['assets']).map((item) => Asset.fromJson(item)).toList();
+    final assets = _readList(
+      json['assets'],
+    ).map((item) => Asset.fromJson(item)).toList();
     return TimelineBucket(
       label: json['label'] as String? ?? 'Untitled bucket',
       assetIds: _readStringList(json['asset_ids']),
@@ -2363,22 +2657,25 @@ class TimelineResponse {
     return TimelineResponse(
       buckets: merged,
       nextCursor: nextPage.nextCursor,
-      totalAssets:
-          nextPage.totalAssets == 0 ? totalAssets : nextPage.totalAssets,
+      totalAssets: nextPage.totalAssets == 0
+          ? totalAssets
+          : nextPage.totalAssets,
       returnedAssets: returnedAssets + nextPage.returnedAssets,
     );
   }
 
   factory TimelineResponse.fromJson(Map<String, dynamic> json) {
-    final buckets = _readList(json['buckets'])
-        .map((item) => TimelineBucket.fromJson(item))
-        .toList();
+    final buckets = _readList(
+      json['buckets'],
+    ).map((item) => TimelineBucket.fromJson(item)).toList();
     return TimelineResponse(
       buckets: buckets,
       nextCursor: json['next_cursor'] as String?,
-      totalAssets: (json['total_assets'] as num?)?.toInt() ??
+      totalAssets:
+          (json['total_assets'] as num?)?.toInt() ??
           buckets.fold<int>(0, (sum, bucket) => sum + bucket.totalAssets),
-      returnedAssets: (json['returned_assets'] as num?)?.toInt() ??
+      returnedAssets:
+          (json['returned_assets'] as num?)?.toInt() ??
           buckets.fold<int>(0, (sum, bucket) => sum + bucket.assets.length),
     );
   }
@@ -2389,6 +2686,9 @@ class SearchQuery {
     required this.text,
     this.people,
     this.places,
+    this.events,
+    this.mediaKind,
+    this.favorite,
     this.fromDate,
     this.toDate,
     this.includeArchived = false,
@@ -2398,6 +2698,9 @@ class SearchQuery {
   final String text;
   final String? people;
   final String? places;
+  final String? events;
+  final String? mediaKind;
+  final bool? favorite;
   final String? fromDate;
   final String? toDate;
   final bool includeArchived;
@@ -2408,6 +2711,10 @@ class SearchQuery {
       if (text.trim().isNotEmpty) 'text': text.trim(),
       if (people != null && people!.trim().isNotEmpty) 'people': people!.trim(),
       if (places != null && places!.trim().isNotEmpty) 'places': places!.trim(),
+      if (events != null && events!.trim().isNotEmpty) 'events': events!.trim(),
+      if (mediaKind != null && mediaKind!.trim().isNotEmpty)
+        'media_kind': mediaKind!.trim(),
+      if (favorite != null) 'favorite': '$favorite',
       if (fromDate != null && fromDate!.trim().isNotEmpty)
         'from_date': fromDate!.trim(),
       if (toDate != null && toDate!.trim().isNotEmpty)
@@ -2422,6 +2729,9 @@ class SearchQuery {
       text: json['text'] as String? ?? '',
       people: json['people'] as String?,
       places: json['places'] as String?,
+      events: json['events'] as String?,
+      mediaKind: json['media_kind'] as String?,
+      favorite: json['favorite'] as bool?,
       fromDate: json['from_date'] as String?,
       toDate: json['to_date'] as String?,
       includeArchived: json['include_archived'] as bool? ?? false,
@@ -2456,18 +2766,18 @@ class SearchResponse {
 
     return SearchResponse(
       query: SearchQuery.fromJson(queryMap),
-      assets: _readList(json['assets'])
-          .map((item) => Asset.fromJson(item))
-          .toList(),
-      people: _readList(json['people'])
-          .map((item) => PersonCluster.fromJson(item))
-          .toList(),
-      places: _readList(json['places'])
-          .map((item) => PlaceCluster.fromJson(item))
-          .toList(),
-      events: _readList(json['events'])
-          .map((item) => EventCluster.fromJson(item))
-          .toList(),
+      assets: _readList(
+        json['assets'],
+      ).map((item) => Asset.fromJson(item)).toList(),
+      people: _readList(
+        json['people'],
+      ).map((item) => PersonCluster.fromJson(item)).toList(),
+      places: _readList(
+        json['places'],
+      ).map((item) => PlaceCluster.fromJson(item)).toList(),
+      events: _readList(
+        json['events'],
+      ).map((item) => EventCluster.fromJson(item)).toList(),
     );
   }
 }
@@ -2518,7 +2828,8 @@ class SearchIndexStatus {
       sceneReady: json['scene_ready'] as bool? ?? false,
       semanticReady: json['semantic_ready'] as bool? ?? false,
       updatedAt: _readDateTime(json['updated_at']),
-      detail: json['detail'] as String? ??
+      detail:
+          json['detail'] as String? ??
           'Search index status unavailable from this daemon.',
     );
   }
@@ -2545,8 +2856,10 @@ class GalleryDashboardData {
   final List<ModelArtifact> models;
   final ModelRuntimeStatus? modelRuntimeStatus;
 
-  int get assetCount => timeline.buckets
-      .fold<int>(0, (sum, bucket) => sum + bucket.assets.length);
+  int get assetCount => timeline.buckets.fold<int>(
+    0,
+    (sum, bucket) => sum + bucket.assets.length,
+  );
 }
 
 class Album {
@@ -2582,12 +2895,14 @@ class LibrarySettings {
   const LibrarySettings({
     required this.libraryRoot,
     required this.defaultImportMode,
+    required this.originalStoragePolicy,
     required this.initializedAt,
     required this.updatedAt,
   });
 
   final String libraryRoot;
   final ImportMode defaultImportMode;
+  final OriginalStoragePolicy originalStoragePolicy;
   final DateTime? initializedAt;
   final DateTime? updatedAt;
 
@@ -2596,6 +2911,9 @@ class LibrarySettings {
       libraryRoot: json['library_root'] as String? ?? '',
       defaultImportMode: ImportModeX.fromJson(
         json['default_import_mode'] as String?,
+      ),
+      originalStoragePolicy: OriginalStoragePolicyX.fromJson(
+        json['original_storage_policy'] as String?,
       ),
       initializedAt: _readDateTime(json['initialized_at']),
       updatedAt: _readDateTime(json['updated_at']),
@@ -2607,15 +2925,18 @@ class LibrarySettingsDraft {
   const LibrarySettingsDraft({
     required this.libraryRoot,
     required this.defaultImportMode,
+    this.originalStoragePolicy = OriginalStoragePolicy.encryptedOnly,
   });
 
   final String libraryRoot;
   final ImportMode defaultImportMode;
+  final OriginalStoragePolicy originalStoragePolicy;
 
   Map<String, dynamic> toJson() {
     return {
       'library_root': libraryRoot,
       'default_import_mode': defaultImportMode.wireValue,
+      'original_storage_policy': originalStoragePolicy.wireValue,
     };
   }
 }
@@ -2791,22 +3112,24 @@ class ImportSession {
       candidates.where((candidate) => candidate.isDuplicate).length;
 
   int get computedSidecarCount => candidates.fold<int>(
-        0,
-        (sum, candidate) => sum + candidate.sidecarPaths.length,
-      );
+    0,
+    (sum, candidate) => sum + candidate.sidecarPaths.length,
+  );
 
   int get computedSelectedBytes => candidates
       .where((candidate) => candidate.selected && !candidate.isDuplicate)
       .fold<int>(0, (sum, candidate) => sum + candidate.bytes);
 
   factory ImportSession.fromJson(Map<String, dynamic> json) {
-    final candidates = _readList(json['candidates'])
-        .map((item) => ImportCandidate.fromJson(item))
-        .toList();
-    final unsupportedFilePaths =
-        _readStringList(json['unsupported_file_paths']);
-    final fallbackDuplicateCount =
-        candidates.where((candidate) => candidate.isDuplicate).length;
+    final candidates = _readList(
+      json['candidates'],
+    ).map((item) => ImportCandidate.fromJson(item)).toList();
+    final unsupportedFilePaths = _readStringList(
+      json['unsupported_file_paths'],
+    );
+    final fallbackDuplicateCount = candidates
+        .where((candidate) => candidate.isDuplicate)
+        .length;
     final fallbackSidecarCount = candidates.fold<int>(
       0,
       (sum, candidate) => sum + candidate.sidecarPaths.length,
@@ -2839,12 +3162,13 @@ class ImportSession {
       unsupportedFilePaths: unsupportedFilePaths,
       selectedCandidateCount:
           (json['selected_candidate_count'] as num?)?.toInt() ??
-              fallbackSelectedCandidates.length,
+          fallbackSelectedCandidates.length,
       selectedBytes:
           (json['selected_bytes'] as num?)?.toInt() ?? fallbackSelectedBytes,
       duplicateCount:
           (json['duplicate_count'] as num?)?.toInt() ?? fallbackDuplicateCount,
-      unsupportedCount: (json['unsupported_count'] as num?)?.toInt() ??
+      unsupportedCount:
+          (json['unsupported_count'] as num?)?.toInt() ??
           unsupportedFilePaths.length,
       sidecarCount:
           (json['sidecar_count'] as num?)?.toInt() ?? fallbackSidecarCount,
@@ -2924,27 +3248,22 @@ class LibraryStatus {
     final rawSettings = json['settings'];
     final settings = rawSettings is Map
         ? LibrarySettings.fromJson(
-            rawSettings.map(
-              (key, value) => MapEntry(key.toString(), value),
-            ),
+            rawSettings.map((key, value) => MapEntry(key.toString(), value)),
           )
         : null;
 
     return LibraryStatus(
       settings: settings,
-      watchFolders: _readList(json['watch_folders'])
-          .map((item) => WatchFolder.fromJson(item))
-          .toList(),
+      watchFolders: _readList(
+        json['watch_folders'],
+      ).map((item) => WatchFolder.fromJson(item)).toList(),
       isInitialized: json['is_initialized'] as bool? ?? settings != null,
     );
   }
 }
 
 class SetupDraft {
-  const SetupDraft({
-    required this.settings,
-    required this.watchFolders,
-  });
+  const SetupDraft({required this.settings, required this.watchFolders});
 
   final LibrarySettingsDraft settings;
   final List<WatchFolderDraft> watchFolders;
@@ -2995,11 +3314,11 @@ class DaemonLaunchResult {
   });
 
   const DaemonLaunchResult.none()
-      : attempted = false,
-        started = false,
-        alreadyRunning = false,
-        attemptedCommands = const [],
-        message = null;
+    : attempted = false,
+      started = false,
+      alreadyRunning = false,
+      attemptedCommands = const [],
+      message = null;
 
   final bool attempted;
   final bool started;
@@ -3111,11 +3430,7 @@ List<Map<String, dynamic>> _readList(Object? raw) {
 
   return raw
       .whereType<Map>()
-      .map(
-        (item) => item.map(
-          (key, value) => MapEntry(key.toString(), value),
-        ),
-      )
+      .map((item) => item.map((key, value) => MapEntry(key.toString(), value)))
       .toList();
 }
 

@@ -157,43 +157,104 @@ pub fn decrypt_chunks_to_bytes(
     let mut plaintext = Vec::new();
 
     for chunk in sorted_chunks {
-        let local_path = chunk.local_path.as_ref().ok_or_else(|| {
-            VaultStoreError::Invalid(format!("chunk {} has no local_path", chunk.id))
-        })?;
-        let nonce_hex = chunk
-            .nonce_hex
-            .as_ref()
-            .ok_or_else(|| VaultStoreError::Invalid(format!("chunk {} has no nonce", chunk.id)))?;
-        let aad = chunk.aad.as_deref().unwrap_or_default();
-        let ciphertext = fs::read(library_root.join(local_path)).map_err(io_error)?;
-        let encrypted_hash = sha256_hex(&ciphertext);
-        if encrypted_hash != chunk.encrypted_hash {
-            return Err(VaultStoreError::Invalid(format!(
-                "encrypted hash mismatch for chunk {}",
-                chunk.id
-            )));
-        }
-        let nonce = decode_hex_12(nonce_hex)?;
-        let mut decrypted = cipher
-            .decrypt(
-                Nonce::from_slice(&nonce),
-                chacha20poly1305::aead::Payload {
-                    msg: &ciphertext,
-                    aad: aad.as_bytes(),
-                },
-            )
-            .map_err(|err| VaultStoreError::Crypto(err.to_string()))?;
-        let content_hash = sha256_hex(&decrypted);
-        if content_hash != chunk.content_hash {
-            return Err(VaultStoreError::Invalid(format!(
-                "plaintext hash mismatch for chunk {}",
-                chunk.id
-            )));
-        }
+        let mut decrypted = decrypt_chunk_to_bytes(&cipher, library_root, &chunk)?;
         plaintext.append(&mut decrypted);
     }
 
     Ok(plaintext)
+}
+
+pub fn decrypt_chunks_range_to_bytes(
+    config: &AppConfig,
+    library_root: &Path,
+    vault_id: Uuid,
+    key_version: u32,
+    chunks: &[crate::domain::BlobChunk],
+    start: u64,
+    end_inclusive: u64,
+) -> Result<Vec<u8>, VaultStoreError> {
+    if start > end_inclusive {
+        return Err(VaultStoreError::Invalid(
+            "range start must be before range end".to_string(),
+        ));
+    }
+
+    let key = load_existing_vault_key(config, vault_id, key_version)?;
+    let cipher = ChaCha20Poly1305::new(Key::from_slice(key.as_ref()));
+    let mut sorted_chunks = chunks.to_vec();
+    sorted_chunks.sort_by_key(|chunk| chunk.chunk_index);
+    let mut plaintext =
+        Vec::with_capacity((end_inclusive - start + 1).min(usize::MAX as u64) as usize);
+    let mut chunk_start = 0_u64;
+
+    for chunk in sorted_chunks {
+        let chunk_end = chunk_start.saturating_add(chunk.bytes);
+        if chunk_end <= start {
+            chunk_start = chunk_end;
+            continue;
+        }
+        if chunk_start > end_inclusive {
+            break;
+        }
+
+        let decrypted = decrypt_chunk_to_bytes(&cipher, library_root, &chunk)?;
+        let slice_start = start.saturating_sub(chunk_start) as usize;
+        let slice_end = (end_inclusive + 1)
+            .min(chunk_end)
+            .saturating_sub(chunk_start) as usize;
+        plaintext.extend_from_slice(&decrypted[slice_start..slice_end]);
+        chunk_start = chunk_end;
+    }
+
+    Ok(plaintext)
+}
+
+fn decrypt_chunk_to_bytes(
+    cipher: &ChaCha20Poly1305,
+    library_root: &Path,
+    chunk: &crate::domain::BlobChunk,
+) -> Result<Vec<u8>, VaultStoreError> {
+    let local_path = chunk
+        .local_path
+        .as_ref()
+        .ok_or_else(|| VaultStoreError::Invalid(format!("chunk {} has no local_path", chunk.id)))?;
+    let nonce_hex = chunk
+        .nonce_hex
+        .as_ref()
+        .ok_or_else(|| VaultStoreError::Invalid(format!("chunk {} has no nonce", chunk.id)))?;
+    let aad = chunk.aad.as_deref().unwrap_or_default();
+    let ciphertext = fs::read(library_root.join(local_path)).map_err(io_error)?;
+    let encrypted_hash = sha256_hex(&ciphertext);
+    if encrypted_hash != chunk.encrypted_hash {
+        return Err(VaultStoreError::Invalid(format!(
+            "encrypted hash mismatch for chunk {}",
+            chunk.id
+        )));
+    }
+    let nonce = decode_hex_12(nonce_hex)?;
+    let decrypted = cipher
+        .decrypt(
+            Nonce::from_slice(&nonce),
+            chacha20poly1305::aead::Payload {
+                msg: &ciphertext,
+                aad: aad.as_bytes(),
+            },
+        )
+        .map_err(|err| VaultStoreError::Crypto(err.to_string()))?;
+    let content_hash = sha256_hex(&decrypted);
+    if content_hash != chunk.content_hash {
+        return Err(VaultStoreError::Invalid(format!(
+            "plaintext hash mismatch for chunk {}",
+            chunk.id
+        )));
+    }
+    if decrypted.len() as u64 != chunk.bytes {
+        return Err(VaultStoreError::Invalid(format!(
+            "plaintext byte count mismatch for chunk {}",
+            chunk.id
+        )));
+    }
+    Ok(decrypted)
 }
 
 pub fn restore_original_from_chunks(

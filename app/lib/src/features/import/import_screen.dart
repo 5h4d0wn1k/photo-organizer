@@ -213,7 +213,7 @@ class _ImportScreenState extends State<ImportScreen> {
       _session = null;
       _committedSession = null;
       _selectedCandidateIds = <String>{};
-      _error = preset.disabledReason;
+      _error = null;
     });
   }
 
@@ -222,9 +222,7 @@ class _ImportScreenState extends State<ImportScreen> {
     final theme = Theme.of(context);
 
     return Scaffold(
-      appBar: AppBar(
-        title: const Text('Import media'),
-      ),
+      appBar: AppBar(title: const Text('Import media')),
       body: ListView(
         padding: const EdgeInsets.all(24),
         children: [
@@ -248,10 +246,7 @@ class _ImportScreenState extends State<ImportScreen> {
                 spacing: 16,
                 runSpacing: 8,
                 children: [
-                  _SafetyPill(
-                    icon: Icons.lock_outline,
-                    label: 'Local only',
-                  ),
+                  _SafetyPill(icon: Icons.lock_outline, label: 'Local only'),
                   _SafetyPill(
                     icon: Icons.cloud_off_outlined,
                     label: 'No cloud upload',
@@ -401,7 +396,8 @@ class _ImportScreenState extends State<ImportScreen> {
               const SizedBox(height: 12),
               CheckboxListTile(
                 value: _moveConfirmed,
-                onChanged: _selectedNonDuplicateCount(_session!) == 0 ||
+                onChanged:
+                    _selectedNonDuplicateCount(_session!) == 0 ||
                         _committedSession != null
                     ? null
                     : (value) {
@@ -440,7 +436,8 @@ class _ImportScreenState extends State<ImportScreen> {
               runSpacing: 12,
               children: [
                 FilledButton.icon(
-                  onPressed: _busy ||
+                  onPressed:
+                      _busy ||
                           _committedSession != null ||
                           _selectedNonDuplicateCount(_session!) == 0 ||
                           (_importMode == ImportMode.move && !_moveConfirmed)
@@ -489,8 +486,8 @@ class _ImportScreenState extends State<ImportScreen> {
                   _importMode = session.importMode;
                   _committedSession =
                       session.status == ImportSessionStatus.committed
-                          ? session
-                          : null;
+                      ? session
+                      : null;
                   _selectedCandidateIds = session.candidates
                       .where(
                         (candidate) =>
@@ -518,7 +515,6 @@ class _ImportPreset {
     required this.placeHint,
     required this.importMode,
     required this.addAsWatchFolder,
-    this.disabledReason,
   });
 
   final String title;
@@ -527,9 +523,6 @@ class _ImportPreset {
   final String placeHint;
   final ImportMode importMode;
   final bool addAsWatchFolder;
-  final String? disabledReason;
-
-  bool get enabled => disabledReason == null;
 }
 
 class _OrganizedArchivePanel extends StatelessWidget {
@@ -557,15 +550,13 @@ class _OrganizedArchivePanel extends StatelessWidget {
       addAsWatchFolder: true,
     ),
     _ImportPreset(
-      title: 'Audio stays separate',
+      title: 'Index organized audio',
       description:
-          'Audio was organized under Ok/Audio, but this gallery indexes photos and videos only.',
+          'Reference verified audio files as first-class vault files alongside photos and videos.',
       path: _ImportScreenState._recommendedAudioRoot,
       placeHint: 'Local organized audio',
       importMode: ImportMode.reference,
-      addAsWatchFolder: false,
-      disabledReason:
-          'Audio import is intentionally outside this Google Photos-like gallery slice.',
+      addAsWatchFolder: true,
     ),
   ];
 
@@ -597,14 +588,14 @@ class _OrganizedArchivePanel extends StatelessWidget {
                   Tooltip(
                     message: preset.description,
                     child: FilledButton.tonalIcon(
-                      onPressed: preset.enabled ? () => onSelect(preset) : null,
+                      onPressed: () => onSelect(preset),
                       icon: Icon(
                         preset.path == _ImportScreenState._recommendedVideoRoot
                             ? Icons.video_library_outlined
                             : preset.path ==
-                                    _ImportScreenState._recommendedAudioRoot
-                                ? Icons.audio_file_outlined
-                                : Icons.photo_library_outlined,
+                                  _ImportScreenState._recommendedAudioRoot
+                            ? Icons.audio_file_outlined
+                            : Icons.photo_library_outlined,
                       ),
                       label: Text(preset.title),
                     ),
@@ -665,9 +656,7 @@ class _ImportPreflightPanel extends StatelessWidget {
               spacing: 12,
               runSpacing: 12,
               children: [
-                _PreflightChip(
-                  label: '$selectedCandidateCount selected media',
-                ),
+                _PreflightChip(label: '$selectedCandidateCount selected media'),
                 _PreflightChip(
                   label: '${session.duplicateCount} duplicates skipped',
                 ),
@@ -765,10 +754,7 @@ class _CommitResultPanel extends StatelessWidget {
 }
 
 class _RecentImportSessions extends StatelessWidget {
-  const _RecentImportSessions({
-    required this.sessions,
-    required this.onOpen,
-  });
+  const _RecentImportSessions({required this.sessions, required this.onOpen});
 
   final List<ImportSession> sessions;
   final void Function(ImportSession session) onOpen;
@@ -879,17 +865,25 @@ class _ImportSessionResults extends StatelessWidget {
                         : 'Ready to import',
                   ].join(' • '),
                 ),
-                secondary: Icon(
-                  candidate.mediaKind == 'video'
-                      ? Icons.videocam_outlined
-                      : Icons.image_outlined,
-                ),
+                secondary: Icon(_assetKindIcon(candidate.mediaKind)),
               ),
           ],
         ),
       ),
     );
   }
+}
+
+IconData _assetKindIcon(String mediaKind) {
+  return switch (mediaKind.toLowerCase()) {
+    'video' => Icons.videocam_outlined,
+    'document' => Icons.description_outlined,
+    'audio' => Icons.audiotrack_outlined,
+    'archive' => Icons.folder_zip_outlined,
+    'text' => Icons.article_outlined,
+    'other' => Icons.insert_drive_file_outlined,
+    _ => Icons.image_outlined,
+  };
 }
 
 class _ImportWarningPanel extends StatelessWidget {
@@ -922,11 +916,7 @@ class _ImportWarningPanel extends StatelessWidget {
             ),
             const SizedBox(height: 8),
             for (final path in shownPaths)
-              Text(
-                path,
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-              ),
+              Text(path, maxLines: 1, overflow: TextOverflow.ellipsis),
             if (hiddenCount > 0) Text('+$hiddenCount more ignored files'),
           ],
         ),
@@ -936,10 +926,7 @@ class _ImportWarningPanel extends StatelessWidget {
 }
 
 class _SafetyPill extends StatelessWidget {
-  const _SafetyPill({
-    required this.icon,
-    required this.label,
-  });
+  const _SafetyPill({required this.icon, required this.label});
 
   final IconData icon;
   final String label;
@@ -948,11 +935,7 @@ class _SafetyPill extends StatelessWidget {
   Widget build(BuildContext context) {
     return Row(
       mainAxisSize: MainAxisSize.min,
-      children: [
-        Icon(icon, size: 18),
-        const SizedBox(width: 6),
-        Text(label),
-      ],
+      children: [Icon(icon, size: 18), const SizedBox(width: 6), Text(label)],
     );
   }
 }
