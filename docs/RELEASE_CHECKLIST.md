@@ -18,12 +18,14 @@
 - Android can upload synthetic media larger than Axum's historical default body limit through offset chunks.
 - Interrupted/resumed, duplicate, and canceled mobile uploads behave correctly.
 - Each phone can see, search, and download each phone's uploaded original before revocation.
+- Each phone that explicitly opts into storage contribution receives encrypted chunk assignments, stores the chunks locally, reports proof-of-possession replicas, and can restore a missing encrypted chunk back to the laptop.
 - Ranged original and preview downloads verify SHA-256.
 - Mobile session refresh rotates the bearer token and rejects the previous token.
 - Current mobile session revocation rejects the old bearer token while other phones remain valid.
 - Device session revocation rejects all sessions for that device.
 - `scripts/android_mobile_app_smoke.sh` installs the debug app on both phones and confirms the visible pairing workspace.
 - Profile/release APKs do not accept the `private_gallery_mobile_bearer_token` debug launch extra.
+- Release APK/AAB signing does not fall back to the debug key; release signing material is supplied through ignored local properties or external CI secrets, and `PRIVATE_GALLERY_READINESS_REQUIRE_RELEASE_SIGNING=1` passes on the release machine/CI job.
 - One real camera-roll item per phone is intentionally uploaded and visible from the other phone and laptop.
 
 ## Data Protection

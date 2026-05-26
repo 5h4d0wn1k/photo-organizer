@@ -311,6 +311,41 @@ void main() {
     final workspace = await client.fetchMobileWorkspace(
       bearerToken: paired.bearerToken,
     );
+    final storageDevice = await client.updateMobileStorageProfile(
+      bearerToken: paired.bearerToken,
+      storageProfile: const DeviceStorageProfile(
+        deviceId: null,
+        totalBytes: null,
+        availableBytes: null,
+        reservedBytes: 1024,
+        acceptsStorage: true,
+        batteryPowered: true,
+        meteredNetwork: false,
+        lowBattery: false,
+      ),
+    );
+    final storagePlan = await client.fetchMobileStoragePlan(
+      bearerToken: paired.bearerToken,
+    );
+    final replicaChunk = await client.downloadMobileReplicaChunk(
+      bearerToken: paired.bearerToken,
+      blobId: storagePlan.assignments.single.blobId,
+      chunkIndex: storagePlan.assignments.single.chunks.single.chunkIndex,
+    );
+    final replicaProof = storagePlan.assignments.single.chunks.single.proofFor(
+      replicaChunk,
+    );
+    final replicaReport = await client.reportMobileReplica(
+      bearerToken: paired.bearerToken,
+      assignment: storagePlan.assignments.single,
+      chunkProofsByIndex: {0: replicaProof},
+    );
+    final replicaRestore = await client.restoreMobileReplicaChunk(
+      bearerToken: paired.bearerToken,
+      blobId: storagePlan.assignments.single.blobId,
+      chunkIndex: storagePlan.assignments.single.chunks.single.chunkIndex,
+      bytes: replicaChunk,
+    );
     final search = await client.searchMobile(
       bearerToken: paired.bearerToken,
       query: const SearchQuery(text: 'photo', limit: 25),
@@ -363,6 +398,11 @@ void main() {
     expect(workspace.timeline.totalAssets, 1);
     expect(workspace.vaultStatus.vault.name, 'Personal vault');
     expect(workspace.capabilities.canSearch, isTrue);
+    expect(storageDevice.storageProfile.acceptsStorage, isTrue);
+    expect(storagePlan.assignments.single.blobId, 'blob-1');
+    expect(replicaChunk, [7, 8, 9]);
+    expect(replicaReport.health, 'healthy');
+    expect(replicaRestore['restored_local_chunk'], isTrue);
     expect(search.assets.single.id, 'asset-1');
     expect(availability.state, AssetAvailabilityState.underReplicated);
     expect(flagged.favorite, isTrue);
@@ -764,6 +804,39 @@ class _MobileSyncJsonClient extends http.BaseClient {
         headers: const {'content-type': 'image/jpeg'},
       );
     }
+    if (request.method == 'GET' &&
+        path == '/mobile/storage/blobs/blob-1/chunks/0') {
+      return http.StreamedResponse(
+        Stream<List<int>>.value(const [7, 8, 9]),
+        HttpStatus.ok,
+        headers: const {
+          'content-type': 'application/octet-stream',
+          'content-length': '3',
+        },
+        contentLength: 3,
+      );
+    }
+    if (request.method == 'PUT' &&
+        path == '/mobile/storage/blobs/blob-1/chunks/0') {
+      final streamed = request as http.Request;
+      expect(streamed.bodyBytes, [7, 8, 9]);
+      return http.StreamedResponse(
+        Stream<List<int>>.value(
+          utf8.encode(
+            jsonEncode({
+              'blob_id': 'blob-1',
+              'chunk_index': 0,
+              'encrypted_hash': 'encrypted-chunk-hash',
+              'encrypted_bytes': 3,
+              'restored_local_chunk': true,
+              'detail': 'restored',
+            }),
+          ),
+        ),
+        HttpStatus.ok,
+        headers: const {'content-type': 'application/json'},
+      );
+    }
     if (request.method == 'PUT' &&
         path.startsWith('/mobile/uploads/upload-1/chunks/')) {
       final streamed = request as http.Request;
@@ -796,6 +869,13 @@ class _MobileSyncJsonClient extends http.BaseClient {
         _mobileSessionJson(revoked: true),
       ],
       ('GET', '/mobile/workspace') => _mobileWorkspaceJson(),
+      ('POST', '/mobile/storage-profile') => _deviceJson(
+        id: 'device-mobile',
+        displayName: 'Moto G',
+      ),
+      ('GET', '/mobile/storage/plan') => _mobileStoragePlanJson(),
+      ('POST', '/mobile/storage/blobs/blob-1/report') =>
+        _mobileReplicaReportJson(),
       ('GET', '/mobile/search') => _mobileSearchJson(),
       ('POST', '/mobile/uploads') => _mobileUploadJson(status: 'pending'),
       ('GET', '/mobile/uploads/upload-1') => _mobileUploadJson(
@@ -837,6 +917,21 @@ class _MobileSyncJsonClient extends http.BaseClient {
       final streamed = request as http.Request;
       final payload = jsonDecode(streamed.body) as Map<String, Object?>;
       expect(payload['favorite'], isTrue);
+    }
+    if (request.method == 'POST' && path == '/mobile/storage-profile') {
+      final streamed = request as http.Request;
+      final payload = jsonDecode(streamed.body) as Map<String, Object?>;
+      final profile = payload['storage_profile'] as Map<String, Object?>;
+      expect(profile['accepts_storage'], isTrue);
+    }
+    if (request.method == 'POST' &&
+        path == '/mobile/storage/blobs/blob-1/report') {
+      final streamed = request as http.Request;
+      final payload = jsonDecode(streamed.body) as Map<String, Object?>;
+      expect(payload['transfer_id'], 'transfer-1');
+      final chunks = payload['chunks'] as List<Object?>;
+      expect(chunks, isNotEmpty);
+      expect((chunks.single as Map<String, Object?>)['proof'], isNotEmpty);
     }
 
     return http.StreamedResponse(
@@ -1140,6 +1235,46 @@ Map<String, Object?> _mobileWorkspaceJson() {
       'can_run_models': false,
       'role_detail': 'mobile contributor',
     },
+  };
+}
+
+Map<String, Object?> _mobileStoragePlanJson() {
+  return {
+    'generated_at': '2026-05-13T06:02:00Z',
+    'device': _deviceJson(id: 'device-mobile', displayName: 'Moto G'),
+    'assignments': [
+      {
+        'transfer_id': 'transfer-1',
+        'vault_id': 'vault-1',
+        'blob_id': 'blob-1',
+        'asset_id': 'asset-1',
+        'encrypted_hash': 'encrypted-blob-hash',
+        'bytes_total': 3,
+        'chunks': [
+          {
+            'chunk_id': 'chunk-1',
+            'chunk_index': 0,
+            'encrypted_hash': 'encrypted-chunk-hash',
+            'encrypted_bytes': 3,
+            'plaintext_bytes': 3,
+            'proof_challenge': 'challenge-1',
+          },
+        ],
+      },
+    ],
+    'detail': '1 encrypted blob replica assignment is ready for this phone.',
+  };
+}
+
+Map<String, Object?> _mobileReplicaReportJson() {
+  return {
+    'blob_id': 'blob-1',
+    'device_id': 'device-mobile',
+    'health': 'healthy',
+    'bytes_present': 3,
+    'verified_at': '2026-05-13T06:03:00Z',
+    'transfer_id': 'transfer-1',
+    'detail': 'phone reported encrypted chunk replica',
   };
 }
 

@@ -1,3 +1,7 @@
+import 'dart:convert';
+
+import 'package:crypto/crypto.dart';
+
 enum ImportMode { copy, reference, move }
 
 enum VaultFileKind { folder, file }
@@ -1624,6 +1628,149 @@ class MobileWorkspaceSnapshot {
               ),
             )
           : MobileWorkspaceCapabilities.fromJson(const <String, dynamic>{}),
+    );
+  }
+}
+
+class MobileReplicaChunkDescriptor {
+  const MobileReplicaChunkDescriptor({
+    required this.chunkId,
+    required this.chunkIndex,
+    required this.encryptedHash,
+    required this.encryptedBytes,
+    required this.plaintextBytes,
+    required this.proofChallenge,
+  });
+
+  final String chunkId;
+  final int chunkIndex;
+  final String encryptedHash;
+  final int encryptedBytes;
+  final int plaintextBytes;
+  final String proofChallenge;
+
+  factory MobileReplicaChunkDescriptor.fromJson(Map<String, dynamic> json) {
+    return MobileReplicaChunkDescriptor(
+      chunkId: json['chunk_id']?.toString() ?? '',
+      chunkIndex: (json['chunk_index'] as num?)?.toInt() ?? 0,
+      encryptedHash: json['encrypted_hash'] as String? ?? '',
+      encryptedBytes: (json['encrypted_bytes'] as num?)?.toInt() ?? 0,
+      plaintextBytes: (json['plaintext_bytes'] as num?)?.toInt() ?? 0,
+      proofChallenge: json['proof_challenge'] as String? ?? '',
+    );
+  }
+
+  String proofFor(List<int> encryptedChunkBytes) {
+    return sha256.convert([
+      ...utf8.encode(proofChallenge),
+      0,
+      ...encryptedChunkBytes,
+    ]).toString();
+  }
+
+  Map<String, dynamic> toReportJson({required String proof}) {
+    return {
+      'chunk_index': chunkIndex,
+      'encrypted_hash': encryptedHash,
+      'encrypted_bytes': encryptedBytes,
+      'proof': proof,
+    };
+  }
+}
+
+class MobileReplicaAssignment {
+  const MobileReplicaAssignment({
+    required this.transferId,
+    required this.vaultId,
+    required this.blobId,
+    required this.assetId,
+    required this.encryptedHash,
+    required this.bytesTotal,
+    required this.chunks,
+  });
+
+  final String transferId;
+  final String vaultId;
+  final String blobId;
+  final String assetId;
+  final String encryptedHash;
+  final int bytesTotal;
+  final List<MobileReplicaChunkDescriptor> chunks;
+
+  factory MobileReplicaAssignment.fromJson(Map<String, dynamic> json) {
+    return MobileReplicaAssignment(
+      transferId: json['transfer_id']?.toString() ?? '',
+      vaultId: json['vault_id']?.toString() ?? '',
+      blobId: json['blob_id']?.toString() ?? '',
+      assetId: json['asset_id']?.toString() ?? '',
+      encryptedHash: json['encrypted_hash'] as String? ?? '',
+      bytesTotal: (json['bytes_total'] as num?)?.toInt() ?? 0,
+      chunks: _readList(
+        json['chunks'],
+      ).map(MobileReplicaChunkDescriptor.fromJson).toList(),
+    );
+  }
+}
+
+class MobileStoragePlan {
+  const MobileStoragePlan({
+    required this.generatedAt,
+    required this.device,
+    required this.assignments,
+    required this.detail,
+  });
+
+  final DateTime generatedAt;
+  final DeviceIdentity device;
+  final List<MobileReplicaAssignment> assignments;
+  final String detail;
+
+  factory MobileStoragePlan.fromJson(Map<String, dynamic> json) {
+    final rawDevice = json['device'];
+    return MobileStoragePlan(
+      generatedAt:
+          _readDateTime(json['generated_at']) ?? DateTime.now().toUtc(),
+      device: rawDevice is Map
+          ? DeviceIdentity.fromJson(
+              rawDevice.map((key, value) => MapEntry(key.toString(), value)),
+            )
+          : DeviceIdentity.fromJson(const <String, dynamic>{}),
+      assignments: _readList(
+        json['assignments'],
+      ).map(MobileReplicaAssignment.fromJson).toList(),
+      detail: json['detail'] as String? ?? '',
+    );
+  }
+}
+
+class MobileReplicaReport {
+  const MobileReplicaReport({
+    required this.blobId,
+    required this.deviceId,
+    required this.health,
+    required this.bytesPresent,
+    required this.verifiedAt,
+    required this.transferId,
+    required this.detail,
+  });
+
+  final String blobId;
+  final String deviceId;
+  final String health;
+  final int bytesPresent;
+  final DateTime? verifiedAt;
+  final String transferId;
+  final String detail;
+
+  factory MobileReplicaReport.fromJson(Map<String, dynamic> json) {
+    return MobileReplicaReport(
+      blobId: json['blob_id']?.toString() ?? '',
+      deviceId: json['device_id']?.toString() ?? '',
+      health: json['health'] as String? ?? 'unverified',
+      bytesPresent: (json['bytes_present'] as num?)?.toInt() ?? 0,
+      verifiedAt: _readDateTime(json['verified_at']),
+      transferId: json['transfer_id']?.toString() ?? '',
+      detail: json['detail'] as String? ?? '',
     );
   }
 }

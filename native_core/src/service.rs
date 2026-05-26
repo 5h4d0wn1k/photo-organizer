@@ -28,8 +28,10 @@ use crate::{
         ImportAssetResponse, ImportMode, ImportSession, ImportSessionStatus, JobKind, JobLog,
         JobRecord, JobStatus, LibrarySettings, LibraryStatusResponse, MediaKind,
         MergePersonRequest, MetadataSource, MobileAssetSummary, MobilePairRequest,
-        MobilePairResponse, MobileSession, MobileSessionRefreshResponse, MobileUpload,
-        MobileUploadRequest, MobileUploadStatus, MobileWorkspaceCapabilities,
+        MobilePairResponse, MobileReplicaAssignment, MobileReplicaChunkDescriptor,
+        MobileReplicaReport, MobileReplicaReportRequest, MobileReplicaRestoreResult, MobileSession,
+        MobileSessionRefreshResponse, MobileStoragePlan, MobileStorageProfileUpdateRequest,
+        MobileUpload, MobileUploadRequest, MobileUploadStatus, MobileWorkspaceCapabilities,
         MobileWorkspaceResponse, ModelArtifact, ModelImportRequest, ModelInstallRequest, ModelTask,
         MoveFileEntryRequest, OcrBlock, OriginalStoragePolicy, PersonCluster, PlaceCluster,
         PrivacyStatus, RebuildRequest, RejectPersonMatchRequest, RelayEndpoint, RenameAlbumRequest,
@@ -463,12 +465,20 @@ impl GalleryService {
             return Err(ServiceError::NotFound(format!("vault {vault_id}")));
         }
 
-        let mut storage_profile = DeviceStorageProfile {
-            battery_powered: true,
-            reserved_bytes: 2 * 1024 * 1024 * 1024,
-            ..DeviceStorageProfile::default()
-        };
-        storage_profile.accepts_storage = false;
+        let mut storage_profile = request.storage_profile.unwrap_or_else(|| {
+            let mut profile = DeviceStorageProfile {
+                battery_powered: true,
+                reserved_bytes: 2 * 1024 * 1024 * 1024,
+                ..DeviceStorageProfile::default()
+            };
+            profile.accepts_storage = false;
+            profile
+        });
+        storage_profile.device_id = None;
+        storage_profile.battery_powered = true;
+        if storage_profile.accepts_storage && storage_profile.reserved_bytes == 0 {
+            storage_profile.reserved_bytes = 2 * 1024 * 1024 * 1024;
+        }
         let device = build_device_identity(
             None,
             display_name.to_string(),
@@ -1097,6 +1107,11 @@ impl GalleryService {
         let jobs = state.jobs.iter().take(25).cloned().collect::<Vec<_>>();
         let vault_status = build_vault_status(&state, session.vault_id)?;
         let devices = vault_status.devices.clone();
+        let mobile_device_accepts_storage = devices
+            .iter()
+            .find(|device| device.id == session.device_id)
+            .map(|device| device.storage_profile.accepts_storage)
+            .unwrap_or(false);
         let now = Utc::now();
         let sessions = state
             .mobile_sessions
@@ -1114,12 +1129,16 @@ impl GalleryService {
             can_search: true,
             can_upload_camera_roll: true,
             can_download_originals: true,
-            can_manage_storage: false,
+            can_manage_storage: mobile_device_accepts_storage,
             can_import_desktop_folders: false,
             can_run_models: false,
-            role_detail:
-                "This paired mobile device can browse, search, upload camera-roll media, and download available originals. Storage policy, desktop folder imports, model management, and backup restore stay on storage-capable desktop devices."
-                    .to_string(),
+            role_detail: if mobile_device_accepts_storage {
+                "This phone can browse, search, upload originals, download originals, and contribute encrypted vault chunks as local-cloud storage. Desktop folder imports, model management, and restore staging stay on desktop."
+                    .to_string()
+            } else {
+                "This paired mobile device can browse, search, upload camera-roll media, and download available originals. Enable storage contribution before it receives encrypted vault chunks."
+                    .to_string()
+            },
         };
         self.persist_locked_state(&state)?;
         Ok(MobileWorkspaceResponse {
@@ -1135,6 +1154,352 @@ impl GalleryService {
             devices,
             sync_network,
             capabilities,
+        })
+    }
+
+    pub async fn update_mobile_storage_profile(
+        &self,
+        bearer_token: &str,
+        request: MobileStorageProfileUpdateRequest,
+    ) -> Result<DeviceIdentity, ServiceError> {
+        let mut state = self.state.write().await;
+        let session = active_mobile_session_from_state(&mut state, bearer_token)?;
+        let device_index = state
+            .devices
+            .iter()
+            .position(|device| device.id == session.device_id)
+            .ok_or_else(|| ServiceError::NotFound(format!("device {}", session.device_id)))?;
+        let mut storage_profile = request.storage_profile;
+        storage_profile.device_id = Some(session.device_id);
+        storage_profile.battery_powered = true;
+        let accepts_storage = storage_profile.accepts_storage;
+        state.devices[device_index].storage_profile = storage_profile;
+        if !accepts_storage {
+            for replica in state.blob_replicas.iter_mut().filter(|replica| {
+                replica.device_id == session.device_id && replica.health == ReplicaHealth::Healthy
+            }) {
+                replica.health = ReplicaHealth::Offline;
+            }
+        }
+        let device = state.devices[device_index].clone();
+        self.persist_locked_state(&state)?;
+        Ok(device)
+    }
+
+    pub async fn mobile_storage_plan(
+        &self,
+        bearer_token: &str,
+    ) -> Result<MobileStoragePlan, ServiceError> {
+        let mut state = self.state.write().await;
+        let session = active_mobile_session_from_state(&mut state, bearer_token)?;
+        ensure_distributed_defaults(&mut state);
+        refresh_blob_records(&self.config, &mut state);
+        let library_root = PathBuf::from(effective_library_root(&state, &self.config));
+        let device = state
+            .devices
+            .iter()
+            .find(|device| device.id == session.device_id)
+            .cloned()
+            .ok_or_else(|| ServiceError::NotFound(format!("device {}", session.device_id)))?;
+        let vault = state
+            .vaults
+            .iter()
+            .find(|vault| vault.id == session.vault_id)
+            .cloned()
+            .ok_or_else(|| ServiceError::NotFound(format!("vault {}", session.vault_id)))?;
+
+        if !device.storage_profile.accepts_storage {
+            self.persist_locked_state(&state)?;
+            return Ok(MobileStoragePlan {
+                generated_at: Utc::now(),
+                device,
+                assignments: Vec::new(),
+                detail:
+                    "This phone is paired for browse/upload/download only. Enable storage contribution to receive encrypted chunks."
+                        .to_string(),
+            });
+        }
+        if !storage_policy_allows_device(&vault.storage_policy, &device)
+            || vault
+                .storage_policy
+                .excluded_device_ids
+                .contains(&device.id)
+        {
+            self.persist_locked_state(&state)?;
+            return Ok(MobileStoragePlan {
+                generated_at: Utc::now(),
+                device,
+                assignments: Vec::new(),
+                detail:
+                    "Storage contribution is paused by vault policy because this phone is low on battery, metered, or below the free-space reserve."
+                        .to_string(),
+            });
+        }
+
+        let required = vault.storage_policy.min_replicas.max(1) as usize;
+        let source_device = local_device_id(&state);
+        let now = Utc::now();
+        let mut assignments = Vec::new();
+        let candidate_blobs = state
+            .blob_records
+            .iter()
+            .filter(|blob| blob.vault_id == session.vault_id && blob.tombstoned_at.is_none())
+            .cloned()
+            .collect::<Vec<_>>();
+        for blob in candidate_blobs {
+            if assignments.len() >= 25 {
+                break;
+            }
+            if state.blob_replicas.iter().any(|replica| {
+                replica.blob_id == blob.id
+                    && replica.device_id == session.device_id
+                    && replica.health == ReplicaHealth::Healthy
+            }) {
+                continue;
+            }
+            let healthy_replica_count = state
+                .blob_replicas
+                .iter()
+                .filter(|replica| {
+                    replica.blob_id == blob.id
+                        && replica.health == ReplicaHealth::Healthy
+                        && device_is_active(&state.devices, replica.device_id)
+                })
+                .count();
+            if healthy_replica_count >= required {
+                continue;
+            }
+            if !encrypted_chunks_available(&state, blob.id, &library_root) {
+                continue;
+            }
+            let transfer_id = if let Some(existing) = state.sync_transfers.iter().find(|transfer| {
+                transfer.vault_id == blob.vault_id
+                    && transfer.blob_id == blob.id
+                    && transfer.from_device_id == source_device
+                    && transfer.to_device_id == session.device_id
+                    && matches!(
+                        transfer.status,
+                        SyncTransferStatus::Pending | SyncTransferStatus::Running
+                    )
+                    && transfer.resumable_until >= now
+            }) {
+                existing.id
+            } else {
+                let transfer = pending_transfer(
+                    blob.vault_id,
+                    blob.id,
+                    source_device,
+                    session.device_id,
+                    blob.bytes,
+                );
+                let id = transfer.id;
+                state.sync_transfers.push(transfer);
+                id
+            };
+            let chunks = encrypted_chunk_descriptors_for_blob(&state, blob.id, transfer_id)?;
+            assignments.push(MobileReplicaAssignment {
+                transfer_id,
+                vault_id: blob.vault_id,
+                blob_id: blob.id,
+                asset_id: blob.asset_id,
+                encrypted_hash: blob.encrypted_hash.clone(),
+                bytes_total: blob.bytes,
+                chunks,
+            });
+        }
+        self.persist_locked_state(&state)?;
+        let detail = if assignments.is_empty() {
+            "No encrypted chunks are currently assigned to this phone; the vault policy is already satisfied or local chunks are unavailable.".to_string()
+        } else {
+            format!(
+                "{} encrypted blob replica assignment(s) are ready for this phone.",
+                assignments.len()
+            )
+        };
+        Ok(MobileStoragePlan {
+            generated_at: Utc::now(),
+            device,
+            assignments,
+            detail,
+        })
+    }
+
+    pub async fn mobile_replica_chunk_bytes(
+        &self,
+        bearer_token: &str,
+        blob_id: Uuid,
+        chunk_index: u32,
+    ) -> Result<Vec<u8>, ServiceError> {
+        let mut state = self.state.write().await;
+        let session = active_mobile_session_from_state(&mut state, bearer_token)?;
+        ensure_mobile_storage_device(&state, &session)?;
+        let blob = blob_for_mobile_session(&state, &session, blob_id)?.clone();
+        let transfer_index =
+            mobile_storage_transfer_index(&state, &session, blob.vault_id, blob.id, None, false)?;
+        let chunk = chunk_for_blob(&state, blob.id, chunk_index)?.clone();
+        let library_root = PathBuf::from(effective_library_root(&state, &self.config));
+        let local_path = chunk.local_path.as_deref().ok_or_else(|| {
+            ServiceError::Invalid(format!("chunk {} has no local encrypted path", chunk.id))
+        })?;
+        let bytes = fs::read(library_root.join(local_path))
+            .map_err(|err| ServiceError::Io(format!("failed to read encrypted chunk: {err}")))?;
+        verify_encrypted_chunk_bytes(&chunk, &bytes)?;
+        let now = Utc::now();
+        let transfer = &mut state.sync_transfers[transfer_index];
+        transfer.status = SyncTransferStatus::Running;
+        transfer.started_at = transfer.started_at.or(Some(now));
+        transfer.updated_at = now;
+        self.persist_locked_state(&state)?;
+        Ok(bytes)
+    }
+
+    pub async fn report_mobile_replica(
+        &self,
+        bearer_token: &str,
+        blob_id: Uuid,
+        request: MobileReplicaReportRequest,
+    ) -> Result<MobileReplicaReport, ServiceError> {
+        let mut state = self.state.write().await;
+        let session = active_mobile_session_from_state(&mut state, bearer_token)?;
+        ensure_mobile_storage_device(&state, &session)?;
+        let blob = blob_for_mobile_session(&state, &session, blob_id)?.clone();
+        let expected_chunks =
+            encrypted_chunk_descriptors_for_blob(&state, blob.id, request.transfer_id)?;
+        if expected_chunks.len() != request.chunks.len() {
+            return Err(ServiceError::Invalid(format!(
+                "replica report must include {} chunk(s), got {}",
+                expected_chunks.len(),
+                request.chunks.len()
+            )));
+        }
+        let library_root = PathBuf::from(effective_library_root(&state, &self.config));
+        for expected in &expected_chunks {
+            let Some(report) = request
+                .chunks
+                .iter()
+                .find(|report| report.chunk_index == expected.chunk_index)
+            else {
+                return Err(ServiceError::Invalid(format!(
+                    "replica report is missing chunk {}",
+                    expected.chunk_index
+                )));
+            };
+            if report.encrypted_hash != expected.encrypted_hash
+                || report.encrypted_bytes != expected.encrypted_bytes
+            {
+                return Err(ServiceError::Invalid(format!(
+                    "replica report for chunk {} did not match encrypted hash/size",
+                    expected.chunk_index
+                )));
+            }
+            let chunk = chunk_for_blob(&state, blob.id, expected.chunk_index)?;
+            let expected_proof = mobile_replica_chunk_proof_from_local(
+                &library_root,
+                chunk,
+                &expected.proof_challenge,
+            )?;
+            if report.proof != expected_proof {
+                return Err(ServiceError::Invalid(format!(
+                    "replica report for chunk {} did not prove possession",
+                    expected.chunk_index
+                )));
+            }
+        }
+        let transfer_index = mobile_storage_transfer_index(
+            &state,
+            &session,
+            blob.vault_id,
+            blob.id,
+            Some(request.transfer_id),
+            true,
+        )?;
+        let now = Utc::now();
+        let transfer = &mut state.sync_transfers[transfer_index];
+        transfer.status = SyncTransferStatus::Completed;
+        transfer.bytes_completed = blob.bytes;
+        transfer.updated_at = now;
+        transfer.started_at = transfer.started_at.or(Some(now));
+        sync_transport::upsert_blob_replica(
+            &mut state,
+            blob.id,
+            session.device_id,
+            blob.bytes,
+            Some(request.transfer_id),
+        );
+        let replica = state
+            .blob_replicas
+            .iter()
+            .find(|replica| replica.blob_id == blob.id && replica.device_id == session.device_id)
+            .cloned()
+            .ok_or_else(|| ServiceError::NotFound("mobile replica".to_string()))?;
+        self.persist_locked_state(&state)?;
+        Ok(MobileReplicaReport {
+            blob_id: blob.id,
+            device_id: session.device_id,
+            health: replica.health,
+            bytes_present: replica.bytes_present,
+            verified_at: replica.verified_at,
+            transfer_id: request.transfer_id,
+            detail: "phone reported encrypted chunk replica and the daemon verified the assignment hashes".to_string(),
+        })
+    }
+
+    pub async fn restore_mobile_replica_chunk(
+        &self,
+        bearer_token: &str,
+        blob_id: Uuid,
+        chunk_index: u32,
+        bytes: Vec<u8>,
+    ) -> Result<MobileReplicaRestoreResult, ServiceError> {
+        let mut state = self.state.write().await;
+        let session = active_mobile_session_from_state(&mut state, bearer_token)?;
+        ensure_mobile_storage_device(&state, &session)?;
+        let blob = blob_for_mobile_session(&state, &session, blob_id)?.clone();
+        if !state.blob_replicas.iter().any(|replica| {
+            replica.blob_id == blob.id
+                && replica.device_id == session.device_id
+                && replica.health == ReplicaHealth::Healthy
+        }) {
+            return Err(ServiceError::Invalid(
+                "this phone has not reported a healthy replica for the requested blob".to_string(),
+            ));
+        }
+        let chunk = chunk_for_blob(&state, blob.id, chunk_index)?.clone();
+        verify_encrypted_chunk_bytes(&chunk, &bytes)?;
+        let local_path = chunk.local_path.as_deref().ok_or_else(|| {
+            ServiceError::Invalid(format!("chunk {} has no local encrypted path", chunk.id))
+        })?;
+        let library_root = PathBuf::from(effective_library_root(&state, &self.config));
+        let destination = library_root.join(local_path);
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent).map_err(|err| {
+                ServiceError::Io(format!("failed to create encrypted chunk directory: {err}"))
+            })?;
+        }
+        fs::write(&destination, &bytes).map_err(|err| {
+            ServiceError::Io(format!(
+                "failed to restore encrypted chunk from phone: {err}"
+            ))
+        })?;
+        if encrypted_chunks_available(&state, blob.id, &library_root)
+            && let Some(local_device) = local_device_id(&state)
+        {
+            sync_transport::upsert_blob_replica(
+                &mut state,
+                blob.id,
+                local_device,
+                blob.bytes,
+                None,
+            );
+        }
+        self.persist_locked_state(&state)?;
+        Ok(MobileReplicaRestoreResult {
+            blob_id: blob.id,
+            chunk_index,
+            encrypted_hash: chunk.encrypted_hash,
+            encrypted_bytes: bytes.len() as u64,
+            restored_local_chunk: true,
+            detail: "encrypted chunk restored from phone storage and verified by hash".to_string(),
         })
     }
 
@@ -5483,6 +5848,170 @@ fn encrypted_chunks_available(state: &LibraryState, blob_id: Uuid, library_root:
     vault_store::encrypted_chunk_files_exist(library_root, &chunks)
 }
 
+fn blob_for_mobile_session<'a>(
+    state: &'a LibraryState,
+    session: &MobileSession,
+    blob_id: Uuid,
+) -> Result<&'a BlobRecord, ServiceError> {
+    state
+        .blob_records
+        .iter()
+        .find(|blob| {
+            blob.id == blob_id && blob.vault_id == session.vault_id && blob.tombstoned_at.is_none()
+        })
+        .ok_or_else(|| ServiceError::NotFound(format!("blob {blob_id}")))
+}
+
+fn chunk_for_blob(
+    state: &LibraryState,
+    blob_id: Uuid,
+    chunk_index: u32,
+) -> Result<&BlobChunk, ServiceError> {
+    state
+        .blob_chunks
+        .iter()
+        .find(|chunk| chunk.blob_id == blob_id && chunk.chunk_index == chunk_index)
+        .ok_or_else(|| ServiceError::NotFound(format!("chunk {chunk_index} for blob {blob_id}")))
+}
+
+fn encrypted_chunk_descriptors_for_blob(
+    state: &LibraryState,
+    blob_id: Uuid,
+    transfer_id: Uuid,
+) -> Result<Vec<MobileReplicaChunkDescriptor>, ServiceError> {
+    let mut chunks = state
+        .blob_chunks
+        .iter()
+        .filter(|chunk| chunk.blob_id == blob_id)
+        .cloned()
+        .collect::<Vec<_>>();
+    chunks.sort_by_key(|chunk| chunk.chunk_index);
+    if chunks.is_empty() {
+        return Err(ServiceError::Invalid(format!(
+            "blob {blob_id} has no encrypted chunks"
+        )));
+    }
+    Ok(chunks
+        .into_iter()
+        .map(|chunk| {
+            let proof_challenge = mobile_replica_chunk_proof_challenge(transfer_id, &chunk);
+            MobileReplicaChunkDescriptor {
+                chunk_id: chunk.id,
+                chunk_index: chunk.chunk_index,
+                encrypted_hash: chunk.encrypted_hash,
+                encrypted_bytes: chunk.encrypted_bytes,
+                plaintext_bytes: chunk.bytes,
+                proof_challenge,
+            }
+        })
+        .collect())
+}
+
+fn ensure_mobile_storage_device(
+    state: &LibraryState,
+    session: &MobileSession,
+) -> Result<(), ServiceError> {
+    let device = state
+        .devices
+        .iter()
+        .find(|device| device.id == session.device_id)
+        .ok_or_else(|| ServiceError::NotFound(format!("device {}", session.device_id)))?;
+    if !device.storage_profile.accepts_storage {
+        return Err(ServiceError::Invalid(
+            "mobile device has not enabled encrypted storage contribution".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn mobile_storage_transfer_index(
+    state: &LibraryState,
+    session: &MobileSession,
+    vault_id: Uuid,
+    blob_id: Uuid,
+    transfer_id: Option<Uuid>,
+    allow_completed: bool,
+) -> Result<usize, ServiceError> {
+    let source_device = local_device_id(state);
+    let now = Utc::now();
+    state
+        .sync_transfers
+        .iter()
+        .position(|transfer| {
+            transfer_id
+                .map(|requested| transfer.id == requested)
+                .unwrap_or(true)
+                && transfer.vault_id == vault_id
+                && transfer.blob_id == blob_id
+                && transfer.from_device_id == source_device
+                && transfer.to_device_id == session.device_id
+                && match transfer.status {
+                    SyncTransferStatus::Pending | SyncTransferStatus::Running => {
+                        transfer.resumable_until >= now
+                    }
+                    SyncTransferStatus::Completed => allow_completed,
+                    SyncTransferStatus::Failed | SyncTransferStatus::Aborted => false,
+                }
+        })
+        .ok_or_else(|| {
+            let detail = transfer_id
+                .map(|id| format!("transfer {id}"))
+                .unwrap_or_else(|| format!("blob {blob_id}"));
+            ServiceError::Invalid(format!(
+                "mobile storage assignment for {detail} does not match this active device session"
+            ))
+        })
+}
+
+fn mobile_replica_chunk_proof_challenge(transfer_id: Uuid, chunk: &BlobChunk) -> String {
+    sha256_hex_bytes(
+        format!(
+            "private-gallery:mobile-replica-proof:{transfer_id}:{}:{}:{}:{}",
+            chunk.id, chunk.chunk_index, chunk.encrypted_hash, chunk.encrypted_bytes
+        )
+        .as_bytes(),
+    )
+}
+
+fn mobile_replica_chunk_proof_hex(proof_challenge: &str, bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(proof_challenge.as_bytes());
+    hasher.update([0]);
+    hasher.update(bytes);
+    hex_string(&hasher.finalize())
+}
+
+fn mobile_replica_chunk_proof_from_local(
+    library_root: &Path,
+    chunk: &BlobChunk,
+    proof_challenge: &str,
+) -> Result<String, ServiceError> {
+    let local_path = chunk.local_path.as_deref().ok_or_else(|| {
+        ServiceError::Invalid(format!("chunk {} has no local encrypted path", chunk.id))
+    })?;
+    let bytes = fs::read(library_root.join(local_path))
+        .map_err(|err| ServiceError::Io(format!("failed to read encrypted chunk: {err}")))?;
+    verify_encrypted_chunk_bytes(chunk, &bytes)?;
+    Ok(mobile_replica_chunk_proof_hex(proof_challenge, &bytes))
+}
+
+fn verify_encrypted_chunk_bytes(chunk: &BlobChunk, bytes: &[u8]) -> Result<(), ServiceError> {
+    let encrypted_hash = sha256_hex_bytes(bytes);
+    if encrypted_hash != chunk.encrypted_hash {
+        return Err(ServiceError::Invalid(format!(
+            "encrypted hash mismatch for chunk {}",
+            chunk.chunk_index
+        )));
+    }
+    if chunk.encrypted_bytes != 0 && bytes.len() as u64 != chunk.encrypted_bytes {
+        return Err(ServiceError::Invalid(format!(
+            "encrypted size mismatch for chunk {}",
+            chunk.chunk_index
+        )));
+    }
+    Ok(())
+}
+
 fn enforce_original_storage_policy(
     config: &AppConfig,
     state: &mut LibraryState,
@@ -7554,20 +8083,22 @@ mod tests {
             CreateManualPersonRequest, CreatePairingSessionRequest, CreateVaultRequest, DeviceRole,
             DeviceStorageProfile, DeviceTrustLevel, EncryptionActivationRequest,
             EnrollDeviceRequest, ImportAssetRequest, ImportMode, ImportSourceKind, MediaKind,
-            MetadataSource, MobilePairRequest, MobileUploadRequest, MobileUploadStatus,
-            ModelImportRequest, ModelInstallRequest, MoveFileEntryRequest, NetworkPolicy,
-            RebuildRequest, RenameAlbumRequest, RenameFileEntryRequest, ReplicaHealth,
-            RevokeDeviceRequest, RunSyncRequest, ScanImportSourceRequest, SearchQuery,
-            StoragePolicy, StoragePolicyMode, SyncTransfer, SyncTransferExecutionStatus,
-            SyncTransferStatus, UpdateAlbumAssetsRequest, UpdateAssetFlagsRequest,
-            UpdateAssetsFlagsRequest, UpdateLibrarySettingsRequest, UpdatePersonAssetsRequest,
-            UpdateVaultStoragePolicyRequest, VaultFileKind,
+            MetadataSource, MobilePairRequest, MobileReplicaChunkReport,
+            MobileReplicaReportRequest, MobileStorageProfileUpdateRequest, MobileUploadRequest,
+            MobileUploadStatus, ModelImportRequest, ModelInstallRequest, MoveFileEntryRequest,
+            NetworkPolicy, RebuildRequest, RenameAlbumRequest, RenameFileEntryRequest,
+            ReplicaHealth, RevokeDeviceRequest, RunSyncRequest, ScanImportSourceRequest,
+            SearchQuery, StoragePolicy, StoragePolicyMode, SyncTransfer,
+            SyncTransferExecutionStatus, SyncTransferStatus, UpdateAlbumAssetsRequest,
+            UpdateAssetFlagsRequest, UpdateAssetsFlagsRequest, UpdateLibrarySettingsRequest,
+            UpdatePersonAssetsRequest, UpdateVaultStoragePolicyRequest, VaultFileKind,
         },
         imports,
     };
 
     use super::{
-        ByteRangeRequest, GalleryService, local_device_id, mobile_upload_dir, sha256_hex_bytes,
+        ByteRangeRequest, GalleryService, effective_library_root, local_device_id,
+        mobile_replica_chunk_proof_hex, mobile_upload_dir, sha256_hex_bytes,
     };
 
     fn temp_root(name: &str) -> PathBuf {
@@ -7696,6 +8227,7 @@ mod tests {
                 device_name: "Moto G".to_string(),
                 platform: "android".to_string(),
                 vault_id: None,
+                storage_profile: None,
             })
             .await
             .expect("pair mobile");
@@ -7912,6 +8444,7 @@ mod tests {
                 device_name: "Moto G".to_string(),
                 platform: "android".to_string(),
                 vault_id: None,
+                storage_profile: None,
             })
             .await
             .expect("pair mobile");
@@ -7982,6 +8515,275 @@ mod tests {
             .expect("range download");
         assert_eq!(range.mime_type, "application/pdf");
         assert_eq!(range.bytes, b"%PDF-1.7");
+    }
+
+    #[tokio::test]
+    async fn mobile_storage_node_receives_reports_and_restores_encrypted_chunks() {
+        let runtime_root = temp_root("mobile-storage-node");
+        let library_root = runtime_root.join("library");
+        let service = GalleryService::new(AppConfig {
+            runtime_root: runtime_root.clone(),
+            ..AppConfig::default()
+        })
+        .expect("service");
+        service
+            .update_library_settings(UpdateLibrarySettingsRequest {
+                library_root: library_root.to_string_lossy().to_string(),
+                default_import_mode: ImportMode::Copy,
+                original_storage_policy: None,
+            })
+            .await
+            .expect("settings");
+
+        let pairing = service
+            .create_pairing_session(CreatePairingSessionRequest {
+                device_name: "Android storage phone".to_string(),
+                platform: "android".to_string(),
+                vault_id: None,
+            })
+            .await
+            .expect("pairing session");
+        let paired = service
+            .pair_mobile_device(MobilePairRequest {
+                pairing_token: pairing.pairing_token,
+                device_name: "Android storage phone".to_string(),
+                platform: "android".to_string(),
+                vault_id: None,
+                storage_profile: Some(DeviceStorageProfile {
+                    device_id: None,
+                    total_bytes: Some(128 * 1024 * 1024 * 1024),
+                    available_bytes: Some(64 * 1024 * 1024 * 1024),
+                    reserved_bytes: 1024 * 1024 * 1024,
+                    accepts_storage: true,
+                    battery_powered: true,
+                    metered_network: false,
+                    low_battery: false,
+                }),
+            })
+            .await
+            .expect("pair storage mobile");
+        assert!(paired.device.storage_profile.accepts_storage);
+
+        let workspace = service
+            .mobile_workspace(&paired.bearer_token)
+            .await
+            .expect("workspace");
+        assert!(workspace.capabilities.can_manage_storage);
+
+        let bytes = b"encrypted chunks should be restorable from a phone".to_vec();
+        let reserved = service
+            .reserve_mobile_upload(
+                &paired.bearer_token,
+                MobileUploadRequest {
+                    original_filename: "phone-storage.jpg".to_string(),
+                    media_kind: MediaKind::Photo,
+                    mime_type: "image/jpeg".to_string(),
+                    bytes: bytes.len() as u64,
+                    content_hash: Some(sha256_hex_bytes(&bytes)),
+                    captured_at: Some(Utc::now()),
+                    place_hint: Some("Home".to_string()),
+                },
+            )
+            .await
+            .expect("reserve upload");
+        let completed = service
+            .receive_mobile_upload(&paired.bearer_token, reserved.id, bytes)
+            .await
+            .expect("complete upload");
+        assert_eq!(completed.status, MobileUploadStatus::Completed);
+
+        let plan = service
+            .mobile_storage_plan(&paired.bearer_token)
+            .await
+            .expect("storage plan");
+        assert_eq!(plan.assignments.len(), 1);
+        let assignment = plan.assignments[0].clone();
+        let first_chunk = assignment.chunks[0].clone();
+        let encrypted_chunk = service
+            .mobile_replica_chunk_bytes(
+                &paired.bearer_token,
+                assignment.blob_id,
+                first_chunk.chunk_index,
+            )
+            .await
+            .expect("download encrypted chunk");
+        assert_eq!(
+            sha256_hex_bytes(&encrypted_chunk),
+            first_chunk.encrypted_hash
+        );
+
+        let metadata_only_report = service
+            .report_mobile_replica(
+                &paired.bearer_token,
+                assignment.blob_id,
+                MobileReplicaReportRequest {
+                    transfer_id: assignment.transfer_id,
+                    chunks: assignment
+                        .chunks
+                        .iter()
+                        .map(|chunk| MobileReplicaChunkReport {
+                            chunk_index: chunk.chunk_index,
+                            encrypted_hash: chunk.encrypted_hash.clone(),
+                            encrypted_bytes: chunk.encrypted_bytes,
+                            proof: sha256_hex_bytes(chunk.encrypted_hash.as_bytes()),
+                        })
+                        .collect(),
+                },
+            )
+            .await;
+        assert!(
+            metadata_only_report.is_err(),
+            "storage reports must prove possession of encrypted bytes, not just echo assignment metadata"
+        );
+
+        let report = service
+            .report_mobile_replica(
+                &paired.bearer_token,
+                assignment.blob_id,
+                MobileReplicaReportRequest {
+                    transfer_id: assignment.transfer_id,
+                    chunks: assignment
+                        .chunks
+                        .iter()
+                        .map(|chunk| MobileReplicaChunkReport {
+                            chunk_index: chunk.chunk_index,
+                            encrypted_hash: chunk.encrypted_hash.clone(),
+                            encrypted_bytes: chunk.encrypted_bytes,
+                            proof: mobile_replica_chunk_proof_hex(
+                                &chunk.proof_challenge,
+                                &encrypted_chunk,
+                            ),
+                        })
+                        .collect(),
+                },
+            )
+            .await
+            .expect("report replica");
+        assert_eq!(report.health, ReplicaHealth::Healthy);
+        assert_eq!(report.device_id, paired.device.id);
+
+        let second_pairing = service
+            .create_pairing_session(CreatePairingSessionRequest {
+                device_name: "Second storage phone".to_string(),
+                platform: "android".to_string(),
+                vault_id: None,
+            })
+            .await
+            .expect("second pairing session");
+        let second_paired = service
+            .pair_mobile_device(MobilePairRequest {
+                pairing_token: second_pairing.pairing_token,
+                device_name: "Second storage phone".to_string(),
+                platform: "android".to_string(),
+                vault_id: None,
+                storage_profile: Some(DeviceStorageProfile {
+                    device_id: None,
+                    total_bytes: Some(128 * 1024 * 1024 * 1024),
+                    available_bytes: Some(64 * 1024 * 1024 * 1024),
+                    reserved_bytes: 1024 * 1024 * 1024,
+                    accepts_storage: true,
+                    battery_powered: true,
+                    metered_network: false,
+                    low_battery: false,
+                }),
+            })
+            .await
+            .expect("pair second storage mobile");
+        service
+            .update_vault_storage_policy(
+                paired.session.vault_id,
+                UpdateVaultStoragePolicyRequest {
+                    policy: StoragePolicy {
+                        mode: StoragePolicyMode::Custom,
+                        min_replicas: 3,
+                        preferred_device_ids: Vec::new(),
+                        excluded_device_ids: vec![second_paired.device.id],
+                        min_free_space_bytes: 0,
+                        allow_metered_network: true,
+                        pause_on_low_battery: false,
+                    },
+                },
+            )
+            .await
+            .expect("exclude second phone from storage policy");
+        let second_plan = service
+            .mobile_storage_plan(&second_paired.bearer_token)
+            .await
+            .expect("second storage plan");
+        assert!(
+            second_plan.assignments.is_empty(),
+            "vault storage policy exclusions must block mobile storage assignments"
+        );
+        assert!(
+            service
+                .mobile_replica_chunk_bytes(
+                    &second_paired.bearer_token,
+                    assignment.blob_id,
+                    first_chunk.chunk_index,
+                )
+                .await
+                .is_err(),
+            "storage phones must not fetch encrypted chunks without a matching transfer assignment"
+        );
+
+        let local_chunk_path = {
+            let state = service.state.read().await;
+            let local_path = state
+                .blob_chunks
+                .iter()
+                .find(|chunk| {
+                    chunk.blob_id == assignment.blob_id
+                        && chunk.chunk_index == first_chunk.chunk_index
+                })
+                .and_then(|chunk| chunk.local_path.clone())
+                .expect("local chunk path");
+            PathBuf::from(effective_library_root(&state, &service.config)).join(local_path)
+        };
+        fs::remove_file(&local_chunk_path).expect("remove local encrypted chunk");
+        assert!(!local_chunk_path.exists());
+
+        let restored = service
+            .restore_mobile_replica_chunk(
+                &paired.bearer_token,
+                assignment.blob_id,
+                first_chunk.chunk_index,
+                encrypted_chunk,
+            )
+            .await
+            .expect("restore encrypted chunk");
+        assert!(restored.restored_local_chunk);
+        assert!(local_chunk_path.exists());
+
+        let disabled = service
+            .update_mobile_storage_profile(
+                &paired.bearer_token,
+                MobileStorageProfileUpdateRequest {
+                    storage_profile: DeviceStorageProfile {
+                        device_id: None,
+                        total_bytes: None,
+                        available_bytes: None,
+                        reserved_bytes: 0,
+                        accepts_storage: false,
+                        battery_powered: true,
+                        metered_network: false,
+                        low_battery: false,
+                    },
+                },
+            )
+            .await
+            .expect("disable storage");
+        assert!(!disabled.storage_profile.accepts_storage);
+        assert!(
+            service
+                .mobile_replica_chunk_bytes(
+                    &paired.bearer_token,
+                    assignment.blob_id,
+                    first_chunk.chunk_index,
+                )
+                .await
+                .is_err(),
+            "phones that opt out of storage must not receive encrypted chunk assignments"
+        );
     }
 
     #[tokio::test]
@@ -8145,6 +8947,7 @@ mod tests {
                 device_name: "Pixel".to_string(),
                 platform: "android".to_string(),
                 vault_id: None,
+                storage_profile: None,
             })
             .await
             .expect("paired");
@@ -8214,6 +9017,7 @@ mod tests {
                 device_name: "Pixel".to_string(),
                 platform: "android".to_string(),
                 vault_id: None,
+                storage_profile: None,
             })
             .await
             .expect("pair mobile");
@@ -8412,6 +9216,7 @@ mod tests {
                 device_name: "Moto G".to_string(),
                 platform: "android".to_string(),
                 vault_id: None,
+                storage_profile: None,
             })
             .await
             .expect("pair mobile");
@@ -8549,6 +9354,7 @@ mod tests {
                 device_name: "Moto G".to_string(),
                 platform: "android".to_string(),
                 vault_id: Some(second_vault.id),
+                storage_profile: None,
             })
             .await;
         assert!(wrong_vault.is_err());
@@ -8576,6 +9382,7 @@ mod tests {
                 device_name: "Old phone".to_string(),
                 platform: "android".to_string(),
                 vault_id: Some(first_vault.id),
+                storage_profile: None,
             })
             .await;
         assert!(expired.is_err());
@@ -8594,6 +9401,7 @@ mod tests {
                 device_name: "Revoked phone".to_string(),
                 platform: "android".to_string(),
                 vault_id: Some(first_vault.id),
+                storage_profile: None,
             })
             .await
             .expect("pair mobile");
@@ -8603,6 +9411,7 @@ mod tests {
                 device_name: "Second phone".to_string(),
                 platform: "android".to_string(),
                 vault_id: Some(first_vault.id),
+                storage_profile: None,
             })
             .await;
         assert!(reused.is_err());

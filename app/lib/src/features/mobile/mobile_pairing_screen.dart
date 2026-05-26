@@ -20,10 +20,13 @@ import '../../models/gallery_models.dart'
         Asset,
         Album,
         DeviceIdentity,
+        DeviceStorageProfile,
         EventCluster,
         JobRecord,
         MobileAssetSummary,
         MobilePairResponse,
+        MobileReplicaAssignment,
+        MobileReplicaChunkDescriptor,
         MobileUpload,
         MobileUploadStatus,
         MobileWorkspaceSnapshot,
@@ -67,6 +70,9 @@ class _MobilePairingScreenState extends State<MobilePairingScreen> {
   static const _storage = FlutterSecureStorage();
   static const _launchInviteChannel = MethodChannel(
     'private_gallery/launch_invite',
+  );
+  static const _deviceStorageChannel = MethodChannel(
+    'private_gallery/device_storage',
   );
   static const _pairingKey = 'private_gallery.pending_pairing_payload';
   static const _desktopUrlKey = 'private_gallery.desktop_url';
@@ -322,6 +328,34 @@ class _MobilePairingScreenState extends State<MobilePairingScreen> {
       throw const FormatException('Enter the desktop URL from the invite.');
     }
     return LocalApiClient(baseUri: uri);
+  }
+
+  Future<DeviceStorageProfile> _phoneStorageProfile({
+    required bool acceptsStorage,
+  }) async {
+    int? totalBytes;
+    int? availableBytes;
+    if (!kIsWeb && Platform.isAndroid) {
+      try {
+        final result = await _deviceStorageChannel
+            .invokeMapMethod<String, Object?>('getStorageProfile');
+        totalBytes = (result?['totalBytes'] as num?)?.toInt();
+        availableBytes = (result?['availableBytes'] as num?)?.toInt();
+      } catch (_) {
+        totalBytes = null;
+        availableBytes = null;
+      }
+    }
+    return DeviceStorageProfile(
+      deviceId: null,
+      totalBytes: totalBytes,
+      availableBytes: availableBytes,
+      reservedBytes: acceptsStorage ? 1024 * 1024 * 1024 : 0,
+      acceptsStorage: acceptsStorage,
+      batteryPowered: true,
+      meteredNetwork: false,
+      lowBattery: false,
+    );
   }
 
   Future<void> _scanInviteQr() async {
@@ -884,6 +918,76 @@ class _MobilePairingScreenState extends State<MobilePairingScreen> {
             'Downloaded ${assets.first.originalFilename} to ${file.path}.';
       });
     });
+  }
+
+  Future<void> _syncPhoneStorage() async {
+    await _runBusy(() async {
+      final token = _requireBearerToken();
+      final client = _client();
+      await client.updateMobileStorageProfile(
+        bearerToken: token,
+        storageProfile: await _phoneStorageProfile(acceptsStorage: true),
+      );
+      final plan = await client.fetchMobileStoragePlan(bearerToken: token);
+      if (plan.assignments.isEmpty) {
+        setState(() {
+          _status = plan.detail;
+        });
+        await _refreshPairedSurfaces();
+        return;
+      }
+
+      var chunkCount = 0;
+      var bytesStored = 0;
+      for (final assignment in plan.assignments) {
+        final chunkProofsByIndex = <int, String>{};
+        for (final chunk in assignment.chunks) {
+          final bytes = await client.downloadMobileReplicaChunk(
+            bearerToken: token,
+            blobId: assignment.blobId,
+            chunkIndex: chunk.chunkIndex,
+          );
+          final digest = sha256.convert(bytes).toString();
+          if (digest != chunk.encryptedHash) {
+            throw StateError(
+              'Encrypted chunk hash mismatch for ${assignment.blobId}/${chunk.chunkIndex}.',
+            );
+          }
+          await _storeReplicaChunk(assignment, chunk, bytes);
+          chunkProofsByIndex[chunk.chunkIndex] = chunk.proofFor(bytes);
+          chunkCount += 1;
+          bytesStored += bytes.length;
+        }
+        await client.reportMobileReplica(
+          bearerToken: token,
+          assignment: assignment,
+          chunkProofsByIndex: chunkProofsByIndex,
+        );
+      }
+
+      setState(() {
+        _status =
+            'Stored ${_formatBytes(bytesStored)} of encrypted vault chunks across $chunkCount chunk(s).';
+      });
+      await _refreshPairedSurfaces();
+    });
+  }
+
+  Future<File> _storeReplicaChunk(
+    MobileReplicaAssignment assignment,
+    MobileReplicaChunkDescriptor chunk,
+    List<int> bytes,
+  ) async {
+    final root = await getApplicationSupportDirectory();
+    final directory = Directory(
+      '${root.path}/mobile_replicas/${_safeLocalFilename(assignment.vaultId)}/${_safeLocalFilename(assignment.blobId)}',
+    );
+    await directory.create(recursive: true);
+    final file = File(
+      '${directory.path}/${chunk.chunkIndex.toString().padLeft(8, '0')}.pgblob',
+    );
+    await file.writeAsBytes(bytes, flush: true);
+    return file;
   }
 
   Future<void> _refreshMobileGallery() async {
@@ -2186,6 +2290,19 @@ class _MobilePairingScreenState extends State<MobilePairingScreen> {
             onPressed: _busy ? null : _checkCameraRollAccess,
             icon: const Icon(Icons.folder_open_outlined),
             label: const Text('Check access'),
+          ),
+        ),
+        const SizedBox(height: 12),
+        _ReferenceActionCard(
+          icon: Icons.dns_outlined,
+          title: 'Phone storage contribution',
+          message: workspace?.capabilities.canManageStorage == true
+              ? 'This phone can store encrypted vault chunks for same-network repair and shared capacity.'
+              : 'Enable this phone as encrypted local-cloud storage when it is on a trusted network.',
+          action: OutlinedButton.icon(
+            onPressed: _busy || _bearerToken == null ? null : _syncPhoneStorage,
+            icon: const Icon(Icons.sync_outlined),
+            label: const Text('Sync storage'),
           ),
         ),
         const SizedBox(height: 12),

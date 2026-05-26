@@ -6,6 +6,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CARGO_BIN="${CARGO_BIN:-cargo}"
 FLUTTER_BIN="${FLUTTER_BIN:-flutter}"
 GIT_BIN="${GIT_BIN:-git}"
+REQUIRE_RELEASE_SIGNING="${PRIVATE_GALLERY_READINESS_REQUIRE_RELEASE_SIGNING:-0}"
 
 pass_count=0
 fail_count=0
@@ -30,6 +31,13 @@ skip() {
 warn() {
   printf 'WARN: %s\n' "$1" >&2
   warn_count=$((warn_count + 1))
+}
+
+is_enabled() {
+  case "${1:-}" in
+    1 | true | TRUE | yes | YES) return 0 ;;
+    *) return 1 ;;
+  esac
 }
 
 run_check() {
@@ -85,6 +93,45 @@ check_git_state() {
     fi
   else
     pass "git worktree has no uncommitted changes"
+  fi
+}
+
+check_android_release_signing_config() {
+  local gradle_file="${ROOT_DIR}/app/android/app/build.gradle.kts"
+  local ignore_file="${ROOT_DIR}/app/android/.gitignore"
+  local properties_file="${ROOT_DIR}/app/android/private-gallery-release.properties"
+  local store_file
+
+  if [[ ! -f "${gradle_file}" ]]; then
+    warn "Android Gradle file not found; Android release signing evidence is unavailable"
+    return 1
+  fi
+  if grep -n 'signingConfigs\.getByName("debug")' "${gradle_file}"; then
+    warn "Android release build must not use the debug signing config"
+    return 1
+  fi
+  if ! grep -qx 'private-gallery-release\.properties' "${ignore_file}"; then
+    warn "Android release signing properties file must be git-ignored"
+    return 1
+  fi
+  if ! is_enabled "${REQUIRE_RELEASE_SIGNING}"; then
+    warn "Android release signing material was not required for this local check; set PRIVATE_GALLERY_READINESS_REQUIRE_RELEASE_SIGNING=1 for release evidence"
+    return 0
+  fi
+  if [[ ! -f "${properties_file}" ]]; then
+    warn "Android release signing properties are required but app/android/private-gallery-release.properties is missing"
+    return 1
+  fi
+  for key in storeFile storePassword keyAlias keyPassword; do
+    if ! grep -Eq "^${key}=.+" "${properties_file}"; then
+      warn "Android release signing properties are missing ${key}"
+      return 1
+    fi
+  done
+  store_file="$(sed -n 's/^storeFile=//p' "${properties_file}" | tail -1)"
+  if [[ ! -f "${ROOT_DIR}/app/android/${store_file}" && ! -f "${store_file}" ]]; then
+    warn "Android release signing keystore file referenced by storeFile was not found"
+    return 1
   fi
 }
 
@@ -165,6 +212,8 @@ if have_command "${GIT_BIN}"; then
 else
   skip "git worktree state (${GIT_BIN} not installed)"
 fi
+
+run_check "Android release signing does not use debug keys" check_android_release_signing_config
 
 if have_command "${CARGO_BIN}"; then
   run_check "cargo fmt --check" run_cargo_fmt

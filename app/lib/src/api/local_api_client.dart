@@ -68,12 +68,14 @@ class LocalApiClient {
     required String deviceName,
     required String platform,
     String? vaultId,
+    DeviceStorageProfile? storageProfile,
   }) async {
     final response = await _postObject('/mobile/pair', {
       'pairing_token': pairingToken,
       'device_name': deviceName,
       'platform': platform,
       if (vaultId != null && vaultId.trim().isNotEmpty) 'vault_id': vaultId,
+      if (storageProfile != null) 'storage_profile': storageProfile.toJson(),
     });
     return MobilePairResponse.fromJson(response);
   }
@@ -96,6 +98,77 @@ class LocalApiClient {
       headers: _mobileHeaders(bearerToken),
     );
     return response.map(MobileSession.fromJson).toList();
+  }
+
+  Future<DeviceIdentity> updateMobileStorageProfile({
+    required String bearerToken,
+    required DeviceStorageProfile storageProfile,
+  }) async {
+    final response = await _postObject('/mobile/storage-profile', {
+      'storage_profile': storageProfile.toJson(),
+    }, headers: _mobileHeaders(bearerToken));
+    return DeviceIdentity.fromJson(response);
+  }
+
+  Future<MobileStoragePlan> fetchMobileStoragePlan({
+    required String bearerToken,
+  }) async {
+    final response = await _getObject(
+      '/mobile/storage/plan',
+      headers: _mobileHeaders(bearerToken),
+    );
+    return MobileStoragePlan.fromJson(response);
+  }
+
+  Future<List<int>> downloadMobileReplicaChunk({
+    required String bearerToken,
+    required String blobId,
+    required int chunkIndex,
+  }) async {
+    final response = await _request(
+      () => _httpClient.get(
+        _resolve('/mobile/storage/blobs/$blobId/chunks/$chunkIndex'),
+        headers: _mobileHeaders(bearerToken),
+      ),
+      '/mobile/storage/blobs/$blobId/chunks/$chunkIndex',
+      timeout: _heavyReadTimeout,
+    );
+    return response.bodyBytes;
+  }
+
+  Future<MobileReplicaReport> reportMobileReplica({
+    required String bearerToken,
+    required MobileReplicaAssignment assignment,
+    required Map<int, String> chunkProofsByIndex,
+  }) async {
+    final response = await _postObject(
+      '/mobile/storage/blobs/${assignment.blobId}/report',
+      {
+        'transfer_id': assignment.transferId,
+        'chunks': [
+          for (final chunk in assignment.chunks)
+            chunk.toReportJson(
+              proof: chunkProofsByIndex[chunk.chunkIndex] ?? '',
+            ),
+        ],
+      },
+      headers: _mobileHeaders(bearerToken),
+    );
+    return MobileReplicaReport.fromJson(response);
+  }
+
+  Future<Map<String, dynamic>> restoreMobileReplicaChunk({
+    required String bearerToken,
+    required String blobId,
+    required int chunkIndex,
+    required List<int> bytes,
+  }) {
+    return _putBytes(
+      '/mobile/storage/blobs/$blobId/chunks/$chunkIndex',
+      bytes,
+      headers: _mobileHeaders(bearerToken),
+      timeout: _heavyReadTimeout,
+    );
   }
 
   Future<MobileSessionRefreshResponse> refreshMobileSession({

@@ -15,6 +15,8 @@ key, pairing-token, bearer-token, or precise metadata storage by default.
   vault, backup, and restore staging.
 - Mobile owner: verifies Android pairing, upload, download, revocation, and
   remote route blocking.
+- Storage owner: verifies encrypted chunk replication, phone storage
+  contribution, repair, eviction, and backup/restore evidence.
 - Security owner: verifies secret handling, local-first boundaries, optional
   bootstrap configuration, and network exposure.
 - Support owner: monitors incoming user reports and owns rollback communication.
@@ -42,6 +44,9 @@ If any owner is missing, do not call the release public-production ready.
 - Link to readiness evidence from `scripts/production-readiness-check.sh`.
 - Android smoke evidence from two authorized physical phones when mobile sync is
   in scope.
+- Phone storage-node evidence showing every opted-in Android phone received
+  encrypted chunk assignments, stored bytes locally, reported proof-of-possession
+  healthy replicas, and restored an encrypted chunk to the laptop.
 - Backup/restore drill evidence for one encrypted library fixture.
 - Open blocker list with owner and decision.
 
@@ -101,6 +106,11 @@ If any owner is missing, do not call the release public-production ready.
    content, and list jobs without mock fallback data.
 5. Confirm new managed imports are sealed into encrypted vault chunks when
    encrypted-only originals are active.
+6. Confirm Android release signing does not use the debug key. Provide signing
+   through `app/android/private-gallery-release.properties` on the release
+   machine or through equivalent CI secrets; never commit keystores or
+   passwords. Run the readiness script with
+   `PRIVATE_GALLERY_READINESS_REQUIRE_RELEASE_SIGNING=1` for release evidence.
 
 ## Remote Boundary Verification
 
@@ -121,6 +131,8 @@ Acceptance:
 - Desktop control routes such as `/library/status` and `/pairing/sessions`
   return `403` to remote clients.
 - Mobile routes require a valid paired bearer token.
+- Storage-node routes under `/mobile/storage/*` require the same paired bearer
+  token and only move encrypted vault chunks.
 - No LAN HTTP endpoint is published for public production unless the release is
   explicitly labeled development-only.
 
@@ -134,6 +146,9 @@ Acceptance:
 5. Confirm the staged restore does not overwrite the active library.
 6. Confirm missing or corrupt vault chunks are reported, not silently replaced
    with plaintext.
+7. With one paired Android storage phone online, delete one encrypted chunk from
+   the release fixture, restore that chunk from the phone, and verify the chunk
+   hash before opening the original.
 
 ## Rollout Strategy
 
@@ -155,6 +170,9 @@ Abort or halt rollout when any of these occur:
 - Backup verification or restore staging fails on a clean encrypted fixture.
 - Two-phone mobile smoke fails for pairing, upload, download, range hash,
   revocation, or route blocking.
+- Phone storage-node smoke fails for encrypted chunk assignment, hash-verified
+  local storage, proof-of-possession replica reporting, or restore-to-laptop
+  repair.
 - Crash or startup failure prevents opening the app or daemon on the supported
   Linux target.
 

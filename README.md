@@ -14,7 +14,7 @@ This repository now contains a desktop-usable MVP for the first phase of the pro
 - Live timeline, places, events, and jobs views backed by persisted API state.
 - Encrypted database activation, encrypted vault chunk storage, local-only OCR indexing/search, model governance, chunk-aware backup export/restore staging, and large-library timeline pagination.
 
-The codebase intentionally preserves API surfaces for people, scenes, semantic search, pairing, and distributed vault sync. The vault/device/sync control plane is typed and persisted, originals are sealed into authenticated encrypted chunks, desktop peers can move encrypted chunks over the Iroh transport, and Android can pair with a desktop daemon over LAN for authenticated upload/download without hosted photo storage.
+The codebase intentionally preserves API surfaces for people, scenes, semantic search, pairing, and distributed vault sync. The vault/device/sync control plane is typed and persisted, originals are sealed into authenticated encrypted chunks, desktop peers can move encrypted chunks over the Iroh transport, and Android can pair with a desktop daemon over LAN/Tailscale for authenticated upload/download and explicit encrypted storage contribution without hosted photo storage.
 
 ## What This Repository Contains
 
@@ -55,7 +55,7 @@ The codebase intentionally preserves API surfaces for people, scenes, semantic s
 
 - Face clustering and real biometric indexing providers.
 - Scene tagging, semantic search, and vector indexing providers.
-- Native Android Iroh transport and background chunk-level mobile sync; current Android sync uses the desktop local API over an explicitly entered LAN URL.
+- Native Android Iroh transport and background chunk-level mobile sync; current Android storage contribution uses the authenticated desktop local API over Tailscale/HTTPS or an explicitly entered LAN development URL.
 - Hosted discovery/relay service deployment and internet NAT traversal validation.
 - File-picker based import selection.
 - In-place restore over the active library; restore is staged into a separate folder for review.
@@ -155,8 +155,9 @@ pairs all phones first, checks remote `/health` and desktop-route blocking for
 LAN URLs, uploads synthetic originals larger than Axum's historical default
 body limit through resumable chunks, proves duplicate/cancel handling, verifies
 cross-device visibility before revocation, downloads ranged originals/previews,
-checks SHA-256 hashes, verifies bearer refresh rejects the previous token, and
-verifies session/device revocation. Use
+checks SHA-256 hashes, verifies each phone can opt into encrypted storage chunk
+replicas, report proof of possession, and restore chunks, verifies bearer
+refresh rejects the previous token, and verifies session/device revocation. Use
 `PRIVATE_GALLERY_SMOKE_DEVICE_SERIALS="serial1 serial2"` to pin the exact phones.
 
 For a Flutter app-level pairing smoke, build/install the debug APK and load a

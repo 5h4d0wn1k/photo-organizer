@@ -932,6 +932,76 @@ pub struct MobileWorkspaceResponse {
     pub capabilities: MobileWorkspaceCapabilities,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MobileStorageProfileUpdateRequest {
+    pub storage_profile: DeviceStorageProfile,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MobileReplicaChunkDescriptor {
+    pub chunk_id: Uuid,
+    pub chunk_index: u32,
+    pub encrypted_hash: String,
+    pub encrypted_bytes: u64,
+    pub plaintext_bytes: u64,
+    pub proof_challenge: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MobileReplicaAssignment {
+    pub transfer_id: Uuid,
+    pub vault_id: Uuid,
+    pub blob_id: Uuid,
+    pub asset_id: Uuid,
+    pub encrypted_hash: String,
+    pub bytes_total: u64,
+    pub chunks: Vec<MobileReplicaChunkDescriptor>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MobileStoragePlan {
+    pub generated_at: DateTime<Utc>,
+    pub device: DeviceIdentity,
+    pub assignments: Vec<MobileReplicaAssignment>,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MobileReplicaChunkReport {
+    pub chunk_index: u32,
+    pub encrypted_hash: String,
+    pub encrypted_bytes: u64,
+    pub proof: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MobileReplicaReportRequest {
+    pub transfer_id: Uuid,
+    #[serde(default)]
+    pub chunks: Vec<MobileReplicaChunkReport>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MobileReplicaReport {
+    pub blob_id: Uuid,
+    pub device_id: Uuid,
+    pub health: ReplicaHealth,
+    pub bytes_present: u64,
+    pub verified_at: Option<DateTime<Utc>>,
+    pub transfer_id: Uuid,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MobileReplicaRestoreResult {
+    pub blob_id: Uuid,
+    pub chunk_index: u32,
+    pub encrypted_hash: String,
+    pub encrypted_bytes: u64,
+    pub restored_local_chunk: bool,
+    pub detail: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ImportCandidate {
     pub id: Uuid,
@@ -1453,6 +1523,8 @@ pub struct MobilePairRequest {
     pub device_name: String,
     pub platform: String,
     pub vault_id: Option<Uuid>,
+    #[serde(default)]
+    pub storage_profile: Option<DeviceStorageProfile>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

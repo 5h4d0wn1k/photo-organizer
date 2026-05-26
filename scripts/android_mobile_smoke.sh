@@ -53,6 +53,19 @@ is_loopback_base_url() {
   esac
 }
 
+device_base_url_port() {
+  local without_scheme host_port
+  without_scheme="${DEVICE_BASE_URL#*://}"
+  host_port="${without_scheme%%/*}"
+  if [[ "${host_port}" == *:* ]]; then
+    printf '%s\n' "${host_port##*:}"
+  elif [[ "${DEVICE_BASE_URL}" == https://* ]]; then
+    printf '443\n'
+  else
+    printf '80\n'
+  fi
+}
+
 should_expect_remote_boundary() {
   case "${EXPECT_REMOTE_BOUNDARY}" in
     1 | true | TRUE | yes | YES) return 0 ;;
@@ -80,6 +93,15 @@ response_body() {
 
 response_sha256() {
   awk -F= '/^BODY_SHA256=/ {print $2; exit}' "$1"
+}
+
+chunk_possession_proof() {
+  local challenge="$1"
+  local file="$2"
+  local prefix_file
+  prefix_file="$(mktemp "${TMP_DIR}/chunk-proof-prefix.XXXXXX")"
+  printf '%s\0' "${challenge}" >"${prefix_file}"
+  cat "${prefix_file}" "${file}" | sha256sum | awk '{print $1}'
 }
 
 ensure_status() {
@@ -116,6 +138,7 @@ json_array_length() {
 require_tool adb
 require_tool awk
 require_tool base64
+require_tool cat
 require_tool curl
 require_tool dd
 require_tool find
@@ -336,7 +359,9 @@ prepare_device() {
   echo "[${serial}] preparing device"
   adb -s "${serial}" shell "mkdir -p $(remote_quote "${DEVICE_TMP_DIR}")" >/dev/null
   if is_loopback_base_url; then
-    adb -s "${serial}" reverse tcp:4821 tcp:4821 >/dev/null
+    local port
+    port="$(device_base_url_port)"
+    adb -s "${serial}" reverse "tcp:${port}" "tcp:${port}" >/dev/null
   fi
   adb -s "${serial}" push "${TMP_DIR}/private-gallery-http-smoke.jar" "${DEVICE_HTTP_JAR}" >/dev/null
 }
@@ -475,6 +500,7 @@ declare -A PAYLOAD_FILE_BY_SERIAL
 declare -A PAYLOAD_HASH_BY_SERIAL
 declare -A PAYLOAD_BYTES_BY_SERIAL
 declare -A SEARCH_LABEL_BY_SERIAL
+VAULT_ID=""
 
 for serial in "${DEVICE_SERIALS[@]}"; do
   prepare_device "${serial}"
@@ -510,13 +536,24 @@ for serial in "${DEVICE_SERIALS[@]}"; do
     -d "$(jq -nc --arg name "${model} smoke" '{device_name:$name, platform:"android"}')")"
   pairing_token="$(jq -r '.pairing_token' <<<"${pairing_json}")"
   pair_body="$(jq -nc --arg token "${pairing_token}" --arg name "${model} smoke" \
-    '{pairing_token:$token, device_name:$name, platform:"android"}')"
+    '{
+      pairing_token:$token,
+      device_name:$name,
+      platform:"android"
+    }')"
   pair_file="${TMP_DIR}/${safe_serial}-pair.response"
   android_http "${serial}" POST /mobile/pair "${pair_body}" - application/json >"${pair_file}"
   ensure_status "${pair_file}" 200 "${serial} pair"
   pair_response="$(response_body "${pair_file}")"
   BEARER_BY_SERIAL["${serial}"]="$(jq -r '.bearer_token' <<<"${pair_response}")"
   DEVICE_ID_BY_SERIAL["${serial}"]="$(jq -r '.device.id' <<<"${pair_response}")"
+  paired_vault_id="$(jq -r '.session.vault_id' <<<"${pair_response}")"
+  if [[ -z "${VAULT_ID}" ]]; then
+    VAULT_ID="${paired_vault_id}"
+  elif [[ "${VAULT_ID}" != "${paired_vault_id}" ]]; then
+    echo "paired devices joined different vaults: ${VAULT_ID} vs ${paired_vault_id}" >&2
+    exit 1
+  fi
 
   session_file="${TMP_DIR}/${safe_serial}-session.response"
   android_http "${serial}" GET /mobile/session "" "${BEARER_BY_SERIAL[${serial}]}" - >"${session_file}"
@@ -537,6 +574,12 @@ for serial in "${DEVICE_SERIALS[@]}"; do
   ensure_not_success "${old_session_file}" "${serial} old bearer rejected after refresh"
   BEARER_BY_SERIAL["${serial}"]="${refreshed_bearer}"
 done
+
+storage_replica_target=$((${#DEVICE_SERIALS[@]} + 1))
+curl -fsS -X POST "${HOST_BASE_URL}/vaults/${VAULT_ID}/storage-policy" \
+  -H 'content-type: application/json' \
+  -d "$(jq -nc --argjson min "${storage_replica_target}" \
+    '{policy:{mode:"custom", min_replicas:$min, preferred_device_ids:[], excluded_device_ids:[], min_free_space_bytes:0, allow_metered_network:true, pause_on_low_battery:false}}')" >/dev/null
 
 for serial in "${DEVICE_SERIALS[@]}"; do
   safe_serial="${SAFE_SERIAL_BY_SERIAL[${serial}]}"
@@ -625,6 +668,79 @@ for serial in "${DEVICE_SERIALS[@]}"; do
   canceled_reject_file="${TMP_DIR}/${safe_serial}-cancel-reject.response"
   android_http "${serial}" PUT "/mobile/uploads/${cancel_id}/chunks/${CHUNK_BYTES}" "late" "${bearer}" application/octet-stream >"${canceled_reject_file}"
   ensure_not_success "${canceled_reject_file}" "${serial} canceled upload rejects chunks"
+done
+
+for storage_serial in "${DEVICE_SERIALS[@]}"; do
+  storage_safe="${SAFE_SERIAL_BY_SERIAL[${storage_serial}]}"
+  storage_bearer="${BEARER_BY_SERIAL[${storage_serial}]}"
+  storage_profile_file="${TMP_DIR}/${storage_safe}-storage-profile.response"
+  android_http "${storage_serial}" POST /mobile/storage-profile \
+    '{"storage_profile":{"total_bytes":null,"available_bytes":null,"reserved_bytes":1073741824,"accepts_storage":true,"battery_powered":true,"metered_network":false,"low_battery":false}}' \
+    "${storage_bearer}" application/json >"${storage_profile_file}"
+  ensure_status "${storage_profile_file}" 200 "${storage_serial} update storage profile"
+
+  storage_plan_file="${TMP_DIR}/${storage_safe}-storage-plan.response"
+  android_http "${storage_serial}" GET /mobile/storage/plan "" "${storage_bearer}" - >"${storage_plan_file}"
+  ensure_status "${storage_plan_file}" 200 "${storage_serial} storage plan"
+  assignment_count="$(response_body "${storage_plan_file}" | jq '.assignments | length')"
+  if [[ "${assignment_count}" -lt 1 ]]; then
+    echo "${storage_serial} did not receive any encrypted storage assignments" >&2
+    response_body "${storage_plan_file}" >&2 || true
+    echo >&2
+    exit 1
+  fi
+
+  for ((assignment_i = 0; assignment_i < assignment_count; assignment_i++)); do
+    assignment="$(response_body "${storage_plan_file}" | jq ".assignments[${assignment_i}]")"
+    storage_blob_id="$(jq -r '.blob_id' <<<"${assignment}")"
+    storage_transfer_id="$(jq -r '.transfer_id' <<<"${assignment}")"
+    chunk_count="$(jq '.chunks | length' <<<"${assignment}")"
+    report_chunks="[]"
+    for ((chunk_i = 0; chunk_i < chunk_count; chunk_i++)); do
+      chunk_index="$(jq -r ".chunks[${chunk_i}].chunk_index" <<<"${assignment}")"
+      expected_hash="$(jq -r ".chunks[${chunk_i}].encrypted_hash" <<<"${assignment}")"
+      expected_bytes="$(jq -r ".chunks[${chunk_i}].encrypted_bytes" <<<"${assignment}")"
+      proof_challenge="$(jq -r ".chunks[${chunk_i}].proof_challenge" <<<"${assignment}")"
+      chunk_file="${TMP_DIR}/${storage_safe}-storage-${storage_blob_id}-${chunk_index}.response"
+      host_chunk="${TMP_DIR}/${storage_safe}-storage-${storage_blob_id}-${chunk_index}.pgblob"
+      device_chunk="${DEVICE_TMP_DIR}/${storage_safe}-storage-${storage_blob_id}-${chunk_index}.pgblob"
+      android_http "${storage_serial}" GET "/mobile/storage/blobs/${storage_blob_id}/chunks/${chunk_index}" "" "${storage_bearer}" - - "${device_chunk}" >"${chunk_file}"
+      ensure_status "${chunk_file}" 200 "${storage_serial} encrypted storage chunk ${chunk_index}"
+      actual_hash="$(response_sha256 "${chunk_file}")"
+      if [[ "${actual_hash}" != "${expected_hash}" ]]; then
+        echo "${storage_serial} encrypted chunk hash mismatch: expected ${expected_hash}, got ${actual_hash}" >&2
+        exit 1
+      fi
+      adb -s "${storage_serial}" pull "${device_chunk}" "${host_chunk}" >/dev/null
+      proof="$(chunk_possession_proof "${proof_challenge}" "${host_chunk}")"
+      report_item="$(jq -nc \
+        --argjson chunk_index "${chunk_index}" \
+        --arg encrypted_hash "${expected_hash}" \
+        --argjson encrypted_bytes "${expected_bytes}" \
+        --arg proof "${proof}" \
+        '{chunk_index:$chunk_index, encrypted_hash:$encrypted_hash, encrypted_bytes:$encrypted_bytes, proof:$proof}')"
+      report_chunks="$(jq -nc --argjson chunks "${report_chunks}" --argjson item "${report_item}" '$chunks + [$item]')"
+
+    done
+
+    storage_report_body="$(jq -nc --arg transfer "${storage_transfer_id}" --argjson chunks "${report_chunks}" \
+      '{transfer_id:$transfer, chunks:$chunks}')"
+    storage_report_file="${TMP_DIR}/${storage_safe}-storage-report-${storage_blob_id}.response"
+    android_http "${storage_serial}" POST "/mobile/storage/blobs/${storage_blob_id}/report" "${storage_report_body}" "${storage_bearer}" application/json >"${storage_report_file}"
+    ensure_status "${storage_report_file}" 200 "${storage_serial} encrypted storage replica report"
+    if [[ "$(response_body "${storage_report_file}" | jq -r '.health')" != "healthy" ]]; then
+      echo "${storage_serial} storage replica was not reported healthy" >&2
+      response_body "${storage_report_file}" >&2 || true
+      exit 1
+    fi
+    for ((chunk_i = 0; chunk_i < chunk_count; chunk_i++)); do
+      chunk_index="$(jq -r ".chunks[${chunk_i}].chunk_index" <<<"${assignment}")"
+      device_chunk="${DEVICE_TMP_DIR}/${storage_safe}-storage-${storage_blob_id}-${chunk_index}.pgblob"
+      restore_file="${TMP_DIR}/${storage_safe}-storage-restore-${storage_blob_id}-${chunk_index}.response"
+      android_http "${storage_serial}" PUT "/mobile/storage/blobs/${storage_blob_id}/chunks/${chunk_index}" "@${device_chunk}" "${storage_bearer}" application/octet-stream >"${restore_file}"
+      ensure_status "${restore_file}" 200 "${storage_serial} encrypted storage chunk restore ${chunk_index}"
+    done
+  done
 done
 
 for viewer in "${DEVICE_SERIALS[@]}"; do

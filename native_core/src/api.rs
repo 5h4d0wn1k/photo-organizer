@@ -27,18 +27,21 @@ use crate::{
         CreateAlbumRequest, CreateDeviceRequest, CreateFileFolderRequest,
         CreateManualPersonRequest, CreatePairingSessionRequest, CreateVaultRequest,
         CreateWatchFolderRequest, EncryptionActivationRequest, EnrollDeviceRequest, FeedbackEvent,
-        HidePersonRequest, MergePersonRequest, MobilePairRequest, MobileUploadRequest,
-        ModelImportRequest, ModelInstallRequest, MoveFileEntryRequest, RebuildRequest,
-        RejectPersonMatchRequest, RenameAlbumRequest, RenameFileEntryRequest, RenamePersonRequest,
-        RevokeDeviceRequest, RunSyncRequest, ScanImportSourceRequest, SearchQuery,
-        SplitPersonRequest, TitleEventRequest, UpdateAlbumAssetsRequest, UpdateAssetFlagsRequest,
+        HidePersonRequest, MergePersonRequest, MobilePairRequest, MobileReplicaReportRequest,
+        MobileStorageProfileUpdateRequest, MobileUploadRequest, ModelImportRequest,
+        ModelInstallRequest, MoveFileEntryRequest, RebuildRequest, RejectPersonMatchRequest,
+        RenameAlbumRequest, RenameFileEntryRequest, RenamePersonRequest, RevokeDeviceRequest,
+        RunSyncRequest, ScanImportSourceRequest, SearchQuery, SplitPersonRequest,
+        TitleEventRequest, UpdateAlbumAssetsRequest, UpdateAssetFlagsRequest,
         UpdateAssetsFlagsRequest, UpdateLibrarySettingsRequest, UpdatePersonAssetsRequest,
         UpdateVaultStoragePolicyRequest,
     },
     service::{ByteRangeRequest, GalleryService, ServiceError},
+    vault_store,
 };
 
 const MOBILE_UPLOAD_BODY_LIMIT_BYTES: usize = 8 * 1024 * 1024;
+const MOBILE_REPLICA_CHUNK_BODY_LIMIT_BYTES: usize = vault_store::CHUNK_BYTES + 1024 * 1024;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -75,6 +78,21 @@ pub fn router(state: AppState) -> Router {
             post(revoke_mobile_device_sessions),
         )
         .route("/mobile/workspace", get(mobile_workspace))
+        .route(
+            "/mobile/storage-profile",
+            post(update_mobile_storage_profile),
+        )
+        .route("/mobile/storage/plan", get(mobile_storage_plan))
+        .route(
+            "/mobile/storage/blobs/{blob_id}/chunks/{chunk_index}",
+            get(mobile_replica_chunk)
+                .put(restore_mobile_replica_chunk)
+                .layer(DefaultBodyLimit::max(MOBILE_REPLICA_CHUNK_BODY_LIMIT_BYTES)),
+        )
+        .route(
+            "/mobile/storage/blobs/{blob_id}/report",
+            post(report_mobile_replica),
+        )
         .route("/mobile/search", get(mobile_search))
         .route("/mobile/uploads", post(reserve_mobile_upload))
         .route(
@@ -553,6 +571,77 @@ async fn mobile_workspace(
 ) -> Result<Json<crate::domain::MobileWorkspaceResponse>, ApiError> {
     let token = mobile_bearer_token(&headers)?;
     Ok(Json(state.service.mobile_workspace(&token).await?))
+}
+
+async fn update_mobile_storage_profile(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<MobileStorageProfileUpdateRequest>,
+) -> Result<Json<crate::domain::DeviceIdentity>, ApiError> {
+    let token = mobile_bearer_token(&headers)?;
+    Ok(Json(
+        state
+            .service
+            .update_mobile_storage_profile(&token, request)
+            .await?,
+    ))
+}
+
+async fn mobile_storage_plan(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<crate::domain::MobileStoragePlan>, ApiError> {
+    let token = mobile_bearer_token(&headers)?;
+    Ok(Json(state.service.mobile_storage_plan(&token).await?))
+}
+
+async fn mobile_replica_chunk(
+    State(state): State<AppState>,
+    Path((blob_id, chunk_index)): Path<(Uuid, u32)>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    let token = mobile_bearer_token(&headers)?;
+    let bytes = state
+        .service
+        .mobile_replica_chunk_bytes(&token, blob_id, chunk_index)
+        .await?;
+    response_with_body(
+        StatusCode::OK,
+        HeaderValue::from_static("application/octet-stream"),
+        None,
+        Some(bytes.len() as u64),
+        bytes,
+    )
+}
+
+async fn report_mobile_replica(
+    State(state): State<AppState>,
+    Path(blob_id): Path<Uuid>,
+    headers: HeaderMap,
+    Json(request): Json<MobileReplicaReportRequest>,
+) -> Result<Json<crate::domain::MobileReplicaReport>, ApiError> {
+    let token = mobile_bearer_token(&headers)?;
+    Ok(Json(
+        state
+            .service
+            .report_mobile_replica(&token, blob_id, request)
+            .await?,
+    ))
+}
+
+async fn restore_mobile_replica_chunk(
+    State(state): State<AppState>,
+    Path((blob_id, chunk_index)): Path<(Uuid, u32)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<crate::domain::MobileReplicaRestoreResult>, ApiError> {
+    let token = mobile_bearer_token(&headers)?;
+    Ok(Json(
+        state
+            .service
+            .restore_mobile_replica_chunk(&token, blob_id, chunk_index, body.to_vec())
+            .await?,
+    ))
 }
 
 async fn mobile_search(

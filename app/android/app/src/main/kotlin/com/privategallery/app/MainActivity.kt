@@ -8,6 +8,7 @@ import io.flutter.plugin.common.MethodChannel
 
 class MainActivity : FlutterActivity() {
     private val launchInviteChannelName = "private_gallery/launch_invite"
+    private val deviceStorageChannelName = "private_gallery/device_storage"
     private var launchInviteChannel: MethodChannel? = null
     private var pendingInvite: Map<String, Any?>? = null
 
@@ -25,6 +26,20 @@ class MainActivity : FlutterActivity() {
                     pendingInvite = null
                     result.success(invite)
                 }
+                else -> result.notImplemented()
+            }
+        }
+        MethodChannel(
+            flutterEngine.dartExecutor.binaryMessenger,
+            deviceStorageChannelName,
+        ).setMethodCallHandler { call, result ->
+            when (call.method) {
+                "getStorageProfile" -> result.success(
+                    mapOf(
+                        "totalBytes" to filesDir.totalSpace,
+                        "availableBytes" to filesDir.usableSpace,
+                    ),
+                )
                 else -> result.notImplemented()
             }
         }
