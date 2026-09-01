@@ -21,6 +21,10 @@ abstract class GalleryRepository {
     required String exportRoot,
     bool includeModels,
   });
+  Future<SupportBundleExportResult> exportSupportBundle({
+    required String exportRoot,
+    bool includeReleaseReadiness,
+  });
   Future<BackupRestorePlan> planRestoreBackup({
     required String exportRoot,
     required String restoreRoot,
@@ -92,6 +96,7 @@ abstract class GalleryRepository {
     bool? favorite,
     bool? archived,
   });
+  Future<Asset> updateAssetTags(String assetId, {required List<String> tags});
   Future<List<Asset>> updateAssetsFlags(
     List<String> assetIds, {
     bool? favorite,
@@ -105,6 +110,13 @@ abstract class GalleryRepository {
   Future<Album> removeAlbumAssets(String id, {required List<String> assetIds});
   Future<Album> renameAlbum(String id, String title);
   Future<void> deleteAlbum(String id);
+  Future<List<SmartFolder>> fetchSmartFolders();
+  Future<SmartFolder> createSmartFolder({
+    required String title,
+    required SearchQuery query,
+  });
+  Future<SearchResponse> runSmartFolder(String id);
+  Future<void> deleteSmartFolder(String id);
   Future<SearchResponse> search(SearchQuery query);
   Future<SearchIndexStatus?> fetchSearchStatus();
   Future<JobRecord> rebuildOcr({int? limit});

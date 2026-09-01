@@ -64,6 +64,22 @@ void main() {
       'Birthday dinner',
     );
     await tester.enterText(
+      find.widgetWithText(TextField, 'Workspace'),
+      'Office',
+    );
+    await tester.enterText(find.widgetWithText(TextField, 'Client'), 'Acme');
+    await tester.enterText(find.widgetWithText(TextField, 'Project'), 'Launch');
+    await tester.enterText(find.widgetWithText(TextField, 'Topic'), 'Reports');
+    await tester.enterText(
+      find.widgetWithText(TextField, 'Source folder'),
+      'Project Launch',
+    );
+    await tester.enterText(
+      find.widgetWithText(TextField, 'Device'),
+      'Office laptop',
+    );
+    await tester.enterText(find.widgetWithText(TextField, 'Tags'), 'invoice');
+    await tester.enterText(
       find.widgetWithText(TextField, 'From'),
       '2026-01-01',
     );
@@ -82,6 +98,13 @@ void main() {
     expect(query.people, 'Mom');
     expect(query.places, 'Goa');
     expect(query.events, 'Birthday dinner');
+    expect(query.workspace, 'Office');
+    expect(query.client, 'Acme');
+    expect(query.project, 'Launch');
+    expect(query.topic, 'Reports');
+    expect(query.sourceFolder, 'Project Launch');
+    expect(query.device, 'Office laptop');
+    expect(query.tags, 'invoice');
     expect(query.mediaKind, 'video');
     expect(query.favorite, isTrue);
     expect(query.fromDate, '2026-01-01');
@@ -89,11 +112,64 @@ void main() {
     expect(query.includeArchived, isTrue);
     expect(query.limit, 80);
   });
+
+  testWidgets('opens and deletes saved smart folders', (
+    WidgetTester tester,
+  ) async {
+    tester.view.physicalSize = const Size(1200, 1000);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(() {
+      tester.view.resetPhysicalSize();
+      tester.view.resetDevicePixelRatio();
+    });
+
+    final repository = _FakeSearchRepository();
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(body: SearchScreen(repository: repository)),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    expect(find.text('Smart folders'), findsOneWidget);
+    expect(find.text('Acme reports'), findsOneWidget);
+
+    await tester.tap(find.text('Acme reports'));
+    await tester.pumpAndSettle();
+
+    expect(repository.runSmartFolderIds, ['smart-1']);
+
+    final chip = find.widgetWithText(InputChip, 'Acme reports');
+    tester.widget<InputChip>(chip).onDeleted!();
+    await tester.pumpAndSettle();
+
+    expect(repository.deletedSmartFolderIds, ['smart-1']);
+    expect(find.text('Acme reports'), findsNothing);
+  });
 }
 
 class _FakeSearchRepository implements GalleryRepository {
   final List<int?> ocrLimits = [];
   final List<SearchQuery> searchQueries = [];
+  final List<String> runSmartFolderIds = [];
+  final List<String> deletedSmartFolderIds = [];
+  final List<SmartFolder> smartFolders = [
+    SmartFolder(
+      id: 'smart-1',
+      title: 'Acme reports',
+      query: const SearchQuery(
+        text: '',
+        workspace: 'Office',
+        client: 'Acme',
+        topic: 'Reports',
+        mediaKind: 'document',
+        limit: 80,
+      ),
+      createdAt: DateTime.utc(2026, 5, 12),
+      updatedAt: DateTime.utc(2026, 5, 12),
+    ),
+  ];
 
   @override
   Future<SearchIndexStatus?> fetchSearchStatus() async {
@@ -254,6 +330,14 @@ class _FakeSearchRepository implements GalleryRepository {
   }
 
   @override
+  Future<SupportBundleExportResult> exportSupportBundle({
+    required String exportRoot,
+    bool includeReleaseReadiness = true,
+  }) {
+    throw UnimplementedError();
+  }
+
+  @override
   Future<BackupRestorePlan> planRestoreBackup({
     required String exportRoot,
     required String restoreRoot,
@@ -314,6 +398,11 @@ class _FakeSearchRepository implements GalleryRepository {
   }
 
   @override
+  Future<Asset> updateAssetTags(String assetId, {required List<String> tags}) {
+    throw UnimplementedError();
+  }
+
+  @override
   Future<List<Asset>> updateAssetsFlags(
     List<String> assetIds, {
     bool? favorite,
@@ -363,6 +452,46 @@ class _FakeSearchRepository implements GalleryRepository {
   @override
   Future<void> deleteAlbum(String id) {
     throw UnimplementedError();
+  }
+
+  @override
+  Future<List<SmartFolder>> fetchSmartFolders() async {
+    return List.unmodifiable(smartFolders);
+  }
+
+  @override
+  Future<SmartFolder> createSmartFolder({
+    required String title,
+    required SearchQuery query,
+  }) async {
+    final folder = SmartFolder(
+      id: 'smart-${smartFolders.length + 1}',
+      title: title,
+      query: query,
+      createdAt: DateTime.utc(2026, 5, 12),
+      updatedAt: DateTime.utc(2026, 5, 12),
+    );
+    smartFolders.add(folder);
+    return folder;
+  }
+
+  @override
+  Future<SearchResponse> runSmartFolder(String id) async {
+    runSmartFolderIds.add(id);
+    final folder = smartFolders.firstWhere((folder) => folder.id == id);
+    return SearchResponse(
+      query: folder.query,
+      assets: const [],
+      people: const [],
+      places: const [],
+      events: const [],
+    );
+  }
+
+  @override
+  Future<void> deleteSmartFolder(String id) async {
+    deletedSmartFolderIds.add(id);
+    smartFolders.removeWhere((folder) => folder.id == id);
   }
 
   @override

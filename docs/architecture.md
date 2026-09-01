@@ -141,7 +141,7 @@ All derived entities carry:
 - Daily-driver v1 mobile sync uses a trusted hotspot/LAN URL such as `http://<laptop-hotspot-ip>:4821`. `scripts/private_gallery_mobile_lan_daemon.sh` binds `0.0.0.0:4821` only when `PRIVATE_GALLERY_ALLOW_REMOTE_MOBILE=1` is set.
 - Desktop invites are QR-first and include the current LAN URL, vault id, and one-time pairing token. The token is stored server-side only for pairing and sessions persist bearer-token hashes.
 - Optional Supabase bootstrap is configured through Flutter `--dart-define` values and `supabase/device_group_bootstrap.sql`; it uses anonymous Auth, RLS-protected tables, and a Postgres RPC for invite claim. It stores only group names, anonymous membership records, client device ids, optional public keys/capabilities/endpoint hints, invite hashes, and timestamps.
-- The daemon injects remote socket information at serve time and blocks non-loopback clients from desktop control routes. It also treats Tailscale Serve identity headers as remote, so path-limited Serve exposure for `/mobile` and `/health` does not expose desktop APIs through the loopback proxy.
+- The daemon injects remote socket information at serve time and blocks non-loopback clients from desktop control routes. It also treats Tailscale Serve identity headers as remote, so path-limited Serve exposure for `/mobile`, `/local-web`, and `/health` does not expose desktop APIs through the loopback proxy. `/local-web/*` serves only the configured built web bundle from `PRIVATE_GALLERY_LOCAL_WEB_ROOT`.
 - Hosted services are modeled only as discovery/relay fallback; hosted photo, thumbnail, OCR, face, embedding, metadata, and key storage remain out of scope.
 - No remote ML, analytics, or geocoding by default.
 

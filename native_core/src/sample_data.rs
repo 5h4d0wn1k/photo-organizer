@@ -3,8 +3,8 @@ use uuid::Uuid;
 
 use crate::domain::{
     Asset, AssetVariant, BoundingBox, EventCluster, EventTitleSource, FaceTemplate, JobKind,
-    JobRecord, JobStatus, MediaKind, ModelProvenance, PersonCluster, PlaceCluster, SyncSession,
-    SyncStatus, VariantKind,
+    ImportMode, JobRecord, JobStatus, MediaKind, ModelProvenance, PersonCluster, PlaceCluster,
+    SyncSession, SyncStatus, VariantKind,
 };
 
 fn id(value: u128) -> Uuid {
@@ -38,15 +38,20 @@ pub fn bootstrap_sample_library() -> SampleLibrary {
             id: beach_id,
             original_filename: "beach-day.jpg".to_string(),
             relative_original_path: "objects/ab/cd/beach-day.jpg".to_string(),
+            source_path: "/samples/beach-day.jpg".to_string(),
             content_hash: "abcdbeach".to_string(),
             media_kind: MediaKind::Photo,
+            import_mode: ImportMode::Copy,
             bytes: 2_048_000,
             mime_type: "image/jpeg".to_string(),
             captured_at: Utc.with_ymd_and_hms(2025, 1, 3, 9, 30, 0).unwrap(),
             imported_at: Utc.with_ymd_and_hms(2025, 1, 3, 18, 0, 0).unwrap(),
             archived: false,
             favorite: true,
+            is_available: true,
             place_hint: Some("Goa".to_string()),
+            manual_tags: Vec::new(),
+            metadata: None,
             variants: vec![AssetVariant {
                 id: id(100),
                 kind: VariantKind::Thumbnail,
@@ -62,15 +67,20 @@ pub fn bootstrap_sample_library() -> SampleLibrary {
             id: dinner_id,
             original_filename: "family-dinner.mp4".to_string(),
             relative_original_path: "objects/ef/01/family-dinner.mp4".to_string(),
+            source_path: "/samples/family-dinner.mp4".to_string(),
             content_hash: "ef01dinner".to_string(),
             media_kind: MediaKind::Video,
+            import_mode: ImportMode::Copy,
             bytes: 16_048_000,
             mime_type: "video/mp4".to_string(),
             captured_at: Utc.with_ymd_and_hms(2025, 1, 3, 19, 45, 0).unwrap(),
             imported_at: Utc.with_ymd_and_hms(2025, 1, 3, 22, 15, 0).unwrap(),
             archived: false,
             favorite: false,
+            is_available: true,
             place_hint: Some("Home".to_string()),
+            manual_tags: Vec::new(),
+            metadata: None,
             variants: vec![AssetVariant {
                 id: id(101),
                 kind: VariantKind::Preview,

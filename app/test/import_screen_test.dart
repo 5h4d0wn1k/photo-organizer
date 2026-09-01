@@ -173,6 +173,14 @@ class _FakeGalleryRepository implements GalleryRepository {
   }
 
   @override
+  Future<SupportBundleExportResult> exportSupportBundle({
+    required String exportRoot,
+    bool includeReleaseReadiness = true,
+  }) {
+    throw UnimplementedError();
+  }
+
+  @override
   Future<BackupRestorePlan> planRestoreBackup({
     required String exportRoot,
     required String restoreRoot,
@@ -225,6 +233,11 @@ class _FakeGalleryRepository implements GalleryRepository {
   }
 
   @override
+  Future<Asset> updateAssetTags(String assetId, {required List<String> tags}) {
+    throw UnimplementedError();
+  }
+
+  @override
   Future<List<Asset>> updateAssetsFlags(
     List<String> assetIds, {
     bool? favorite,
@@ -273,6 +286,29 @@ class _FakeGalleryRepository implements GalleryRepository {
 
   @override
   Future<void> deleteAlbum(String id) {
+    throw UnimplementedError();
+  }
+
+  @override
+  Future<List<SmartFolder>> fetchSmartFolders() {
+    throw UnimplementedError();
+  }
+
+  @override
+  Future<SmartFolder> createSmartFolder({
+    required String title,
+    required SearchQuery query,
+  }) {
+    throw UnimplementedError();
+  }
+
+  @override
+  Future<SearchResponse> runSmartFolder(String id) {
+    throw UnimplementedError();
+  }
+
+  @override
+  Future<void> deleteSmartFolder(String id) {
     throw UnimplementedError();
   }
 

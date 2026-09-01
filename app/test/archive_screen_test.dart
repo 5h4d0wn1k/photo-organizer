@@ -79,9 +79,42 @@ class _FakeArchiveRepository implements GalleryRepository {
   }
 
   @override
+  Future<AssetAvailability> fetchAssetAvailability(String assetId) async {
+    return _availability(assetId);
+  }
+
+  @override
+  Future<AssetAvailability> pinLocalAsset(String assetId) async {
+    return _availability(assetId);
+  }
+
+  @override
+  Future<AssetAvailability> evictLocalAsset(String assetId) async {
+    return _availability(assetId, localReplica: false);
+  }
+
+  @override
   dynamic noSuchMethod(Invocation invocation) {
     throw UnimplementedError(invocation.memberName.toString());
   }
+}
+
+AssetAvailability _availability(String assetId, {bool localReplica = true}) {
+  return AssetAvailability(
+    assetId: assetId,
+    vaultId: 'vault-1',
+    state: localReplica
+        ? AssetAvailabilityState.localAvailable
+        : AssetAvailabilityState.remoteAvailable,
+    localReplica: localReplica,
+    reachableReplicaDeviceIds: localReplica ? const [] : const ['device-2'],
+    offlineReplicaDeviceIds: const [],
+    replicaCount: 2,
+    requiredReplicaCount: 2,
+    detail: localReplica
+        ? 'original is available on this device'
+        : 'original is stored on another reachable device',
+  );
 }
 
 Asset _asset({

@@ -21,6 +21,7 @@ import '../models/gallery_models.dart';
 import '../repositories/gallery_repository.dart';
 import '../repositories/resilient_gallery_repository.dart';
 import '../theme/app_theme.dart';
+import '../widgets/app_ui.dart';
 
 enum GalleryClientMode { desktop, mobile }
 
@@ -618,6 +619,7 @@ class _GalleryWorkspaceShell extends StatelessWidget {
         onVerifyModel: onVerifyModel,
         onVerifyBackup: repository.verifyBackup,
         onExportBackup: repository.exportBackup,
+        onExportSupportBundle: repository.exportSupportBundle,
         onPlanRestoreBackup: repository.planRestoreBackup,
         onRunRestoreBackup: repository.runRestoreBackup,
         onSaveSettings: onSaveSettings,
@@ -675,10 +677,29 @@ class _GalleryWorkspaceShell extends StatelessWidget {
         label: Text('Settings'),
       ),
     ];
+    final diagnostics = workspace.diagnostics;
+    final assetCount = diagnostics?.assets ?? workspace.dashboard.assetCount;
+    final syncSessions = diagnostics?.syncSessions ?? 0;
+    final localOnlyHealthy = workspace.privacyStatus?.localOnlyHealthy ?? false;
+    final encryptedOnly =
+        workspace.settings.originalStoragePolicy ==
+        OriginalStoragePolicy.encryptedOnly;
 
     return LayoutBuilder(
       builder: (context, constraints) {
         final wide = constraints.maxWidth >= 980;
+        final header = _WorkspaceCommandHeader(
+          pageTitle: pageTitle,
+          libraryRoot: workspace.settings.libraryRoot,
+          assetCount: assetCount,
+          watchFolderCount: workspace.watchFolders.length,
+          syncSessionCount: syncSessions,
+          localOnlyHealthy: localOnlyHealthy,
+          encryptedOnly: encryptedOnly,
+          loading: loading,
+          onImport: onImport,
+          onRefresh: onRefresh,
+        );
 
         return Scaffold(
           drawer: wide
@@ -690,9 +711,13 @@ class _GalleryWorkspaceShell extends StatelessWidget {
                     Navigator.of(context).maybePop();
                   },
                   children: [
-                    const Padding(
-                      padding: EdgeInsets.fromLTRB(24, 24, 24, 12),
-                      child: Text('Private Gallery'),
+                    Padding(
+                      padding: const EdgeInsets.fromLTRB(24, 24, 24, 16),
+                      child: _DrawerBrandHeader(
+                        assetCount: assetCount,
+                        encryptedOnly: encryptedOnly,
+                        localOnlyHealthy: localOnlyHealthy,
+                      ),
                     ),
                     for (final destination in destinations)
                       NavigationDrawerDestination(
@@ -702,7 +727,7 @@ class _GalleryWorkspaceShell extends StatelessWidget {
                   ],
                 ),
           appBar: AppBar(
-            title: Text(pageTitle),
+            title: const Text('Private Gallery'),
             actions: [
               IconButton(
                 onPressed: onImport,
@@ -732,12 +757,279 @@ class _GalleryWorkspaceShell extends StatelessWidget {
                       onDestinationSelected: onSelectIndex,
                     ),
                     const VerticalDivider(width: 1),
-                    Expanded(child: pages[selectedIndex]),
+                    Expanded(
+                      child: Column(
+                        children: [
+                          header,
+                          Expanded(child: pages[selectedIndex]),
+                        ],
+                      ),
+                    ),
                   ],
                 )
-              : IndexedStack(index: selectedIndex, children: pages),
+              : Column(
+                  children: [
+                    header,
+                    Expanded(
+                      child: IndexedStack(
+                        index: selectedIndex,
+                        children: pages,
+                      ),
+                    ),
+                  ],
+                ),
         );
       },
     );
   }
+}
+
+class _WorkspaceCommandHeader extends StatelessWidget {
+  const _WorkspaceCommandHeader({
+    required this.pageTitle,
+    required this.libraryRoot,
+    required this.assetCount,
+    required this.watchFolderCount,
+    required this.syncSessionCount,
+    required this.localOnlyHealthy,
+    required this.encryptedOnly,
+    required this.loading,
+    required this.onImport,
+    required this.onRefresh,
+  });
+
+  final String pageTitle;
+  final String libraryRoot;
+  final int assetCount;
+  final int watchFolderCount;
+  final int syncSessionCount;
+  final bool localOnlyHealthy;
+  final bool encryptedOnly;
+  final bool loading;
+  final Future<void> Function() onImport;
+  final Future<void> Function() onRefresh;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return DecoratedBox(
+      decoration: BoxDecoration(
+        color: theme.colorScheme.surfaceContainerLowest,
+        border: Border(
+          bottom: BorderSide(color: theme.colorScheme.outlineVariant),
+        ),
+      ),
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(24, 16, 24, 16),
+        child: LayoutBuilder(
+          builder: (context, constraints) {
+            final compact = constraints.maxWidth < 760;
+            final titleBlock = Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(pageTitle, style: theme.textTheme.headlineSmall),
+                const SizedBox(height: 6),
+                Text(
+                  _shortPath(libraryRoot),
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: theme.textTheme.bodySmall,
+                ),
+                const SizedBox(height: 10),
+                Wrap(
+                  spacing: 8,
+                  runSpacing: 8,
+                  children: [
+                    AppStatusBadge(
+                      label: localOnlyHealthy ? 'Local only' : 'Remote enabled',
+                      tone: localOnlyHealthy
+                          ? AppStatusTone.success
+                          : AppStatusTone.warning,
+                      icon: localOnlyHealthy
+                          ? Icons.verified_user_outlined
+                          : Icons.public_outlined,
+                    ),
+                    AppStatusBadge(
+                      label: encryptedOnly
+                          ? 'Encrypted originals'
+                          : 'Plaintext originals',
+                      tone: encryptedOnly
+                          ? AppStatusTone.success
+                          : AppStatusTone.warning,
+                      icon: encryptedOnly
+                          ? Icons.lock_outline
+                          : Icons.folder_open_outlined,
+                    ),
+                  ],
+                ),
+              ],
+            );
+
+            final metrics = Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: [
+                _HeaderMetric(
+                  icon: Icons.photo_library_outlined,
+                  label: 'Items',
+                  value: '$assetCount',
+                ),
+                _HeaderMetric(
+                  icon: Icons.folder_copy_outlined,
+                  label: 'Watch',
+                  value: '$watchFolderCount',
+                ),
+                _HeaderMetric(
+                  icon: Icons.devices_outlined,
+                  label: 'Sync',
+                  value: '$syncSessionCount',
+                ),
+              ],
+            );
+
+            final actions = Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: [
+                FilledButton.icon(
+                  onPressed: onImport,
+                  icon: const Icon(Icons.file_upload_outlined),
+                  label: const Text('Import'),
+                ),
+                OutlinedButton.icon(
+                  onPressed: loading
+                      ? null
+                      : () {
+                          onRefresh();
+                        },
+                  icon: const Icon(Icons.refresh),
+                  label: const Text('Refresh'),
+                ),
+              ],
+            );
+
+            if (compact) {
+              return Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  titleBlock,
+                  const SizedBox(height: 14),
+                  metrics,
+                  const SizedBox(height: 14),
+                  actions,
+                ],
+              );
+            }
+
+            return Row(
+              crossAxisAlignment: CrossAxisAlignment.center,
+              children: [
+                Expanded(flex: 2, child: titleBlock),
+                const SizedBox(width: 24),
+                Expanded(child: metrics),
+                const SizedBox(width: 24),
+                actions,
+              ],
+            );
+          },
+        ),
+      ),
+    );
+  }
+}
+
+class _HeaderMetric extends StatelessWidget {
+  const _HeaderMetric({
+    required this.icon,
+    required this.label,
+    required this.value,
+  });
+
+  final IconData icon;
+  final String label;
+  final String value;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return DecoratedBox(
+      decoration: BoxDecoration(
+        color: theme.colorScheme.surfaceContainerLow,
+        border: Border.all(color: theme.colorScheme.outlineVariant),
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(icon, size: 18, color: theme.colorScheme.primary),
+            const SizedBox(width: 8),
+            Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(label, style: theme.textTheme.labelSmall),
+                Text(value, style: theme.textTheme.titleSmall),
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _DrawerBrandHeader extends StatelessWidget {
+  const _DrawerBrandHeader({
+    required this.assetCount,
+    required this.encryptedOnly,
+    required this.localOnlyHealthy,
+  });
+
+  final int assetCount;
+  final bool encryptedOnly;
+  final bool localOnlyHealthy;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text('Private Gallery', style: theme.textTheme.titleLarge),
+        const SizedBox(height: 8),
+        Text('$assetCount indexed items', style: theme.textTheme.bodySmall),
+        const SizedBox(height: 12),
+        Wrap(
+          spacing: 8,
+          runSpacing: 8,
+          children: [
+            AppStatusBadge(
+              label: localOnlyHealthy ? 'Local only' : 'Remote',
+              tone: localOnlyHealthy
+                  ? AppStatusTone.success
+                  : AppStatusTone.warning,
+            ),
+            AppStatusBadge(
+              label: encryptedOnly ? 'Encrypted' : 'Plaintext',
+              tone: encryptedOnly
+                  ? AppStatusTone.success
+                  : AppStatusTone.warning,
+            ),
+          ],
+        ),
+      ],
+    );
+  }
+}
+
+String _shortPath(String path) {
+  if (path.isEmpty) {
+    return 'No library root selected';
+  }
+  if (path.length <= 72) {
+    return path;
+  }
+  return '...${path.substring(path.length - 69)}';
 }

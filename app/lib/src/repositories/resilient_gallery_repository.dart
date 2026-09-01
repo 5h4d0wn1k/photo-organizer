@@ -229,6 +229,17 @@ class ResilientGalleryRepository implements GalleryRepository {
   }
 
   @override
+  Future<SupportBundleExportResult> exportSupportBundle({
+    required String exportRoot,
+    bool includeReleaseReadiness = true,
+  }) {
+    return _delegate.exportSupportBundle(
+      exportRoot: exportRoot,
+      includeReleaseReadiness: includeReleaseReadiness,
+    );
+  }
+
+  @override
   Future<BackupRestorePlan> planRestoreBackup({
     required String exportRoot,
     required String restoreRoot,
@@ -309,6 +320,11 @@ class ResilientGalleryRepository implements GalleryRepository {
   }
 
   @override
+  Future<Asset> updateAssetTags(String assetId, {required List<String> tags}) {
+    return _delegate.updateAssetTags(assetId, tags: tags);
+  }
+
+  @override
   Future<List<Asset>> updateAssetsFlags(
     List<String> assetIds, {
     bool? favorite,
@@ -362,6 +378,29 @@ class ResilientGalleryRepository implements GalleryRepository {
   @override
   Future<void> deleteAlbum(String id) {
     return _delegate.deleteAlbum(id);
+  }
+
+  @override
+  Future<List<SmartFolder>> fetchSmartFolders() {
+    return _delegate.fetchSmartFolders();
+  }
+
+  @override
+  Future<SmartFolder> createSmartFolder({
+    required String title,
+    required SearchQuery query,
+  }) {
+    return _delegate.createSmartFolder(title: title, query: query);
+  }
+
+  @override
+  Future<SearchResponse> runSmartFolder(String id) {
+    return _delegate.runSmartFolder(id);
+  }
+
+  @override
+  Future<void> deleteSmartFolder(String id) {
+    return _delegate.deleteSmartFolder(id);
   }
 
   @override

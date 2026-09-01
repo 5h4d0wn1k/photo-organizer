@@ -4,6 +4,7 @@ import '../../models/gallery_models.dart';
 import '../../repositories/gallery_repository.dart';
 import '../../widgets/asset_grid.dart';
 import '../../widgets/empty_state_panel.dart';
+import '../media/media_viewer.dart';
 
 class SearchScreen extends StatefulWidget {
   const SearchScreen({super.key, required this.repository});
@@ -21,15 +22,27 @@ class _SearchScreenState extends State<SearchScreen> {
   final TextEditingController _personController = TextEditingController();
   final TextEditingController _placeController = TextEditingController();
   final TextEditingController _eventController = TextEditingController();
+  final TextEditingController _workspaceController = TextEditingController();
+  final TextEditingController _clientController = TextEditingController();
+  final TextEditingController _projectController = TextEditingController();
+  final TextEditingController _topicController = TextEditingController();
+  final TextEditingController _sourceFolderController = TextEditingController();
+  final TextEditingController _deviceController = TextEditingController();
+  final TextEditingController _tagsController = TextEditingController();
   final TextEditingController _fromDateController = TextEditingController();
   final TextEditingController _toDateController = TextEditingController();
   Future<SearchResponse>? _searchFuture;
   late Future<SearchIndexStatus?> _statusFuture;
+  List<SmartFolder> _smartFolders = const [];
+  SearchQuery? _lastSubmittedQuery;
   String? _submittedQuery;
+  String? _smartFolderError;
   JobRecord? _lastOcrJob;
   JobRecord? _lastSceneJob;
   String? _ocrError;
   String? _sceneError;
+  bool _loadingSmartFolders = false;
+  bool _savingSmartFolder = false;
   bool _ocrRunning = false;
   bool _sceneRunning = false;
   bool _includeArchived = false;
@@ -40,6 +53,7 @@ class _SearchScreenState extends State<SearchScreen> {
   void initState() {
     super.initState();
     _statusFuture = widget.repository.fetchSearchStatus();
+    _loadSmartFolders();
   }
 
   @override
@@ -48,6 +62,13 @@ class _SearchScreenState extends State<SearchScreen> {
     _personController.dispose();
     _placeController.dispose();
     _eventController.dispose();
+    _workspaceController.dispose();
+    _clientController.dispose();
+    _projectController.dispose();
+    _topicController.dispose();
+    _sourceFolderController.dispose();
+    _deviceController.dispose();
+    _tagsController.dispose();
     _fromDateController.dispose();
     _toDateController.dispose();
     super.dispose();
@@ -59,7 +80,14 @@ class _SearchScreenState extends State<SearchScreen> {
       people: _emptyToNull(_personController.text),
       places: _emptyToNull(_placeController.text),
       events: _emptyToNull(_eventController.text),
+      workspace: _emptyToNull(_workspaceController.text),
+      client: _emptyToNull(_clientController.text),
+      project: _emptyToNull(_projectController.text),
+      topic: _emptyToNull(_topicController.text),
+      sourceFolder: _emptyToNull(_sourceFolderController.text),
+      device: _emptyToNull(_deviceController.text),
       mediaKind: _mediaKind,
+      tags: _emptyToNull(_tagsController.text),
       favorite: _favoritesOnly ? true : null,
       fromDate: _emptyToNull(_fromDateController.text),
       toDate: _emptyToNull(_toDateController.text),
@@ -70,7 +98,14 @@ class _SearchScreenState extends State<SearchScreen> {
         query.people == null &&
         query.places == null &&
         query.events == null &&
+        query.workspace == null &&
+        query.client == null &&
+        query.project == null &&
+        query.topic == null &&
+        query.sourceFolder == null &&
+        query.device == null &&
         query.mediaKind == null &&
+        query.tags == null &&
         query.favorite == null &&
         query.fromDate == null &&
         query.toDate == null &&
@@ -78,14 +113,145 @@ class _SearchScreenState extends State<SearchScreen> {
       setState(() {
         _submittedQuery = null;
         _searchFuture = null;
+        _lastSubmittedQuery = null;
       });
       return;
     }
 
     setState(() {
       _submittedQuery = _queryLabel(query);
+      _lastSubmittedQuery = query;
       _searchFuture = widget.repository.search(query);
     });
+  }
+
+  Future<void> _loadSmartFolders() async {
+    setState(() {
+      _loadingSmartFolders = true;
+      _smartFolderError = null;
+    });
+    try {
+      final folders = await widget.repository.fetchSmartFolders();
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _smartFolders = folders;
+      });
+    } catch (error) {
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _smartFolderError = '$error';
+      });
+    } finally {
+      if (mounted) {
+        setState(() {
+          _loadingSmartFolders = false;
+        });
+      }
+    }
+  }
+
+  Future<void> _saveSmartFolder() async {
+    final query = _lastSubmittedQuery;
+    if (query == null) {
+      return;
+    }
+    final title = await _promptForSmartFolderTitle();
+    if (title == null || title.trim().isEmpty) {
+      return;
+    }
+    setState(() {
+      _savingSmartFolder = true;
+      _smartFolderError = null;
+    });
+    try {
+      await widget.repository.createSmartFolder(
+        title: title.trim(),
+        query: query,
+      );
+      await _loadSmartFolders();
+      _showMessage('Smart folder saved.');
+    } catch (error) {
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _smartFolderError = '$error';
+      });
+    } finally {
+      if (mounted) {
+        setState(() {
+          _savingSmartFolder = false;
+        });
+      }
+    }
+  }
+
+  Future<void> _runSmartFolder(SmartFolder folder) async {
+    setState(() {
+      _submittedQuery = 'smart:${folder.title}';
+      _lastSubmittedQuery = folder.query;
+      _searchFuture = widget.repository.runSmartFolder(folder.id);
+    });
+  }
+
+  Future<void> _deleteSmartFolder(SmartFolder folder) async {
+    try {
+      await widget.repository.deleteSmartFolder(folder.id);
+      await _loadSmartFolders();
+      _showMessage('Smart folder deleted.');
+    } catch (error) {
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _smartFolderError = '$error';
+      });
+    }
+  }
+
+  Future<String?> _promptForSmartFolderTitle() {
+    final controller = TextEditingController(
+      text: _submittedQuery == null || _submittedQuery!.isEmpty
+          ? 'Smart folder'
+          : _submittedQuery!,
+    );
+    return showDialog<String>(
+      context: context,
+      builder: (context) {
+        return AlertDialog(
+          title: const Text('Save smart folder'),
+          content: TextField(
+            controller: controller,
+            autofocus: true,
+            decoration: const InputDecoration(labelText: 'Name'),
+            onSubmitted: (value) => Navigator.of(context).pop(value),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(),
+              child: const Text('Cancel'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.of(context).pop(controller.text),
+              child: const Text('Save'),
+            ),
+          ],
+        );
+      },
+    ).whenComplete(controller.dispose);
+  }
+
+  void _showMessage(String message) {
+    if (!mounted) {
+      return;
+    }
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(SnackBar(content: Text(message)));
   }
 
   String? _emptyToNull(String value) {
@@ -99,7 +265,14 @@ class _SearchScreenState extends State<SearchScreen> {
       if (query.people != null) 'person:${query.people}',
       if (query.places != null) 'place:${query.places}',
       if (query.events != null) 'event:${query.events}',
+      if (query.workspace != null) 'workspace:${query.workspace}',
+      if (query.client != null) 'client:${query.client}',
+      if (query.project != null) 'project:${query.project}',
+      if (query.topic != null) 'topic:${query.topic}',
+      if (query.sourceFolder != null) 'folder:${query.sourceFolder}',
+      if (query.device != null) 'device:${query.device}',
       if (query.mediaKind != null) 'kind:${query.mediaKind}',
+      if (query.tags != null) 'tags:${query.tags}',
       if (query.favorite == true) 'favorites',
       if (query.fromDate != null) 'from:${query.fromDate}',
       if (query.toDate != null) 'to:${query.toDate}',
@@ -172,6 +345,16 @@ class _SearchScreenState extends State<SearchScreen> {
     }
   }
 
+  Future<void> _showAssetDetails(Asset asset) {
+    return MediaViewer.show(
+      context,
+      asset: asset,
+      loadAvailability: widget.repository.fetchAssetAvailability,
+      pinLocalAsset: widget.repository.pinLocalAsset,
+      evictLocalAsset: widget.repository.evictLocalAsset,
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
@@ -184,11 +367,6 @@ class _SearchScreenState extends State<SearchScreen> {
           const Text(
             'Search',
             style: TextStyle(fontSize: 30, fontWeight: FontWeight.w700),
-          ),
-          const SizedBox(height: 12),
-          Text(
-            'Search stays honest in this slice: if the daemon has not indexed anything yet, you will see empty results instead of demo matches.',
-            style: theme.textTheme.bodyLarge,
           ),
           const SizedBox(height: 12),
           FutureBuilder<SearchIndexStatus?>(
@@ -265,9 +443,6 @@ class _SearchScreenState extends State<SearchScreen> {
                                     : 'Index next $_safeOcrBatchLimit photos',
                               ),
                             ),
-                            const Text(
-                              'Uses local Tesseract only, skips already-indexed photos, and never uploads media.',
-                            ),
                             OutlinedButton.icon(
                               onPressed: _sceneRunning ? null : _runSceneBatch,
                               icon: _sceneRunning
@@ -287,9 +462,6 @@ class _SearchScreenState extends State<SearchScreen> {
                                     : 'Index next $_safeOcrBatchLimit scene tags',
                               ),
                             ),
-                            const Text(
-                              'Uses local heuristic image analysis only. No cloud labels, no model download.',
-                            ),
                           ],
                         ),
                       ),
@@ -299,6 +471,18 @@ class _SearchScreenState extends State<SearchScreen> {
               );
             },
           ),
+          if (_loadingSmartFolders ||
+              _smartFolders.isNotEmpty ||
+              _smartFolderError != null) ...[
+            const SizedBox(height: 12),
+            _SmartFolderStrip(
+              folders: _smartFolders,
+              loading: _loadingSmartFolders,
+              error: _smartFolderError,
+              onOpen: _runSmartFolder,
+              onDelete: _deleteSmartFolder,
+            ),
+          ],
           if (_lastOcrJob != null || _ocrError != null) ...[
             const SizedBox(height: 12),
             Card(
@@ -378,6 +562,84 @@ class _SearchScreenState extends State<SearchScreen> {
                   controller: _eventController,
                   decoration: const InputDecoration(
                     labelText: 'Event',
+                    border: OutlineInputBorder(),
+                  ),
+                  onSubmitted: (_) => _runSearch(),
+                ),
+              ),
+              SizedBox(
+                width: 220,
+                child: TextField(
+                  controller: _workspaceController,
+                  decoration: const InputDecoration(
+                    labelText: 'Workspace',
+                    border: OutlineInputBorder(),
+                  ),
+                  onSubmitted: (_) => _runSearch(),
+                ),
+              ),
+              SizedBox(
+                width: 220,
+                child: TextField(
+                  controller: _clientController,
+                  decoration: const InputDecoration(
+                    labelText: 'Client',
+                    border: OutlineInputBorder(),
+                  ),
+                  onSubmitted: (_) => _runSearch(),
+                ),
+              ),
+              SizedBox(
+                width: 220,
+                child: TextField(
+                  controller: _projectController,
+                  decoration: const InputDecoration(
+                    labelText: 'Project',
+                    border: OutlineInputBorder(),
+                  ),
+                  onSubmitted: (_) => _runSearch(),
+                ),
+              ),
+              SizedBox(
+                width: 220,
+                child: TextField(
+                  controller: _topicController,
+                  decoration: const InputDecoration(
+                    labelText: 'Topic',
+                    border: OutlineInputBorder(),
+                  ),
+                  onSubmitted: (_) => _runSearch(),
+                ),
+              ),
+              SizedBox(
+                width: 220,
+                child: TextField(
+                  controller: _sourceFolderController,
+                  decoration: const InputDecoration(
+                    labelText: 'Source folder',
+                    border: OutlineInputBorder(),
+                  ),
+                  onSubmitted: (_) => _runSearch(),
+                ),
+              ),
+              SizedBox(
+                width: 220,
+                child: TextField(
+                  controller: _deviceController,
+                  decoration: const InputDecoration(
+                    labelText: 'Device',
+                    border: OutlineInputBorder(),
+                  ),
+                  onSubmitted: (_) => _runSearch(),
+                ),
+              ),
+              SizedBox(
+                width: 220,
+                child: TextField(
+                  controller: _tagsController,
+                  decoration: const InputDecoration(
+                    labelText: 'Tags',
+                    hintText: 'invoice, family',
                     border: OutlineInputBorder(),
                   ),
                   onSubmitted: (_) => _runSearch(),
@@ -484,6 +746,19 @@ class _SearchScreenState extends State<SearchScreen> {
                 icon: const Icon(Icons.search),
                 label: const Text('Find'),
               ),
+              OutlinedButton.icon(
+                onPressed: _lastSubmittedQuery == null || _savingSmartFolder
+                    ? null
+                    : _saveSmartFolder,
+                icon: _savingSmartFolder
+                    ? const SizedBox(
+                        width: 16,
+                        height: 16,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      )
+                    : const Icon(Icons.create_new_folder_outlined),
+                label: const Text('Save smart folder'),
+              ),
             ],
           ),
           const SizedBox(height: 20),
@@ -529,7 +804,10 @@ class _SearchScreenState extends State<SearchScreen> {
                         children: [
                           Text('Assets', style: theme.textTheme.titleLarge),
                           const SizedBox(height: 12),
-                          AssetGrid(assets: data.assets),
+                          AssetGrid(
+                            assets: data.assets,
+                            onAssetSelected: _showAssetDetails,
+                          ),
                           const SizedBox(height: 24),
                           Text(
                             'People matches: ${data.people.length}',
@@ -575,6 +853,76 @@ class _SearchScreenState extends State<SearchScreen> {
                   ),
           ),
         ],
+      ),
+    );
+  }
+}
+
+class _SmartFolderStrip extends StatelessWidget {
+  const _SmartFolderStrip({
+    required this.folders,
+    required this.loading,
+    required this.error,
+    required this.onOpen,
+    required this.onDelete,
+  });
+
+  final List<SmartFolder> folders;
+  final bool loading;
+  final String? error;
+  final ValueChanged<SmartFolder> onOpen;
+  final ValueChanged<SmartFolder> onDelete;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return DecoratedBox(
+      decoration: BoxDecoration(
+        border: Border.all(color: theme.dividerColor),
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: Padding(
+        padding: const EdgeInsets.all(10),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                const Icon(Icons.auto_awesome_motion_outlined, size: 18),
+                const SizedBox(width: 8),
+                Text('Smart folders', style: theme.textTheme.titleSmall),
+                if (loading) ...[
+                  const SizedBox(width: 10),
+                  const SizedBox(
+                    width: 14,
+                    height: 14,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  ),
+                ],
+              ],
+            ),
+            if (error != null) ...[
+              const SizedBox(height: 6),
+              Text(error!, style: TextStyle(color: theme.colorScheme.error)),
+            ],
+            if (folders.isNotEmpty) ...[
+              const SizedBox(height: 8),
+              Wrap(
+                spacing: 8,
+                runSpacing: 8,
+                children: [
+                  for (final folder in folders)
+                    InputChip(
+                      avatar: const Icon(Icons.folder_special_outlined),
+                      label: Text(folder.title),
+                      onPressed: () => onOpen(folder),
+                      onDeleted: () => onDelete(folder),
+                    ),
+                ],
+              ),
+            ],
+          ],
+        ),
       ),
     );
   }

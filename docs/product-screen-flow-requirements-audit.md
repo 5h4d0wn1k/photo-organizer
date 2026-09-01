@@ -21,25 +21,45 @@ This audit is based on the repository docs, Flutter screens, Rust API/domain sur
 
 ## Product North Star
 
-Private Gallery is a private, local-first Google Photos alternative. It should organize photos and videos intelligently while giving the user personal-cloud convenience across phone, desktop, and storage devices without forcing private media into hosted photo storage.
+Private Gallery is a private, local-first shared-storage cloud and smart
+organizer for photos, videos, documents, and work files. It should give users
+cloud convenience from their own trusted devices while keeping private content,
+metadata, OCR text, face data, embeddings, keys, tokens, and activity away from
+company-controlled storage and intelligence systems.
 
-The product is not only a local cloud. The local-cloud layer is the access, sync, availability, and protection system. The larger product goal is media organization and rediscovery: timeline, albums, faces/people, occasions/events, places, OCR text, scenes, semantic search, duplicates, corrections, backup, and long-term preservation.
+The product is not only a gallery and not only sync. Shared storage is the
+infrastructure: device groups, encrypted chunks, availability, protection,
+backup, and long-distance reachability. Smart organization is the daily value:
+timeline, albums, faces/people, occasions/events, places, OCR text, scenes,
+semantic search, duplicates, corrections, projects, clients, workspaces,
+folders, file types, backup, and long-term preservation.
 
 ## Core Goals
 
-- Organize photos and videos like Google Photos while keeping processing local-first.
-- Let users create a private device group and join phones, desktops, and storage devices by QR.
+- Organize photos, videos, documents, screenshots, audio, archives, text files,
+  and work/project folders while keeping processing local-first.
+- Let users create a private device group and join phones, desktops, NAS,
+  external drives, office machines, family devices, and storage-only devices by
+  QR/manual invite.
 - Show one unified library across joined devices when devices are reachable.
 - Let a single device keep working independently when other devices are offline.
 - Make unavailable media explicit instead of invisible: online, offline, out of network, missing, remote-only, under-replicated, protected.
-- Keep originals, thumbnails, OCR text, embeddings, face templates, GPS metadata, vault keys, desktop pairing tokens, mobile bearer tokens, and raw LAN tokens out of cloud services by default.
+- Keep originals, files, thumbnails, OCR text, embeddings, face templates, GPS
+  metadata, vault keys, desktop pairing tokens, mobile bearer tokens, and raw LAN
+  tokens out of cloud services by default.
 - Use optional Supabase only for metadata bootstrap: group name, membership, invite hashes, capabilities, endpoint hints.
 - Support safe local import, dedupe, move/copy/reference modes, sidecar handling, corrections, backup, restore staging, model governance, and encrypted sensitive indexes.
-- Provide mature UI on every platform: phone should open a real gallery after joining, not a debug pairing utility.
+- Complete release paths for Windows, Linux, macOS, Android/Play Store,
+  iOS/App Store, web/browser access, optional local web UI, and direct desktop
+  installers/packages.
+- Provide mature UI on every platform: phone should open a real gallery after
+  joining, web/local-web access should respect privacy boundaries, and platform
+  surfaces should not feel like debug pairing utilities.
 
 ## Product Principles
 
-- Private by default: no analytics, cloud AI, remote geocoding, or hosted media storage in v1.
+- Private by default: no analytics, cloud AI, remote geocoding, hosted file/media
+  storage, or training on user libraries in v1.
 - Local intelligence: metadata, OCR, scene tags, people/faces, search, and future embeddings run from local files only.
 - Honest capability: disabled/gated features must say why they are gated.
 - Reversible organization: albums, people labels, place corrections, and event titles are metadata changes; media files are not silently moved or deleted.
@@ -52,6 +72,9 @@ The product is not only a local cloud. The local-cloud layer is the access, sync
 - Desktop owner: imports folders, runs indexing, manages vaults/devices, backup/restore, models, storage policy.
 - Storage device/NAS: stores encrypted chunks, improves replica protection, may be storage-only.
 - Family member/member device: browses and contributes if authorized; future role controls should distinguish owner/admin/contributor/viewer/storage-only.
+- Business/workspace owner: shares project folders, client files, and team
+  workspaces across trusted office or remote devices with roles, audit, storage
+  policy, and privacy-first collaboration.
 
 ## Current Desktop Information Architecture
 
@@ -950,6 +973,10 @@ Phone or desktop creates/joins metadata-only group through Supabase anonymous au
 
 - Improve local metadata extraction.
 - Add robust screenshot/document/video filters.
+- Add document, PDF, archive, audio, text-file, project, client, workspace, and
+  smart-folder organization.
+- Add business/workspace correction loops for project/client tags, workspace
+  folders, and team-visible metadata.
 - Expand OCR management and coverage.
 - Add model-approved face detection and clustering.
 - Add face review/merge/split UX.
@@ -972,16 +999,33 @@ Phone or desktop creates/joins metadata-only group through Supabase anonymous au
 - Harden Supabase RLS and invite lifecycle.
 - Add endpoint discovery/relay hints.
 - Optional Tailscale/Cloudflare/Vercel invite landing page.
-- Keep hosted media storage out of default product boundary.
+- Keep hosted file/media storage, OCR, embeddings, face data, precise metadata,
+  and keys out of the default product boundary.
 
 ### Phase 5: Production Readiness
 
 - CI workflow.
-- Release builds for Linux/macOS/Windows/Android.
-- Installer/update flow.
+- Release builds for Linux, macOS, Windows, Android/Play Store, iOS/App Store,
+  web/browser access, optional local web UI, and direct desktop packages.
+- Installer, app signing, notarization, store metadata, update, and rollback
+  flows.
+- Platform-specific tests for desktop, mobile, web, local-web, store compliance,
+  privacy disclosures, and release smoke coverage.
 - Crash-free local logging without telemetry.
 - Product PRFAQ, critical user journeys, ADRs, SLOs, runbooks, rollback docs.
 - Visual regression and accessibility test gates.
+
+### Phase 6: Subscription And Workspace Packaging
+
+- Low-cost personal subscription with a genuinely useful lowest tier.
+- Entitlement checks for device count, family/workspace limits, relay priority,
+  OCR/intelligence scale, storage-policy features, and admin controls.
+- Offline grace behavior so a local library remains usable without billing
+  connectivity.
+- Business/workspace roles, permissions, audit logs, support boundaries, and
+  billing model.
+- Privacy-preserving diagnostics and support flows that do not upload content or
+  private metadata.
 
 ## Repo Operating-System Gaps
 

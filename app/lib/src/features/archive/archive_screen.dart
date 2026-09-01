@@ -53,9 +53,9 @@ class _ArchiveScreenState extends State<ArchiveScreen> {
       if (!mounted) {
         return;
       }
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('$error')),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('$error')));
     }
   }
 
@@ -68,6 +68,9 @@ class _ArchiveScreenState extends State<ArchiveScreen> {
         Navigator.of(context).maybePop();
         _unarchive(asset);
       },
+      loadAvailability: widget.repository.fetchAssetAvailability,
+      pinLocalAsset: widget.repository.pinLocalAsset,
+      evictLocalAsset: widget.repository.evictLocalAsset,
     );
   }
 

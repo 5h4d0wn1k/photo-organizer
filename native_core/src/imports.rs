@@ -502,6 +502,7 @@ pub fn build_imported_asset(request: ImportAssetRequest) -> (Asset, JobRecord) {
         favorite: false,
         is_available: true,
         place_hint: request.place_hint,
+        manual_tags: Vec::new(),
         metadata: None,
         variants: vec![preview, thumbnail],
     };
@@ -570,11 +571,13 @@ where
                     .into_iter()
                     .map(|value| value.to_string_lossy().to_string())
                     .collect::<Vec<_>>();
-            let extracted_metadata = metadata::extract_import_metadata(
+            let mut extracted_metadata = metadata::extract_import_metadata(
                 &path,
                 &sidecar_paths,
                 filesystem_captured_at.unwrap_or_else(Utc::now),
             );
+            extracted_metadata.organization =
+                metadata::derive_file_organization_hints(&path, Some(&source_root));
             let captured_at = extracted_metadata.captured_at;
             let relative_destination =
                 derive_managed_original_path(&content_hash, &original_filename, captured_at);
@@ -611,6 +614,7 @@ where
                 destination_path,
                 sidecar_paths,
                 safety_status,
+                organization: extracted_metadata.organization,
             })
         })
         .collect::<Result<Vec<_>, std::io::Error>>()?;
@@ -792,6 +796,39 @@ mod tests {
             infer_media_kind(&nested.join("payload.bin")),
             Some(MediaKind::Other)
         );
+    }
+
+    #[test]
+    fn scan_source_derives_business_file_organization_hints() {
+        let root = temp_dir("scan-organization");
+        let project_dir = root
+            .join("Office")
+            .join("Client Acme")
+            .join("Project Launch");
+        fs::create_dir_all(&project_dir).expect("project dir");
+        fs::write(project_dir.join("proposal.pdf"), b"pdf").expect("write pdf");
+        let request = ScanImportSourceRequest {
+            source_path: root.to_string_lossy().to_string(),
+            source_kind: ImportSourceKind::Folder,
+            recursive: true,
+            import_mode: Some(ImportMode::Reference),
+            add_as_watch_folder: false,
+            place_hint: None,
+        };
+
+        let session = scan_source(&request, ImportMode::Reference, None, |_| None)
+            .expect("scan should succeed");
+
+        assert_eq!(session.candidates.len(), 1);
+        let candidate = &session.candidates[0];
+        assert_eq!(candidate.media_kind, MediaKind::Document);
+        assert_eq!(
+            candidate.organization.source_folder.as_deref(),
+            Some("Project Launch")
+        );
+        assert_eq!(candidate.organization.workspace.as_deref(), Some("Office"));
+        assert_eq!(candidate.organization.client.as_deref(), Some("Acme"));
+        assert_eq!(candidate.organization.project.as_deref(), Some("Launch"));
     }
 
     #[test]

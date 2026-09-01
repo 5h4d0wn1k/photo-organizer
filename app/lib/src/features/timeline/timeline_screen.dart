@@ -50,9 +50,7 @@ class _TimelineScreenState extends State<TimelineScreen> {
         )) {
       _timeline = widget.workspace.dashboard.timeline;
       _loadMoreError = null;
-      _selectedAssetIds.removeWhere(
-        (id) => !_visibleAssetIds.contains(id),
-      );
+      _selectedAssetIds.removeWhere((id) => !_visibleAssetIds.contains(id));
     }
   }
 
@@ -127,10 +125,7 @@ class _TimelineScreenState extends State<TimelineScreen> {
     });
   }
 
-  Future<void> _bulkUpdateAssetFlags({
-    bool? favorite,
-    bool? archived,
-  }) async {
+  Future<void> _bulkUpdateAssetFlags({bool? favorite, bool? archived}) async {
     final ids = _selectedAssetIds.toList(growable: false);
     if (ids.isEmpty) {
       return;
@@ -150,11 +145,11 @@ class _TimelineScreenState extends State<TimelineScreen> {
       _clearSelection();
       final action = archived != null
           ? archived
-              ? 'archived'
-              : 'unarchived'
+                ? 'archived'
+                : 'unarchived'
           : favorite == true
-              ? 'marked as favorite'
-              : 'removed from favorites';
+          ? 'marked as favorite'
+          : 'removed from favorites';
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(content: Text('${updated.length} assets $action.')),
       );
@@ -162,9 +157,9 @@ class _TimelineScreenState extends State<TimelineScreen> {
       if (!mounted) {
         return;
       }
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('$error')),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('$error')));
     }
   }
 
@@ -233,15 +228,15 @@ class _TimelineScreenState extends State<TimelineScreen> {
                   OutlinedButton(
                     onPressed: selectedAlbumId == null
                         ? null
-                        : () => Navigator.of(context).pop(
-                              _AlbumAssignment.existing(selectedAlbumId!),
-                            ),
+                        : () => Navigator.of(
+                            context,
+                          ).pop(_AlbumAssignment.existing(selectedAlbumId!)),
                     child: const Text('Add existing'),
                   ),
                 FilledButton(
-                  onPressed: () => Navigator.of(context).pop(
-                    _AlbumAssignment.create(newAlbumController.text),
-                  ),
+                  onPressed: () => Navigator.of(
+                    context,
+                  ).pop(_AlbumAssignment.create(newAlbumController.text)),
                   child: const Text('Create and add'),
                 ),
               ],
@@ -280,9 +275,9 @@ class _TimelineScreenState extends State<TimelineScreen> {
       if (!mounted) {
         return;
       }
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('$error')),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('$error')));
     }
   }
 
@@ -346,7 +341,75 @@ class _TimelineScreenState extends State<TimelineScreen> {
         Navigator.of(context).maybePop();
         _addAssetToAlbum(asset);
       },
+      onEditTags: () {
+        Navigator.of(context).maybePop();
+        _editAssetTags(asset);
+      },
+      loadAvailability: widget.repository.fetchAssetAvailability,
+      pinLocalAsset: widget.repository.pinLocalAsset,
+      evictLocalAsset: widget.repository.evictLocalAsset,
     );
+  }
+
+  Future<void> _editAssetTags(Asset asset) async {
+    final controller = TextEditingController(text: asset.manualTags.join(', '));
+    final value = await showDialog<String>(
+      context: context,
+      builder: (context) {
+        return AlertDialog(
+          title: Text('Edit tags for ${asset.originalFilename}'),
+          content: TextField(
+            controller: controller,
+            autofocus: true,
+            decoration: const InputDecoration(
+              labelText: 'Tags',
+              hintText: 'work, invoice, family',
+              border: OutlineInputBorder(),
+            ),
+            onSubmitted: (value) => Navigator.of(context).pop(value),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(),
+              child: const Text('Cancel'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.of(context).pop(controller.text),
+              child: const Text('Save'),
+            ),
+          ],
+        );
+      },
+    ).whenComplete(controller.dispose);
+    if (value == null) {
+      return;
+    }
+    final tags = value
+        .split(',')
+        .map((tag) => tag.trim())
+        .where((tag) => tag.isNotEmpty)
+        .toList();
+    try {
+      final updated = await widget.repository.updateAssetTags(
+        asset.id,
+        tags: tags,
+      );
+      await widget.onLibraryChanged();
+      await _reloadTimeline(includeArchived: _showArchived);
+      if (!mounted) {
+        return;
+      }
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('${updated.originalFilename} tags updated.')),
+      );
+    } catch (error) {
+      if (!mounted) {
+        return;
+      }
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('$error')));
+    }
   }
 
   Future<void> _updateAssetFlags(
@@ -367,11 +430,11 @@ class _TimelineScreenState extends State<TimelineScreen> {
       }
       final action = archived != null
           ? updated.archived
-              ? 'archived'
-              : 'unarchived'
+                ? 'archived'
+                : 'unarchived'
           : updated.favorite
-              ? 'marked as favorite'
-              : 'removed from favorites';
+          ? 'marked as favorite'
+          : 'removed from favorites';
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(content: Text('${updated.originalFilename} $action.')),
       );
@@ -379,9 +442,9 @@ class _TimelineScreenState extends State<TimelineScreen> {
       if (!mounted) {
         return;
       }
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('$error')),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('$error')));
     }
   }
 
@@ -446,15 +509,15 @@ class _TimelineScreenState extends State<TimelineScreen> {
                   OutlinedButton(
                     onPressed: selectedAlbumId == null
                         ? null
-                        : () => Navigator.of(context).pop(
-                              _AlbumAssignment.existing(selectedAlbumId!),
-                            ),
+                        : () => Navigator.of(
+                            context,
+                          ).pop(_AlbumAssignment.existing(selectedAlbumId!)),
                     child: const Text('Add existing'),
                   ),
                 FilledButton(
-                  onPressed: () => Navigator.of(context).pop(
-                    _AlbumAssignment.create(newAlbumController.text),
-                  ),
+                  onPressed: () => Navigator.of(
+                    context,
+                  ).pop(_AlbumAssignment.create(newAlbumController.text)),
                   child: const Text('Create and add'),
                 ),
               ],
@@ -474,10 +537,7 @@ class _TimelineScreenState extends State<TimelineScreen> {
         if (title.isEmpty) {
           return;
         }
-        await widget.repository.createAlbum(
-          title: title,
-          assetIds: [asset.id],
-        );
+        await widget.repository.createAlbum(title: title, assetIds: [asset.id]);
       } else if (assignment.albumId != null) {
         await widget.repository.addAlbumAssets(
           assignment.albumId!,
@@ -495,9 +555,9 @@ class _TimelineScreenState extends State<TimelineScreen> {
       if (!mounted) {
         return;
       }
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('$error')),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('$error')));
     }
   }
 
@@ -562,15 +622,15 @@ class _TimelineScreenState extends State<TimelineScreen> {
                   OutlinedButton(
                     onPressed: selectedPersonId == null
                         ? null
-                        : () => Navigator.of(context).pop(
-                              _PersonAssignment.existing(selectedPersonId!),
-                            ),
+                        : () => Navigator.of(
+                            context,
+                          ).pop(_PersonAssignment.existing(selectedPersonId!)),
                     child: const Text('Assign existing'),
                   ),
                 FilledButton(
-                  onPressed: () => Navigator.of(context).pop(
-                    _PersonAssignment.create(newPersonController.text),
-                  ),
+                  onPressed: () => Navigator.of(
+                    context,
+                  ).pop(_PersonAssignment.create(newPersonController.text)),
                   child: const Text('Create and assign'),
                 ),
               ],
@@ -611,9 +671,9 @@ class _TimelineScreenState extends State<TimelineScreen> {
       if (!mounted) {
         return;
       }
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('$error')),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('$error')));
     }
   }
 
@@ -659,11 +719,11 @@ class _TimelineScreenState extends State<TimelineScreen> {
               label: 'Import mode',
               value:
                   widget.workspace.settings.defaultImportMode == ImportMode.copy
-                      ? 'Copy'
-                      : widget.workspace.settings.defaultImportMode ==
-                              ImportMode.move
-                          ? 'Move'
-                          : 'Reference',
+                  ? 'Copy'
+                  : widget.workspace.settings.defaultImportMode ==
+                        ImportMode.move
+                  ? 'Move'
+                  : 'Reference',
             ),
           ],
         ),
@@ -720,8 +780,9 @@ class _TimelineScreenState extends State<TimelineScreen> {
                   label: Text(_selectionMode ? 'Selection on' : 'Select'),
                 ),
                 OutlinedButton.icon(
-                  onPressed:
-                      _visibleAssets.isEmpty ? null : _selectVisibleAssets,
+                  onPressed: _visibleAssets.isEmpty
+                      ? null
+                      : _selectVisibleAssets,
                   icon: const Icon(Icons.select_all),
                   label: const Text('Select visible'),
                 ),
@@ -843,10 +904,7 @@ class _TimelineScreenState extends State<TimelineScreen> {
 }
 
 class _PersonAssignment {
-  const _PersonAssignment._({
-    this.personId,
-    this.createName,
-  });
+  const _PersonAssignment._({this.personId, this.createName});
 
   factory _PersonAssignment.existing(String personId) {
     return _PersonAssignment._(personId: personId);
@@ -861,10 +919,7 @@ class _PersonAssignment {
 }
 
 class _AlbumAssignment {
-  const _AlbumAssignment._({
-    this.albumId,
-    this.createTitle,
-  });
+  const _AlbumAssignment._({this.albumId, this.createTitle});
 
   factory _AlbumAssignment.existing(String albumId) {
     return _AlbumAssignment._(albumId: albumId);

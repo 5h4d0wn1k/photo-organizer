@@ -46,6 +46,8 @@ class LocalGalleryRepository implements GalleryRepository {
 
     final diagnostics = await _safeDiagnostics();
     final privacyStatus = await _safePrivacyStatus();
+    final entitlementStatus = await _safeEntitlementStatus();
+    final platformReleaseReadiness = await _safePlatformReleaseReadiness();
 
     try {
       final status = await _apiClient.fetchLibraryStatus();
@@ -66,6 +68,8 @@ class LocalGalleryRepository implements GalleryRepository {
           dashboard: dashboard,
           diagnostics: diagnostics,
           privacyStatus: privacyStatus,
+          entitlementStatus: entitlementStatus,
+          platformReleaseReadiness: platformReleaseReadiness,
         ),
         launchResult: launchResult,
       );
@@ -300,6 +304,17 @@ class LocalGalleryRepository implements GalleryRepository {
   }
 
   @override
+  Future<SupportBundleExportResult> exportSupportBundle({
+    required String exportRoot,
+    bool includeReleaseReadiness = true,
+  }) {
+    return _apiClient.exportSupportBundle(
+      exportRoot: exportRoot,
+      includeReleaseReadiness: includeReleaseReadiness,
+    );
+  }
+
+  @override
   Future<BackupRestorePlan> planRestoreBackup({
     required String exportRoot,
     required String restoreRoot,
@@ -380,6 +395,11 @@ class LocalGalleryRepository implements GalleryRepository {
   }
 
   @override
+  Future<Asset> updateAssetTags(String assetId, {required List<String> tags}) {
+    return _apiClient.updateAssetTags(assetId, tags: tags);
+  }
+
+  @override
   Future<List<Asset>> updateAssetsFlags(
     List<String> assetIds, {
     bool? favorite,
@@ -433,6 +453,29 @@ class LocalGalleryRepository implements GalleryRepository {
   @override
   Future<void> deleteAlbum(String id) {
     return _apiClient.deleteAlbum(id);
+  }
+
+  @override
+  Future<List<SmartFolder>> fetchSmartFolders() {
+    return _apiClient.fetchSmartFolders();
+  }
+
+  @override
+  Future<SmartFolder> createSmartFolder({
+    required String title,
+    required SearchQuery query,
+  }) {
+    return _apiClient.createSmartFolder(title: title, query: query);
+  }
+
+  @override
+  Future<SearchResponse> runSmartFolder(String id) {
+    return _apiClient.runSmartFolder(id);
+  }
+
+  @override
+  Future<void> deleteSmartFolder(String id) {
+    return _apiClient.deleteSmartFolder(id);
   }
 
   @override
@@ -621,6 +664,7 @@ class LocalGalleryRepository implements GalleryRepository {
     final places = await _apiClient.fetchPlaces();
     final events = await _apiClient.fetchEvents();
     final jobs = await _apiClient.fetchJobs();
+    final auditEvents = await _safeAuditEvents();
     final models = await _safeModels();
     final modelRuntimeStatus = await _safeModelRuntimeStatus();
 
@@ -630,6 +674,7 @@ class LocalGalleryRepository implements GalleryRepository {
       people: people,
       places: places,
       events: events,
+      auditEvents: auditEvents,
       jobs: jobs,
       models: models,
       modelRuntimeStatus: modelRuntimeStatus,
@@ -652,9 +697,34 @@ class LocalGalleryRepository implements GalleryRepository {
     }
   }
 
+  Future<EntitlementStatusResponse?> _safeEntitlementStatus() async {
+    try {
+      return await _apiClient.fetchEntitlementStatus();
+    } catch (_) {
+      return null;
+    }
+  }
+
+  Future<PlatformReleaseReadinessResponse?>
+  _safePlatformReleaseReadiness() async {
+    try {
+      return await _apiClient.fetchPlatformReleaseReadiness();
+    } catch (_) {
+      return null;
+    }
+  }
+
   Future<List<ModelArtifact>> _safeModels() async {
     try {
       return await _apiClient.fetchModels();
+    } catch (_) {
+      return const [];
+    }
+  }
+
+  Future<List<AuditEvent>> _safeAuditEvents() async {
+    try {
+      return await _apiClient.fetchAuditEvents(limit: 50);
     } catch (_) {
       return const [];
     }

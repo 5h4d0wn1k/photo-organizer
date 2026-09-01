@@ -76,6 +76,20 @@ void main() {
     expect(runtime.offlineReady, isTrue);
   });
 
+  test('fetches local duplicate review summaries', () async {
+    final client = LocalApiClient(
+      httpClient: _DuplicateReviewJsonClient(),
+      baseUri: Uri.parse('http://127.0.0.1:4821'),
+    );
+
+    final summary = await client.fetchDuplicateReviewSummary();
+
+    expect(summary.duplicateCandidates, 2);
+    expect(summary.protectedBytes, 4096);
+    expect(summary.entries.single.assetId, 'asset-1');
+    expect(summary.entries.single.sourceKinds, ['folder']);
+  });
+
   test('uses manual people creation and asset assignment endpoints', () async {
     final client = LocalApiClient(
       httpClient: _PeopleJsonClient(),
@@ -126,6 +140,10 @@ void main() {
       favorite: true,
       archived: true,
     );
+    final tagged = await client.updateAssetTags(
+      'asset-1',
+      tags: const ['invoice', 'client'],
+    );
     final bulkUpdated = await client.updateAssetsFlags(const [
       'asset-1',
       'asset-2',
@@ -135,6 +153,7 @@ void main() {
 
     expect(updated.favorite, isTrue);
     expect(updated.archived, isTrue);
+    expect(tagged.manualTags, ['invoice', 'client']);
     expect(bulkUpdated, hasLength(1));
     expect(bulkUpdated.single.favorite, isTrue);
     expect(favorites.single.favorite, isTrue);
@@ -170,6 +189,33 @@ void main() {
     expect(added.assetIds, ['asset-1', 'asset-2']);
     expect(removed.assetIds, ['asset-2']);
     expect(renamed.title, 'Family trip');
+  });
+
+  test('uses saved smart folder endpoints', () async {
+    final client = LocalApiClient(
+      httpClient: _SmartFolderJsonClient(),
+      baseUri: Uri.parse('http://127.0.0.1:4821'),
+    );
+
+    final created = await client.createSmartFolder(
+      title: 'Acme reports',
+      query: const SearchQuery(
+        text: '',
+        workspace: 'Office',
+        client: 'Acme',
+        topic: 'Reports',
+        mediaKind: 'document',
+      ),
+    );
+    final folders = await client.fetchSmartFolders();
+    final search = await client.runSmartFolder('smart-1');
+    await client.deleteSmartFolder('smart-1');
+
+    expect(created.title, 'Acme reports');
+    expect(created.query.client, 'Acme');
+    expect(folders.single.id, 'smart-1');
+    expect(search.query.topic, 'Reports');
+    expect(search.assets.single.id, 'asset-1');
   });
 
   test('uses distributed vault device and sync endpoints', () async {
@@ -217,6 +263,12 @@ void main() {
     final endpoint = await client.fetchLocalEndpoint();
     final retried = await client.retrySyncTransfer('transfer-1');
     final canceled = await client.cancelSyncTransfer('transfer-1');
+    final entitlementStatus = await client.fetchEntitlementStatus();
+    final releaseReadiness = await client.fetchPlatformReleaseReadiness();
+    final supportBundle = await client.exportSupportBundle(
+      exportRoot: '/backup',
+    );
+    final auditEvents = await client.fetchAuditEvents(limit: 5);
     final availability = await client.fetchAssetAvailability('asset-1');
     final pinned = await client.pinLocalAsset('asset-1');
     final evicted = await client.evictLocalAsset('asset-1');
@@ -238,6 +290,14 @@ void main() {
     expect(endpoint.descriptor.nodeId, 'local-node-device-1');
     expect(retried.status, SyncTransferStatus.pending);
     expect(canceled.status, SyncTransferStatus.aborted);
+    expect(entitlementStatus.tier, EntitlementTier.personalCore);
+    expect(entitlementStatus.safeLocalAccessAllowed, isTrue);
+    expect(releaseReadiness.requiredSurfaceCount, 8);
+    expect(releaseReadiness.blockedSurfaceCount, 0);
+    expect(supportBundle.privateDataExcluded, isTrue);
+    expect(supportBundle.redactedFields, contains('account_id_hash'));
+    expect(auditEvents.single.action, 'device.enroll');
+    expect(auditEvents.single.actorLabel, 'Office desktop');
     expect(availability.state, AssetAvailabilityState.underReplicated);
     expect(pinned.state, AssetAvailabilityState.transferPending);
     expect(evicted.state, AssetAvailabilityState.remoteAvailable);
@@ -348,7 +408,12 @@ void main() {
     );
     final search = await client.searchMobile(
       bearerToken: paired.bearerToken,
-      query: const SearchQuery(text: 'photo', limit: 25),
+      query: const SearchQuery(
+        text: 'photo',
+        device: 'Moto G',
+        tags: 'invoice',
+        limit: 25,
+      ),
     );
     final availability = await client.fetchMobileAssetAvailability(
       bearerToken: paired.bearerToken,
@@ -358,6 +423,11 @@ void main() {
       bearerToken: paired.bearerToken,
       assetId: assets.single.assetId,
       favorite: true,
+    );
+    final tagged = await client.updateMobileAssetTags(
+      bearerToken: paired.bearerToken,
+      assetId: assets.single.assetId,
+      tags: const ['invoice'],
     );
     final original = await client.downloadMobileOriginal(
       bearerToken: paired.bearerToken,
@@ -406,7 +476,9 @@ void main() {
     expect(search.assets.single.id, 'asset-1');
     expect(availability.state, AssetAvailabilityState.underReplicated);
     expect(flagged.favorite, isTrue);
+    expect(tagged.manualTags, ['invoice']);
     expect(original, [1, 2, 3]);
+    expect(streamedOriginal.path, endsWith('downloaded.jpg'));
     expect(await streamedOriginal.readAsBytes(), [1, 2, 3]);
     expect(preview, [4, 5, 6]);
     expect(revokedDeviceSessions.single.revokedAt, isNotNull);
@@ -576,6 +648,42 @@ class _ModelJsonClient extends http.BaseClient {
   }
 }
 
+class _DuplicateReviewJsonClient extends http.BaseClient {
+  @override
+  Future<http.StreamedResponse> send(http.BaseRequest request) async {
+    final body = switch ((request.method, request.url.path)) {
+      ('GET', '/duplicates') => {
+        'generated_at': '2026-05-13T06:00:00Z',
+        'duplicate_assets': 1,
+        'duplicate_candidates': 2,
+        'protected_bytes': 4096,
+        'sessions_with_duplicates': 1,
+        'entries': [
+          {
+            'asset_id': 'asset-1',
+            'media_kind': 'photo',
+            'original_bytes': 2048,
+            'duplicate_candidates': 2,
+            'protected_bytes': 4096,
+            'first_seen_at': '2026-05-13T06:00:00Z',
+            'last_seen_at': '2026-05-13T06:05:00Z',
+            'import_session_ids': ['session-1'],
+            'source_kinds': ['folder'],
+          },
+        ],
+        'privacy_detail': 'Computed locally.',
+      },
+      _ => throw StateError('Unexpected ${request.method} ${request.url.path}'),
+    };
+    final bytes = utf8.encode(jsonEncode(body));
+    return http.StreamedResponse(
+      Stream<List<int>>.value(bytes),
+      HttpStatus.ok,
+      headers: const {'content-type': 'application/json'},
+    );
+  }
+}
+
 Map<String, Object?> _runtimeJson() {
   return {
     'ok': true,
@@ -639,8 +747,10 @@ class _AssetFlagsJsonClient extends http.BaseClient {
     final asset = _assetJson()
       ..['favorite'] = true
       ..['archived'] = true;
+    final tagged = _assetJson()..['manual_tags'] = ['invoice', 'client'];
     final body = switch ((request.method, path)) {
       ('POST', '/assets/asset-1/flags') => asset,
+      ('POST', '/assets/asset-1/tags') => tagged,
       ('POST', '/assets/flags/bulk') => [asset],
       ('GET', '/assets/favorites') => [asset],
       ('GET', '/assets/archived') => [asset],
@@ -649,10 +759,13 @@ class _AssetFlagsJsonClient extends http.BaseClient {
     if (request.method == 'POST') {
       final streamed = request as http.Request;
       final payload = jsonDecode(streamed.body) as Map<String, Object?>;
-      expect(payload['favorite'], isTrue);
       if (path == '/assets/asset-1/flags') {
+        expect(payload['favorite'], isTrue);
         expect(payload['archived'], isTrue);
+      } else if (path == '/assets/asset-1/tags') {
+        expect(payload['tags'], ['invoice', 'client']);
       } else {
+        expect(payload['favorite'], isTrue);
         expect(payload['asset_ids'], ['asset-1', 'asset-2']);
       }
     }
@@ -682,6 +795,45 @@ class _AlbumJsonClient extends http.BaseClient {
       ('DELETE', '/albums/album-1') => null,
       _ => throw StateError('Unexpected ${request.method} $path'),
     };
+    final bytes = utf8.encode(jsonEncode(body));
+    return http.StreamedResponse(
+      Stream<List<int>>.value(bytes),
+      request.method == 'DELETE' ? HttpStatus.noContent : HttpStatus.ok,
+      headers: const {'content-type': 'application/json'},
+    );
+  }
+}
+
+class _SmartFolderJsonClient extends http.BaseClient {
+  @override
+  Future<http.StreamedResponse> send(http.BaseRequest request) async {
+    final path = request.url.path;
+    final body = switch ((request.method, path)) {
+      ('GET', '/smart-folders') => [_smartFolderJson()],
+      ('POST', '/smart-folders') => _smartFolderJson(),
+      ('GET', '/smart-folders/smart-1/search') => {
+        'query': _smartFolderQueryJson(),
+        'assets': [_assetJson()],
+        'people': [],
+        'places': [],
+        'events': [],
+      },
+      ('DELETE', '/smart-folders/smart-1') => null,
+      _ => throw StateError('Unexpected ${request.method} $path'),
+    };
+
+    if (request.method == 'POST' && path == '/smart-folders') {
+      final streamed = request as http.Request;
+      final payload = jsonDecode(streamed.body) as Map<String, Object?>;
+      expect(payload['title'], 'Acme reports');
+      final query = payload['query'] as Map<String, Object?>;
+      expect(query['workspace'], 'Office');
+      expect(query['client'], 'Acme');
+      expect(query['topic'], 'Reports');
+      expect(query['media_kind'], 'document');
+      expect(query['include_archived'], isFalse);
+    }
+
     final bytes = utf8.encode(jsonEncode(body));
     return http.StreamedResponse(
       Stream<List<int>>.value(bytes),
@@ -724,6 +876,10 @@ class _VaultSyncJsonClient extends http.BaseClient {
       ('POST', '/sync/transfers/transfer-1/cancel') => _transferJson(
         status: 'aborted',
       ),
+      ('GET', '/entitlements/status') => _entitlementStatusJson(),
+      ('GET', '/release/readiness') => _releaseReadinessJson(),
+      ('POST', '/support/bundle') => _supportBundleJson(),
+      ('GET', '/audit/events') => [_auditEventJson()],
       ('GET', '/assets/asset-1/availability') => _availabilityJson(),
       ('POST', '/assets/asset-1/pin-local') => _availabilityJson(
         state: 'transfer_pending',
@@ -751,12 +907,21 @@ class _VaultSyncJsonClient extends http.BaseClient {
       expect(payload['id'], 'cloud-group-id');
       expect(payload['name'], 'Family');
     }
+    if (request.method == 'POST' && path == '/support/bundle') {
+      final streamed = request as http.Request;
+      final payload = jsonDecode(streamed.body) as Map<String, Object?>;
+      expect(payload['export_root'], '/backup');
+      expect(payload['include_release_readiness'], isTrue);
+    }
     if (request.method == 'POST' && path == '/pairing/sessions') {
       final streamed = request as http.Request;
       final payload = jsonDecode(streamed.body) as Map<String, Object?>;
       expect(payload['device_name'], 'Moto G');
       expect(payload['platform'], 'android');
       expect(payload['vault_id'], 'vault-1');
+    }
+    if (request.method == 'GET' && path == '/audit/events') {
+      expect(request.url.queryParameters['limit'], '5');
     }
 
     final bytes = utf8.encode(jsonEncode(body));
@@ -766,6 +931,24 @@ class _VaultSyncJsonClient extends http.BaseClient {
       headers: const {'content-type': 'application/json'},
     );
   }
+}
+
+Map<String, Object?> _auditEventJson() {
+  return {
+    'id': 'audit-1',
+    'action': 'device.enroll',
+    'target_kind': 'device',
+    'target_id': 'device-2',
+    'actor_device_id': 'device-1',
+    'actor_label': 'Office desktop',
+    'summary': 'Enrolled device NAS',
+    'payload': {
+      'device_id': 'device-2',
+      'vault_id': 'vault-1',
+      'accepts_storage': true,
+    },
+    'created_at': '2026-05-14T07:00:00Z',
+  };
 }
 
 class _MobileSyncJsonClient extends http.BaseClient {
@@ -896,6 +1079,8 @@ class _MobileSyncJsonClient extends http.BaseClient {
       ('GET', '/mobile/assets/asset-1/availability') => _availabilityJson(),
       ('POST', '/mobile/assets/asset-1/flags') =>
         _assetJson()..['favorite'] = true,
+      ('POST', '/mobile/assets/asset-1/tags') =>
+        _assetJson()..['manual_tags'] = ['invoice'],
       _ => throw StateError('Unexpected ${request.method} $path'),
     };
 
@@ -911,12 +1096,19 @@ class _MobileSyncJsonClient extends http.BaseClient {
     }
     if (request.method == 'GET' && path == '/mobile/search') {
       expect(request.url.queryParameters['text'], 'photo');
+      expect(request.url.queryParameters['device'], 'Moto G');
+      expect(request.url.queryParameters['tags'], 'invoice');
       expect(request.url.queryParameters['limit'], '25');
     }
     if (request.method == 'POST' && path == '/mobile/assets/asset-1/flags') {
       final streamed = request as http.Request;
       final payload = jsonDecode(streamed.body) as Map<String, Object?>;
       expect(payload['favorite'], isTrue);
+    }
+    if (request.method == 'POST' && path == '/mobile/assets/asset-1/tags') {
+      final streamed = request as http.Request;
+      final payload = jsonDecode(streamed.body) as Map<String, Object?>;
+      expect(payload['tags'], ['invoice']);
     }
     if (request.method == 'POST' && path == '/mobile/storage-profile') {
       final streamed = request as http.Request;
@@ -1061,6 +1253,98 @@ Map<String, Object?> _storagePolicyJson() {
     'min_free_space_bytes': 1024,
     'allow_metered_network': false,
     'pause_on_low_battery': true,
+  };
+}
+
+Map<String, Object?> _entitlementStatusJson() {
+  return {
+    'tier': 'personal_core',
+    'effective_status': 'active',
+    'limits': {
+      'device_limit': 3,
+      'member_limit': 1,
+      'workspace_limit': 1,
+      'monthly_ocr_limit': 1000,
+      'relay_priority': 'none',
+      'advanced_admin_controls': false,
+    },
+    'cache': null,
+    'offline_grace_active': false,
+    'paid_features_available': true,
+    'safe_local_access_allowed': true,
+    'content_exposure_prevented': true,
+    'detail':
+        'Personal core local access is available without sending content to billing.',
+  };
+}
+
+Map<String, Object?> _releaseReadinessJson() {
+  return {
+    'generated_at': '2026-05-14T07:00:00Z',
+    'overall_status': 'in_progress',
+    'required_surface_count': 8,
+    'ready_surface_count': 0,
+    'detail': 'Cross-platform release is incomplete.',
+    'surfaces': [
+      _releaseSurfaceJson('linux_desktop', 'Linux desktop', 'in_progress'),
+      _releaseSurfaceJson('windows_desktop', 'Windows desktop', 'in_progress'),
+      _releaseSurfaceJson('macos_desktop', 'macOS desktop', 'in_progress'),
+      _releaseSurfaceJson(
+        'android_play_store',
+        'Android / Play Store',
+        'in_progress',
+      ),
+      _releaseSurfaceJson('ios_app_store', 'iOS / App Store', 'in_progress'),
+      _releaseSurfaceJson('web_browser', 'Web/browser', 'in_progress'),
+      _releaseSurfaceJson('local_web_ui', 'Local web UI', 'in_progress'),
+      _releaseSurfaceJson(
+        'direct_desktop_distribution',
+        'Direct desktop distribution',
+        'in_progress',
+      ),
+    ],
+  };
+}
+
+Map<String, Object?> _releaseSurfaceJson(
+  String surface,
+  String label,
+  String status,
+) {
+  return {
+    'surface': surface,
+    'label': label,
+    'status': status,
+    'distribution': 'Release artifact',
+    'evidence': [
+      {
+        'key': '${surface}_evidence',
+        'label': 'Evidence',
+        'status': 'missing',
+        'detail': 'Missing release evidence.',
+      },
+    ],
+    'blockers': ['Missing release evidence.'],
+    'next_step': 'Record release evidence.',
+  };
+}
+
+Map<String, Object?> _supportBundleJson() {
+  return {
+    'exported_at': '2026-05-14T07:05:00Z',
+    'export_root': '/backup',
+    'bundle_path': '/backup/support/private-gallery-support-bundle.json',
+    'sections': [
+      'summary',
+      'privacy',
+      'entitlements',
+      'backup_health',
+      'release_readiness',
+      'redaction',
+    ],
+    'redacted_fields': ['original_filename', 'account_id_hash'],
+    'private_data_excluded': true,
+    'ok': true,
   };
 }
 
@@ -1418,6 +1702,7 @@ Map<String, Object?> _assetJson() {
     'imported_at': '2026-05-13T06:01:00Z',
     'archived': false,
     'favorite': false,
+    'manual_tags': [],
     'place_hint': null,
     'variants': [],
   };
@@ -1432,6 +1717,27 @@ Map<String, Object?> _albumJson(
     'title': title,
     'asset_ids': assetIds,
     'cover_asset_id': assetIds.isEmpty ? null : assetIds.first,
+    'created_at': '2026-05-13T06:00:00Z',
+    'updated_at': '2026-05-13T06:00:00Z',
+  };
+}
+
+Map<String, Object?> _smartFolderQueryJson() {
+  return {
+    'workspace': 'Office',
+    'client': 'Acme',
+    'topic': 'Reports',
+    'media_kind': 'document',
+    'include_archived': false,
+    'limit': 80,
+  };
+}
+
+Map<String, Object?> _smartFolderJson() {
+  return {
+    'id': 'smart-1',
+    'title': 'Acme reports',
+    'query': _smartFolderQueryJson(),
     'created_at': '2026-05-13T06:00:00Z',
     'updated_at': '2026-05-13T06:00:00Z',
   };

@@ -158,6 +158,10 @@ class AssetGrid extends StatelessWidget {
                                     ),
                                   if (asset.metadata?.geo != null)
                                     const _AssetBadge(label: 'GPS'),
+                                  if (asset.manualTags.isNotEmpty)
+                                    _AssetBadge(
+                                      label: '#${asset.manualTags.first}',
+                                    ),
                                   if (dimensions != null)
                                     _AssetBadge(label: dimensions),
                                   _AssetBadge(

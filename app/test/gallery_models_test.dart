@@ -2,6 +2,122 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:private_gallery_app/src/models/gallery_models.dart';
 
 void main() {
+  test('parses local admin audit event payloads', () {
+    final event = AuditEvent.fromJson({
+      'id': 'audit-1',
+      'action': 'vault.storage_policy.update',
+      'target_kind': 'vault',
+      'target_id': 'vault-1',
+      'actor_device_id': 'device-1',
+      'actor_label': 'Office desktop',
+      'summary': 'Updated storage policy for Family',
+      'payload': {
+        'vault_id': 'vault-1',
+        'storage_policy': {'mode': 'protected_min_2'},
+      },
+      'created_at': '2026-05-14T07:00:00Z',
+    });
+
+    expect(event.id, 'audit-1');
+    expect(event.action, 'vault.storage_policy.update');
+    expect(event.actorLabel, 'Office desktop');
+    expect(event.payload['vault_id'], 'vault-1');
+    expect(event.createdAt.toIso8601String(), '2026-05-14T07:00:00.000Z');
+  });
+
+  test('parses mobile role capabilities for storage-only workspaces', () {
+    final capabilities = MobileWorkspaceCapabilities.fromJson({
+      'can_browse_library': false,
+      'can_search': false,
+      'can_upload_camera_roll': false,
+      'can_download_originals': false,
+      'can_manage_storage': true,
+      'can_import_desktop_folders': false,
+      'can_run_models': false,
+      'role_detail':
+          'Storage-only mobile access cannot browse or download content.',
+    });
+
+    expect(capabilities.canBrowseLibrary, isFalse);
+    expect(capabilities.canSearch, isFalse);
+    expect(capabilities.canUploadCameraRoll, isFalse);
+    expect(capabilities.canDownloadOriginals, isFalse);
+    expect(capabilities.canManageStorage, isTrue);
+    expect(capabilities.roleDetail, contains('Storage-only'));
+  });
+
+  test('serializes explicit file organization search filters', () {
+    const query = SearchQuery(
+      text: 'report',
+      workspace: 'Office',
+      client: 'Acme',
+      project: 'Launch',
+      topic: 'Reports',
+      sourceFolder: 'Project Launch',
+      device: 'Office laptop',
+      mediaKind: 'document',
+      tags: 'invoice, client',
+      limit: 25,
+    );
+
+    expect(query.toQueryParameters(), {
+      'text': 'report',
+      'workspace': 'Office',
+      'client': 'Acme',
+      'project': 'Launch',
+      'topic': 'Reports',
+      'source_folder': 'Project Launch',
+      'device': 'Office laptop',
+      'media_kind': 'document',
+      'tags': 'invoice, client',
+      'include_archived': 'false',
+      'limit': '25',
+    });
+    expect(query.toJson(), {
+      'text': 'report',
+      'workspace': 'Office',
+      'client': 'Acme',
+      'project': 'Launch',
+      'topic': 'Reports',
+      'source_folder': 'Project Launch',
+      'device': 'Office laptop',
+      'media_kind': 'document',
+      'tags': 'invoice, client',
+      'include_archived': false,
+      'limit': 25,
+    });
+  });
+
+  test('parses saved smart folder search query', () {
+    final folder = SmartFolder.fromJson({
+      'id': 'smart-1',
+      'title': 'Client reports',
+      'query': {
+        'workspace': 'Office',
+        'client': 'Acme',
+        'topic': 'Reports',
+        'media_kind': 'document',
+        'tags': 'invoice',
+        'favorite': true,
+        'include_archived': true,
+        'limit': 80,
+      },
+      'created_at': '2026-05-12T10:00:00Z',
+      'updated_at': '2026-05-12T11:00:00Z',
+    });
+
+    expect(folder.id, 'smart-1');
+    expect(folder.title, 'Client reports');
+    expect(folder.query.workspace, 'Office');
+    expect(folder.query.client, 'Acme');
+    expect(folder.query.topic, 'Reports');
+    expect(folder.query.mediaKind, 'document');
+    expect(folder.query.tags, 'invoice');
+    expect(folder.query.favorite, isTrue);
+    expect(folder.query.includeArchived, isTrue);
+    expect(folder.query.limit, 80);
+  });
+
   test('parses timeline response payload', () {
     final response = TimelineResponse.fromJson({
       'buckets': [
@@ -21,6 +137,7 @@ void main() {
               'imported_at': '2025-01-03T10:30:00Z',
               'archived': false,
               'favorite': true,
+              'manual_tags': ['family', 'tax docs'],
               'place_hint': 'Goa',
               'metadata': {
                 'asset_id': 'asset-1',
@@ -29,6 +146,14 @@ void main() {
                 'width': 4000,
                 'height': 3000,
                 'camera': {'make': 'Google', 'model': 'Pixel'},
+                'organization': {
+                  'source_folder': 'Project Launch',
+                  'workspace': 'Office',
+                  'client': 'Client Acme',
+                  'project': 'Project Launch',
+                  'topic': 'Launch',
+                  'path_segments': ['Office', 'Client Acme', 'Project Launch'],
+                },
                 'geo': {
                   'latitude': 15.2993,
                   'longitude': 74.1240,
@@ -74,6 +199,14 @@ void main() {
       response.buckets.single.assets.single.metadata?.geo?.latitude,
       15.2993,
     );
+    expect(
+      response.buckets.single.assets.single.metadata?.organization.client,
+      'Client Acme',
+    );
+    expect(response.buckets.single.assets.single.manualTags, [
+      'family',
+      'tax docs',
+    ]);
   });
 
   test('parses import session preflight fields with fallback safety', () {
@@ -99,6 +232,12 @@ void main() {
           'import_mode': 'move',
           'sidecar_paths': ['/tmp/source/a.jpg.json'],
           'safety_status': 'ready_to_move_verified_after_commit',
+          'organization': {
+            'workspace': 'Office',
+            'client': 'Client Acme',
+            'project': 'Project Launch',
+            'path_segments': ['Office', 'Client Acme', 'Project Launch'],
+          },
         },
         {
           'id': 'candidate-2',
@@ -136,6 +275,40 @@ void main() {
     expect(session.requiresMoveConfirmation, isTrue);
     expect(session.sourceContainsManagedLibrary, isTrue);
     expect(session.candidates[1].mediaKind, 'document');
+    expect(session.candidates[0].organization.project, 'Project Launch');
+    expect(
+      session.candidates[0].organization.summary,
+      contains('Client: Client Acme'),
+    );
+  });
+
+  test('parses duplicate review summary payloads', () {
+    final summary = DuplicateReviewSummary.fromJson({
+      'generated_at': '2026-05-13T06:00:00Z',
+      'duplicate_assets': 1,
+      'duplicate_candidates': 2,
+      'protected_bytes': 4096,
+      'sessions_with_duplicates': 1,
+      'entries': [
+        {
+          'asset_id': 'asset-1',
+          'media_kind': 'document',
+          'original_bytes': 2048,
+          'duplicate_candidates': 2,
+          'protected_bytes': 4096,
+          'first_seen_at': '2026-05-13T06:00:00Z',
+          'last_seen_at': '2026-05-13T06:05:00Z',
+          'import_session_ids': ['session-1'],
+          'source_kinds': ['folder'],
+        },
+      ],
+      'privacy_detail': 'Computed locally.',
+    });
+
+    expect(summary.hasDuplicates, isTrue);
+    expect(summary.protectedBytes, 4096);
+    expect(summary.entries.single.mediaKind, 'document');
+    expect(summary.entries.single.importSessionIds, ['session-1']);
   });
 
   test('parses privacy status and model governance fields', () {
@@ -176,6 +349,101 @@ void main() {
       status.installedModels.single.installStatus,
       ModelInstallStatus.installed,
     );
+  });
+
+  test('parses entitlement status with offline grace limits', () {
+    final status = EntitlementStatusResponse.fromJson({
+      'tier': 'family_remote',
+      'effective_status': 'offline_grace',
+      'limits': {
+        'device_limit': 8,
+        'member_limit': 6,
+        'workspace_limit': 2,
+        'monthly_ocr_limit': 5000,
+        'relay_priority': 'standard',
+        'advanced_admin_controls': false,
+      },
+      'cache': {
+        'tier': 'family_remote',
+        'status': 'past_due',
+        'account_id_hash':
+            '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef',
+        'plan_code': 'family_remote.monthly',
+        'limits': {
+          'device_limit': 8,
+          'member_limit': 6,
+          'workspace_limit': 2,
+          'monthly_ocr_limit': 5000,
+          'relay_priority': 'standard',
+          'advanced_admin_controls': false,
+        },
+        'checked_at': '2026-05-14T07:00:00Z',
+        'expires_at': '2026-05-15T07:00:00Z',
+        'offline_grace_expires_at': '2026-06-14T07:00:00Z',
+        'source': 'local_entitlement_cache',
+        'detail': 'Cached past-due entitlement; no content metadata stored.',
+        'updated_at': '2026-05-14T07:00:00Z',
+      },
+      'offline_grace_active': true,
+      'paid_features_available': true,
+      'safe_local_access_allowed': true,
+      'content_exposure_prevented': true,
+      'detail': 'Offline grace is preserving paid features.',
+    });
+
+    expect(status.tier, EntitlementTier.familyRemote);
+    expect(status.effectiveStatus, EntitlementEffectiveStatus.offlineGrace);
+    expect(status.offlineGraceActive, isTrue);
+    expect(status.contentExposurePrevented, isTrue);
+    expect(status.limits.deviceLimit, 8);
+    expect(status.limits.relayPriority, EntitlementRelayPriority.standard);
+    expect(status.cache?.status, EntitlementCacheStatus.pastDue);
+    expect(status.cache?.hasAccountHash, isTrue);
+    expect(status.cache?.planCode, 'family_remote.monthly');
+  });
+
+  test('parses platform release readiness for all required surfaces', () {
+    final readiness = PlatformReleaseReadinessResponse.fromJson({
+      'generated_at': '2026-05-14T07:00:00Z',
+      'overall_status': 'in_progress',
+      'required_surface_count': 8,
+      'ready_surface_count': 0,
+      'detail': 'Cross-platform release is incomplete.',
+      'surfaces': [
+        _releaseSurface('linux_desktop', 'Linux desktop', 'in_progress'),
+        _releaseSurface('windows_desktop', 'Windows desktop', 'in_progress'),
+        _releaseSurface('macos_desktop', 'macOS desktop', 'in_progress'),
+        _releaseSurface(
+          'android_play_store',
+          'Android / Play Store',
+          'in_progress',
+        ),
+        _releaseSurface('ios_app_store', 'iOS / App Store', 'in_progress'),
+        _releaseSurface('web_browser', 'Web/browser', 'in_progress'),
+        _releaseSurface('local_web_ui', 'Local web UI', 'in_progress'),
+        _releaseSurface(
+          'direct_desktop_distribution',
+          'Direct desktop distribution',
+          'in_progress',
+        ),
+      ],
+    });
+
+    expect(readiness.overallStatus, PlatformReleaseReadinessStatus.inProgress);
+    expect(readiness.requiredSurfaceCount, 8);
+    expect(readiness.readySurfaceCount, 0);
+    expect(readiness.blockedSurfaceCount, 0);
+    expect(readiness.surfaces.map((surface) => surface.surface), [
+      PlatformReleaseSurface.linuxDesktop,
+      PlatformReleaseSurface.windowsDesktop,
+      PlatformReleaseSurface.macosDesktop,
+      PlatformReleaseSurface.androidPlayStore,
+      PlatformReleaseSurface.iosAppStore,
+      PlatformReleaseSurface.webBrowser,
+      PlatformReleaseSurface.localWebUi,
+      PlatformReleaseSurface.directDesktopDistribution,
+    ]);
+    expect(readiness.surfaces[4].missingEvidenceCount, 1);
   });
 
   test('parses search index OCR coverage fields with safe defaults', () {
@@ -311,8 +579,24 @@ void main() {
           'mime_type': 'application/pdf',
           'bytes': 4096,
           'content_hash': 'hash',
+          'origin_device_id': 'device-1',
           'created_at': '2026-05-26T06:01:00Z',
           'updated_at': '2026-05-26T06:01:00Z',
+          'organization': {
+            'source_folder': 'Project Launch',
+            'workspace': 'Office',
+            'client': 'Acme',
+            'project': 'Launch',
+            'topic': 'Reports',
+            'path_segments': ['Office', 'Acme', 'Launch'],
+          },
+        },
+      ],
+      'devices': [
+        {
+          'id': 'device-1',
+          'display_name': 'Office laptop',
+          'platform': 'linux',
         },
       ],
     });
@@ -323,6 +607,12 @@ void main() {
     expect(tree.childrenOf('root-1').single.kind, VaultFileKind.file);
     expect(tree.childrenOf('root-1').single.isFile, isTrue);
     expect(tree.childrenOf('root-1').single.mediaKind, 'document');
+    expect(tree.childrenOf('root-1').single.originDeviceId, 'device-1');
+    expect(tree.childrenOf('root-1').single.organization.workspace, 'Office');
+    expect(tree.childrenOf('root-1').single.organization.client, 'Acme');
+    expect(tree.childrenOf('root-1').single.organization.project, 'Launch');
+    expect(tree.devices.single.label, 'Office laptop (linux)');
+    expect(tree.devicesById['device-1']?.displayName, 'Office laptop');
   });
 
   test('parses chunk-aware backup and restore fields', () {
@@ -352,6 +642,15 @@ void main() {
       'bytes_copied': 4096,
       'model_files_checked': 1,
       'missing_model_paths': [],
+      'ok': true,
+    });
+    final supportBundle = SupportBundleExportResult.fromJson({
+      'exported_at': '2026-05-15T06:01:30Z',
+      'export_root': '/backup',
+      'bundle_path': '/backup/support/private-gallery-support-bundle.json',
+      'sections': ['summary', 'privacy', 'redaction'],
+      'redacted_fields': ['original_filename', 'account_id_hash'],
+      'private_data_excluded': true,
       'ok': true,
     });
     final plan = BackupRestorePlan.fromJson({
@@ -384,8 +683,33 @@ void main() {
     expect(verification.missingVaultChunkPaths.single, contains('bad.pgblob'));
     expect(export.vaultChunksCopied, 4);
     expect(export.bytesCopied, 4096);
+    expect(supportBundle.privateDataExcluded, isTrue);
+    expect(supportBundle.redactedFields, contains('account_id_hash'));
     expect(plan.vaultChunksAvailable, 4);
     expect(plan.requiresConfirmation, isTrue);
     expect(run.databaseRestoredTo, '/restore/runtime/db/gallery.sqlite3');
   });
+}
+
+Map<String, Object?> _releaseSurface(
+  String surface,
+  String label,
+  String status,
+) {
+  return {
+    'surface': surface,
+    'label': label,
+    'status': status,
+    'distribution': 'Release artifact',
+    'evidence': [
+      {
+        'key': '${surface}_evidence',
+        'label': 'Evidence',
+        'status': 'missing',
+        'detail': 'Missing release evidence.',
+      },
+    ],
+    'blockers': ['Missing release evidence.'],
+    'next_step': 'Record release evidence.',
+  };
 }

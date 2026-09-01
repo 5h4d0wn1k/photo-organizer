@@ -4,7 +4,7 @@ import 'package:intl/intl.dart';
 import '../../models/gallery_models.dart';
 import 'mobile_gallery_panel.dart';
 
-enum _WorkspaceTab { gallery, search, organize, devices, activity }
+enum _WorkspaceTab { gallery, files, search, organize, devices, activity }
 
 class MobileWorkspacePanel extends StatefulWidget {
   const MobileWorkspacePanel({
@@ -22,6 +22,11 @@ class MobileWorkspacePanel extends StatefulWidget {
     this.onOpenAsset,
     this.previewImageFor,
     this.onSearch,
+    this.fileTree,
+    this.fileTreeLoading = false,
+    this.fileTreeError,
+    this.onRefreshFiles,
+    this.onDownloadFile,
     this.onToggleFavorite,
     this.onToggleArchived,
   });
@@ -40,6 +45,11 @@ class MobileWorkspacePanel extends StatefulWidget {
   final ImageProvider<Object>? Function(MobileAssetSummary asset)?
   previewImageFor;
   final Future<SearchResponse> Function(SearchQuery query)? onSearch;
+  final VaultFileTreeResponse? fileTree;
+  final bool fileTreeLoading;
+  final String? fileTreeError;
+  final VoidCallback? onRefreshFiles;
+  final Future<void> Function(VaultFileEntry entry)? onDownloadFile;
   final Future<void> Function(Asset asset, bool favorite)? onToggleFavorite;
   final Future<void> Function(Asset asset, bool archived)? onToggleArchived;
 
@@ -49,15 +59,53 @@ class MobileWorkspacePanel extends StatefulWidget {
 
 class _MobileWorkspacePanelState extends State<MobileWorkspacePanel> {
   final _searchController = TextEditingController();
+  final _workspaceController = TextEditingController();
+  final _clientController = TextEditingController();
+  final _projectController = TextEditingController();
+  final _topicController = TextEditingController();
+  final _sourceFolderController = TextEditingController();
+  final _deviceController = TextEditingController();
+  final _tagsController = TextEditingController();
   var _selectedTab = _WorkspaceTab.gallery;
   var _searching = false;
+  String? _mediaKind;
+  String? _currentFolderId;
   SearchResponse? _searchResult;
   String? _searchError;
 
   @override
+  void didUpdateWidget(covariant MobileWorkspacePanel oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    final tree = widget.fileTree;
+    if (tree == null || _currentFolderId == null) {
+      return;
+    }
+    final stillExists = tree.entries.any(
+      (entry) => entry.id == _currentFolderId && entry.isFolder,
+    );
+    if (!stillExists) {
+      _currentFolderId = null;
+    }
+  }
+
+  @override
   void dispose() {
     _searchController.dispose();
+    _workspaceController.dispose();
+    _clientController.dispose();
+    _projectController.dispose();
+    _topicController.dispose();
+    _sourceFolderController.dispose();
+    _deviceController.dispose();
+    _tagsController.dispose();
     super.dispose();
+  }
+
+  VaultFileEntry? _currentFolder(VaultFileTreeResponse? tree) {
+    if (tree == null) {
+      return null;
+    }
+    return _currentFolderFromTree(tree, _currentFolderId);
   }
 
   @override
@@ -98,6 +146,7 @@ class _MobileWorkspacePanelState extends State<MobileWorkspacePanel> {
         _WorkspaceSummary(
           workspace: workspace,
           visibleAssetCount: assets.length,
+          fileTree: widget.fileTree,
         ),
         if (widget.error != null) ...[
           const SizedBox(height: 12),
@@ -156,6 +205,8 @@ class _MobileWorkspacePanelState extends State<MobileWorkspacePanel> {
           onOpenAsset: widget.onOpenAsset,
           previewImageFor: widget.previewImageFor,
         );
+      case _WorkspaceTab.files:
+        return _buildFiles(context);
       case _WorkspaceTab.search:
         return _buildSearch(context);
       case _WorkspaceTab.organize:
@@ -251,6 +302,120 @@ class _MobileWorkspacePanelState extends State<MobileWorkspacePanel> {
     );
   }
 
+  Widget _buildFiles(BuildContext context) {
+    final tree = widget.fileTree;
+    final current = _currentFolder(tree);
+    final children = tree == null || current == null
+        ? const <VaultFileEntry>[]
+        : _childrenOf(tree, current.id);
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        _Section(
+          title: 'Files & Documents',
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Wrap(
+                spacing: 8,
+                runSpacing: 8,
+                children: [
+                  _Metric(
+                    icon: Icons.folder_outlined,
+                    label: 'Folders',
+                    value:
+                        '${tree?.entries.where((entry) => entry.isFolder).length ?? 0}',
+                  ),
+                  _Metric(
+                    icon: Icons.insert_drive_file_outlined,
+                    label: 'Files',
+                    value:
+                        '${tree?.entries.where((entry) => entry.isFile).length ?? 0}',
+                  ),
+                  _Metric(
+                    icon: Icons.description_outlined,
+                    label: 'Documents',
+                    value:
+                        '${tree?.entries.where((entry) => entry.mediaKind == 'document').length ?? 0}',
+                  ),
+                ],
+              ),
+              const SizedBox(height: 12),
+              OutlinedButton.icon(
+                onPressed: widget.busy || widget.fileTreeLoading
+                    ? null
+                    : widget.onRefreshFiles,
+                icon: const Icon(Icons.refresh),
+                label: const Text('Refresh files'),
+              ),
+            ],
+          ),
+        ),
+        if (widget.fileTreeLoading) ...[
+          const SizedBox(height: 12),
+          const LinearProgressIndicator(minHeight: 2),
+        ],
+        if (widget.fileTreeError != null) ...[
+          const SizedBox(height: 12),
+          _Notice(
+            icon: Icons.warning_amber_outlined,
+            title: 'Files unavailable',
+            message: widget.fileTreeError!,
+          ),
+        ],
+        const SizedBox(height: 12),
+        if (tree == null || current == null)
+          const _Notice(
+            icon: Icons.folder_open_outlined,
+            title: 'No shared files yet',
+            message:
+                'Files and documents uploaded to the group appear here alongside photos and videos.',
+          )
+        else ...[
+          _FileBreadcrumbs(
+            tree: tree,
+            current: current,
+            onOpen: (entry) {
+              setState(() => _currentFolderId = entry.id);
+            },
+          ),
+          const SizedBox(height: 12),
+          _EntityList(
+            emptyTitle: 'This folder is empty',
+            emptyMessage:
+                'Upload media, documents, or other files from a trusted device.',
+            children: [
+              for (final child in children)
+                _EntityRow(
+                  icon: _fileIcon(child),
+                  title: child.name,
+                  subtitle: _fileSubtitle(
+                    child,
+                    sourceDeviceLabel: _deviceLabelForEntry(tree, child),
+                  ),
+                  onTap: child.isFolder
+                      ? () {
+                          setState(() => _currentFolderId = child.id);
+                        }
+                      : null,
+                  trailing: child.isFile
+                      ? IconButton(
+                          onPressed:
+                              widget.busy || widget.onDownloadFile == null
+                              ? null
+                              : () => widget.onDownloadFile!(child),
+                          icon: const Icon(Icons.download_outlined),
+                          tooltip: 'Download file',
+                        )
+                      : const Icon(Icons.chevron_right),
+                ),
+            ],
+          ),
+        ],
+      ],
+    );
+  }
+
   Widget _buildSearch(BuildContext context) {
     final result = _searchResult;
     final resultAssets =
@@ -278,6 +443,100 @@ class _MobileWorkspacePanelState extends State<MobileWorkspacePanel> {
               onPressed: widget.busy || _searching ? null : _runSearch,
               icon: const Icon(Icons.search),
               tooltip: 'Search',
+            ),
+          ],
+        ),
+        const SizedBox(height: 12),
+        Wrap(
+          spacing: 8,
+          runSpacing: 8,
+          children: [
+            _SearchFilterField(
+              width: 160,
+              controller: _workspaceController,
+              label: 'Workspace',
+              onSubmitted: _runSearch,
+            ),
+            _SearchFilterField(
+              width: 160,
+              controller: _clientController,
+              label: 'Client',
+              onSubmitted: _runSearch,
+            ),
+            _SearchFilterField(
+              width: 160,
+              controller: _projectController,
+              label: 'Project',
+              onSubmitted: _runSearch,
+            ),
+            _SearchFilterField(
+              width: 160,
+              controller: _topicController,
+              label: 'Topic',
+              onSubmitted: _runSearch,
+            ),
+            _SearchFilterField(
+              width: 180,
+              controller: _sourceFolderController,
+              label: 'Source folder',
+              onSubmitted: _runSearch,
+            ),
+            _SearchFilterField(
+              width: 160,
+              controller: _deviceController,
+              label: 'Device',
+              onSubmitted: _runSearch,
+            ),
+            _SearchFilterField(
+              width: 160,
+              controller: _tagsController,
+              label: 'Tags',
+              onSubmitted: _runSearch,
+            ),
+            FilterChip(
+              avatar: const Icon(Icons.image_outlined, size: 18),
+              label: const Text('Photos'),
+              selected: _mediaKind == 'photo',
+              onSelected: (value) {
+                setState(() => _mediaKind = value ? 'photo' : null);
+                _runSearch();
+              },
+            ),
+            FilterChip(
+              avatar: const Icon(Icons.movie_outlined, size: 18),
+              label: const Text('Videos'),
+              selected: _mediaKind == 'video',
+              onSelected: (value) {
+                setState(() => _mediaKind = value ? 'video' : null);
+                _runSearch();
+              },
+            ),
+            FilterChip(
+              avatar: const Icon(Icons.description_outlined, size: 18),
+              label: const Text('Documents'),
+              selected: _mediaKind == 'document',
+              onSelected: (value) {
+                setState(() => _mediaKind = value ? 'document' : null);
+                _runSearch();
+              },
+            ),
+            FilterChip(
+              avatar: const Icon(Icons.folder_zip_outlined, size: 18),
+              label: const Text('Archives'),
+              selected: _mediaKind == 'archive',
+              onSelected: (value) {
+                setState(() => _mediaKind = value ? 'archive' : null);
+                _runSearch();
+              },
+            ),
+            FilterChip(
+              avatar: const Icon(Icons.notes_outlined, size: 18),
+              label: const Text('Text'),
+              selected: _mediaKind == 'text',
+              onSelected: (value) {
+                setState(() => _mediaKind = value ? 'text' : null);
+                _runSearch();
+              },
             ),
           ],
         ),
@@ -445,7 +704,7 @@ class _MobileWorkspacePanelState extends State<MobileWorkspacePanel> {
               ),
               _CapabilityLine(
                 enabled: workspace.capabilities.canManageStorage,
-                label: 'Manage storage policy',
+                label: 'Contribute encrypted storage',
               ),
               if (workspace.capabilities.roleDetail.isNotEmpty) ...[
                 const SizedBox(height: 8),
@@ -482,10 +741,26 @@ class _MobileWorkspacePanelState extends State<MobileWorkspacePanel> {
       return;
     }
     final text = _searchController.text.trim();
-    if (text.isEmpty) {
+    final workspace = _emptyToNull(_workspaceController.text);
+    final client = _emptyToNull(_clientController.text);
+    final project = _emptyToNull(_projectController.text);
+    final topic = _emptyToNull(_topicController.text);
+    final sourceFolder = _emptyToNull(_sourceFolderController.text);
+    final device = _emptyToNull(_deviceController.text);
+    final tags = _emptyToNull(_tagsController.text);
+    if (text.isEmpty &&
+        workspace == null &&
+        client == null &&
+        project == null &&
+        topic == null &&
+        sourceFolder == null &&
+        device == null &&
+        _mediaKind == null &&
+        tags == null) {
       setState(() {
         _searchResult = null;
-        _searchError = 'Enter a search term.';
+        _searchError =
+            'Enter a search term, device, kind, or organization filter.';
       });
       return;
     }
@@ -494,7 +769,20 @@ class _MobileWorkspacePanelState extends State<MobileWorkspacePanel> {
       _searchError = null;
     });
     try {
-      final result = await search(SearchQuery(text: text, limit: 60));
+      final result = await search(
+        SearchQuery(
+          text: text,
+          workspace: workspace,
+          client: client,
+          project: project,
+          topic: topic,
+          sourceFolder: sourceFolder,
+          device: device,
+          mediaKind: _mediaKind,
+          tags: tags,
+          limit: 60,
+        ),
+      );
       if (!mounted) {
         return;
       }
@@ -516,16 +804,54 @@ class _MobileWorkspacePanelState extends State<MobileWorkspacePanel> {
       }
     }
   }
+
+  String? _emptyToNull(String value) {
+    final trimmed = value.trim();
+    return trimmed.isEmpty ? null : trimmed;
+  }
+}
+
+class _SearchFilterField extends StatelessWidget {
+  const _SearchFilterField({
+    required this.width,
+    required this.controller,
+    required this.label,
+    required this.onSubmitted,
+  });
+
+  final double width;
+  final TextEditingController controller;
+  final String label;
+  final VoidCallback onSubmitted;
+
+  @override
+  Widget build(BuildContext context) {
+    return SizedBox(
+      width: width,
+      child: TextField(
+        controller: controller,
+        textInputAction: TextInputAction.search,
+        decoration: InputDecoration(
+          border: const OutlineInputBorder(),
+          labelText: label,
+          isDense: true,
+        ),
+        onSubmitted: (_) => onSubmitted(),
+      ),
+    );
+  }
 }
 
 class _WorkspaceSummary extends StatelessWidget {
   const _WorkspaceSummary({
     required this.workspace,
     required this.visibleAssetCount,
+    required this.fileTree,
   });
 
   final MobileWorkspaceSnapshot workspace;
   final int visibleAssetCount;
+  final VaultFileTreeResponse? fileTree;
 
   @override
   Widget build(BuildContext context) {
@@ -542,6 +868,12 @@ class _WorkspaceSummary extends StatelessWidget {
             icon: Icons.photo_library_outlined,
             label: 'Media',
             value: '$visibleAssetCount',
+          ),
+          _Metric(
+            icon: Icons.insert_drive_file_outlined,
+            label: 'Files',
+            value:
+                '${fileTree?.entries.where((entry) => entry.isFile).length ?? 0}',
           ),
           _Metric(
             icon: Icons.photo_album_outlined,
@@ -668,12 +1000,14 @@ class _EntityRow extends StatelessWidget {
     required this.icon,
     required this.title,
     required this.subtitle,
+    this.onTap,
     this.trailing,
   });
 
   final IconData icon;
   final String title;
   final String subtitle;
+  final VoidCallback? onTap;
   final Widget? trailing;
 
   @override
@@ -685,6 +1019,7 @@ class _EntityRow extends StatelessWidget {
         borderRadius: BorderRadius.circular(8),
       ),
       child: ListTile(
+        onTap: onTap,
         leading: Icon(icon),
         title: Text(title, maxLines: 1, overflow: TextOverflow.ellipsis),
         subtitle: Text(subtitle, maxLines: 2, overflow: TextOverflow.ellipsis),
@@ -778,6 +1113,47 @@ class _SearchContext extends StatelessWidget {
   }
 }
 
+class _FileBreadcrumbs extends StatelessWidget {
+  const _FileBreadcrumbs({
+    required this.tree,
+    required this.current,
+    required this.onOpen,
+  });
+
+  final VaultFileTreeResponse tree;
+  final VaultFileEntry current;
+  final ValueChanged<VaultFileEntry> onOpen;
+
+  @override
+  Widget build(BuildContext context) {
+    final path = _pathEntries(tree, current);
+    return SingleChildScrollView(
+      scrollDirection: Axis.horizontal,
+      child: Row(
+        children: [
+          for (var index = 0; index < path.length; index++) ...[
+            ActionChip(
+              avatar: Icon(
+                index == 0 ? Icons.cloud_queue : Icons.folder_outlined,
+                size: 18,
+              ),
+              label: Text(path[index].name),
+              onPressed: index == path.length - 1
+                  ? null
+                  : () => onOpen(path[index]),
+            ),
+            if (index < path.length - 1)
+              const Padding(
+                padding: EdgeInsets.symmetric(horizontal: 4),
+                child: Icon(Icons.chevron_right, size: 18),
+              ),
+          ],
+        ],
+      ),
+    );
+  }
+}
+
 class _Notice extends StatelessWidget {
   const _Notice({
     required this.icon,
@@ -864,10 +1240,108 @@ MobileAssetSummary _summaryFromAsset(Asset asset) {
   );
 }
 
+VaultFileEntry? _currentFolderFromTree(
+  VaultFileTreeResponse tree,
+  String? currentFolderId,
+) {
+  if (currentFolderId != null) {
+    for (final entry in tree.entries) {
+      if (entry.id == currentFolderId && entry.isFolder) {
+        return entry;
+      }
+    }
+  }
+  return tree.roots.where((entry) => entry.isFolder).firstOrNull;
+}
+
+List<VaultFileEntry> _childrenOf(VaultFileTreeResponse tree, String parentId) {
+  final children = tree.childrenOf(parentId);
+  children.sort((left, right) {
+    final kind = (left.isFile ? 1 : 0).compareTo(right.isFile ? 1 : 0);
+    if (kind != 0) {
+      return kind;
+    }
+    return left.name.toLowerCase().compareTo(right.name.toLowerCase());
+  });
+  return children;
+}
+
+List<VaultFileEntry> _pathEntries(
+  VaultFileTreeResponse tree,
+  VaultFileEntry current,
+) {
+  final byId = {for (final entry in tree.entries) entry.id: entry};
+  final path = <VaultFileEntry>[];
+  var cursor = current;
+  while (true) {
+    path.insert(0, cursor);
+    final parentId = cursor.parentId;
+    if (parentId == null || !byId.containsKey(parentId)) {
+      break;
+    }
+    cursor = byId[parentId]!;
+  }
+  return path;
+}
+
+IconData _fileIcon(VaultFileEntry entry) {
+  if (entry.isFolder) {
+    return Icons.folder_outlined;
+  }
+  return switch (entry.mediaKind) {
+    'photo' => Icons.image_outlined,
+    'video' => Icons.movie_outlined,
+    'document' => Icons.description_outlined,
+    'audio' => Icons.audio_file_outlined,
+    'archive' => Icons.folder_zip_outlined,
+    'text' => Icons.notes_outlined,
+    _ => Icons.insert_drive_file_outlined,
+  };
+}
+
+String? _deviceLabelForEntry(VaultFileTreeResponse tree, VaultFileEntry entry) {
+  final originDeviceId = entry.originDeviceId;
+  if (originDeviceId == null) {
+    return null;
+  }
+  return tree.devicesById[originDeviceId]?.label ?? 'Unknown device';
+}
+
+String _fileSubtitle(VaultFileEntry entry, {String? sourceDeviceLabel}) {
+  if (entry.isFolder) {
+    return entry.isTrashed ? 'Folder - trash' : 'Folder';
+  }
+  final type = entry.mediaKind ?? entry.mimeType ?? 'file';
+  final parts = <String>['$type - ${_formatBytes(entry.bytes)}'];
+  if (sourceDeviceLabel != null && sourceDeviceLabel.trim().isNotEmpty) {
+    parts.add('from $sourceDeviceLabel');
+  }
+  final organization = entry.organization.summary;
+  if (organization.isNotEmpty) {
+    parts.add(organization);
+  }
+  return parts.join(' - ');
+}
+
+String _formatBytes(int bytes) {
+  if (bytes >= 1024 * 1024 * 1024) {
+    return '${(bytes / (1024 * 1024 * 1024)).toStringAsFixed(1)} GB';
+  }
+  if (bytes >= 1024 * 1024) {
+    return '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
+  }
+  if (bytes >= 1024) {
+    return '${(bytes / 1024).toStringAsFixed(1)} KB';
+  }
+  return '$bytes B';
+}
+
 String _tabLabel(_WorkspaceTab tab) {
   switch (tab) {
     case _WorkspaceTab.gallery:
       return 'Gallery';
+    case _WorkspaceTab.files:
+      return 'Files';
     case _WorkspaceTab.search:
       return 'Search';
     case _WorkspaceTab.organize:
@@ -883,6 +1357,8 @@ IconData _tabIcon(_WorkspaceTab tab) {
   switch (tab) {
     case _WorkspaceTab.gallery:
       return Icons.photo_library_outlined;
+    case _WorkspaceTab.files:
+      return Icons.folder_outlined;
     case _WorkspaceTab.search:
       return Icons.search;
     case _WorkspaceTab.organize:

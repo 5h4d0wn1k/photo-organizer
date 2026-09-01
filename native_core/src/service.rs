@@ -6,7 +6,8 @@ use std::{
     sync::Arc,
 };
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
+use serde::Serialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -16,17 +17,19 @@ use uuid::Uuid;
 use crate::{
     config::AppConfig,
     domain::{
-        Album, Asset, AssetAvailability, AssetAvailabilityState, BackupExportRequest,
+        Album, Asset, AssetAvailability, AssetAvailabilityState, AuditEvent, BackupExportRequest,
         BackupExportResult, BackupRestorePlan, BackupRestorePlanRequest, BackupRestoreRunRequest,
         BackupRestoreRunResult, BackupVerification, BackupVerifyRequest, BlobChunk, BlobRecord,
         BlobReplica, CapabilityGrant, CorrectDateRequest, CorrectPlaceRequest, CorrectionKind,
         CorrectionRecord, CreateAlbumRequest, CreateDeviceRequest, CreateFileFolderRequest,
-        CreateManualPersonRequest, CreatePairingSessionRequest, CreateVaultRequest,
-        CreateWatchFolderRequest, DeviceIdentity, DevicePairing, DeviceRole, DeviceStorageProfile,
-        DeviceTrustLevel, EncryptionActivationRequest, EncryptionActivationResult,
-        EnrollDeviceRequest, EventCluster, FeedbackEvent, HidePersonRequest, ImportAssetRequest,
-        ImportAssetResponse, ImportMode, ImportSession, ImportSessionStatus, JobKind, JobLog,
-        JobRecord, JobStatus, LibrarySettings, LibraryStatusResponse, MediaKind,
+        CreateManualPersonRequest, CreatePairingSessionRequest, CreateSmartFolderRequest,
+        CreateVaultRequest, CreateWatchFolderRequest, DeviceIdentity, DevicePairing, DeviceRole,
+        DeviceStorageProfile, DeviceTrustLevel, DuplicateReviewEntry, DuplicateReviewSummary,
+        EncryptionActivationRequest, EncryptionActivationResult, EnrollDeviceRequest,
+        EntitlementCache, EntitlementCacheStatus, EntitlementEffectiveStatus,
+        EntitlementStatusResponse, EntitlementTier, EventCluster, FeedbackEvent, HidePersonRequest,
+        ImportAssetRequest, ImportAssetResponse, ImportMode, ImportSession, ImportSessionStatus,
+        JobKind, JobLog, JobRecord, JobStatus, LibrarySettings, LibraryStatusResponse, MediaKind,
         MergePersonRequest, MetadataSource, MobileAssetSummary, MobilePairRequest,
         MobilePairResponse, MobileReplicaAssignment, MobileReplicaChunkDescriptor,
         MobileReplicaReport, MobileReplicaReportRequest, MobileReplicaRestoreResult, MobileSession,
@@ -34,15 +37,19 @@ use crate::{
         MobileUpload, MobileUploadRequest, MobileUploadStatus, MobileWorkspaceCapabilities,
         MobileWorkspaceResponse, ModelArtifact, ModelImportRequest, ModelInstallRequest, ModelTask,
         MoveFileEntryRequest, OcrBlock, OriginalStoragePolicy, PersonCluster, PlaceCluster,
+        PlatformReleaseEvidence, PlatformReleaseEvidenceStatus, PlatformReleaseReadinessResponse,
+        PlatformReleaseReadinessStatus, PlatformReleaseSurface, PlatformReleaseSurfaceReadiness,
         PrivacyStatus, RebuildRequest, RejectPersonMatchRequest, RelayEndpoint, RenameAlbumRequest,
         RenameFileEntryRequest, RenamePersonRequest, ReplicaHealth, RevokeDeviceRequest,
         RunSyncRequest, ScanImportSourceRequest, SceneTag, SearchIndexStatus, SearchQuery,
-        SearchResponse, SplitPersonRequest, StoragePolicy, StoragePolicyMode, SyncConflict,
-        SyncNetworkStatus, SyncPlan, SyncSession, SyncTransfer, SyncTransferExecutionResult,
+        SearchResponse, SmartFolder, SplitPersonRequest, StoragePolicy, StoragePolicyMode,
+        SupportBundleExportRequest, SupportBundleExportResult, SyncConflict, SyncNetworkStatus,
+        SyncPlan, SyncSession, SyncTransfer, SyncTransferExecutionResult,
         SyncTransferExecutionStatus, SyncTransferStatus, TimelineBucket, TimelineResponse,
-        UpdateAlbumAssetsRequest, UpdateAssetFlagsRequest, UpdateAssetsFlagsRequest,
-        UpdateLibrarySettingsRequest, UpdatePersonAssetsRequest, UpdateVaultStoragePolicyRequest,
-        VariantKind, Vault, VaultFileEntry, VaultFileKind, VaultFileTreeResponse, VaultInvite,
+        UpdateAlbumAssetsRequest, UpdateAssetFlagsRequest, UpdateAssetTagsRequest,
+        UpdateAssetsFlagsRequest, UpdateEntitlementCacheRequest, UpdateLibrarySettingsRequest,
+        UpdatePersonAssetsRequest, UpdateVaultStoragePolicyRequest, VariantKind, Vault,
+        VaultFileDeviceSummary, VaultFileEntry, VaultFileKind, VaultFileTreeResponse, VaultInvite,
         VaultKeyEnvelope, VaultMember, VaultStatus, WatchFolder,
     },
     events, imports, metadata, ml_sidecar, model_registry, ocr, people, search, security,
@@ -63,11 +70,14 @@ pub(crate) struct LibraryState {
     pub(crate) assets: Vec<crate::domain::Asset>,
     pub(crate) file_entries: Vec<VaultFileEntry>,
     pub(crate) albums: Vec<Album>,
+    pub(crate) smart_folders: Vec<SmartFolder>,
     pub(crate) people: Vec<PersonCluster>,
     pub(crate) places: Vec<PlaceCluster>,
     pub(crate) events: Vec<EventCluster>,
     pub(crate) faces: Vec<crate::domain::FaceTemplate>,
     pub(crate) feedback: Vec<FeedbackEvent>,
+    pub(crate) audit_events: Vec<AuditEvent>,
+    pub(crate) entitlement_cache: Option<EntitlementCache>,
     pub(crate) vaults: Vec<Vault>,
     pub(crate) devices: Vec<DeviceIdentity>,
     pub(crate) vault_members: Vec<VaultMember>,
@@ -92,6 +102,19 @@ pub(crate) struct LibraryState {
     pub(crate) scene_tags: Vec<SceneTag>,
 }
 
+#[derive(Debug, Clone)]
+struct DuplicateReviewAccumulator {
+    asset_id: Uuid,
+    media_kind: MediaKind,
+    original_bytes: u64,
+    duplicate_candidates: usize,
+    protected_bytes: u64,
+    first_seen_at: DateTime<Utc>,
+    last_seen_at: DateTime<Utc>,
+    import_session_ids: BTreeSet<Uuid>,
+    source_kinds: BTreeSet<String>,
+}
+
 impl From<PersistedLibraryState> for LibraryState {
     fn from(state: PersistedLibraryState) -> Self {
         Self {
@@ -100,11 +123,14 @@ impl From<PersistedLibraryState> for LibraryState {
             assets: state.assets,
             file_entries: state.file_entries,
             albums: state.albums,
+            smart_folders: state.smart_folders,
             people: state.people,
             places: state.places,
             events: state.events,
             faces: state.faces,
             feedback: state.feedback,
+            audit_events: state.audit_events,
+            entitlement_cache: state.entitlement_cache,
             vaults: state.vaults,
             devices: state.devices,
             vault_members: state.vault_members,
@@ -139,11 +165,14 @@ impl LibraryState {
             assets: self.assets.clone(),
             file_entries: self.file_entries.clone(),
             albums: self.albums.clone(),
+            smart_folders: self.smart_folders.clone(),
             people: self.people.clone(),
             places: self.places.clone(),
             events: self.events.clone(),
             faces: self.faces.clone(),
             feedback: self.feedback.clone(),
+            audit_events: self.audit_events.clone(),
+            entitlement_cache: self.entitlement_cache.clone(),
             vaults: self.vaults.clone(),
             devices: self.devices.clone(),
             vault_members: self.vault_members.clone(),
@@ -411,6 +440,20 @@ impl GalleryService {
         };
 
         state.pairings.push(pairing.clone());
+        let (actor_device_id, actor_label) = local_actor(&state);
+        push_audit_event(
+            &mut state,
+            "pairing.create",
+            ("pairing", Some(pairing.id)),
+            (actor_device_id, actor_label),
+            format!("Created pairing invite for {}", pairing.device_name),
+            json!({
+                "pairing_id": pairing.id,
+                "vault_id": pairing.vault_id,
+                "platform": pairing.platform,
+                "expires_at": pairing.expires_at,
+            }),
+        );
         self.persist_locked_state(&state)?;
         Ok(pairing)
     }
@@ -505,6 +548,20 @@ impl GalleryService {
             revoked_at: None,
         };
         state.mobile_sessions.push(session.clone());
+        push_audit_event(
+            &mut state,
+            "device.mobile_pair",
+            ("device", Some(device.id)),
+            (Some(device.id), Some(device.display_name.clone())),
+            format!("Paired mobile device {}", device.display_name),
+            json!({
+                "device_id": device.id,
+                "session_id": session.id,
+                "vault_id": vault_id,
+                "platform": device.platform,
+                "accepts_storage": device.storage_profile.accepts_storage,
+            }),
+        );
         self.persist_locked_state(&state)?;
 
         Ok(MobilePairResponse {
@@ -570,6 +627,8 @@ impl GalleryService {
         let mut state = self.state.write().await;
         let session = active_mobile_session_from_state(&mut state, bearer_token)?;
         let now = Utc::now();
+        let role = mobile_session_role(&state, &session)?;
+        let can_view_all_sessions = matches!(role, DeviceRole::Admin);
         let mut sessions = state
             .mobile_sessions
             .iter()
@@ -577,6 +636,7 @@ impl GalleryService {
                 candidate.vault_id == session.vault_id
                     && candidate.revoked_at.is_none()
                     && candidate.expires_at >= now
+                    && (can_view_all_sessions || candidate.device_id == session.device_id)
             })
             .cloned()
             .collect::<Vec<_>>();
@@ -611,12 +671,8 @@ impl GalleryService {
     ) -> Result<Vec<MobileSession>, ServiceError> {
         let mut state = self.state.write().await;
         let session = active_mobile_session_from_state(&mut state, bearer_token)?;
-        let requester_can_manage = state.vault_members.iter().any(|member| {
-            member.vault_id == session.vault_id
-                && member.device_id == session.device_id
-                && member.revoked_at.is_none()
-                && member.role == DeviceRole::Admin
-        });
+        let requester_can_manage =
+            matches!(mobile_session_role(&state, &session)?, DeviceRole::Admin);
         if session.device_id != device_id && !requester_can_manage {
             return Err(ServiceError::Invalid(
                 "mobile devices can only revoke their own sessions unless they are vault admins"
@@ -674,6 +730,7 @@ impl GalleryService {
 
         let mut state = self.state.write().await;
         let session = active_mobile_session_from_state(&mut state, bearer_token)?;
+        ensure_mobile_can_contribute(&state, &session, "upload originals")?;
         let now = Utc::now();
         let upload = MobileUpload {
             id: Uuid::new_v4(),
@@ -718,6 +775,7 @@ impl GalleryService {
         }
         let mut state = self.state.write().await;
         let session = active_mobile_session_from_state(&mut state, bearer_token)?;
+        ensure_mobile_can_contribute(&state, &session, "upload originals")?;
         let upload_index = mobile_upload_index_for_session(&state, &session, upload_id)?;
         let upload = state.mobile_uploads[upload_index].clone();
         if upload.status == MobileUploadStatus::Completed {
@@ -827,6 +885,7 @@ impl GalleryService {
 
         let mut state = self.state.write().await;
         let session = active_mobile_session_from_state(&mut state, bearer_token)?;
+        ensure_mobile_can_contribute(&state, &session, "upload originals")?;
         let upload_index = mobile_upload_index_for_session(&state, &session, upload_id)?;
         let upload_path = mobile_upload_path(&self.config, &state.mobile_uploads[upload_index]);
         reconcile_mobile_upload_progress(&mut state.mobile_uploads[upload_index], &upload_path)?;
@@ -885,6 +944,7 @@ impl GalleryService {
     ) -> Result<MobileUpload, ServiceError> {
         let mut state = self.state.write().await;
         let session = active_mobile_session_from_state(&mut state, bearer_token)?;
+        ensure_mobile_can_contribute(&state, &session, "upload originals")?;
         let upload_index = mobile_upload_index_for_session(&state, &session, upload_id)?;
         let upload = state.mobile_uploads[upload_index].clone();
         if upload.status == MobileUploadStatus::Completed {
@@ -1036,6 +1096,14 @@ impl GalleryService {
         ensure_distributed_defaults(state);
         refresh_blob_records(&self.config, state);
         ensure_file_namespace_defaults(state);
+        if let Some(entry) = state
+            .file_entries
+            .iter_mut()
+            .find(|entry| entry.vault_id == upload.vault_id && entry.asset_id == Some(asset_id))
+        {
+            entry.origin_device_id = Some(upload.device_id);
+            entry.updated_at = Utc::now();
+        }
         let completed = state.mobile_uploads[upload_index].clone();
         let _ = fs::remove_dir_all(upload_dir);
         Ok(completed)
@@ -1047,6 +1115,7 @@ impl GalleryService {
     ) -> Result<Vec<MobileAssetSummary>, ServiceError> {
         let mut state = self.state.write().await;
         let session = active_mobile_session_from_state(&mut state, bearer_token)?;
+        ensure_mobile_can_browse(&state, &session)?;
         ensure_distributed_defaults(&mut state);
         refresh_blob_records(&self.config, &mut state);
         let library_root = PathBuf::from(effective_library_root(&state, &self.config));
@@ -1090,8 +1159,14 @@ impl GalleryService {
         let session = active_mobile_session_from_state(&mut state, bearer_token)?;
         ensure_distributed_defaults(&mut state);
         refresh_blob_records(&self.config, &mut state);
+        let role = mobile_session_role(&state, &session)?;
 
-        let visible_asset_ids = asset_ids_for_vault(&state, session.vault_id);
+        let can_browse = mobile_role_can_browse(&role);
+        let visible_asset_ids = if can_browse {
+            asset_ids_for_vault(&state, session.vault_id)
+        } else {
+            BTreeSet::new()
+        };
         let visible_assets = state
             .assets
             .iter()
@@ -1104,7 +1179,11 @@ impl GalleryService {
         let people = filter_people_for_assets(&state.people, &visible_asset_ids);
         let places = filter_places_for_assets(&state.places, &visible_asset_ids);
         let events = filter_events_for_assets(&state.events, &visible_asset_ids);
-        let jobs = state.jobs.iter().take(25).cloned().collect::<Vec<_>>();
+        let jobs = if can_browse {
+            state.jobs.iter().take(25).cloned().collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
         let vault_status = build_vault_status(&state, session.vault_id)?;
         let devices = vault_status.devices.clone();
         let mobile_device_accepts_storage = devices
@@ -1124,22 +1203,7 @@ impl GalleryService {
             .cloned()
             .collect::<Vec<_>>();
         let sync_network = build_sync_network_status(&state, runtime);
-        let capabilities = MobileWorkspaceCapabilities {
-            can_browse_library: true,
-            can_search: true,
-            can_upload_camera_roll: true,
-            can_download_originals: true,
-            can_manage_storage: mobile_device_accepts_storage,
-            can_import_desktop_folders: false,
-            can_run_models: false,
-            role_detail: if mobile_device_accepts_storage {
-                "This phone can browse, search, upload originals, download originals, and contribute encrypted vault chunks as local-cloud storage. Desktop folder imports, model management, and restore staging stay on desktop."
-                    .to_string()
-            } else {
-                "This paired mobile device can browse, search, upload camera-roll media, and download available originals. Enable storage contribution before it receives encrypted vault chunks."
-                    .to_string()
-            },
-        };
+        let capabilities = mobile_workspace_capabilities(&role, mobile_device_accepts_storage);
         self.persist_locked_state(&state)?;
         Ok(MobileWorkspaceResponse {
             session,
@@ -1164,6 +1228,7 @@ impl GalleryService {
     ) -> Result<DeviceIdentity, ServiceError> {
         let mut state = self.state.write().await;
         let session = active_mobile_session_from_state(&mut state, bearer_token)?;
+        ensure_mobile_can_manage_storage(&state, &session)?;
         let device_index = state
             .devices
             .iter()
@@ -1194,6 +1259,7 @@ impl GalleryService {
         let session = active_mobile_session_from_state(&mut state, bearer_token)?;
         ensure_distributed_defaults(&mut state);
         refresh_blob_records(&self.config, &mut state);
+        let role = mobile_session_role(&state, &session)?;
         let library_root = PathBuf::from(effective_library_root(&state, &self.config));
         let device = state
             .devices
@@ -1208,6 +1274,18 @@ impl GalleryService {
             .cloned()
             .ok_or_else(|| ServiceError::NotFound(format!("vault {}", session.vault_id)))?;
 
+        if !mobile_role_can_manage_storage(&role) {
+            self.persist_locked_state(&state)?;
+            return Ok(MobileStoragePlan {
+                generated_at: Utc::now(),
+                device,
+                assignments: Vec::new(),
+                detail: format!(
+                    "The {} role cannot receive encrypted vault chunks as a storage node.",
+                    mobile_role_label(&role)
+                ),
+            });
+        }
         if !device.storage_profile.accepts_storage {
             self.persist_locked_state(&state)?;
             return Ok(MobileStoragePlan {
@@ -1510,6 +1588,7 @@ impl GalleryService {
     ) -> Result<SearchResponse, ServiceError> {
         let mut state = self.state.write().await;
         let session = active_mobile_session_from_state(&mut state, bearer_token)?;
+        ensure_mobile_can_search(&state, &session)?;
         let visible_asset_ids = asset_ids_for_vault(&state, session.vault_id);
         self.persist_locked_state(&state)?;
         drop(state);
@@ -1531,6 +1610,7 @@ impl GalleryService {
     ) -> Result<AssetAvailability, ServiceError> {
         let mut state = self.state.write().await;
         let session = active_mobile_session_from_state(&mut state, bearer_token)?;
+        ensure_mobile_can_browse(&state, &session)?;
         ensure_distributed_defaults(&mut state);
         refresh_blob_records(&self.config, &mut state);
         ensure_asset_belongs_to_vault(&state, session.vault_id, asset_id)?;
@@ -1548,10 +1628,27 @@ impl GalleryService {
         {
             let mut state = self.state.write().await;
             let session = active_mobile_session_from_state(&mut state, bearer_token)?;
+            ensure_mobile_can_contribute(&state, &session, "update library curation")?;
             ensure_asset_belongs_to_vault(&state, session.vault_id, asset_id)?;
             self.persist_locked_state(&state)?;
         }
         self.update_asset_flags(asset_id, request).await
+    }
+
+    pub async fn update_mobile_asset_tags(
+        &self,
+        bearer_token: &str,
+        asset_id: Uuid,
+        request: UpdateAssetTagsRequest,
+    ) -> Result<Asset, ServiceError> {
+        {
+            let mut state = self.state.write().await;
+            let session = active_mobile_session_from_state(&mut state, bearer_token)?;
+            ensure_mobile_can_contribute(&state, &session, "update library curation")?;
+            ensure_asset_belongs_to_vault(&state, session.vault_id, asset_id)?;
+            self.persist_locked_state(&state)?;
+        }
+        self.update_asset_tags(asset_id, request).await
     }
 
     pub async fn mobile_original_bytes(
@@ -1562,6 +1659,7 @@ impl GalleryService {
         {
             let mut state = self.state.write().await;
             let session = active_mobile_session_from_state(&mut state, bearer_token)?;
+            ensure_mobile_can_download_originals(&state, &session)?;
             ensure_distributed_defaults(&mut state);
             refresh_blob_records(&self.config, &mut state);
             let belongs_to_session_vault = state.blob_records.iter().any(|blob| {
@@ -1586,6 +1684,7 @@ impl GalleryService {
         {
             let mut state = self.state.write().await;
             let session = active_mobile_session_from_state(&mut state, bearer_token)?;
+            ensure_mobile_can_download_originals(&state, &session)?;
             ensure_distributed_defaults(&mut state);
             refresh_blob_records(&self.config, &mut state);
             let belongs_to_session_vault = state.blob_records.iter().any(|blob| {
@@ -1609,6 +1708,7 @@ impl GalleryService {
         {
             let mut state = self.state.write().await;
             let session = active_mobile_session_from_state(&mut state, bearer_token)?;
+            ensure_mobile_can_download_originals(&state, &session)?;
             ensure_distributed_defaults(&mut state);
             refresh_blob_records(&self.config, &mut state);
             let belongs_to_session_vault = state.blob_records.iter().any(|blob| {
@@ -1696,6 +1796,7 @@ impl GalleryService {
     ) -> Result<VaultFileTreeResponse, ServiceError> {
         let mut state = self.state.write().await;
         let session = active_mobile_session_from_state(&mut state, bearer_token)?;
+        ensure_mobile_can_browse(&state, &session)?;
         ensure_distributed_defaults(&mut state);
         refresh_blob_records(&self.config, &mut state);
         ensure_file_namespace_defaults(&mut state);
@@ -1737,6 +1838,7 @@ impl GalleryService {
             created_at: now,
             updated_at: now,
             trashed_at: None,
+            organization: Default::default(),
         };
         state.file_entries.push(entry.clone());
         self.persist_locked_state(&state)?;
@@ -1934,6 +2036,7 @@ impl GalleryService {
     ) -> Result<Uuid, ServiceError> {
         let mut state = self.state.write().await;
         let session = active_mobile_session_from_state(&mut state, bearer_token)?;
+        ensure_mobile_can_download_originals(&state, &session)?;
         ensure_distributed_defaults(&mut state);
         refresh_blob_records(&self.config, &mut state);
         ensure_file_namespace_defaults(&mut state);
@@ -2040,8 +2143,22 @@ impl GalleryService {
             ensure_local_vault_member(&mut state, requested_id, now);
             refresh_blob_records(&self.config, &mut state);
             ensure_file_namespace_defaults(&mut state);
+            let vault = state.vaults[index].clone();
+            let actor_label = local_device_name(&state);
+            push_audit_event(
+                &mut state,
+                "vault.create",
+                ("vault", Some(vault.id)),
+                (Some(local_device), actor_label),
+                format!("Created device group {}", vault.name),
+                json!({
+                    "vault_id": vault.id,
+                    "storage_policy": vault.storage_policy,
+                    "replaced_bootstrap_vault": true,
+                }),
+            );
             self.persist_locked_state(&state)?;
-            return Ok(state.vaults[index].clone());
+            return Ok(vault);
         }
         let vault = Vault {
             id: requested_id,
@@ -2067,6 +2184,19 @@ impl GalleryService {
         state.vaults.push(vault.clone());
         refresh_blob_records(&self.config, &mut state);
         ensure_file_namespace_defaults(&mut state);
+        let actor_label = local_device_name(&state);
+        push_audit_event(
+            &mut state,
+            "vault.create",
+            ("vault", Some(vault.id)),
+            (Some(local_device), actor_label),
+            format!("Created device group {}", vault.name),
+            json!({
+                "vault_id": vault.id,
+                "storage_policy": vault.storage_policy,
+                "replaced_bootstrap_vault": false,
+            }),
+        );
         self.persist_locked_state(&state)?;
         Ok(vault)
     }
@@ -2096,6 +2226,18 @@ impl GalleryService {
         updated.storage_policy = normalize_storage_policy(Some(request.policy));
         updated.updated_at = Utc::now();
         let vault = updated.clone();
+        let (actor_device_id, actor_label) = local_actor(&state);
+        push_audit_event(
+            &mut state,
+            "vault.storage_policy.update",
+            ("vault", Some(vault.id)),
+            (actor_device_id, actor_label),
+            format!("Updated storage policy for {}", vault.name),
+            json!({
+                "vault_id": vault.id,
+                "storage_policy": vault.storage_policy,
+            }),
+        );
         self.persist_locked_state(&state)?;
         Ok(vault)
     }
@@ -2121,7 +2263,23 @@ impl GalleryService {
         let role = request
             .role
             .unwrap_or_else(|| default_role_for_trust(device.trust_level));
+        let audit_role = role.clone();
         let device = add_device_to_state(&mut state, device, role, None)?;
+        let (actor_device_id, actor_label) = local_actor(&state);
+        push_audit_event(
+            &mut state,
+            "device.create",
+            ("device", Some(device.id)),
+            (actor_device_id, actor_label),
+            format!("Added device {}", device.display_name),
+            json!({
+                "device_id": device.id,
+                "platform": device.platform,
+                "trust_level": device.trust_level,
+                "role": audit_role,
+                "accepts_storage": device.storage_profile.accepts_storage,
+            }),
+        );
         self.persist_locked_state(&state)?;
         Ok(device)
     }
@@ -2156,7 +2314,9 @@ impl GalleryService {
         let role = request
             .role
             .unwrap_or_else(|| default_role_for_trust(device.trust_level));
+        let audit_role = role.clone();
         let device = add_device_to_state(&mut state, device, role, vault_id)?;
+        let endpoint_present = endpoint.is_some();
         if let Some(endpoint) = endpoint {
             sync_transport::upsert_relay_endpoint(
                 &mut state,
@@ -2167,6 +2327,23 @@ impl GalleryService {
                 endpoint.expires_at,
             );
         }
+        let (actor_device_id, actor_label) = local_actor(&state);
+        push_audit_event(
+            &mut state,
+            "device.enroll",
+            ("device", Some(device.id)),
+            (actor_device_id, actor_label),
+            format!("Enrolled device {}", device.display_name),
+            json!({
+                "device_id": device.id,
+                "vault_id": vault_id,
+                "platform": device.platform,
+                "trust_level": device.trust_level,
+                "role": audit_role,
+                "accepts_storage": device.storage_profile.accepts_storage,
+                "endpoint_present": endpoint_present,
+            }),
+        );
         self.persist_locked_state(&state)?;
         Ok(device)
     }
@@ -2174,7 +2351,7 @@ impl GalleryService {
     pub async fn revoke_device(
         &self,
         device_id: Uuid,
-        _request: RevokeDeviceRequest,
+        request: RevokeDeviceRequest,
     ) -> Result<DeviceIdentity, ServiceError> {
         let mut state = self.state.write().await;
         let now = Utc::now();
@@ -2213,6 +2390,19 @@ impl GalleryService {
         }) {
             replica.health = ReplicaHealth::Offline;
         }
+        let (actor_device_id, actor_label) = local_actor(&state);
+        push_audit_event(
+            &mut state,
+            "device.revoke",
+            ("device", Some(updated.id)),
+            (actor_device_id, actor_label),
+            format!("Revoked device {}", updated.display_name),
+            json!({
+                "device_id": updated.id,
+                "platform": updated.platform,
+                "reason_present": request.reason.as_ref().is_some_and(|value| !value.trim().is_empty()),
+            }),
+        );
         self.persist_locked_state(&state)?;
         Ok(updated)
     }
@@ -2256,6 +2446,34 @@ impl GalleryService {
             plan.execution_results = self
                 .execute_pending_sync_transfers(request.vault_id)
                 .await?;
+            let completed_results = plan
+                .execution_results
+                .iter()
+                .filter(|result| result.status == SyncTransferExecutionStatus::Completed)
+                .count();
+            let failed_results = plan
+                .execution_results
+                .iter()
+                .filter(|result| result.status == SyncTransferExecutionStatus::Failed)
+                .count();
+            let mut state = self.state.write().await;
+            let (actor_device_id, actor_label) = local_actor(&state);
+            push_audit_event(
+                &mut state,
+                "sync.run",
+                ("sync", request.vault_id),
+                (actor_device_id, actor_label),
+                "Ran sync planner".to_string(),
+                json!({
+                    "vault_id": request.vault_id,
+                    "planned_transfers": plan.transfers.len(),
+                    "execution_results": plan.execution_results.len(),
+                    "completed_results": completed_results,
+                    "failed_results": failed_results,
+                    "under_replicated_blobs": plan.under_replicated_blob_ids.len(),
+                }),
+            );
+            self.persist_locked_state(&state)?;
         }
         Ok(plan)
     }
@@ -2280,6 +2498,19 @@ impl GalleryService {
             .start()
             .await
             .map_err(sync_transport_error)?;
+        {
+            let mut state = self.state.write().await;
+            let (actor_device_id, actor_label) = local_actor(&state);
+            push_audit_event(
+                &mut state,
+                "sync.network.start",
+                ("sync_network", None),
+                (actor_device_id, actor_label),
+                "Started encrypted sync network".to_string(),
+                json!({ "transport": "encrypted_p2p" }),
+            );
+            self.persist_locked_state(&state)?;
+        }
         Ok(self.sync_network_status().await)
     }
 
@@ -2288,6 +2519,19 @@ impl GalleryService {
             .stop()
             .await
             .map_err(sync_transport_error)?;
+        {
+            let mut state = self.state.write().await;
+            let (actor_device_id, actor_label) = local_actor(&state);
+            push_audit_event(
+                &mut state,
+                "sync.network.stop",
+                ("sync_network", None),
+                (actor_device_id, actor_label),
+                "Stopped encrypted sync network".to_string(),
+                json!({ "transport": "encrypted_p2p" }),
+            );
+            self.persist_locked_state(&state)?;
+        }
         Ok(self.sync_network_status().await)
     }
 
@@ -2651,6 +2895,18 @@ impl GalleryService {
         }
         if availability.reachable_replica_device_ids.is_empty() {
             if self.restore_original_from_local_chunks_locked(&mut state, asset_id)? {
+                let actor_label = local_device_name(&state);
+                push_audit_event(
+                    &mut state,
+                    "asset.pin_local",
+                    ("asset", Some(asset_id)),
+                    (Some(local_device), actor_label),
+                    "Pinned asset from local encrypted chunks".to_string(),
+                    json!({
+                        "asset_id": asset_id,
+                        "method": "local_encrypted_chunks",
+                    }),
+                );
                 self.persist_locked_state(&state)?;
                 return build_asset_availability(&state, asset_id);
             }
@@ -2671,7 +2927,25 @@ impl GalleryService {
             local_device,
             blob.bytes,
         );
+        let transfer_id = transfer.id;
+        let from_device_id = transfer.from_device_id;
         state.sync_transfers.push(transfer);
+        let actor_label = local_device_name(&state);
+        push_audit_event(
+            &mut state,
+            "asset.pin_local",
+            ("asset", Some(asset_id)),
+            (Some(local_device), actor_label),
+            "Queued local pin transfer for asset".to_string(),
+            json!({
+                "asset_id": asset_id,
+                "vault_id": blob.vault_id,
+                "blob_id": blob.id,
+                "transfer_id": transfer_id,
+                "from_device_id": from_device_id,
+                "to_device_id": local_device,
+            }),
+        );
         self.persist_locked_state(&state)?;
         build_asset_availability(&state, asset_id)
     }
@@ -2697,17 +2971,18 @@ impl GalleryService {
             .iter()
             .find(|vault| vault.id == blob.vault_id)
             .ok_or_else(|| ServiceError::NotFound(format!("vault {}", blob.vault_id)))?;
-        if vault.storage_policy.mode == StoragePolicyMode::MaxPoolSingleCopy {
+        let storage_policy = vault.storage_policy.clone();
+        if storage_policy.mode == StoragePolicyMode::MaxPoolSingleCopy {
             return Err(ServiceError::Invalid(
                 "local eviction for only-copy vaults requires an explicit risk confirmation UI"
                     .to_string(),
             ));
         }
         let remote_verified = verified_remote_replica_count(&state, &blob, local_device);
-        if remote_verified < vault.storage_policy.min_replicas as usize {
+        if remote_verified < storage_policy.min_replicas as usize {
             return Err(ServiceError::Invalid(format!(
                 "local eviction blocked until {} verified P2P remote replicas exist",
-                vault.storage_policy.min_replicas
+                storage_policy.min_replicas
             )));
         }
 
@@ -2738,6 +3013,21 @@ impl GalleryService {
             replica.bytes_present = 0;
             replica.verified_at = None;
         }
+        let actor_label = local_device_name(&state);
+        push_audit_event(
+            &mut state,
+            "asset.evict_local",
+            ("asset", Some(asset_id)),
+            (Some(local_device), actor_label),
+            "Evicted local managed copy after replica verification".to_string(),
+            json!({
+                "asset_id": asset_id,
+                "vault_id": blob.vault_id,
+                "blob_id": blob.id,
+                "verified_remote_replicas": remote_verified,
+                "required_remote_replicas": storage_policy.min_replicas,
+            }),
+        );
         self.persist_locked_state(&state)?;
         build_asset_availability(&state, asset_id)
     }
@@ -2920,6 +3210,100 @@ impl GalleryService {
 
     pub async fn import_sessions(&self) -> Vec<ImportSession> {
         self.state.read().await.import_sessions.clone()
+    }
+
+    pub async fn duplicate_review_summary(&self) -> DuplicateReviewSummary {
+        let state = self.state.read().await;
+        let generated_at = Utc::now();
+        let assets_by_id = state
+            .assets
+            .iter()
+            .map(|asset| (asset.id, (asset.media_kind.clone(), asset.bytes)))
+            .collect::<BTreeMap<_, _>>();
+        let mut entries = BTreeMap::<Uuid, DuplicateReviewAccumulator>::new();
+        let mut sessions_with_duplicates = BTreeSet::<Uuid>::new();
+
+        for session in state
+            .import_sessions
+            .iter()
+            .filter(|session| session.status == ImportSessionStatus::Committed)
+        {
+            let seen_at = session.completed_at.unwrap_or(session.created_at);
+            let source_kind = enum_label(&session.source_kind, "folder");
+            let mut session_had_duplicate = false;
+
+            for candidate in session
+                .candidates
+                .iter()
+                .filter(|candidate| candidate.selected && candidate.duplicate_asset_id.is_some())
+            {
+                let Some(asset_id) = candidate.duplicate_asset_id else {
+                    continue;
+                };
+                let (media_kind, original_bytes) = assets_by_id
+                    .get(&asset_id)
+                    .cloned()
+                    .unwrap_or_else(|| (candidate.media_kind.clone(), candidate.bytes));
+                let entry = entries
+                    .entry(asset_id)
+                    .or_insert_with(|| DuplicateReviewAccumulator {
+                        asset_id,
+                        media_kind,
+                        original_bytes,
+                        duplicate_candidates: 0,
+                        protected_bytes: 0,
+                        first_seen_at: seen_at,
+                        last_seen_at: seen_at,
+                        import_session_ids: BTreeSet::new(),
+                        source_kinds: BTreeSet::new(),
+                    });
+                entry.duplicate_candidates += 1;
+                entry.protected_bytes += candidate.bytes;
+                entry.first_seen_at = entry.first_seen_at.min(seen_at);
+                entry.last_seen_at = entry.last_seen_at.max(seen_at);
+                entry.import_session_ids.insert(session.id);
+                entry.source_kinds.insert(source_kind.clone());
+                session_had_duplicate = true;
+            }
+
+            if session_had_duplicate {
+                sessions_with_duplicates.insert(session.id);
+            }
+        }
+
+        let mut entries = entries
+            .into_values()
+            .map(|entry| DuplicateReviewEntry {
+                asset_id: entry.asset_id,
+                media_kind: entry.media_kind,
+                original_bytes: entry.original_bytes,
+                duplicate_candidates: entry.duplicate_candidates,
+                protected_bytes: entry.protected_bytes,
+                first_seen_at: entry.first_seen_at,
+                last_seen_at: entry.last_seen_at,
+                import_session_ids: entry.import_session_ids.into_iter().collect(),
+                source_kinds: entry.source_kinds.into_iter().collect(),
+            })
+            .collect::<Vec<_>>();
+        entries.sort_by(|left, right| {
+            right
+                .protected_bytes
+                .cmp(&left.protected_bytes)
+                .then_with(|| right.duplicate_candidates.cmp(&left.duplicate_candidates))
+                .then_with(|| left.asset_id.cmp(&right.asset_id))
+        });
+        let duplicate_candidates = entries.iter().map(|entry| entry.duplicate_candidates).sum();
+        let protected_bytes = entries.iter().map(|entry| entry.protected_bytes).sum();
+
+        DuplicateReviewSummary {
+            generated_at,
+            duplicate_assets: entries.len(),
+            duplicate_candidates,
+            protected_bytes,
+            sessions_with_duplicates: sessions_with_duplicates.len(),
+            entries,
+            privacy_detail: "Computed locally from committed import-session checksums; source paths, filenames, OCR text, faces, tags, embeddings, and exact metadata are excluded.".to_string(),
+        }
     }
 
     pub async fn commit_import_session(
@@ -3232,6 +3616,7 @@ impl GalleryService {
                     sidecar_title: None,
                     sidecar_description: None,
                     folder_hint: None,
+                    organization: Default::default(),
                     derived: crate::domain::ModelProvenance::local("manual-correction", "v1"),
                 });
             metadata.captured_at = request.captured_at;
@@ -3398,6 +3783,42 @@ impl GalleryService {
                 "applied": {
                     "favorite": updated.favorite,
                     "archived": updated.archived,
+                },
+            }),
+            created_at: Utc::now(),
+        });
+        self.persist_locked_state(&state)?;
+        Ok(updated)
+    }
+
+    pub async fn update_asset_tags(
+        &self,
+        asset_id: Uuid,
+        request: UpdateAssetTagsRequest,
+    ) -> Result<Asset, ServiceError> {
+        let tags = normalize_manual_tags(request.tags)?;
+        let mut state = self.state.write().await;
+        let (previous_tags, updated) = {
+            let asset = state
+                .assets
+                .iter_mut()
+                .find(|asset| asset.id == asset_id)
+                .ok_or_else(|| ServiceError::NotFound(format!("asset {asset_id}")))?;
+            let previous_tags = asset.manual_tags.clone();
+            asset.manual_tags = tags;
+            (previous_tags, asset.clone())
+        };
+
+        state.feedback.push(FeedbackEvent {
+            id: Uuid::new_v4(),
+            kind: crate::domain::FeedbackKind::UpdateAssetTags,
+            payload: json!({
+                "asset_id": asset_id,
+                "previous": {
+                    "manual_tags": previous_tags,
+                },
+                "applied": {
+                    "manual_tags": updated.manual_tags,
                 },
             }),
             created_at: Utc::now(),
@@ -3684,6 +4105,62 @@ impl GalleryService {
         });
         self.persist_locked_state(&state)?;
         Ok(())
+    }
+
+    pub async fn smart_folders(&self) -> Vec<SmartFolder> {
+        self.state.read().await.smart_folders.clone()
+    }
+
+    pub async fn create_smart_folder(
+        &self,
+        request: CreateSmartFolderRequest,
+    ) -> Result<SmartFolder, ServiceError> {
+        let title = request.title.trim();
+        if title.is_empty() {
+            return Err(ServiceError::Invalid("title must not be empty".to_string()));
+        }
+        if !search_query_has_filters(&request.query) {
+            return Err(ServiceError::Invalid(
+                "smart folder query must include at least one filter".to_string(),
+            ));
+        }
+
+        let mut state = self.state.write().await;
+        let now = Utc::now();
+        let folder = SmartFolder {
+            id: Uuid::new_v4(),
+            title: title.to_string(),
+            query: request.query,
+            created_at: now,
+            updated_at: now,
+        };
+        state.smart_folders.insert(0, folder.clone());
+        self.persist_locked_state(&state)?;
+        Ok(folder)
+    }
+
+    pub async fn delete_smart_folder(&self, folder_id: Uuid) -> Result<(), ServiceError> {
+        let mut state = self.state.write().await;
+        let before = state.smart_folders.len();
+        state.smart_folders.retain(|folder| folder.id != folder_id);
+        if state.smart_folders.len() == before {
+            return Err(ServiceError::NotFound(format!("smart folder {folder_id}")));
+        }
+        self.persist_locked_state(&state)?;
+        Ok(())
+    }
+
+    pub async fn run_smart_folder(&self, folder_id: Uuid) -> Result<SearchResponse, ServiceError> {
+        let query = self
+            .state
+            .read()
+            .await
+            .smart_folders
+            .iter()
+            .find(|folder| folder.id == folder_id)
+            .map(|folder| folder.query.clone())
+            .ok_or_else(|| ServiceError::NotFound(format!("smart folder {folder_id}")))?;
+        Ok(self.search(query).await)
     }
 
     pub async fn people(&self) -> Vec<PersonCluster> {
@@ -4218,12 +4695,16 @@ impl GalleryService {
         let state = self.state.read().await;
         search::search_library(
             query,
-            &state.assets,
-            &state.people,
-            &state.places,
-            &state.events,
-            &state.ocr_blocks,
-            &state.scene_tags,
+            search::SearchCorpus {
+                assets: &state.assets,
+                people: &state.people,
+                places: &state.places,
+                events: &state.events,
+                ocr_blocks: &state.ocr_blocks,
+                scene_tags: &state.scene_tags,
+                file_entries: &state.file_entries,
+                devices: &state.devices,
+            },
         )
     }
 
@@ -4326,6 +4807,85 @@ impl GalleryService {
             .filter(|log| log.job_id == job_id)
             .cloned()
             .collect())
+    }
+
+    pub async fn audit_events(&self, limit: Option<usize>) -> Vec<AuditEvent> {
+        let mut events = self.state.read().await.audit_events.clone();
+        events.sort_by(|left, right| {
+            right
+                .created_at
+                .cmp(&left.created_at)
+                .then_with(|| right.id.cmp(&left.id))
+        });
+        if let Some(limit) = limit {
+            events.truncate(limit);
+        }
+        events
+    }
+
+    pub async fn entitlement_status(&self) -> EntitlementStatusResponse {
+        let state = self.state.read().await;
+        build_entitlement_status(state.entitlement_cache.as_ref(), Utc::now())
+    }
+
+    pub async fn update_entitlement_cache(
+        &self,
+        request: UpdateEntitlementCacheRequest,
+    ) -> Result<EntitlementStatusResponse, ServiceError> {
+        let mut state = self.state.write().await;
+        let now = Utc::now();
+        let tier = request.tier;
+        let account_id_hash = normalize_account_id_hash(request.account_id_hash.as_deref())?;
+        let plan_code = normalize_public_code(request.plan_code.as_deref(), "plan_code")?;
+        let source = normalize_public_code(request.source.as_deref(), "source")?
+            .unwrap_or_else(|| "local_entitlement_cache".to_string());
+        let limits = request.limits.unwrap_or_else(|| tier.default_limits());
+        let cache = EntitlementCache {
+            tier,
+            status: request.status,
+            account_id_hash,
+            plan_code,
+            limits,
+            checked_at: request.checked_at.unwrap_or(now),
+            expires_at: request.expires_at,
+            offline_grace_expires_at: request.offline_grace_expires_at,
+            source,
+            detail: entitlement_cache_detail(request.status).to_string(),
+            updated_at: now,
+        };
+        state.entitlement_cache = Some(cache);
+        let response = build_entitlement_status(state.entitlement_cache.as_ref(), now);
+        let has_account_hash = state
+            .entitlement_cache
+            .as_ref()
+            .and_then(|cache| cache.account_id_hash.as_ref())
+            .is_some();
+        push_audit_event(
+            &mut state,
+            "entitlement.cache.update",
+            ("entitlement", None),
+            (None, Some("local entitlement cache".to_string())),
+            format!(
+                "Updated {:?} entitlement cache with {:?} effective status",
+                response.tier, response.effective_status
+            ),
+            json!({
+                "tier": response.tier,
+                "effective_status": response.effective_status,
+                "has_account_hash": has_account_hash,
+                "content_exposure_prevented": response.content_exposure_prevented,
+                "safe_local_access_allowed": response.safe_local_access_allowed,
+                "device_limit": response.limits.device_limit,
+                "member_limit": response.limits.member_limit,
+                "workspace_limit": response.limits.workspace_limit,
+            }),
+        );
+        self.persist_locked_state(&state)?;
+        Ok(response)
+    }
+
+    pub async fn platform_release_readiness(&self) -> PlatformReleaseReadinessResponse {
+        build_platform_release_readiness(Utc::now())
     }
 
     pub async fn cancel_job(&self, job_id: Uuid) -> Result<JobRecord, ServiceError> {
@@ -4890,6 +5450,166 @@ impl GalleryService {
         })
     }
 
+    pub async fn export_support_bundle(
+        &self,
+        request: SupportBundleExportRequest,
+    ) -> Result<SupportBundleExportResult, ServiceError> {
+        if request.export_root.trim().is_empty() {
+            return Err(ServiceError::Invalid(
+                "export_root must not be empty".to_string(),
+            ));
+        }
+
+        let export_root = PathBuf::from(&request.export_root);
+        let support_dir = export_root.join("support");
+        fs::create_dir_all(&support_dir).map_err(|err| ServiceError::Io(err.to_string()))?;
+        let bundle_path = support_dir.join("private-gallery-support-bundle.json");
+        let exported_at = Utc::now();
+        let verification = self
+            .verify_backup(BackupVerifyRequest { export_root: None })
+            .await?;
+        let release_readiness = if request.include_release_readiness {
+            Some(self.platform_release_readiness().await)
+        } else {
+            None
+        };
+        let redacted_fields = support_bundle_redacted_fields();
+        let sections = vec![
+            "summary".to_string(),
+            "privacy".to_string(),
+            "entitlements".to_string(),
+            "backup_health".to_string(),
+            "release_readiness".to_string(),
+            "redaction".to_string(),
+        ];
+        let bundle = {
+            let state = self.state.read().await;
+            let privacy =
+                model_registry::privacy_status(&self.config).map_err(model_registry_error)?;
+            let entitlement =
+                build_entitlement_status(state.entitlement_cache.as_ref(), exported_at);
+            let mut media_kind_counts = BTreeMap::<String, usize>::new();
+            for asset in &state.assets {
+                let kind = serde_json::to_value(&asset.media_kind)
+                    .ok()
+                    .and_then(|value| value.as_str().map(ToString::to_string))
+                    .unwrap_or_else(|| "other".to_string());
+                *media_kind_counts.entry(kind).or_default() += 1;
+            }
+            let mut device_platform_counts = BTreeMap::<String, usize>::new();
+            for device in &state.devices {
+                *device_platform_counts
+                    .entry(device.platform.trim().to_ascii_lowercase())
+                    .or_default() += 1;
+            }
+            let mut recent_audit_actions = BTreeMap::<String, usize>::new();
+            for event in state.audit_events.iter().take(50) {
+                *recent_audit_actions
+                    .entry(event.action.clone())
+                    .or_default() += 1;
+            }
+            json!({
+                "exported_at": exported_at,
+                "local_only": true,
+                "private_data_excluded": true,
+                "summary": {
+                    "asset_count": state.assets.len(),
+                    "media_kind_counts": media_kind_counts,
+                    "album_count": state.albums.len(),
+                    "smart_folder_count": state.smart_folders.len(),
+                    "people_cluster_count": state.people.len(),
+                    "place_cluster_count": state.places.len(),
+                    "event_cluster_count": state.events.len(),
+                    "vault_count": state.vaults.len(),
+                    "device_count": state.devices.len(),
+                    "device_platform_counts": device_platform_counts,
+                    "mobile_session_count": state.mobile_sessions.len(),
+                    "sync_transfer_count": state.sync_transfers.len(),
+                    "job_count": state.jobs.len(),
+                    "audit_event_count": state.audit_events.len(),
+                    "recent_audit_action_counts": recent_audit_actions,
+                },
+                "privacy": {
+                    "network_policy": privacy.network_policy,
+                    "loopback_only": privacy.loopback_only,
+                    "developer_mode": privacy.developer_mode,
+                    "remote_mobile_access_enabled": privacy.remote_mobile_access_enabled,
+                    "photo_processing_network_allowed": privacy.photo_processing_network_allowed,
+                    "model_download_requires_confirmation": privacy.model_download_requires_confirmation,
+                    "telemetry_enabled": privacy.telemetry_enabled,
+                    "analytics_enabled": privacy.analytics_enabled,
+                    "cloud_ai_enabled": privacy.cloud_ai_enabled,
+                    "database_encrypted": privacy.encryption.database_encrypted,
+                    "derived_data_encrypted": privacy.encryption.derived_data_encrypted,
+                    "sensitive_indexing_allowed": privacy.encryption.sensitive_indexing_allowed,
+                    "installed_model_count": privacy.installed_models.len(),
+                },
+                "entitlements": {
+                    "tier": entitlement.tier,
+                    "effective_status": entitlement.effective_status,
+                    "offline_grace_active": entitlement.offline_grace_active,
+                    "paid_features_available": entitlement.paid_features_available,
+                    "safe_local_access_allowed": entitlement.safe_local_access_allowed,
+                    "content_exposure_prevented": entitlement.content_exposure_prevented,
+                    "limits": entitlement.limits,
+                    "account_identifier_redacted": entitlement
+                        .cache
+                        .as_ref()
+                        .and_then(|cache| cache.account_id_hash.as_ref())
+                        .is_some(),
+                },
+                "backup_health": {
+                    "checked_at": verification.checked_at,
+                    "assets_checked": verification.assets_checked,
+                    "missing_asset_count": verification.missing_asset_paths.len(),
+                    "vault_chunks_checked": verification.vault_chunks_checked,
+                    "missing_vault_chunk_count": verification.missing_vault_chunk_paths.len(),
+                    "model_files_checked": verification.model_files_checked,
+                    "missing_model_count": verification.missing_model_paths.len(),
+                    "database_hash_present": verification.database_sha256.is_some(),
+                    "ok": verification.ok,
+                },
+                "release_readiness": release_readiness,
+                "redaction": {
+                    "redacted_fields": redacted_fields,
+                    "excluded_private_data": [
+                        "media files",
+                        "vault chunks",
+                        "database copy",
+                        "absolute paths",
+                        "file names",
+                        "folder names",
+                        "OCR text",
+                        "face templates",
+                        "embeddings",
+                        "manual tags",
+                        "exact GPS/capture metadata",
+                        "vault keys",
+                        "bearer tokens",
+                        "pairing tokens",
+                        "account hashes"
+                    ]
+                }
+            })
+        };
+        fs::write(
+            &bundle_path,
+            serde_json::to_string_pretty(&bundle)
+                .map_err(|err| ServiceError::Storage(err.to_string()))?,
+        )
+        .map_err(|err| ServiceError::Io(err.to_string()))?;
+
+        Ok(SupportBundleExportResult {
+            exported_at,
+            export_root: export_root.to_string_lossy().to_string(),
+            bundle_path: bundle_path.to_string_lossy().to_string(),
+            sections,
+            redacted_fields,
+            private_data_excluded: true,
+            ok: verification.ok,
+        })
+    }
+
     pub async fn verify_backup(
         &self,
         _request: BackupVerifyRequest,
@@ -5239,6 +5959,7 @@ fn ensure_file_namespace_defaults(state: &mut LibraryState) -> bool {
                     created_at: now,
                     updated_at: now,
                     trashed_at: None,
+                    organization: Default::default(),
                 });
                 changed = true;
             }
@@ -5319,6 +6040,11 @@ fn ensure_file_namespace_defaults(state: &mut LibraryState) -> bool {
                 created_at: asset.imported_at,
                 updated_at: now,
                 trashed_at: None,
+                organization: asset
+                    .metadata
+                    .as_ref()
+                    .map(|metadata| metadata.organization.clone())
+                    .unwrap_or_default(),
             });
             changed = true;
         }
@@ -5345,6 +6071,16 @@ fn build_file_tree_response(
     vault_id: Option<Uuid>,
     include_trashed: bool,
 ) -> VaultFileTreeResponse {
+    let organization_by_asset_id = state
+        .assets
+        .iter()
+        .filter_map(|asset| {
+            asset
+                .metadata
+                .as_ref()
+                .map(|metadata| (asset.id, metadata.organization.clone()))
+        })
+        .collect::<HashMap<_, _>>();
     let mut entries = state
         .file_entries
         .iter()
@@ -5354,7 +6090,15 @@ fn build_file_tree_response(
                 .unwrap_or(true)
         })
         .filter(|entry| include_trashed || entry.trashed_at.is_none())
-        .cloned()
+        .map(|entry| {
+            let mut entry = entry.clone();
+            if let Some(asset_id) = entry.asset_id
+                && let Some(organization) = organization_by_asset_id.get(&asset_id)
+            {
+                entry.organization = organization.clone();
+            }
+            entry
+        })
         .collect::<Vec<_>>();
     entries.sort_by(|left, right| {
         left.vault_id
@@ -5369,10 +6113,32 @@ fn build_file_tree_response(
         .filter(|entry| entry.parent_id.is_none())
         .map(|entry| entry.id)
         .collect::<Vec<_>>();
+    let origin_device_ids = entries
+        .iter()
+        .filter_map(|entry| entry.origin_device_id)
+        .collect::<BTreeSet<_>>();
+    let mut devices = state
+        .devices
+        .iter()
+        .filter(|device| origin_device_ids.contains(&device.id))
+        .map(|device| VaultFileDeviceSummary {
+            id: device.id,
+            display_name: device.display_name.clone(),
+            platform: device.platform.clone(),
+            revoked_at: device.revoked_at,
+        })
+        .collect::<Vec<_>>();
+    devices.sort_by(|left, right| {
+        left.display_name
+            .to_lowercase()
+            .cmp(&right.display_name.to_lowercase())
+            .then(left.id.cmp(&right.id))
+    });
     VaultFileTreeResponse {
         vault_id,
         root_entry_ids,
         entries,
+        devices,
     }
 }
 
@@ -5911,6 +6677,7 @@ fn ensure_mobile_storage_device(
     state: &LibraryState,
     session: &MobileSession,
 ) -> Result<(), ServiceError> {
+    ensure_mobile_can_manage_storage(state, session)?;
     let device = state
         .devices
         .iter()
@@ -6139,6 +6906,10 @@ fn local_device_name(state: &LibraryState) -> Option<String> {
         .map(|device| device.display_name.clone())
 }
 
+fn local_actor(state: &LibraryState) -> (Option<Uuid>, Option<String>) {
+    (local_device_id(state), local_device_name(state))
+}
+
 fn active_mobile_session_from_state(
     state: &mut LibraryState,
     bearer_token: &str,
@@ -6199,6 +6970,174 @@ fn active_mobile_session_from_state(
     state.mobile_sessions[session_index].last_seen_at = Some(now);
     state.devices[device_index].last_seen_at = Some(now);
     Ok(state.mobile_sessions[session_index].clone())
+}
+
+fn mobile_session_role(
+    state: &LibraryState,
+    session: &MobileSession,
+) -> Result<DeviceRole, ServiceError> {
+    state
+        .vault_members
+        .iter()
+        .find(|member| {
+            member.vault_id == session.vault_id
+                && member.device_id == session.device_id
+                && member.revoked_at.is_none()
+        })
+        .map(|member| member.role.clone())
+        .ok_or_else(|| {
+            ServiceError::Invalid("mobile session device is not an active vault member".to_string())
+        })
+}
+
+fn mobile_role_can_browse(role: &DeviceRole) -> bool {
+    matches!(
+        role,
+        DeviceRole::Admin | DeviceRole::Contributor | DeviceRole::Viewer
+    )
+}
+
+fn mobile_role_can_search(role: &DeviceRole) -> bool {
+    mobile_role_can_browse(role)
+}
+
+fn mobile_role_can_download_originals(role: &DeviceRole) -> bool {
+    mobile_role_can_browse(role)
+}
+
+fn mobile_role_can_contribute(role: &DeviceRole) -> bool {
+    matches!(role, DeviceRole::Admin | DeviceRole::Contributor)
+}
+
+fn mobile_role_can_manage_storage(role: &DeviceRole) -> bool {
+    matches!(
+        role,
+        DeviceRole::Admin | DeviceRole::Contributor | DeviceRole::StorageOnly
+    )
+}
+
+fn mobile_role_denied(action: &str, role: &DeviceRole) -> ServiceError {
+    ServiceError::Invalid(format!(
+        "mobile role {} cannot {action}",
+        mobile_role_label(role)
+    ))
+}
+
+fn mobile_role_label(role: &DeviceRole) -> &'static str {
+    match role {
+        DeviceRole::Admin => "admin",
+        DeviceRole::Contributor => "contributor",
+        DeviceRole::Viewer => "viewer",
+        DeviceRole::StorageOnly => "storage-only",
+    }
+}
+
+fn ensure_mobile_can_browse(
+    state: &LibraryState,
+    session: &MobileSession,
+) -> Result<(), ServiceError> {
+    let role = mobile_session_role(state, session)?;
+    if mobile_role_can_browse(&role) {
+        Ok(())
+    } else {
+        Err(mobile_role_denied("browse library content", &role))
+    }
+}
+
+fn ensure_mobile_can_search(
+    state: &LibraryState,
+    session: &MobileSession,
+) -> Result<(), ServiceError> {
+    let role = mobile_session_role(state, session)?;
+    if mobile_role_can_search(&role) {
+        Ok(())
+    } else {
+        Err(mobile_role_denied("search library content", &role))
+    }
+}
+
+fn ensure_mobile_can_download_originals(
+    state: &LibraryState,
+    session: &MobileSession,
+) -> Result<(), ServiceError> {
+    let role = mobile_session_role(state, session)?;
+    if mobile_role_can_download_originals(&role) {
+        Ok(())
+    } else {
+        Err(mobile_role_denied("download originals", &role))
+    }
+}
+
+fn ensure_mobile_can_contribute(
+    state: &LibraryState,
+    session: &MobileSession,
+    action: &str,
+) -> Result<(), ServiceError> {
+    let role = mobile_session_role(state, session)?;
+    if mobile_role_can_contribute(&role) {
+        Ok(())
+    } else {
+        Err(mobile_role_denied(action, &role))
+    }
+}
+
+fn ensure_mobile_can_manage_storage(
+    state: &LibraryState,
+    session: &MobileSession,
+) -> Result<(), ServiceError> {
+    let role = mobile_session_role(state, session)?;
+    if mobile_role_can_manage_storage(&role) {
+        Ok(())
+    } else {
+        Err(mobile_role_denied("contribute encrypted storage", &role))
+    }
+}
+
+fn mobile_workspace_capabilities(
+    role: &DeviceRole,
+    accepts_storage: bool,
+) -> MobileWorkspaceCapabilities {
+    let can_browse = mobile_role_can_browse(role);
+    let can_search = mobile_role_can_search(role);
+    let can_upload = mobile_role_can_contribute(role);
+    let can_download = mobile_role_can_download_originals(role);
+    let can_manage_storage = mobile_role_can_manage_storage(role) && accepts_storage;
+    let role_detail = match role {
+        DeviceRole::Admin => {
+            if accepts_storage {
+                "Admin mobile access can browse, search, upload, download, manage sessions, and contribute encrypted vault chunks."
+            } else {
+                "Admin mobile access can browse, search, upload, download, and manage sessions. Enable storage contribution before this device receives encrypted chunks."
+            }
+        }
+        DeviceRole::Contributor => {
+            if accepts_storage {
+                "Contributor mobile access can browse, search, upload, download, curate tags/favorites, and contribute encrypted vault chunks."
+            } else {
+                "Contributor mobile access can browse, search, upload camera-roll media, download originals, and curate tags/favorites."
+            }
+        }
+        DeviceRole::Viewer => {
+            "Viewer mobile access is read-only: browse, search, and download are allowed; uploads, curation changes, and storage contribution are blocked."
+        }
+        DeviceRole::StorageOnly => {
+            if accepts_storage {
+                "Storage-only mobile access cannot browse or download content; it can receive and prove encrypted vault chunks for protection."
+            } else {
+                "Storage-only mobile access cannot browse or download content. Enable storage contribution before it receives encrypted vault chunks."
+            }
+        }
+    };
+    MobileWorkspaceCapabilities {
+        can_browse_library: can_browse,
+        can_search,
+        can_upload_camera_roll: can_upload,
+        can_download_originals: can_download,
+        can_manage_storage,
+        can_import_desktop_folders: false,
+        can_run_models: false,
+        role_detail: role_detail.to_string(),
+    }
 }
 
 fn new_mobile_bearer_token() -> String {
@@ -7464,6 +8403,57 @@ fn validate_asset_ids(
     Ok(asset_ids)
 }
 
+fn search_query_has_filters(query: &SearchQuery) -> bool {
+    string_filter_present(query.text.as_deref())
+        || string_filter_present(query.people.as_deref())
+        || string_filter_present(query.places.as_deref())
+        || string_filter_present(query.events.as_deref())
+        || string_filter_present(query.workspace.as_deref())
+        || string_filter_present(query.client.as_deref())
+        || string_filter_present(query.project.as_deref())
+        || string_filter_present(query.topic.as_deref())
+        || string_filter_present(query.source_folder.as_deref())
+        || string_filter_present(query.device.as_deref())
+        || string_filter_present(query.media_kind.as_deref())
+        || string_filter_present(query.tags.as_deref())
+        || query.favorite.is_some()
+        || string_filter_present(query.from_date.as_deref())
+        || string_filter_present(query.to_date.as_deref())
+}
+
+fn string_filter_present(value: Option<&str>) -> bool {
+    value.map(str::trim).is_some_and(|value| !value.is_empty())
+}
+
+fn normalize_manual_tags(tags: Vec<String>) -> Result<Vec<String>, ServiceError> {
+    const MAX_TAGS: usize = 50;
+    const MAX_TAG_CHARS: usize = 64;
+
+    let mut normalized = Vec::new();
+    let mut seen = BTreeSet::<String>::new();
+    for raw in tags {
+        let tag = raw.trim();
+        if tag.is_empty() {
+            continue;
+        }
+        if tag.chars().count() > MAX_TAG_CHARS {
+            return Err(ServiceError::Invalid(format!(
+                "manual tag '{tag}' exceeds {MAX_TAG_CHARS} characters"
+            )));
+        }
+        let key = tag.to_lowercase();
+        if seen.insert(key) {
+            normalized.push(tag.to_string());
+        }
+    }
+    if normalized.len() > MAX_TAGS {
+        return Err(ServiceError::Invalid(format!(
+            "manual tags cannot exceed {MAX_TAGS} entries"
+        )));
+    }
+    Ok(normalized)
+}
+
 fn assets_by_ids(
     assets: &[Asset],
     requested_asset_ids: &[Uuid],
@@ -7721,6 +8711,13 @@ fn refresh_import_session_summaries(state: &mut LibraryState, config: &AppConfig
     }
 }
 
+fn enum_label<T: Serialize>(value: &T, fallback: &str) -> String {
+    serde_json::to_value(value)
+        .ok()
+        .and_then(|value| value.as_str().map(ToString::to_string))
+        .unwrap_or_else(|| fallback.to_string())
+}
+
 fn completed_job(kind: JobKind, detail: String) -> JobRecord {
     JobRecord {
         id: Uuid::new_v4(),
@@ -7763,6 +8760,501 @@ fn job_log(job_id: Uuid, level: impl Into<String>, message: impl Into<String>) -
     }
 }
 
+fn build_entitlement_status(
+    cache: Option<&EntitlementCache>,
+    now: chrono::DateTime<Utc>,
+) -> EntitlementStatusResponse {
+    let Some(cache) = cache else {
+        let tier = EntitlementTier::PersonalCore;
+        return EntitlementStatusResponse {
+            tier,
+            effective_status: EntitlementEffectiveStatus::Active,
+            limits: tier.default_limits(),
+            cache: None,
+            offline_grace_active: false,
+            paid_features_available: true,
+            safe_local_access_allowed: true,
+            content_exposure_prevented: true,
+            detail: "Personal core local access is available without sending content or metadata to a billing service.".to_string(),
+        };
+    };
+
+    let active_window = cache
+        .expires_at
+        .as_ref()
+        .map(|expires_at| expires_at > &now)
+        .unwrap_or(true);
+    let cache_is_active = cache.status == EntitlementCacheStatus::Active && active_window;
+    let offline_grace_active = !cache_is_active
+        && cache
+            .offline_grace_expires_at
+            .as_ref()
+            .map(|expires_at| expires_at > &now)
+            .unwrap_or(false);
+    let effective_status = if cache_is_active {
+        EntitlementEffectiveStatus::Active
+    } else if offline_grace_active {
+        EntitlementEffectiveStatus::OfflineGrace
+    } else {
+        match cache.status {
+            EntitlementCacheStatus::Unavailable => EntitlementEffectiveStatus::Unavailable,
+            EntitlementCacheStatus::Active
+            | EntitlementCacheStatus::PastDue
+            | EntitlementCacheStatus::Canceled
+            | EntitlementCacheStatus::Expired => EntitlementEffectiveStatus::Expired,
+        }
+    };
+
+    let paid_features_available = matches!(
+        effective_status,
+        EntitlementEffectiveStatus::Active | EntitlementEffectiveStatus::OfflineGrace
+    );
+    let detail = match effective_status {
+        EntitlementEffectiveStatus::Active => {
+            "Entitlement is active. Checks use only privacy-preserving billing identifiers and coarse limits."
+        }
+        EntitlementEffectiveStatus::OfflineGrace => {
+            "Billing is unavailable or stale, so offline grace is preserving paid features without exposing content."
+        }
+        EntitlementEffectiveStatus::Expired => {
+            "Paid features are outside the entitlement window. Already-local access, export, restore, and revocation remain available."
+        }
+        EntitlementEffectiveStatus::Unavailable => {
+            "Entitlement state is unavailable. Already-local access, export, restore, and revocation remain available."
+        }
+    };
+
+    EntitlementStatusResponse {
+        tier: cache.tier,
+        effective_status,
+        limits: cache.limits.clone(),
+        cache: Some(cache.clone()),
+        offline_grace_active,
+        paid_features_available,
+        safe_local_access_allowed: true,
+        content_exposure_prevented: true,
+        detail: detail.to_string(),
+    }
+}
+
+fn build_platform_release_readiness(
+    now: chrono::DateTime<Utc>,
+) -> PlatformReleaseReadinessResponse {
+    let surfaces = vec![
+        platform_surface(
+            PlatformReleaseSurface::LinuxDesktop,
+            "Linux desktop",
+            PlatformReleaseReadinessStatus::InProgress,
+            "Direct Linux bundle/package",
+            vec![
+                evidence(
+                    "linux_runner",
+                    "Flutter Linux runner",
+                    PlatformReleaseEvidenceStatus::Passed,
+                    "Linux desktop runner exists and is part of the current desktop MVP.",
+                ),
+                evidence(
+                    "linux_release_script",
+                    "Linux release bundle script",
+                    PlatformReleaseEvidenceStatus::Partial,
+                    "A local bundle script exists, but final release still needs immutable artifact, checksum/signing, and smoke evidence.",
+                ),
+                evidence(
+                    "linux_release_smoke",
+                    "Daemon/import/search/vault/backup smoke",
+                    PlatformReleaseEvidenceStatus::Missing,
+                    "Run and record the release-bundle smoke on a clean Linux machine before publishing.",
+                ),
+            ],
+            vec![
+                "Missing signed or checksummed release artifact evidence.",
+                "Missing clean-machine Linux release smoke evidence.",
+            ],
+            "Produce a checksummed Linux bundle from a tag and record daemon startup, import, search, vault, backup, and rollback evidence.",
+        ),
+        platform_surface(
+            PlatformReleaseSurface::WindowsDesktop,
+            "Windows desktop",
+            PlatformReleaseReadinessStatus::InProgress,
+            "Signed Windows installer/package",
+            vec![
+                evidence(
+                    "windows_runner",
+                    "Flutter Windows runner",
+                    PlatformReleaseEvidenceStatus::Passed,
+                    "Windows desktop runner exists.",
+                ),
+                evidence(
+                    "windows_installer",
+                    "Installer/update/uninstall flow",
+                    PlatformReleaseEvidenceStatus::Missing,
+                    "No signed Windows installer, update, uninstall, or rollback evidence is recorded.",
+                ),
+                evidence(
+                    "windows_secure_storage",
+                    "Windows secure-storage validation",
+                    PlatformReleaseEvidenceStatus::Missing,
+                    "Validate key/token storage behavior on Windows before release.",
+                ),
+            ],
+            vec![
+                "Missing signed installer/package.",
+                "Missing Windows secure-storage and lifecycle smoke evidence.",
+            ],
+            "Add a Windows packaging pipeline and run daemon launch, secure storage, import/vault, update, and uninstall smokes.",
+        ),
+        platform_surface(
+            PlatformReleaseSurface::MacosDesktop,
+            "macOS desktop",
+            PlatformReleaseReadinessStatus::InProgress,
+            "Signed and notarized macOS app",
+            vec![
+                evidence(
+                    "macos_runner",
+                    "Flutter macOS runner",
+                    PlatformReleaseEvidenceStatus::Passed,
+                    "macOS desktop runner exists.",
+                ),
+                evidence(
+                    "macos_sign_notarize",
+                    "Signing and notarization",
+                    PlatformReleaseEvidenceStatus::Missing,
+                    "No signing, notarization, Gatekeeper, or rollback evidence is recorded.",
+                ),
+                evidence(
+                    "macos_keychain_privacy",
+                    "Keychain and privacy prompt review",
+                    PlatformReleaseEvidenceStatus::Missing,
+                    "Validate keychain storage and file/media permission prompts before release.",
+                ),
+            ],
+            vec![
+                "Missing signing/notarization pipeline.",
+                "Missing macOS keychain and privacy prompt evidence.",
+            ],
+            "Build a signed/notarized macOS artifact and record keychain, sandbox/privacy prompt, import, vault, update, and rollback evidence.",
+        ),
+        platform_surface(
+            PlatformReleaseSurface::AndroidPlayStore,
+            "Android / Play Store",
+            PlatformReleaseReadinessStatus::InProgress,
+            "Release-signed APK/AAB through Play Store",
+            vec![
+                evidence(
+                    "android_runner",
+                    "Flutter Android runner",
+                    PlatformReleaseEvidenceStatus::Passed,
+                    "Android runner exists with pairing, upload, download, and storage contribution flows.",
+                ),
+                evidence(
+                    "android_smoke_scripts",
+                    "Android API and app smoke scripts",
+                    PlatformReleaseEvidenceStatus::Partial,
+                    "Two-phone API/app smoke scripts exist; release evidence must run them with real devices and signing enabled.",
+                ),
+                evidence(
+                    "play_store_policy",
+                    "Play Store signing and privacy declarations",
+                    PlatformReleaseEvidenceStatus::Missing,
+                    "Release signing, Play declarations, staged rollout, and store privacy evidence are not yet recorded.",
+                ),
+            ],
+            vec![
+                "Missing release-signed APK/AAB evidence.",
+                "Missing Play policy/privacy declaration evidence.",
+                "Native Android chunk transport remains future work.",
+            ],
+            "Run release signing readiness, two-phone pairing/upload/download/storage-node smokes, and prepare Play privacy/staged rollout evidence.",
+        ),
+        platform_surface(
+            PlatformReleaseSurface::IosAppStore,
+            "iOS / App Store",
+            PlatformReleaseReadinessStatus::InProgress,
+            "Signed iOS app through App Store",
+            vec![
+                evidence(
+                    "ios_runner",
+                    "Flutter iOS runner",
+                    PlatformReleaseEvidenceStatus::Passed,
+                    "Flutter iOS runner exists with Private Gallery app identity.",
+                ),
+                evidence(
+                    "ios_permissions",
+                    "iOS media/files permissions and secure storage",
+                    PlatformReleaseEvidenceStatus::Partial,
+                    "iOS camera and photo-library privacy prompts are declared; secure storage, file access, and background transfer behavior still need device tests.",
+                ),
+                evidence(
+                    "app_store_privacy",
+                    "App Store privacy labels and review evidence",
+                    PlatformReleaseEvidenceStatus::Missing,
+                    "App Store signing, privacy labels, and review evidence are not recorded.",
+                ),
+            ],
+            vec![
+                "Missing App Store signing/privacy label evidence.",
+                "Missing iOS secure-storage, file access, and transfer smoke evidence.",
+            ],
+            "Build and sign the iOS target on macOS, then record pairing, upload/download, secure storage, file permission, privacy label, and review evidence.",
+        ),
+        platform_surface(
+            PlatformReleaseSurface::WebBrowser,
+            "Web/browser",
+            PlatformReleaseReadinessStatus::InProgress,
+            "Browser client with no default company-hosted content",
+            vec![
+                evidence(
+                    "web_runner",
+                    "Flutter/web browser target",
+                    PlatformReleaseEvidenceStatus::Passed,
+                    "Flutter web runner exists and builds to build/web.",
+                ),
+                evidence(
+                    "web_privacy_boundary",
+                    "No-content web boundary",
+                    PlatformReleaseEvidenceStatus::Partial,
+                    "Browser client points at a user-supplied trusted device URL and has no default company-hosted content path; auth/session, storage limits, CORS/CSRF, and local-web exposure still need smoke evidence.",
+                ),
+                evidence(
+                    "web_upload_download_smoke",
+                    "Browser upload/download smoke",
+                    PlatformReleaseEvidenceStatus::Missing,
+                    "Browser upload/download behavior is not implemented or tested.",
+                ),
+            ],
+            vec![
+                "Missing browser upload/download smoke evidence.",
+                "Missing browser auth/session, CORS/CSRF, and storage-boundary evidence.",
+            ],
+            "Run browser upload/download, session, storage-limit, CORS/CSRF, and no-hosted-content smokes against the web build.",
+        ),
+        platform_surface(
+            PlatformReleaseSurface::LocalWebUi,
+            "Local web UI",
+            PlatformReleaseReadinessStatus::InProgress,
+            "Browser UI served from a trusted local device",
+            vec![
+                evidence(
+                    "desktop_route_boundary",
+                    "Remote desktop/admin route isolation",
+                    PlatformReleaseEvidenceStatus::Passed,
+                    "Daemon route-boundary tests keep desktop/admin APIs blocked for remote clients while allowing static local-web assets.",
+                ),
+                evidence(
+                    "local_web_serving",
+                    "Trusted-device local web serving",
+                    PlatformReleaseEvidenceStatus::Partial,
+                    "The daemon can serve a built Flutter web bundle from PRIVATE_GALLERY_LOCAL_WEB_ROOT at /local-web; release still needs packaged bundle and browser smoke evidence.",
+                ),
+                evidence(
+                    "tailscale_lan_rules",
+                    "LAN/Tailscale exposure rules",
+                    PlatformReleaseEvidenceStatus::Partial,
+                    "Remote clients may receive /local-web static assets, /health, and paired /mobile/* routes; desktop/admin APIs remain blocked, but final CSRF/CORS and exposure review is still required.",
+                ),
+            ],
+            vec![
+                "Missing packaged local-web bundle smoke evidence.",
+                "Missing CSRF/CORS and browser route-exposure review.",
+            ],
+            "Package the web bundle for local serving, then run browser, CSRF/CORS, and remote route-boundary smokes against /local-web.",
+        ),
+        platform_surface(
+            PlatformReleaseSurface::DirectDesktopDistribution,
+            "Direct desktop distribution",
+            PlatformReleaseReadinessStatus::InProgress,
+            "Direct installers/packages outside app stores",
+            vec![
+                evidence(
+                    "desktop_runners",
+                    "Desktop runners",
+                    PlatformReleaseEvidenceStatus::Passed,
+                    "Linux, Windows, and macOS desktop runners exist.",
+                ),
+                evidence(
+                    "checksums_signing",
+                    "Checksums, signing, and update channel",
+                    PlatformReleaseEvidenceStatus::Missing,
+                    "Release checksums/signing, update strategy, and rollback evidence are not recorded.",
+                ),
+                evidence(
+                    "support_diagnostics",
+                    "Support diagnostics",
+                    PlatformReleaseEvidenceStatus::Passed,
+                    "Redacted local support bundle export exists and excludes content, paths, metadata, keys, tokens, and account hashes.",
+                ),
+            ],
+            vec![
+                "Missing cross-desktop packaging/signing evidence.",
+                "Missing update and rollback path.",
+            ],
+            "Create repeatable desktop packaging jobs with checksums/signing, update/rollback notes, and release-machine support-bundle evidence.",
+        ),
+    ];
+    let ready_surface_count = surfaces
+        .iter()
+        .filter(|surface| surface.status == PlatformReleaseReadinessStatus::Ready)
+        .count();
+    PlatformReleaseReadinessResponse {
+        generated_at: now,
+        overall_status: PlatformReleaseReadinessStatus::InProgress,
+        required_surface_count: surfaces.len(),
+        ready_surface_count,
+        surfaces,
+        detail: "Cross-platform release is not complete until every required surface has repeatable signing, packaging/store, privacy, smoke-test, update, and rollback evidence.".to_string(),
+    }
+}
+
+fn platform_surface(
+    surface: PlatformReleaseSurface,
+    label: &str,
+    status: PlatformReleaseReadinessStatus,
+    distribution: &str,
+    evidence: Vec<PlatformReleaseEvidence>,
+    blockers: Vec<&str>,
+    next_step: &str,
+) -> PlatformReleaseSurfaceReadiness {
+    PlatformReleaseSurfaceReadiness {
+        surface,
+        label: label.to_string(),
+        status,
+        distribution: distribution.to_string(),
+        evidence,
+        blockers: blockers.into_iter().map(ToString::to_string).collect(),
+        next_step: next_step.to_string(),
+    }
+}
+
+fn evidence(
+    key: &str,
+    label: &str,
+    status: PlatformReleaseEvidenceStatus,
+    detail: &str,
+) -> PlatformReleaseEvidence {
+    PlatformReleaseEvidence {
+        key: key.to_string(),
+        label: label.to_string(),
+        status,
+        detail: detail.to_string(),
+    }
+}
+
+fn support_bundle_redacted_fields() -> Vec<String> {
+    [
+        "library_root",
+        "database_path",
+        "source_path",
+        "relative_original_path",
+        "original_filename",
+        "sidecar_title",
+        "sidecar_description",
+        "folder_hint",
+        "manual_tags",
+        "ocr_text",
+        "face_templates",
+        "embeddings",
+        "exact_gps",
+        "captured_at",
+        "vault_keys",
+        "bearer_tokens",
+        "pairing_tokens",
+        "account_id_hash",
+        "device_display_names",
+        "audit_summaries",
+    ]
+    .into_iter()
+    .map(ToString::to_string)
+    .collect()
+}
+
+fn entitlement_cache_detail(status: EntitlementCacheStatus) -> &'static str {
+    match status {
+        EntitlementCacheStatus::Active => "Cached active entitlement; no content metadata stored.",
+        EntitlementCacheStatus::PastDue => {
+            "Cached past-due entitlement; offline grace decides paid feature availability."
+        }
+        EntitlementCacheStatus::Canceled => {
+            "Cached canceled entitlement; safe local access remains available."
+        }
+        EntitlementCacheStatus::Expired => {
+            "Cached expired entitlement; safe local access remains available."
+        }
+        EntitlementCacheStatus::Unavailable => {
+            "Cached unavailable entitlement; safe local access remains available."
+        }
+    }
+}
+
+fn trim_optional_string(raw: Option<&str>) -> Option<String> {
+    raw.map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+fn normalize_public_code(raw: Option<&str>, field: &str) -> Result<Option<String>, ServiceError> {
+    let Some(value) = trim_optional_string(raw) else {
+        return Ok(None);
+    };
+    if value.len() > 80 {
+        return Err(ServiceError::Invalid(format!(
+            "{field} must be 80 characters or fewer"
+        )));
+    }
+    if !value
+        .chars()
+        .all(|value| value.is_ascii_alphanumeric() || matches!(value, '_' | '-' | '.'))
+    {
+        return Err(ServiceError::Invalid(format!(
+            "{field} must use only letters, numbers, dots, dashes, or underscores"
+        )));
+    }
+    Ok(Some(value))
+}
+
+fn normalize_account_id_hash(raw: Option<&str>) -> Result<Option<String>, ServiceError> {
+    let Some(value) = trim_optional_string(raw) else {
+        return Ok(None);
+    };
+    if value.len() < 32 || value.len() > 128 || !value.chars().all(|item| item.is_ascii_hexdigit())
+    {
+        return Err(ServiceError::Invalid(
+            "account_id_hash must be a hash-like hexadecimal identifier and must not contain email, device, file, or path data".to_string(),
+        ));
+    }
+    Ok(Some(value.to_ascii_lowercase()))
+}
+
+fn push_audit_event<Action, TargetKind, Summary>(
+    state: &mut LibraryState,
+    action: Action,
+    target: (TargetKind, Option<Uuid>),
+    actor: (Option<Uuid>, Option<String>),
+    summary: Summary,
+    payload: serde_json::Value,
+) where
+    Action: Into<String>,
+    TargetKind: Into<String>,
+    Summary: Into<String>,
+{
+    state.audit_events.insert(
+        0,
+        AuditEvent {
+            id: Uuid::new_v4(),
+            action: action.into(),
+            target_kind: target.0.into(),
+            target_id: target.1,
+            actor_device_id: actor.0,
+            actor_label: actor.1,
+            summary: summary.into(),
+            payload,
+            created_at: Utc::now(),
+        },
+    );
+    if state.audit_events.len() > 1000 {
+        state.audit_events.truncate(1000);
+    }
+}
+
 fn asset_file_path(asset: &crate::domain::Asset, library_root: &Path) -> PathBuf {
     match asset.import_mode {
         ImportMode::Reference => PathBuf::from(&asset.source_path),
@@ -7789,11 +9281,12 @@ fn attach_extracted_metadata(
     candidate: &crate::domain::ImportCandidate,
     source_path: &Path,
 ) {
-    let extracted = metadata::extract_import_metadata(
+    let mut extracted = metadata::extract_import_metadata(
         source_path,
         &candidate.sidecar_paths,
         candidate.captured_at.unwrap_or(asset.captured_at),
     );
+    extracted.organization = candidate.organization.clone();
     asset.captured_at = extracted.captured_at;
     if asset.place_hint.is_none() {
         asset.place_hint = metadata::coarse_place_label(&extracted);
@@ -8073,25 +9566,30 @@ fn ocr_no_text_marker(asset_id: Uuid, info: &ocr::OcrProviderInfo) -> OcrBlock {
 mod tests {
     use std::{fs, path::PathBuf};
 
-    use chrono::{Datelike, Utc};
+    use chrono::{Datelike, Duration, Utc};
 
     use crate::{
         config::AppConfig,
         domain::{
             AssetAvailabilityState, BlobReplica, CorrectDateRequest, CorrectPlaceRequest,
             CreateAlbumRequest, CreateDeviceRequest, CreateFileFolderRequest,
-            CreateManualPersonRequest, CreatePairingSessionRequest, CreateVaultRequest, DeviceRole,
-            DeviceStorageProfile, DeviceTrustLevel, EncryptionActivationRequest,
-            EnrollDeviceRequest, ImportAssetRequest, ImportMode, ImportSourceKind, MediaKind,
-            MetadataSource, MobilePairRequest, MobileReplicaChunkReport,
-            MobileReplicaReportRequest, MobileStorageProfileUpdateRequest, MobileUploadRequest,
-            MobileUploadStatus, ModelImportRequest, ModelInstallRequest, MoveFileEntryRequest,
-            NetworkPolicy, RebuildRequest, RenameAlbumRequest, RenameFileEntryRequest,
-            ReplicaHealth, RevokeDeviceRequest, RunSyncRequest, ScanImportSourceRequest,
-            SearchQuery, StoragePolicy, StoragePolicyMode, SyncTransfer,
+            CreateManualPersonRequest, CreatePairingSessionRequest, CreateSmartFolderRequest,
+            CreateVaultRequest, DeviceRole, DeviceStorageProfile, DeviceTrustLevel,
+            EncryptionActivationRequest, EnrollDeviceRequest, EntitlementCacheStatus,
+            EntitlementEffectiveStatus, EntitlementLimits, EntitlementRelayPriority,
+            EntitlementTier, FileOrganizationHints, ImportAssetRequest, ImportMode,
+            ImportSourceKind, MediaKind, MetadataSource, MobilePairRequest,
+            MobileReplicaChunkReport, MobileReplicaReportRequest,
+            MobileStorageProfileUpdateRequest, MobileUploadRequest, MobileUploadStatus,
+            ModelImportRequest, ModelInstallRequest, MoveFileEntryRequest, NetworkPolicy,
+            PlatformReleaseEvidenceStatus, PlatformReleaseReadinessStatus, PlatformReleaseSurface,
+            RebuildRequest, RenameAlbumRequest, RenameFileEntryRequest, ReplicaHealth,
+            RevokeDeviceRequest, RunSyncRequest, ScanImportSourceRequest, SearchQuery,
+            StoragePolicy, StoragePolicyMode, SupportBundleExportRequest, SyncTransfer,
             SyncTransferExecutionStatus, SyncTransferStatus, UpdateAlbumAssetsRequest,
-            UpdateAssetFlagsRequest, UpdateAssetsFlagsRequest, UpdateLibrarySettingsRequest,
-            UpdatePersonAssetsRequest, UpdateVaultStoragePolicyRequest, VaultFileKind,
+            UpdateAssetFlagsRequest, UpdateAssetTagsRequest, UpdateAssetsFlagsRequest,
+            UpdateEntitlementCacheRequest, UpdateLibrarySettingsRequest, UpdatePersonAssetsRequest,
+            UpdateVaultStoragePolicyRequest, VaultFileKind,
         },
         imports,
     };
@@ -8108,6 +9606,37 @@ mod tests {
         ));
         fs::create_dir_all(&root).expect("create temp root");
         root
+    }
+
+    async fn set_mobile_member_role(
+        service: &GalleryService,
+        device_id: uuid::Uuid,
+        role: DeviceRole,
+        accepts_storage: bool,
+    ) {
+        let mut state = service.state.write().await;
+        let trust_level = if role == DeviceRole::StorageOnly {
+            DeviceTrustLevel::StorageOnly
+        } else {
+            DeviceTrustLevel::Trusted
+        };
+        let device = state
+            .devices
+            .iter_mut()
+            .find(|device| device.id == device_id)
+            .expect("mobile device");
+        device.trust_level = trust_level;
+        device.storage_profile.accepts_storage = accepts_storage;
+        device.storage_profile.device_id = Some(device_id);
+        for member in state
+            .vault_members
+            .iter_mut()
+            .filter(|member| member.device_id == device_id && member.revoked_at.is_none())
+        {
+            member.role = role.clone();
+            member.trust_level = trust_level;
+        }
+        service.persist_locked_state(&state).expect("persist role");
     }
 
     fn write_green_ppm_with_jpg_name(path: &std::path::Path) {
@@ -8193,6 +9722,241 @@ mod tests {
             .expect("settings should save");
 
         assert_eq!(settings.default_import_mode, ImportMode::Copy);
+    }
+
+    #[tokio::test]
+    async fn entitlement_cache_preserves_core_access_and_offline_grace() {
+        let runtime_root = temp_root("entitlements");
+        let config = AppConfig {
+            runtime_root: runtime_root.clone(),
+            ..AppConfig::default()
+        };
+        let service = GalleryService::new(config.clone()).expect("service");
+
+        let default_status = service.entitlement_status().await;
+        assert_eq!(default_status.tier, EntitlementTier::PersonalCore);
+        assert_eq!(
+            default_status.effective_status,
+            EntitlementEffectiveStatus::Active
+        );
+        assert!(default_status.safe_local_access_allowed);
+        assert!(default_status.content_exposure_prevented);
+        assert!(default_status.cache.is_none());
+
+        let now = Utc::now();
+        let response = service
+            .update_entitlement_cache(UpdateEntitlementCacheRequest {
+                tier: EntitlementTier::FamilyRemote,
+                status: EntitlementCacheStatus::PastDue,
+                account_id_hash: Some(
+                    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string(),
+                ),
+                plan_code: Some("family_remote.monthly".to_string()),
+                limits: Some(EntitlementLimits {
+                    device_limit: 8,
+                    member_limit: 6,
+                    workspace_limit: 2,
+                    monthly_ocr_limit: 5_000,
+                    relay_priority: EntitlementRelayPriority::Standard,
+                    advanced_admin_controls: false,
+                }),
+                checked_at: Some(now - Duration::days(2)),
+                expires_at: Some(now - Duration::days(1)),
+                offline_grace_expires_at: Some(now + Duration::days(14)),
+                source: Some("unit_test".to_string()),
+            })
+            .await
+            .expect("entitlement cache update");
+
+        assert_eq!(response.tier, EntitlementTier::FamilyRemote);
+        assert_eq!(
+            response.effective_status,
+            EntitlementEffectiveStatus::OfflineGrace
+        );
+        assert!(response.offline_grace_active);
+        assert!(response.paid_features_available);
+        assert!(response.safe_local_access_allowed);
+        assert_eq!(response.limits.device_limit, 8);
+
+        let events = service.audit_events(Some(1)).await;
+        assert_eq!(events[0].action, "entitlement.cache.update");
+        assert!(!events[0].payload.to_string().contains("0123456789abcdef"));
+
+        let restarted = GalleryService::new(config).expect("restarted service");
+        let persisted = restarted.entitlement_status().await;
+        assert_eq!(
+            persisted.effective_status,
+            EntitlementEffectiveStatus::OfflineGrace
+        );
+        assert!(persisted.cache.is_some());
+    }
+
+    #[tokio::test]
+    async fn entitlement_cache_rejects_raw_account_identifiers() {
+        let runtime_root = temp_root("entitlement-privacy");
+        let service = GalleryService::new(AppConfig {
+            runtime_root: runtime_root.clone(),
+            ..AppConfig::default()
+        })
+        .expect("service");
+
+        let error = service
+            .update_entitlement_cache(UpdateEntitlementCacheRequest {
+                tier: EntitlementTier::PersonalCore,
+                status: EntitlementCacheStatus::Active,
+                account_id_hash: Some("alex@example.com".to_string()),
+                plan_code: Some("personal_core.monthly".to_string()),
+                limits: None,
+                checked_at: None,
+                expires_at: None,
+                offline_grace_expires_at: None,
+                source: Some("unit_test".to_string()),
+            })
+            .await
+            .expect_err("raw account identifiers must be rejected");
+
+        assert!(error.to_string().contains("account_id_hash"));
+    }
+
+    #[tokio::test]
+    async fn platform_release_readiness_tracks_all_required_surfaces() {
+        let runtime_root = temp_root("platform-release-readiness");
+        let service = GalleryService::new(AppConfig {
+            runtime_root: runtime_root.clone(),
+            ..AppConfig::default()
+        })
+        .expect("service");
+
+        let readiness = service.platform_release_readiness().await;
+        assert_eq!(readiness.required_surface_count, 8);
+        assert_eq!(readiness.surfaces.len(), 8);
+        assert_eq!(
+            readiness.overall_status,
+            PlatformReleaseReadinessStatus::InProgress
+        );
+        assert_eq!(readiness.ready_surface_count, 0);
+
+        let surfaces = readiness
+            .surfaces
+            .iter()
+            .map(|surface| surface.surface)
+            .collect::<Vec<_>>();
+        for required in [
+            PlatformReleaseSurface::LinuxDesktop,
+            PlatformReleaseSurface::WindowsDesktop,
+            PlatformReleaseSurface::MacosDesktop,
+            PlatformReleaseSurface::AndroidPlayStore,
+            PlatformReleaseSurface::IosAppStore,
+            PlatformReleaseSurface::WebBrowser,
+            PlatformReleaseSurface::LocalWebUi,
+            PlatformReleaseSurface::DirectDesktopDistribution,
+        ] {
+            assert!(surfaces.contains(&required), "missing {required:?}");
+        }
+
+        let ios = readiness
+            .surfaces
+            .iter()
+            .find(|surface| surface.surface == PlatformReleaseSurface::IosAppStore)
+            .expect("iOS surface");
+        assert_eq!(ios.status, PlatformReleaseReadinessStatus::InProgress);
+        assert!(
+            ios.evidence.iter().any(|item| item.key == "ios_runner"
+                && item.status == PlatformReleaseEvidenceStatus::Passed)
+        );
+
+        let web = readiness
+            .surfaces
+            .iter()
+            .find(|surface| surface.surface == PlatformReleaseSurface::WebBrowser)
+            .expect("web surface");
+        assert_eq!(web.status, PlatformReleaseReadinessStatus::InProgress);
+        assert!(
+            web.evidence.iter().any(|item| item.key == "web_runner"
+                && item.status == PlatformReleaseEvidenceStatus::Passed)
+        );
+        assert!(web.next_step.contains("browser upload/download"));
+
+        let local_web = readiness
+            .surfaces
+            .iter()
+            .find(|surface| surface.surface == PlatformReleaseSurface::LocalWebUi)
+            .expect("local web surface");
+        assert_eq!(local_web.status, PlatformReleaseReadinessStatus::InProgress);
+        assert!(
+            local_web
+                .evidence
+                .iter()
+                .any(|item| item.key == "desktop_route_boundary"
+                    && item.status == PlatformReleaseEvidenceStatus::Passed)
+        );
+    }
+
+    #[tokio::test]
+    async fn support_bundle_exports_redacted_local_diagnostics() {
+        let runtime_root = temp_root("support-bundle");
+        let sensitive_library_root = runtime_root.join("library-alex-private-tax-photos");
+        let support_root = runtime_root.join("support-export");
+        let account_hash =
+            "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789".to_string();
+        let service = GalleryService::new(AppConfig {
+            runtime_root: runtime_root.clone(),
+            ..AppConfig::default()
+        })
+        .expect("service");
+        service
+            .update_library_settings(UpdateLibrarySettingsRequest {
+                library_root: sensitive_library_root.to_string_lossy().to_string(),
+                default_import_mode: ImportMode::Copy,
+                original_storage_policy: None,
+            })
+            .await
+            .expect("settings");
+        service
+            .update_entitlement_cache(UpdateEntitlementCacheRequest {
+                tier: EntitlementTier::FamilyRemote,
+                status: EntitlementCacheStatus::Active,
+                account_id_hash: Some(account_hash.clone()),
+                plan_code: Some("family_remote.monthly".to_string()),
+                limits: None,
+                checked_at: None,
+                expires_at: None,
+                offline_grace_expires_at: None,
+                source: Some("unit_test".to_string()),
+            })
+            .await
+            .expect("entitlement");
+
+        let result = service
+            .export_support_bundle(SupportBundleExportRequest {
+                export_root: support_root.to_string_lossy().to_string(),
+                include_release_readiness: true,
+            })
+            .await
+            .expect("support bundle");
+
+        assert!(result.private_data_excluded);
+        assert!(
+            result
+                .redacted_fields
+                .iter()
+                .any(|field| field == "account_id_hash")
+        );
+        assert!(result.sections.iter().any(|section| section == "redaction"));
+
+        let bundle_text = fs::read_to_string(&result.bundle_path).expect("bundle text");
+        assert!(!bundle_text.contains(&account_hash));
+        assert!(!bundle_text.contains(sensitive_library_root.to_string_lossy().as_ref()));
+        assert!(!bundle_text.contains("library-alex-private-tax-photos"));
+        assert!(!bundle_text.contains("\"database_path\":"));
+        assert!(bundle_text.contains("private_data_excluded"));
+        assert!(bundle_text.contains("account_identifier_redacted"));
+        assert!(bundle_text.contains("release_readiness"));
+
+        let bundle: serde_json::Value = serde_json::from_str(&bundle_text).expect("bundle json");
+        assert_eq!(bundle["private_data_excluded"], true);
+        assert_eq!(bundle["entitlements"]["account_identifier_redacted"], true);
+        assert!(bundle["backup_health"]["missing_asset_count"].is_number());
     }
 
     #[tokio::test]
@@ -8285,6 +10049,23 @@ mod tests {
             .expect("receive duplicate");
         assert_eq!(duplicate.asset_id, Some(asset_id));
 
+        let mobile_tree = service
+            .mobile_file_tree(&paired.bearer_token, false)
+            .await
+            .expect("mobile file tree");
+        let uploaded_file = mobile_tree
+            .entries
+            .iter()
+            .find(|entry| entry.asset_id == Some(asset_id))
+            .expect("uploaded file entry");
+        assert_eq!(uploaded_file.origin_device_id, Some(paired.device.id));
+        assert!(
+            mobile_tree
+                .devices
+                .iter()
+                .any(|device| { device.id == paired.device.id && device.display_name == "Moto G" })
+        );
+
         let assets = service
             .mobile_assets(&paired.bearer_token)
             .await
@@ -8315,7 +10096,14 @@ mod tests {
                     people: None,
                     places: None,
                     events: None,
+                    workspace: None,
+                    client: None,
+                    project: None,
+                    topic: None,
+                    source_folder: None,
+                    device: None,
                     media_kind: None,
+                    tags: None,
                     favorite: None,
                     from_date: None,
                     to_date: None,
@@ -8327,6 +10115,34 @@ mod tests {
             .expect("mobile search");
         assert_eq!(search.assets.len(), 1);
         assert_eq!(search.assets[0].id, asset_id);
+
+        let device_search = service
+            .mobile_search(
+                &paired.bearer_token,
+                SearchQuery {
+                    text: None,
+                    people: None,
+                    places: None,
+                    events: None,
+                    workspace: None,
+                    client: None,
+                    project: None,
+                    topic: None,
+                    source_folder: None,
+                    device: Some("Moto".to_string()),
+                    media_kind: None,
+                    tags: None,
+                    favorite: None,
+                    from_date: None,
+                    to_date: None,
+                    include_archived: false,
+                    limit: Some(10),
+                },
+            )
+            .await
+            .expect("mobile device search");
+        assert_eq!(device_search.assets.len(), 1);
+        assert_eq!(device_search.assets[0].id, asset_id);
 
         let availability = service
             .mobile_asset_availability(&paired.bearer_token, asset_id)
@@ -8488,7 +10304,14 @@ mod tests {
                     people: None,
                     places: None,
                     events: None,
+                    workspace: None,
+                    client: None,
+                    project: None,
+                    topic: None,
+                    source_folder: None,
+                    device: None,
                     media_kind: Some("documents".to_string()),
+                    tags: None,
                     favorite: None,
                     from_date: None,
                     to_date: None,
@@ -8515,6 +10338,192 @@ mod tests {
             .expect("range download");
         assert_eq!(range.mime_type, "application/pdf");
         assert_eq!(range.bytes, b"%PDF-1.7");
+    }
+
+    #[tokio::test]
+    async fn mobile_roles_enforce_viewer_contributor_and_storage_only_boundaries() {
+        let runtime_root = temp_root("mobile-role-boundaries");
+        let library_root = runtime_root.join("library");
+        let source = runtime_root.join("desktop-photo.jpg");
+        let original_bytes = b"desktop imported family photo".to_vec();
+        fs::write(&source, &original_bytes).expect("write source");
+        let service = GalleryService::new(AppConfig {
+            runtime_root,
+            ..AppConfig::default()
+        })
+        .expect("service");
+        service
+            .update_library_settings(UpdateLibrarySettingsRequest {
+                library_root: library_root.to_string_lossy().to_string(),
+                default_import_mode: ImportMode::Copy,
+                original_storage_policy: None,
+            })
+            .await
+            .expect("settings");
+        let imported = service
+            .import_asset(ImportAssetRequest {
+                source_path: source.to_string_lossy().to_string(),
+                original_filename: "desktop-photo.jpg".to_string(),
+                media_kind: MediaKind::Photo,
+                mime_type: "image/jpeg".to_string(),
+                bytes: original_bytes.len() as u64,
+                content_hash: Some(sha256_hex_bytes(&original_bytes)),
+                captured_at: Some(Utc::now()),
+                place_hint: None,
+                import_mode: Some(ImportMode::Copy),
+            })
+            .await
+            .expect("desktop import");
+        let pairing = service
+            .create_pairing_session(CreatePairingSessionRequest {
+                device_name: "Role phone".to_string(),
+                platform: "android".to_string(),
+                vault_id: None,
+            })
+            .await
+            .expect("pairing");
+        let paired = service
+            .pair_mobile_device(MobilePairRequest {
+                pairing_token: pairing.pairing_token,
+                device_name: "Role phone".to_string(),
+                platform: "android".to_string(),
+                vault_id: None,
+                storage_profile: Some(DeviceStorageProfile {
+                    device_id: None,
+                    total_bytes: Some(64 * 1024 * 1024 * 1024),
+                    available_bytes: Some(32 * 1024 * 1024 * 1024),
+                    reserved_bytes: 1024 * 1024,
+                    accepts_storage: true,
+                    battery_powered: true,
+                    metered_network: false,
+                    low_battery: false,
+                }),
+            })
+            .await
+            .expect("pair phone");
+
+        set_mobile_member_role(&service, paired.device.id, DeviceRole::Viewer, true).await;
+        let viewer_workspace = service
+            .mobile_workspace(&paired.bearer_token)
+            .await
+            .expect("viewer workspace");
+        assert!(viewer_workspace.capabilities.can_browse_library);
+        assert!(viewer_workspace.capabilities.can_search);
+        assert!(viewer_workspace.capabilities.can_download_originals);
+        assert!(!viewer_workspace.capabilities.can_upload_camera_roll);
+        assert!(!viewer_workspace.capabilities.can_manage_storage);
+        assert!(
+            viewer_workspace
+                .capabilities
+                .role_detail
+                .contains("read-only")
+        );
+        assert_eq!(viewer_workspace.timeline.total_assets, 1);
+        service
+            .mobile_original_bytes(&paired.bearer_token, imported.asset.id)
+            .await
+            .expect("viewer download");
+        assert!(
+            service
+                .reserve_mobile_upload(
+                    &paired.bearer_token,
+                    MobileUploadRequest {
+                        original_filename: "viewer-upload.jpg".to_string(),
+                        media_kind: MediaKind::Photo,
+                        mime_type: "image/jpeg".to_string(),
+                        bytes: 1,
+                        content_hash: None,
+                        captured_at: None,
+                        place_hint: None,
+                    },
+                )
+                .await
+                .is_err(),
+            "viewer role must not upload originals"
+        );
+        assert!(
+            service
+                .update_mobile_asset_tags(
+                    &paired.bearer_token,
+                    imported.asset.id,
+                    UpdateAssetTagsRequest {
+                        tags: vec!["viewer".to_string()],
+                    },
+                )
+                .await
+                .is_err(),
+            "viewer role must not curate tags"
+        );
+        assert!(
+            service
+                .update_mobile_storage_profile(
+                    &paired.bearer_token,
+                    MobileStorageProfileUpdateRequest {
+                        storage_profile: DeviceStorageProfile {
+                            device_id: None,
+                            total_bytes: None,
+                            available_bytes: None,
+                            reserved_bytes: 0,
+                            accepts_storage: true,
+                            battery_powered: true,
+                            metered_network: false,
+                            low_battery: false,
+                        },
+                    },
+                )
+                .await
+                .is_err(),
+            "viewer role must not become a storage node without an admin role change"
+        );
+        let viewer_storage_plan = service
+            .mobile_storage_plan(&paired.bearer_token)
+            .await
+            .expect("viewer storage plan");
+        assert!(viewer_storage_plan.assignments.is_empty());
+        assert!(viewer_storage_plan.detail.contains("viewer role"));
+
+        set_mobile_member_role(&service, paired.device.id, DeviceRole::StorageOnly, true).await;
+        let storage_workspace = service
+            .mobile_workspace(&paired.bearer_token)
+            .await
+            .expect("storage-only workspace");
+        assert!(!storage_workspace.capabilities.can_browse_library);
+        assert!(!storage_workspace.capabilities.can_search);
+        assert!(!storage_workspace.capabilities.can_upload_camera_roll);
+        assert!(!storage_workspace.capabilities.can_download_originals);
+        assert!(storage_workspace.capabilities.can_manage_storage);
+        assert_eq!(storage_workspace.timeline.total_assets, 0);
+        assert!(
+            service.mobile_assets(&paired.bearer_token).await.is_err(),
+            "storage-only role must not list content"
+        );
+        assert!(
+            service
+                .mobile_original_bytes(&paired.bearer_token, imported.asset.id)
+                .await
+                .is_err(),
+            "storage-only role must not download originals"
+        );
+        let storage_plan = service
+            .mobile_storage_plan(&paired.bearer_token)
+            .await
+            .expect("storage-only plan");
+        assert_eq!(storage_plan.assignments.len(), 1);
+        let assignment = storage_plan.assignments[0].clone();
+        let chunk = assignment.chunks[0].clone();
+        let encrypted_chunk = service
+            .mobile_replica_chunk_bytes(&paired.bearer_token, assignment.blob_id, chunk.chunk_index)
+            .await
+            .expect("storage-only encrypted chunk");
+        assert_eq!(sha256_hex_bytes(&encrypted_chunk), chunk.encrypted_hash);
+
+        set_mobile_member_role(&service, paired.device.id, DeviceRole::Contributor, false).await;
+        let contributor_workspace = service
+            .mobile_workspace(&paired.bearer_token)
+            .await
+            .expect("contributor workspace");
+        assert!(contributor_workspace.capabilities.can_upload_camera_roll);
+        assert!(!contributor_workspace.capabilities.can_manage_storage);
     }
 
     #[tokio::test]
@@ -8790,7 +10799,7 @@ mod tests {
     async fn vault_file_namespace_manages_folders_trash_and_mobile_listing() {
         let runtime_root = temp_root("vault-file-namespace");
         let library_root = runtime_root.join("library");
-        let source_dir = runtime_root.join("source");
+        let source_dir = runtime_root.join("project-renewal");
         fs::create_dir_all(&source_dir).expect("source dir");
         let document_path = source_dir.join("report.pdf");
         let bytes = b"%PDF-1.7 private gallery file namespace".to_vec();
@@ -8846,6 +10855,15 @@ mod tests {
             file.content_hash.as_deref(),
             Some(imported.asset.content_hash.as_str())
         );
+        assert_eq!(file.organization.project.as_deref(), Some("renewal"));
+        let file_origin_device_id = file.origin_device_id.expect("file origin device");
+        let origin_device = tree
+            .devices
+            .iter()
+            .find(|device| device.id == file_origin_device_id)
+            .expect("file tree origin device summary");
+        assert!(!origin_device.display_name.trim().is_empty());
+        assert!(!origin_device.platform.trim().is_empty());
 
         let folder = service
             .create_file_folder(CreateFileFolderRequest {
@@ -8982,6 +11000,15 @@ mod tests {
                 .count(),
             1,
             "startup backfill must not duplicate asset file entries"
+        );
+        let reopened_file = reopened_tree
+            .entries
+            .iter()
+            .find(|entry| entry.asset_id == Some(asset_id))
+            .expect("reopened asset file");
+        assert_eq!(
+            reopened_file.organization.project.as_deref(),
+            Some("renewal")
         );
     }
 
@@ -9222,6 +11249,99 @@ mod tests {
             .expect("pair mobile");
 
         assert_eq!(paired.session.vault_id, vault.id);
+    }
+
+    #[tokio::test]
+    async fn audit_events_track_admin_actions_and_persist_locally() {
+        let runtime_root = temp_root("admin-audit-events");
+        let library_root = runtime_root.join("library");
+        let config = AppConfig {
+            runtime_root,
+            ..AppConfig::default()
+        };
+        let service = GalleryService::new(config.clone()).expect("service");
+        service
+            .update_library_settings(UpdateLibrarySettingsRequest {
+                library_root: library_root.to_string_lossy().to_string(),
+                default_import_mode: ImportMode::Copy,
+                original_storage_policy: None,
+            })
+            .await
+            .expect("settings");
+        let vault = service
+            .create_vault(CreateVaultRequest {
+                id: None,
+                name: "Family group".to_string(),
+                storage_policy: None,
+            })
+            .await
+            .expect("vault");
+        let pairing = service
+            .create_pairing_session(CreatePairingSessionRequest {
+                device_name: "Phone".to_string(),
+                platform: "android".to_string(),
+                vault_id: Some(vault.id),
+            })
+            .await
+            .expect("pairing");
+        let paired = service
+            .pair_mobile_device(MobilePairRequest {
+                pairing_token: pairing.pairing_token.clone(),
+                device_name: "Phone".to_string(),
+                platform: "android".to_string(),
+                vault_id: Some(vault.id),
+                storage_profile: None,
+            })
+            .await
+            .expect("pair mobile");
+        let storage_device = service
+            .create_device(CreateDeviceRequest {
+                display_name: "NAS".to_string(),
+                platform: "linux".to_string(),
+                public_key: Some("nas-audit-key".to_string()),
+                trust_level: Some(DeviceTrustLevel::StorageOnly),
+                role: Some(DeviceRole::StorageOnly),
+                storage_profile: None,
+            })
+            .await
+            .expect("device");
+        service
+            .revoke_device(
+                storage_device.id,
+                RevokeDeviceRequest {
+                    reason: Some("lost".to_string()),
+                },
+            )
+            .await
+            .expect("revoke");
+
+        let events = service.audit_events(None).await;
+        let actions = events
+            .iter()
+            .map(|event| event.action.as_str())
+            .collect::<Vec<_>>();
+        assert!(actions.contains(&"vault.create"));
+        assert!(actions.contains(&"pairing.create"));
+        assert!(actions.contains(&"device.mobile_pair"));
+        assert!(actions.contains(&"device.create"));
+        assert!(actions.contains(&"device.revoke"));
+        assert!(
+            events
+                .iter()
+                .any(|event| event.actor_label.as_deref() == Some("Phone"))
+        );
+        let serialized_events = serde_json::to_string(&events).expect("serialize events");
+        assert!(!serialized_events.contains(&pairing.pairing_token));
+        assert!(!serialized_events.contains(&paired.bearer_token));
+
+        let restarted = GalleryService::new(config).expect("restart");
+        let persisted = restarted.audit_events(Some(3)).await;
+        assert_eq!(persisted.len(), 3);
+        assert!(
+            persisted
+                .iter()
+                .any(|event| event.action == "device.revoke")
+        );
     }
 
     #[tokio::test]
@@ -10369,6 +12489,122 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn manual_tags_persist_and_search_locally() {
+        let runtime_root = temp_root("manual-tags");
+        let library_root = runtime_root.join("library");
+        let source_root = runtime_root.join("source");
+        fs::create_dir_all(&source_root).expect("source dir");
+        let invoice_path = source_root.join("invoice.pdf");
+        fs::write(&invoice_path, b"invoice-bytes").expect("write file");
+
+        let service = GalleryService::new(AppConfig {
+            runtime_root: runtime_root.clone(),
+            ..AppConfig::default()
+        })
+        .expect("service");
+
+        service
+            .update_library_settings(UpdateLibrarySettingsRequest {
+                library_root: library_root.to_string_lossy().to_string(),
+                default_import_mode: ImportMode::Reference,
+                original_storage_policy: None,
+            })
+            .await
+            .expect("settings");
+
+        let imported = service
+            .import_asset(ImportAssetRequest {
+                source_path: invoice_path.to_string_lossy().to_string(),
+                original_filename: "invoice.pdf".to_string(),
+                media_kind: MediaKind::Document,
+                mime_type: "application/pdf".to_string(),
+                bytes: 13,
+                content_hash: Some(sha256_hex_bytes(b"invoice-bytes")),
+                captured_at: Some(Utc::now()),
+                place_hint: None,
+                import_mode: Some(ImportMode::Reference),
+            })
+            .await
+            .expect("import invoice");
+
+        let tagged = service
+            .update_asset_tags(
+                imported.asset.id,
+                UpdateAssetTagsRequest {
+                    tags: vec![
+                        " invoice ".to_string(),
+                        "Client Acme".to_string(),
+                        "invoice".to_string(),
+                    ],
+                },
+            )
+            .await
+            .expect("update tags");
+        assert_eq!(tagged.manual_tags, vec!["invoice", "Client Acme"]);
+
+        let tag_result = service
+            .search(SearchQuery {
+                text: None,
+                people: None,
+                places: None,
+                events: None,
+                workspace: None,
+                client: None,
+                project: None,
+                topic: None,
+                source_folder: None,
+                device: None,
+                media_kind: Some("documents".to_string()),
+                tags: Some("invoice, acme".to_string()),
+                favorite: None,
+                from_date: None,
+                to_date: None,
+                include_archived: false,
+                limit: None,
+            })
+            .await;
+        assert_eq!(tag_result.assets.len(), 1);
+        assert_eq!(tag_result.assets[0].id, imported.asset.id);
+
+        let text_result = service
+            .search(SearchQuery {
+                text: Some("acme".to_string()),
+                people: None,
+                places: None,
+                events: None,
+                workspace: None,
+                client: None,
+                project: None,
+                topic: None,
+                source_folder: None,
+                device: None,
+                media_kind: None,
+                tags: None,
+                favorite: None,
+                from_date: None,
+                to_date: None,
+                include_archived: false,
+                limit: None,
+            })
+            .await;
+        assert_eq!(text_result.assets.len(), 1);
+
+        let restarted = GalleryService::new(AppConfig {
+            runtime_root,
+            ..AppConfig::default()
+        })
+        .expect("restarted service");
+        let visible = restarted.timeline().await;
+        let restarted_asset = visible
+            .buckets
+            .iter()
+            .flat_map(|bucket| bucket.assets.iter())
+            .find(|asset| asset.id == imported.asset.id)
+            .expect("restarted tagged asset");
+        assert_eq!(restarted_asset.manual_tags, vec!["invoice", "Client Acme"]);
+    }
+
+    #[tokio::test]
     async fn manual_albums_persist_and_manage_membership_without_touching_files() {
         let runtime_root = temp_root("manual-albums");
         let library_root = runtime_root.join("library");
@@ -10482,6 +12718,118 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn smart_folders_persist_and_run_local_search_filters() {
+        let runtime_root = temp_root("smart-folders");
+        let library_root = runtime_root.join("library");
+        let source_root = runtime_root.join("source");
+        fs::create_dir_all(&source_root).expect("source dir");
+        let proposal_path = source_root.join("proposal.pdf");
+        fs::write(&proposal_path, b"private proposal").expect("write proposal");
+
+        let service = GalleryService::new(AppConfig {
+            runtime_root: runtime_root.clone(),
+            ..AppConfig::default()
+        })
+        .expect("service");
+
+        service
+            .update_library_settings(UpdateLibrarySettingsRequest {
+                library_root: library_root.to_string_lossy().to_string(),
+                default_import_mode: ImportMode::Reference,
+                original_storage_policy: None,
+            })
+            .await
+            .expect("settings");
+
+        let imported = service
+            .import_asset(ImportAssetRequest {
+                source_path: proposal_path.to_string_lossy().to_string(),
+                original_filename: "proposal.pdf".to_string(),
+                media_kind: MediaKind::Document,
+                mime_type: "application/pdf".to_string(),
+                bytes: 16,
+                content_hash: Some(sha256_hex_bytes(b"private proposal")),
+                captured_at: Some(Utc::now()),
+                place_hint: None,
+                import_mode: Some(ImportMode::Reference),
+            })
+            .await
+            .expect("import proposal");
+
+        {
+            let mut state = service.state.write().await;
+            let asset = state
+                .assets
+                .iter_mut()
+                .find(|asset| asset.id == imported.asset.id)
+                .expect("asset");
+            let metadata = asset.metadata.as_mut().expect("metadata");
+            metadata.folder_hint = Some("Project Launch".to_string());
+            metadata.organization = FileOrganizationHints {
+                source_folder: Some("Project Launch".to_string()),
+                workspace: Some("Office".to_string()),
+                client: Some("Client Acme".to_string()),
+                project: Some("Project Launch".to_string()),
+                topic: Some("Reports".to_string()),
+                path_segments: vec![
+                    "Office".to_string(),
+                    "Client Acme".to_string(),
+                    "Project Launch".to_string(),
+                ],
+            };
+            service.persist_locked_state(&state).expect("persist hints");
+        }
+
+        let folder = service
+            .create_smart_folder(CreateSmartFolderRequest {
+                title: "Acme launch reports".to_string(),
+                query: SearchQuery {
+                    text: None,
+                    people: None,
+                    places: None,
+                    events: None,
+                    workspace: Some("office".to_string()),
+                    client: Some("acme".to_string()),
+                    project: Some("launch".to_string()),
+                    topic: Some("reports".to_string()),
+                    source_folder: Some("project launch".to_string()),
+                    device: None,
+                    media_kind: Some("documents".to_string()),
+                    tags: None,
+                    favorite: None,
+                    from_date: None,
+                    to_date: None,
+                    include_archived: false,
+                    limit: None,
+                },
+            })
+            .await
+            .expect("create smart folder");
+
+        let result = service
+            .run_smart_folder(folder.id)
+            .await
+            .expect("run smart folder");
+        assert_eq!(result.assets.len(), 1);
+        assert_eq!(result.assets[0].id, imported.asset.id);
+
+        let restarted = GalleryService::new(AppConfig {
+            runtime_root,
+            ..AppConfig::default()
+        })
+        .expect("restarted service");
+        let folders = restarted.smart_folders().await;
+        assert_eq!(folders.len(), 1);
+        assert_eq!(folders[0].title, "Acme launch reports");
+        let restarted_result = restarted
+            .run_smart_folder(folders[0].id)
+            .await
+            .expect("run restarted smart folder");
+        assert_eq!(restarted_result.assets.len(), 1);
+        assert_eq!(restarted_result.assets[0].id, imported.asset.id);
+    }
+
+    #[tokio::test]
     async fn dedupes_copy_imports_after_first_commit() {
         let runtime_root = temp_root("dedupe");
         let library_root = runtime_root.join("library");
@@ -10533,6 +12881,81 @@ mod tests {
             .expect("second scan");
 
         assert!(second.candidates[0].duplicate_asset_id.is_some());
+    }
+
+    #[tokio::test]
+    async fn duplicate_review_summarizes_committed_skipped_imports() {
+        let runtime_root = temp_root("duplicate-review");
+        let library_root = runtime_root.join("library");
+        let first_source = runtime_root.join("first-source");
+        let second_source = runtime_root.join("second-source");
+        fs::create_dir_all(&first_source).expect("first source dir");
+        fs::create_dir_all(&second_source).expect("second source dir");
+        let bytes = b"same-private-file-bytes";
+        fs::write(first_source.join("a.jpg"), bytes).expect("write first");
+        fs::write(second_source.join("b.jpg"), bytes).expect("write duplicate");
+
+        let service = GalleryService::new(AppConfig {
+            runtime_root: runtime_root.clone(),
+            ..AppConfig::default()
+        })
+        .expect("service");
+
+        service
+            .update_library_settings(UpdateLibrarySettingsRequest {
+                library_root: library_root.to_string_lossy().to_string(),
+                default_import_mode: ImportMode::Copy,
+                original_storage_policy: None,
+            })
+            .await
+            .expect("settings");
+
+        let first = service
+            .scan_import_source(ScanImportSourceRequest {
+                source_path: first_source.to_string_lossy().to_string(),
+                source_kind: ImportSourceKind::Folder,
+                recursive: false,
+                import_mode: Some(ImportMode::Copy),
+                add_as_watch_folder: false,
+                place_hint: None,
+            })
+            .await
+            .expect("first scan");
+        let first = service
+            .commit_import_session(first.id, vec![], Some(ImportMode::Copy), None)
+            .await
+            .expect("first commit");
+        let original_asset_id = first.imported_asset_ids[0];
+
+        let duplicate = service
+            .scan_import_source(ScanImportSourceRequest {
+                source_path: second_source.to_string_lossy().to_string(),
+                source_kind: ImportSourceKind::Folder,
+                recursive: false,
+                import_mode: Some(ImportMode::Copy),
+                add_as_watch_folder: false,
+                place_hint: None,
+            })
+            .await
+            .expect("duplicate scan");
+        service
+            .commit_import_session(duplicate.id, vec![], Some(ImportMode::Copy), None)
+            .await
+            .expect("duplicate commit");
+
+        let summary = service.duplicate_review_summary().await;
+
+        assert_eq!(summary.duplicate_assets, 1);
+        assert_eq!(summary.duplicate_candidates, 1);
+        assert_eq!(summary.sessions_with_duplicates, 1);
+        assert_eq!(summary.protected_bytes, bytes.len() as u64);
+        assert!(summary.privacy_detail.contains("source paths"));
+        let entry = summary.entries.first().expect("duplicate entry");
+        assert_eq!(entry.asset_id, original_asset_id);
+        assert_eq!(entry.media_kind, MediaKind::Photo);
+        assert_eq!(entry.original_bytes, bytes.len() as u64);
+        assert_eq!(entry.protected_bytes, bytes.len() as u64);
+        assert_eq!(entry.source_kinds, vec!["folder".to_string()]);
     }
 
     #[tokio::test]
@@ -11322,7 +13745,14 @@ mod tests {
                 people: None,
                 places: None,
                 events: None,
+                workspace: None,
+                client: None,
+                project: None,
+                topic: None,
+                source_folder: None,
+                device: None,
                 media_kind: None,
+                tags: None,
                 favorite: None,
                 from_date: None,
                 to_date: None,
@@ -11345,7 +13775,14 @@ mod tests {
                 people: None,
                 places: None,
                 events: None,
+                workspace: None,
+                client: None,
+                project: None,
+                topic: None,
+                source_folder: None,
+                device: None,
                 media_kind: None,
+                tags: None,
                 favorite: None,
                 from_date: None,
                 to_date: None,
@@ -11583,7 +14020,14 @@ mod tests {
                 people: None,
                 places: None,
                 events: None,
+                workspace: None,
+                client: None,
+                project: None,
+                topic: None,
+                source_folder: None,
+                device: None,
                 media_kind: None,
+                tags: None,
                 favorite: None,
                 from_date: None,
                 to_date: None,
@@ -11601,7 +14045,14 @@ mod tests {
                 people: None,
                 places: None,
                 events: None,
+                workspace: None,
+                client: None,
+                project: None,
+                topic: None,
+                source_folder: None,
+                device: None,
                 media_kind: None,
+                tags: None,
                 favorite: None,
                 from_date: None,
                 to_date: None,
@@ -11825,7 +14276,14 @@ mod tests {
                 people: None,
                 places: None,
                 events: None,
+                workspace: None,
+                client: None,
+                project: None,
+                topic: None,
+                source_folder: None,
+                device: None,
                 media_kind: None,
+                tags: None,
                 favorite: None,
                 from_date: None,
                 to_date: None,

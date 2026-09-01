@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:private_gallery_app/src/app/private_gallery_app.dart';
+import 'package:private_gallery_app/src/features/media/media_viewer.dart';
 import 'package:private_gallery_app/src/features/mobile/mobile_gallery_panel.dart';
 import 'package:private_gallery_app/src/features/mobile/mobile_media_viewer.dart';
 import 'package:private_gallery_app/src/features/mobile/mobile_pairing_screen.dart';
@@ -106,6 +107,7 @@ void main() {
     WidgetTester tester,
   ) async {
     var searches = 0;
+    SearchQuery? lastQuery;
     await tester.pumpWidget(
       MaterialApp(
         home: Scaffold(
@@ -115,11 +117,13 @@ void main() {
                 workspace: _workspace(),
                 loading: false,
                 busy: false,
+                fileTree: _fileTree(),
                 onRefresh: () {},
                 onUploadNewestItem: () {},
                 onCheckSession: () {},
                 onSearch: (query) async {
                   searches += 1;
+                  lastQuery = query;
                   return SearchResponse.fromJson(_searchJson());
                 },
               ),
@@ -132,17 +136,51 @@ void main() {
     expect(find.text('Family group'), findsOneWidget);
     expect(find.text('family.jpg'), findsWidgets);
 
+    await tester.tap(find.widgetWithText(NavigationDestination, 'Files'));
+    await tester.pumpAndSettle();
+    expect(find.text('launch-plan.pdf'), findsOneWidget);
+    expect(find.textContaining('from Office laptop (linux)'), findsOneWidget);
+    expect(find.textContaining('Workspace: Office'), findsOneWidget);
+
     await tester.tap(find.widgetWithText(NavigationDestination, 'Devices'));
     await tester.pumpAndSettle();
     expect(find.text('Not seen on LAN'), findsWidgets);
 
     await tester.tap(find.widgetWithText(NavigationDestination, 'Search'));
     await tester.pumpAndSettle();
-    await tester.enterText(find.byType(TextField).last, 'family');
-    await tester.tap(find.widgetWithIcon(IconButton, Icons.search));
+    await tester.enterText(
+      find.widgetWithText(TextField, 'Search this group'),
+      'family',
+    );
+    await tester.enterText(
+      find.widgetWithText(TextField, 'Workspace'),
+      'Office',
+    );
+    await tester.enterText(find.widgetWithText(TextField, 'Client'), 'Acme');
+    await tester.enterText(find.widgetWithText(TextField, 'Project'), 'Launch');
+    await tester.enterText(find.widgetWithText(TextField, 'Topic'), 'Reports');
+    await tester.enterText(
+      find.widgetWithText(TextField, 'Source folder'),
+      'Project Launch',
+    );
+    await tester.enterText(
+      find.widgetWithText(TextField, 'Device'),
+      'Office laptop',
+    );
+    await tester.enterText(find.widgetWithText(TextField, 'Tags'), 'invoice');
+    await tester.tap(find.widgetWithText(FilterChip, 'Documents'));
     await tester.pumpAndSettle();
 
     expect(searches, 1);
+    expect(lastQuery?.text, 'family');
+    expect(lastQuery?.workspace, 'Office');
+    expect(lastQuery?.client, 'Acme');
+    expect(lastQuery?.project, 'Launch');
+    expect(lastQuery?.topic, 'Reports');
+    expect(lastQuery?.sourceFolder, 'Project Launch');
+    expect(lastQuery?.device, 'Office laptop');
+    expect(lastQuery?.tags, 'invoice');
+    expect(lastQuery?.mediaKind, 'document');
     expect(find.text('family.jpg'), findsOneWidget);
   });
 
@@ -213,6 +251,174 @@ void main() {
           .onPressed,
       null,
     );
+  });
+
+  testWidgets('mobile media viewer shows group availability details', (
+    WidgetTester tester,
+  ) async {
+    tester.view.physicalSize = const Size(1200, 1200);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(() {
+      tester.view.resetPhysicalSize();
+      tester.view.resetDevicePixelRatio();
+    });
+
+    var fetches = 0;
+    final asset = _mobileAsset(available: false);
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: MobileMediaViewer.group(
+          asset: asset,
+          loadOriginalFile: () async => throw StateError('not available'),
+          saveOriginal: () async => throw StateError('not available'),
+          loadAvailability: () async {
+            fetches += 1;
+            return _availability(
+              state: AssetAvailabilityState.underReplicated,
+              localReplica: false,
+              offlineReplicaDeviceIds: const ['desktop-1'],
+              replicaCount: 1,
+              requiredReplicaCount: 2,
+              detail:
+                  'only 1/2 required replicas are healthy; desktop is offline',
+            );
+          },
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    expect(fetches, 1);
+    await tester.tap(find.byIcon(Icons.info_outline).first);
+    await tester.pumpAndSettle();
+
+    expect(find.text('Availability'), findsOneWidget);
+    expect(find.text('Under-replicated'), findsOneWidget);
+    expect(find.text('1/2 replicas'), findsOneWidget);
+    expect(find.text('1 offline'), findsOneWidget);
+    expect(find.textContaining('desktop is offline'), findsOneWidget);
+  });
+
+  testWidgets('media viewer displays and edits manual tags', (
+    WidgetTester tester,
+  ) async {
+    tester.view.physicalSize = const Size(1200, 1200);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(() {
+      tester.view.resetPhysicalSize();
+      tester.view.resetDevicePixelRatio();
+    });
+
+    var edited = 0;
+    final asset = Asset.fromJson(
+      _assetJson()..['manual_tags'] = ['invoice', 'client'],
+    );
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: MediaViewer(asset: asset, onEditTags: () => edited += 1),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    expect(find.text('TAGS'), findsOneWidget);
+    expect(find.text('invoice, client'), findsOneWidget);
+
+    final editTags = find.widgetWithText(OutlinedButton, 'Edit tags');
+    await tester.ensureVisible(editTags);
+    await tester.tap(editTags);
+    await tester.pump();
+
+    expect(edited, 1);
+  });
+
+  testWidgets('media viewer exposes local availability pin and eviction', (
+    WidgetTester tester,
+  ) async {
+    tester.view.physicalSize = const Size(1200, 1200);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(() {
+      tester.view.resetPhysicalSize();
+      tester.view.resetDevicePixelRatio();
+    });
+
+    final asset = Asset.fromJson(_assetJson());
+    var fetches = 0;
+    var pins = 0;
+    var evictions = 0;
+    var availability = _availability(
+      state: AssetAvailabilityState.underReplicated,
+      localReplica: true,
+      replicaCount: 1,
+      requiredReplicaCount: 2,
+      detail:
+          'original opens locally, but only 1/2 required replicas are healthy',
+    );
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: MediaViewer(
+            asset: asset,
+            loadAvailability: (_) async {
+              fetches += 1;
+              return availability;
+            },
+            evictLocalAsset: (_) async {
+              evictions += 1;
+              availability = _availability(
+                state: AssetAvailabilityState.remoteAvailable,
+                localReplica: false,
+                reachableReplicaDeviceIds: const ['storage-1'],
+                replicaCount: 2,
+                requiredReplicaCount: 2,
+                detail: 'original is stored on another reachable device',
+              );
+              return availability;
+            },
+            pinLocalAsset: (_) async {
+              pins += 1;
+              availability = _availability(
+                state: AssetAvailabilityState.transferPending,
+                localReplica: false,
+                reachableReplicaDeviceIds: const ['storage-1'],
+                replicaCount: 2,
+                requiredReplicaCount: 2,
+                detail: 'a local pin or replica transfer is pending',
+              );
+              return availability;
+            },
+          ),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    expect(fetches, 1);
+    expect(find.text('Availability'), findsOneWidget);
+    expect(find.text('Under-replicated'), findsOneWidget);
+    expect(find.text('1/2 replicas'), findsOneWidget);
+    expect(find.textContaining('only 1/2 required replicas'), findsOneWidget);
+
+    final evict = find.widgetWithText(OutlinedButton, 'Evict local');
+    await tester.ensureVisible(evict);
+    await tester.tap(evict);
+    await tester.pumpAndSettle();
+
+    expect(evictions, 1);
+    expect(find.text('Remote reachable'), findsOneWidget);
+    expect(find.text('2/2 replicas'), findsOneWidget);
+
+    final pin = find.widgetWithText(FilledButton, 'Pin local');
+    await tester.ensureVisible(pin);
+    await tester.tap(pin);
+    await tester.pumpAndSettle();
+
+    expect(pins, 1);
+    expect(find.text('Transfer pending'), findsOneWidget);
   });
 }
 
@@ -369,9 +575,76 @@ Map<String, Object?> _assetJson() {
     'imported_at': '2026-05-13T06:00:01Z',
     'archived': false,
     'favorite': false,
+    'manual_tags': [],
     'place_hint': null,
     'variants': [],
   };
+}
+
+AssetAvailability _availability({
+  required AssetAvailabilityState state,
+  required bool localReplica,
+  required int replicaCount,
+  required int requiredReplicaCount,
+  required String detail,
+  List<String> reachableReplicaDeviceIds = const [],
+  List<String> offlineReplicaDeviceIds = const [],
+}) {
+  return AssetAvailability(
+    assetId: 'asset-1',
+    vaultId: 'vault-1',
+    state: state,
+    localReplica: localReplica,
+    reachableReplicaDeviceIds: reachableReplicaDeviceIds,
+    offlineReplicaDeviceIds: offlineReplicaDeviceIds,
+    replicaCount: replicaCount,
+    requiredReplicaCount: requiredReplicaCount,
+    detail: detail,
+  );
+}
+
+VaultFileTreeResponse _fileTree() {
+  return VaultFileTreeResponse.fromJson({
+    'vault_id': 'vault-1',
+    'root_entry_ids': ['root-1'],
+    'entries': [
+      {
+        'id': 'root-1',
+        'vault_id': 'vault-1',
+        'name': 'Family vault',
+        'kind': 'folder',
+        'bytes': 0,
+        'created_at': '2026-05-13T06:00:00Z',
+        'updated_at': '2026-05-13T06:00:00Z',
+      },
+      {
+        'id': 'file-1',
+        'vault_id': 'vault-1',
+        'parent_id': 'root-1',
+        'asset_id': 'asset-file-1',
+        'name': 'launch-plan.pdf',
+        'kind': 'file',
+        'media_kind': 'document',
+        'mime_type': 'application/pdf',
+        'bytes': 8192,
+        'content_hash': 'file-hash-1',
+        'origin_device_id': 'desktop-1',
+        'created_at': '2026-05-13T06:01:00Z',
+        'updated_at': '2026-05-13T06:01:00Z',
+        'organization': {
+          'source_folder': 'Project Launch',
+          'workspace': 'Office',
+          'client': 'Acme',
+          'project': 'Launch',
+          'topic': 'Reports',
+          'path_segments': ['Office', 'Acme', 'Launch'],
+        },
+      },
+    ],
+    'devices': [
+      {'id': 'desktop-1', 'display_name': 'Office laptop', 'platform': 'linux'},
+    ],
+  });
 }
 
 Map<String, Object?> _deviceJson() {

@@ -3,46 +3,48 @@ import 'package:flutter/material.dart';
 class AppColors {
   const AppColors._();
 
-  static const ink = Color(0xFF111827);
+  static const ink = Color(0xFF151A23);
   static const slate = Color(0xFF334155);
-  static const muted = Color(0xFF64748B);
-  static const canvas = Color(0xFFFCF8FA);
+  static const muted = Color(0xFF667085);
+  static const canvas = Color(0xFFF5F7F5);
   static const panel = Color(0xFFFFFFFF);
-  static const panelMuted = Color(0xFFF6F3F5);
-  static const border = Color(0xFFC6C6CD);
-  static const navy = Color(0xFF0F172A);
-  static const active = Color(0xFF0F766E);
-  static const warning = Color(0xFFF59E0B);
+  static const panelMuted = Color(0xFFEDF2F4);
+  static const border = Color(0xFFCBD5E1);
+  static const navy = Color(0xFF172033);
+  static const active = Color(0xFF08736A);
+  static const info = Color(0xFF2563EB);
+  static const warning = Color(0xFFB7791F);
   static const danger = Color(0xFFBA1A1A);
 }
 
 ThemeData buildAppTheme() {
-  final seed = ColorScheme.fromSeed(
-    seedColor: AppColors.navy,
-    brightness: Brightness.light,
-  ).copyWith(
-    primary: AppColors.navy,
-    onPrimary: Colors.white,
-    primaryContainer: const Color(0xFFDAE2FD),
-    onPrimaryContainer: AppColors.navy,
-    secondary: AppColors.slate,
-    onSecondary: Colors.white,
-    secondaryContainer: const Color(0xFFD5E3FD),
-    onSecondaryContainer: const Color(0xFF0D1C2F),
-    tertiary: AppColors.active,
-    onTertiary: Colors.white,
-    error: AppColors.danger,
-    surface: AppColors.canvas,
-    surfaceContainerLowest: AppColors.panel,
-    surfaceContainerLow: AppColors.panelMuted,
-    surfaceContainer: const Color(0xFFF0EDEF),
-    surfaceContainerHigh: const Color(0xFFEAE7E9),
-    surfaceContainerHighest: const Color(0xFFE4E2E4),
-    onSurface: AppColors.ink,
-    onSurfaceVariant: const Color(0xFF45464D),
-    outline: const Color(0xFF76777D),
-    outlineVariant: AppColors.border,
-  );
+  final seed =
+      ColorScheme.fromSeed(
+        seedColor: AppColors.navy,
+        brightness: Brightness.light,
+      ).copyWith(
+        primary: AppColors.navy,
+        onPrimary: Colors.white,
+        primaryContainer: const Color(0xFFDAE2FD),
+        onPrimaryContainer: AppColors.navy,
+        secondary: AppColors.slate,
+        onSecondary: Colors.white,
+        secondaryContainer: const Color(0xFFD7E4F2),
+        onSecondaryContainer: const Color(0xFF0D1C2F),
+        tertiary: AppColors.active,
+        onTertiary: Colors.white,
+        error: AppColors.danger,
+        surface: AppColors.canvas,
+        surfaceContainerLowest: AppColors.panel,
+        surfaceContainerLow: AppColors.panelMuted,
+        surfaceContainer: const Color(0xFFE9EFF1),
+        surfaceContainerHigh: const Color(0xFFE1E8EB),
+        surfaceContainerHighest: const Color(0xFFD8E0E4),
+        onSurface: AppColors.ink,
+        onSurfaceVariant: const Color(0xFF475467),
+        outline: const Color(0xFF76777D),
+        outlineVariant: AppColors.border,
+      );
 
   return ThemeData(
     colorScheme: seed,
@@ -56,6 +58,7 @@ ThemeData buildAppTheme() {
       scrolledUnderElevation: 0,
       backgroundColor: AppColors.canvas,
       foregroundColor: AppColors.ink,
+      surfaceTintColor: Colors.transparent,
       titleTextStyle: TextStyle(
         color: AppColors.ink,
         fontSize: 20,
@@ -68,6 +71,9 @@ ThemeData buildAppTheme() {
       backgroundColor: AppColors.panel,
       labelType: NavigationRailLabelType.none,
       minExtendedWidth: 220,
+      indicatorShape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(8),
+      ),
       unselectedLabelTextStyle: const TextStyle(color: AppColors.muted),
       selectedLabelTextStyle: const TextStyle(
         color: AppColors.ink,
@@ -77,6 +83,7 @@ ThemeData buildAppTheme() {
     navigationBarTheme: NavigationBarThemeData(
       backgroundColor: AppColors.panel,
       indicatorColor: seed.primaryContainer,
+      surfaceTintColor: Colors.transparent,
       labelTextStyle: WidgetStateProperty.resolveWith((states) {
         final selected = states.contains(WidgetState.selected);
         return TextStyle(
@@ -89,9 +96,7 @@ ThemeData buildAppTheme() {
     inputDecorationTheme: InputDecorationTheme(
       filled: true,
       fillColor: AppColors.panel,
-      border: OutlineInputBorder(
-        borderRadius: BorderRadius.circular(8),
-      ),
+      border: OutlineInputBorder(borderRadius: BorderRadius.circular(8)),
       enabledBorder: OutlineInputBorder(
         borderRadius: BorderRadius.circular(8),
         borderSide: const BorderSide(color: AppColors.border),
@@ -131,7 +136,7 @@ ThemeData buildAppTheme() {
       color: AppColors.panel,
       surfaceTintColor: Colors.transparent,
       shape: RoundedRectangleBorder(
-        borderRadius: BorderRadius.circular(12),
+        borderRadius: BorderRadius.circular(8),
         side: const BorderSide(color: AppColors.border),
       ),
       margin: EdgeInsets.zero,

@@ -4,10 +4,30 @@
 
 - Confirm there are no committed local env files, service credentials, bearer tokens, pairing tokens, signing keys, runtime databases, or media exports.
 - Confirm every exposed credential from local workspace files has been rotated at its provider.
+- Confirm the release scope and completion evidence against [platform-release-and-entitlements.md](platform-release-and-entitlements.md).
 - Run Rust checks: `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`, and `cargo test`.
 - Run Flutter checks from `app/`: `flutter analyze` and `flutter test`.
 - Run secret scanning and dependency audit in CI.
 - Generate or refresh an SBOM artifact from CI.
+
+## Platform And Store Completion
+
+- Linux desktop release has a signed or checksummed bundle/package, daemon startup smoke, import/search/vault/backup smoke, and rollback instructions.
+- Windows desktop release has a signed installer/package, daemon launch smoke, Windows secure-storage validation, import/vault smoke, and update/uninstall behavior.
+- macOS desktop release is signed/notarized where required, validates keychain storage, reviews sandbox/privacy prompts, and passes import/vault smoke.
+- Android Play Store release has a release-signed APK/AAB, Play policy/privacy declarations, staged rollout plan, and mobile pairing/upload/download/storage-node/revocation evidence.
+- iOS App Store release has signing, privacy disclosures, permission review, secure-storage validation, and pairing/upload/download behavior designed within iOS platform limits.
+- Web/browser release has a privacy-compatible boundary, no default company-hosted content, auth/session review, browser storage review, and upload/download smoke.
+- Local web UI release is served from a trusted device, keeps desktop/admin routes isolated, passes CORS/CSRF review, and has LAN/Tailscale exposure rules.
+- Direct desktop installers/packages include checksums, signing where available, update strategy, rollback path, and support diagnostics.
+
+## Subscription And Entitlements
+
+- Lowest paid tier remains genuinely usable: local cloud, device group, LAN sync, organization, search, and backup.
+- Entitlement checks cover device count, family/workspace limits, relay priority, OCR/intelligence scale, storage-policy features, and admin controls.
+- Existing local libraries keep safe offline grace when billing checks are unavailable.
+- Billing identifiers and support flows exclude private content, file names, OCR text, face data, exact metadata, vault keys, bearer tokens, and pairing tokens.
+- Business/workspace features include roles, permissions, audit logs, support boundaries, and admin reporting before business launch.
 
 ## Functional Smoke
 

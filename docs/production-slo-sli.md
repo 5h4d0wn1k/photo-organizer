@@ -5,21 +5,28 @@
 Private Gallery is local-first, so production reliability is measured through
 local runtime signals, release smokes, job records, and user-consented support
 evidence instead of hosted telemetry. Do not add analytics, crash reporting, or
-remote diagnostics that send media, thumbnails, OCR text, embeddings, face data,
-pairing tokens, bearer tokens, vault keys, or precise metadata off-device.
+remote diagnostics that send files, media, thumbnails, OCR text, embeddings, face
+data, project/client metadata, pairing tokens, bearer tokens, vault keys, or
+precise metadata off-device.
 
 ## Critical User Journeys
 
 - Open the desktop app and connect to the local daemon.
 - Initialize or open an encrypted local library.
-- Import media without duplicates or unintended plaintext managed originals.
-- Browse timeline, jobs, places, events, search, and vault status from live API
-  data.
-- Pair an Android phone through Tailscale/HTTPS or an explicitly enabled LAN
-  development URL.
+- Import media and general files without duplicates or unintended plaintext
+  managed originals.
+- Browse timeline, files, jobs, places, events, search, and vault status from
+  live API data.
+- Pair mobile/desktop/storage devices through Tailscale/HTTPS, private networks,
+  or an explicitly enabled LAN development URL.
 - Upload and download originals through authenticated `/mobile/*` routes.
 - Revoke sessions and devices.
 - Verify backup readiness and stage restore into a separate root.
+- Release scoped surfaces for Windows, Linux, macOS, Android/Play Store,
+  iOS/App Store, web/browser access, local web UI, and direct installers with
+  platform-specific evidence.
+- Enforce subscription entitlements without exposing content or breaking safe
+  offline local use.
 
 ## Service Level Objectives
 
@@ -32,6 +39,8 @@ pairing tokens, bearer tokens, vault keys, or precise metadata off-device.
 | Mobile sync correctness | 99% of paired upload/download attempts succeed when the daemon is reachable and the session is valid. | Two-phone smoke, user support reports. | Pair/upload/download/range hash/revocation failures block mobile release. |
 | Backup and restore readiness | 100% of release fixture backups verify and restore only into a staging root. | Release drill. | In-place overwrite or unverifiable backup blocks release. |
 | Token and key secrecy | 100% of logs, docs, artifacts, and support bundles exclude secrets and raw tokens. | Secret scan, manual review, support sampling. | Any exposure blocks release until rotated and remediated. |
+| Platform release evidence | 100% of in-scope platform releases have signing/package/store/privacy/test evidence recorded. | Release checklist and owner signoff. | Missing evidence blocks that platform release. |
+| Entitlement privacy | 100% of billing and entitlement checks avoid content, file names, OCR text, face data, exact metadata, keys, and tokens. | Code review, release checks, support-bundle review. | Any content-coupled billing path blocks paid launch. |
 
 ## Service Level Indicators
 
@@ -44,6 +53,8 @@ Track these locally during release smokes and from user-provided diagnostics:
 - `import_commit_success`: import commit job reaches success state.
 - `import_checksum_verified`: asset checksum matches the imported payload.
 - `vault_chunk_verified`: encrypted chunk hash verification passes.
+- `file_organization_available`: file tree, tags/folders, search, and correction
+  workflows load from live local API data.
 - `mobile_pair_success`: phone receives a valid session through one-time pairing.
 - `mobile_upload_complete_success`: chunked upload completes with expected size
   and optional SHA-256 hash.
@@ -53,6 +64,10 @@ Track these locally during release smokes and from user-provided diagnostics:
 - `backup_verify_success`: backup verify reports required database, original,
   vault chunk, and model-file availability.
 - `restore_staged_success`: restore run writes only to the selected staging root.
+- `platform_release_evidence_complete`: release-scoped platform evidence is
+  present in the checklist/runbook.
+- `entitlement_content_exposure_absent`: subscription checks and support bundles
+  exclude private content and metadata.
 
 ## Error Budget Policy
 
@@ -61,9 +76,13 @@ Treat the following as zero-budget reliability or security failures:
 - Remote access to desktop control routes.
 - Uploading media, thumbnails, OCR text, embeddings, vault keys, bearer tokens,
   pairing tokens, or precise metadata to hosted services by default.
+- Uploading files, project/client metadata, workspace content, billing-linked
+  content identifiers, or local search history to hosted services by default.
 - Data loss, silent corruption, or restore over the active library.
 - Secret material in release artifacts or support bundles.
 - Inability to revoke a mobile session or device.
+- Paid entitlement behavior that blocks already-local safe use during temporary
+  billing connectivity loss.
 
 For ordinary app defects, spend the error budget only when the issue has a clear
 workaround, does not risk private data, and does not affect import, backup,
@@ -99,6 +118,10 @@ come from release checks, support reports, and maintainer-run probes.
 - Review SLOs before every public release.
 - Re-run the mobile SLO gates when Android pairing, upload, download, auth, or
   networking changes.
+- Re-run platform release gates when Windows, macOS, iOS, web, local-web,
+  installers, signing, stores, or update flows change.
+- Re-run entitlement gates when subscription tiers, billing, workspace limits,
+  relay priority, support bundles, or audit logs change.
 - Re-run backup and restore gates when storage, vault, schema, encryption, import,
   or backup code changes.
 - Tighten objectives only after enough release evidence exists to support them.

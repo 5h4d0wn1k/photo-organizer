@@ -20,12 +20,9 @@ class AppSurface extends StatelessWidget {
       decoration: BoxDecoration(
         color: color ?? Theme.of(context).colorScheme.surfaceContainerLowest,
         border: Border.all(color: Theme.of(context).colorScheme.outlineVariant),
-        borderRadius: BorderRadius.circular(12),
+        borderRadius: BorderRadius.circular(8),
       ),
-      child: Padding(
-        padding: padding,
-        child: child,
-      ),
+      child: Padding(padding: padding, child: child),
     );
   }
 }
@@ -59,10 +56,7 @@ class AppSectionHeader extends StatelessWidget {
             ],
           ),
         ),
-        if (trailing != null) ...[
-          const SizedBox(width: 12),
-          trailing!,
-        ],
+        if (trailing != null) ...[const SizedBox(width: 12), trailing!],
       ],
     );
   }
@@ -122,7 +116,7 @@ class AppStatusBadge extends StatelessWidget {
       AppStatusTone.success => AppColors.active,
       AppStatusTone.warning => AppColors.warning,
       AppStatusTone.danger => AppColors.danger,
-      AppStatusTone.info => Theme.of(context).colorScheme.primary,
+      AppStatusTone.info => AppColors.info,
       AppStatusTone.neutral => AppColors.muted,
     };
     return DecoratedBox(
@@ -136,15 +130,18 @@ class AppStatusBadge extends StatelessWidget {
         child: Row(
           mainAxisSize: MainAxisSize.min,
           children: [
-            Icon(icon ?? Icons.circle,
-                size: icon == null ? 7 : 14, color: color),
+            Icon(
+              icon ?? Icons.circle,
+              size: icon == null ? 7 : 14,
+              color: color,
+            ),
             const SizedBox(width: 6),
             Text(
               label,
               style: Theme.of(context).textTheme.labelSmall?.copyWith(
-                    color: color,
-                    fontWeight: FontWeight.w800,
-                  ),
+                color: color,
+                fontWeight: FontWeight.w800,
+              ),
             ),
           ],
         ),
@@ -153,13 +150,7 @@ class AppStatusBadge extends StatelessWidget {
   }
 }
 
-enum AppStatusTone {
-  neutral,
-  info,
-  success,
-  warning,
-  danger,
-}
+enum AppStatusTone { neutral, info, success, warning, danger }
 
 class AppMetadataRow extends StatelessWidget {
   const AppMetadataRow({
@@ -184,10 +175,7 @@ class AppMetadataRow extends StatelessWidget {
         children: [
           SizedBox(
             width: 132,
-            child: Text(
-              label.toUpperCase(),
-              style: theme.textTheme.labelSmall,
-            ),
+            child: Text(label.toUpperCase(), style: theme.textTheme.labelSmall),
           ),
           Expanded(
             child: selectable
@@ -229,10 +217,7 @@ class AppNotice extends StatelessWidget {
                 Text(title, style: Theme.of(context).textTheme.titleMedium),
                 const SizedBox(height: 4),
                 Text(message),
-                if (action != null) ...[
-                  const SizedBox(height: 12),
-                  action!,
-                ],
+                if (action != null) ...[const SizedBox(height: 12), action!],
               ],
             ),
           ),

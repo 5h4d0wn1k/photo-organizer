@@ -6,6 +6,60 @@ enum ImportMode { copy, reference, move }
 
 enum VaultFileKind { folder, file }
 
+class FileOrganizationHints {
+  const FileOrganizationHints({
+    this.sourceFolder,
+    this.workspace,
+    this.client,
+    this.project,
+    this.topic,
+    this.pathSegments = const [],
+  });
+
+  final String? sourceFolder;
+  final String? workspace;
+  final String? client;
+  final String? project;
+  final String? topic;
+  final List<String> pathSegments;
+
+  bool get hasAny {
+    return sourceFolder != null ||
+        workspace != null ||
+        client != null ||
+        project != null ||
+        topic != null ||
+        pathSegments.isNotEmpty;
+  }
+
+  String get summary {
+    final parts = <String>[
+      if (workspace != null) 'Workspace: $workspace',
+      if (client != null) 'Client: $client',
+      if (project != null) 'Project: $project',
+      if (topic != null && topic != project) 'Topic: $topic',
+      if (sourceFolder != null && sourceFolder != project)
+        'Folder: $sourceFolder',
+    ];
+    return parts.join(' • ');
+  }
+
+  factory FileOrganizationHints.fromJson(Object? json) {
+    if (json is! Map) {
+      return const FileOrganizationHints();
+    }
+    final mapped = json.map((key, value) => MapEntry(key.toString(), value));
+    return FileOrganizationHints(
+      sourceFolder: mapped['source_folder'] as String?,
+      workspace: mapped['workspace'] as String?,
+      client: mapped['client'] as String?,
+      project: mapped['project'] as String?,
+      topic: mapped['topic'] as String?,
+      pathSegments: _readStringList(mapped['path_segments']),
+    );
+  }
+}
+
 extension VaultFileKindX on VaultFileKind {
   String get wireValue {
     switch (this) {
@@ -655,6 +709,566 @@ class PrivacyStatus {
   }
 }
 
+enum EntitlementTier { personalCore, familyRemote, powerWorkspace, business }
+
+extension EntitlementTierX on EntitlementTier {
+  String get wireValue {
+    switch (this) {
+      case EntitlementTier.familyRemote:
+        return 'family_remote';
+      case EntitlementTier.powerWorkspace:
+        return 'power_workspace';
+      case EntitlementTier.business:
+        return 'business';
+      case EntitlementTier.personalCore:
+        return 'personal_core';
+    }
+  }
+
+  String get label {
+    switch (this) {
+      case EntitlementTier.familyRemote:
+        return 'Family remote';
+      case EntitlementTier.powerWorkspace:
+        return 'Power workspace';
+      case EntitlementTier.business:
+        return 'Business';
+      case EntitlementTier.personalCore:
+        return 'Personal core';
+    }
+  }
+
+  EntitlementLimits get defaultLimits {
+    switch (this) {
+      case EntitlementTier.familyRemote:
+        return const EntitlementLimits(
+          deviceLimit: 8,
+          memberLimit: 6,
+          workspaceLimit: 2,
+          monthlyOcrLimit: 5000,
+          relayPriority: EntitlementRelayPriority.standard,
+          advancedAdminControls: false,
+        );
+      case EntitlementTier.powerWorkspace:
+        return const EntitlementLimits(
+          deviceLimit: 20,
+          memberLimit: 12,
+          workspaceLimit: 5,
+          monthlyOcrLimit: 20000,
+          relayPriority: EntitlementRelayPriority.priority,
+          advancedAdminControls: true,
+        );
+      case EntitlementTier.business:
+        return const EntitlementLimits(
+          deviceLimit: 100,
+          memberLimit: 100,
+          workspaceLimit: 25,
+          monthlyOcrLimit: 100000,
+          relayPriority: EntitlementRelayPriority.priority,
+          advancedAdminControls: true,
+        );
+      case EntitlementTier.personalCore:
+        return const EntitlementLimits(
+          deviceLimit: 3,
+          memberLimit: 1,
+          workspaceLimit: 1,
+          monthlyOcrLimit: 1000,
+          relayPriority: EntitlementRelayPriority.none,
+          advancedAdminControls: false,
+        );
+    }
+  }
+
+  static EntitlementTier fromJson(String? value) {
+    switch (value) {
+      case 'family_remote':
+        return EntitlementTier.familyRemote;
+      case 'power_workspace':
+        return EntitlementTier.powerWorkspace;
+      case 'business':
+        return EntitlementTier.business;
+      case 'personal_core':
+      default:
+        return EntitlementTier.personalCore;
+    }
+  }
+}
+
+enum EntitlementRelayPriority { none, standard, priority }
+
+extension EntitlementRelayPriorityX on EntitlementRelayPriority {
+  String get label {
+    switch (this) {
+      case EntitlementRelayPriority.standard:
+        return 'Standard relay';
+      case EntitlementRelayPriority.priority:
+        return 'Priority relay';
+      case EntitlementRelayPriority.none:
+        return 'No relay';
+    }
+  }
+
+  static EntitlementRelayPriority fromJson(String? value) {
+    switch (value) {
+      case 'standard':
+        return EntitlementRelayPriority.standard;
+      case 'priority':
+        return EntitlementRelayPriority.priority;
+      case 'none':
+      default:
+        return EntitlementRelayPriority.none;
+    }
+  }
+}
+
+enum EntitlementCacheStatus { active, pastDue, canceled, expired, unavailable }
+
+extension EntitlementCacheStatusX on EntitlementCacheStatus {
+  String get label {
+    switch (this) {
+      case EntitlementCacheStatus.active:
+        return 'Active';
+      case EntitlementCacheStatus.pastDue:
+        return 'Past due';
+      case EntitlementCacheStatus.canceled:
+        return 'Canceled';
+      case EntitlementCacheStatus.expired:
+        return 'Expired';
+      case EntitlementCacheStatus.unavailable:
+        return 'Unavailable';
+    }
+  }
+
+  static EntitlementCacheStatus fromJson(String? value) {
+    switch (value) {
+      case 'past_due':
+        return EntitlementCacheStatus.pastDue;
+      case 'canceled':
+        return EntitlementCacheStatus.canceled;
+      case 'expired':
+        return EntitlementCacheStatus.expired;
+      case 'unavailable':
+        return EntitlementCacheStatus.unavailable;
+      case 'active':
+      default:
+        return EntitlementCacheStatus.active;
+    }
+  }
+}
+
+enum EntitlementEffectiveStatus { active, offlineGrace, expired, unavailable }
+
+extension EntitlementEffectiveStatusX on EntitlementEffectiveStatus {
+  String get label {
+    switch (this) {
+      case EntitlementEffectiveStatus.offlineGrace:
+        return 'Offline grace';
+      case EntitlementEffectiveStatus.expired:
+        return 'Expired';
+      case EntitlementEffectiveStatus.unavailable:
+        return 'Unavailable';
+      case EntitlementEffectiveStatus.active:
+        return 'Active';
+    }
+  }
+
+  static EntitlementEffectiveStatus fromJson(String? value) {
+    switch (value) {
+      case 'offline_grace':
+        return EntitlementEffectiveStatus.offlineGrace;
+      case 'expired':
+        return EntitlementEffectiveStatus.expired;
+      case 'unavailable':
+        return EntitlementEffectiveStatus.unavailable;
+      case 'active':
+      default:
+        return EntitlementEffectiveStatus.active;
+    }
+  }
+}
+
+class EntitlementLimits {
+  const EntitlementLimits({
+    required this.deviceLimit,
+    required this.memberLimit,
+    required this.workspaceLimit,
+    required this.monthlyOcrLimit,
+    required this.relayPriority,
+    required this.advancedAdminControls,
+  });
+
+  final int deviceLimit;
+  final int memberLimit;
+  final int workspaceLimit;
+  final int monthlyOcrLimit;
+  final EntitlementRelayPriority relayPriority;
+  final bool advancedAdminControls;
+
+  factory EntitlementLimits.fromJson(Map<String, dynamic> json) {
+    return EntitlementLimits(
+      deviceLimit: (json['device_limit'] as num?)?.toInt() ?? 3,
+      memberLimit: (json['member_limit'] as num?)?.toInt() ?? 1,
+      workspaceLimit: (json['workspace_limit'] as num?)?.toInt() ?? 1,
+      monthlyOcrLimit: (json['monthly_ocr_limit'] as num?)?.toInt() ?? 1000,
+      relayPriority: EntitlementRelayPriorityX.fromJson(
+        json['relay_priority'] as String?,
+      ),
+      advancedAdminControls: json['advanced_admin_controls'] as bool? ?? false,
+    );
+  }
+}
+
+class EntitlementCache {
+  const EntitlementCache({
+    required this.tier,
+    required this.status,
+    required this.accountIdHash,
+    required this.planCode,
+    required this.limits,
+    required this.checkedAt,
+    required this.expiresAt,
+    required this.offlineGraceExpiresAt,
+    required this.source,
+    required this.detail,
+    required this.updatedAt,
+  });
+
+  final EntitlementTier tier;
+  final EntitlementCacheStatus status;
+  final String? accountIdHash;
+  final String? planCode;
+  final EntitlementLimits limits;
+  final DateTime? checkedAt;
+  final DateTime? expiresAt;
+  final DateTime? offlineGraceExpiresAt;
+  final String source;
+  final String detail;
+  final DateTime? updatedAt;
+
+  bool get hasAccountHash => accountIdHash != null && accountIdHash!.isNotEmpty;
+
+  factory EntitlementCache.fromJson(Map<String, dynamic> json) {
+    final tier = EntitlementTierX.fromJson(json['tier'] as String?);
+    final rawLimits = json['limits'];
+    return EntitlementCache(
+      tier: tier,
+      status: EntitlementCacheStatusX.fromJson(json['status'] as String?),
+      accountIdHash: json['account_id_hash'] as String?,
+      planCode: json['plan_code'] as String?,
+      limits: rawLimits is Map
+          ? EntitlementLimits.fromJson(
+              rawLimits.map((key, value) => MapEntry(key.toString(), value)),
+            )
+          : tier.defaultLimits,
+      checkedAt: _readDateTime(json['checked_at']),
+      expiresAt: _readDateTime(json['expires_at']),
+      offlineGraceExpiresAt: _readDateTime(json['offline_grace_expires_at']),
+      source: json['source'] as String? ?? 'local_entitlement_cache',
+      detail:
+          json['detail'] as String? ??
+          'Cached entitlement; no content metadata stored.',
+      updatedAt: _readDateTime(json['updated_at']),
+    );
+  }
+}
+
+class EntitlementStatusResponse {
+  const EntitlementStatusResponse({
+    required this.tier,
+    required this.effectiveStatus,
+    required this.limits,
+    required this.cache,
+    required this.offlineGraceActive,
+    required this.paidFeaturesAvailable,
+    required this.safeLocalAccessAllowed,
+    required this.contentExposurePrevented,
+    required this.detail,
+  });
+
+  final EntitlementTier tier;
+  final EntitlementEffectiveStatus effectiveStatus;
+  final EntitlementLimits limits;
+  final EntitlementCache? cache;
+  final bool offlineGraceActive;
+  final bool paidFeaturesAvailable;
+  final bool safeLocalAccessAllowed;
+  final bool contentExposurePrevented;
+  final String detail;
+
+  bool get isHealthy =>
+      safeLocalAccessAllowed &&
+      contentExposurePrevented &&
+      (paidFeaturesAvailable ||
+          effectiveStatus == EntitlementEffectiveStatus.expired);
+
+  factory EntitlementStatusResponse.fromJson(Map<String, dynamic> json) {
+    final tier = EntitlementTierX.fromJson(json['tier'] as String?);
+    final rawLimits = json['limits'];
+    final rawCache = json['cache'];
+    return EntitlementStatusResponse(
+      tier: tier,
+      effectiveStatus: EntitlementEffectiveStatusX.fromJson(
+        json['effective_status'] as String?,
+      ),
+      limits: rawLimits is Map
+          ? EntitlementLimits.fromJson(
+              rawLimits.map((key, value) => MapEntry(key.toString(), value)),
+            )
+          : tier.defaultLimits,
+      cache: rawCache is Map
+          ? EntitlementCache.fromJson(
+              rawCache.map((key, value) => MapEntry(key.toString(), value)),
+            )
+          : null,
+      offlineGraceActive: json['offline_grace_active'] as bool? ?? false,
+      paidFeaturesAvailable: json['paid_features_available'] as bool? ?? true,
+      safeLocalAccessAllowed:
+          json['safe_local_access_allowed'] as bool? ?? true,
+      contentExposurePrevented:
+          json['content_exposure_prevented'] as bool? ?? true,
+      detail:
+          json['detail'] as String? ??
+          'Entitlement status is local and privacy-preserving.',
+    );
+  }
+}
+
+enum PlatformReleaseSurface {
+  linuxDesktop,
+  windowsDesktop,
+  macosDesktop,
+  androidPlayStore,
+  iosAppStore,
+  webBrowser,
+  localWebUi,
+  directDesktopDistribution,
+}
+
+extension PlatformReleaseSurfaceX on PlatformReleaseSurface {
+  String get label {
+    switch (this) {
+      case PlatformReleaseSurface.linuxDesktop:
+        return 'Linux desktop';
+      case PlatformReleaseSurface.windowsDesktop:
+        return 'Windows desktop';
+      case PlatformReleaseSurface.macosDesktop:
+        return 'macOS desktop';
+      case PlatformReleaseSurface.androidPlayStore:
+        return 'Android / Play Store';
+      case PlatformReleaseSurface.iosAppStore:
+        return 'iOS / App Store';
+      case PlatformReleaseSurface.webBrowser:
+        return 'Web/browser';
+      case PlatformReleaseSurface.localWebUi:
+        return 'Local web UI';
+      case PlatformReleaseSurface.directDesktopDistribution:
+        return 'Direct desktop distribution';
+    }
+  }
+
+  static PlatformReleaseSurface fromJson(String? value) {
+    switch (value) {
+      case 'windows_desktop':
+        return PlatformReleaseSurface.windowsDesktop;
+      case 'macos_desktop':
+        return PlatformReleaseSurface.macosDesktop;
+      case 'android_play_store':
+        return PlatformReleaseSurface.androidPlayStore;
+      case 'ios_app_store':
+        return PlatformReleaseSurface.iosAppStore;
+      case 'web_browser':
+        return PlatformReleaseSurface.webBrowser;
+      case 'local_web_ui':
+        return PlatformReleaseSurface.localWebUi;
+      case 'direct_desktop_distribution':
+        return PlatformReleaseSurface.directDesktopDistribution;
+      case 'linux_desktop':
+      default:
+        return PlatformReleaseSurface.linuxDesktop;
+    }
+  }
+}
+
+enum PlatformReleaseReadinessStatus { planned, inProgress, blocked, ready }
+
+extension PlatformReleaseReadinessStatusX on PlatformReleaseReadinessStatus {
+  String get label {
+    switch (this) {
+      case PlatformReleaseReadinessStatus.planned:
+        return 'Planned';
+      case PlatformReleaseReadinessStatus.inProgress:
+        return 'In progress';
+      case PlatformReleaseReadinessStatus.blocked:
+        return 'Blocked';
+      case PlatformReleaseReadinessStatus.ready:
+        return 'Ready';
+    }
+  }
+
+  static PlatformReleaseReadinessStatus fromJson(String? value) {
+    switch (value) {
+      case 'planned':
+        return PlatformReleaseReadinessStatus.planned;
+      case 'blocked':
+        return PlatformReleaseReadinessStatus.blocked;
+      case 'ready':
+        return PlatformReleaseReadinessStatus.ready;
+      case 'in_progress':
+      default:
+        return PlatformReleaseReadinessStatus.inProgress;
+    }
+  }
+}
+
+enum PlatformReleaseEvidenceStatus { missing, partial, passed, notApplicable }
+
+extension PlatformReleaseEvidenceStatusX on PlatformReleaseEvidenceStatus {
+  String get label {
+    switch (this) {
+      case PlatformReleaseEvidenceStatus.missing:
+        return 'Missing';
+      case PlatformReleaseEvidenceStatus.partial:
+        return 'Partial';
+      case PlatformReleaseEvidenceStatus.passed:
+        return 'Passed';
+      case PlatformReleaseEvidenceStatus.notApplicable:
+        return 'Not applicable';
+    }
+  }
+
+  static PlatformReleaseEvidenceStatus fromJson(String? value) {
+    switch (value) {
+      case 'partial':
+        return PlatformReleaseEvidenceStatus.partial;
+      case 'passed':
+        return PlatformReleaseEvidenceStatus.passed;
+      case 'not_applicable':
+        return PlatformReleaseEvidenceStatus.notApplicable;
+      case 'missing':
+      default:
+        return PlatformReleaseEvidenceStatus.missing;
+    }
+  }
+}
+
+class PlatformReleaseEvidence {
+  const PlatformReleaseEvidence({
+    required this.key,
+    required this.label,
+    required this.status,
+    required this.detail,
+  });
+
+  final String key;
+  final String label;
+  final PlatformReleaseEvidenceStatus status;
+  final String detail;
+
+  factory PlatformReleaseEvidence.fromJson(Map<String, dynamic> json) {
+    return PlatformReleaseEvidence(
+      key: json['key'] as String? ?? 'unknown',
+      label: json['label'] as String? ?? 'Release evidence',
+      status: PlatformReleaseEvidenceStatusX.fromJson(
+        json['status'] as String?,
+      ),
+      detail: json['detail'] as String? ?? '',
+    );
+  }
+}
+
+class PlatformReleaseSurfaceReadiness {
+  const PlatformReleaseSurfaceReadiness({
+    required this.surface,
+    required this.label,
+    required this.status,
+    required this.distribution,
+    required this.evidence,
+    required this.blockers,
+    required this.nextStep,
+  });
+
+  final PlatformReleaseSurface surface;
+  final String label;
+  final PlatformReleaseReadinessStatus status;
+  final String distribution;
+  final List<PlatformReleaseEvidence> evidence;
+  final List<String> blockers;
+  final String nextStep;
+
+  int get missingEvidenceCount => evidence
+      .where((item) => item.status == PlatformReleaseEvidenceStatus.missing)
+      .length;
+
+  factory PlatformReleaseSurfaceReadiness.fromJson(Map<String, dynamic> json) {
+    final surface = PlatformReleaseSurfaceX.fromJson(
+      json['surface'] as String?,
+    );
+    return PlatformReleaseSurfaceReadiness(
+      surface: surface,
+      label: json['label'] as String? ?? surface.label,
+      status: PlatformReleaseReadinessStatusX.fromJson(
+        json['status'] as String?,
+      ),
+      distribution: json['distribution'] as String? ?? '',
+      evidence: _readList(
+        json['evidence'],
+      ).map((item) => PlatformReleaseEvidence.fromJson(item)).toList(),
+      blockers: _readStringList(json['blockers']),
+      nextStep: json['next_step'] as String? ?? '',
+    );
+  }
+}
+
+class PlatformReleaseReadinessResponse {
+  const PlatformReleaseReadinessResponse({
+    required this.generatedAt,
+    required this.overallStatus,
+    required this.surfaces,
+    required this.requiredSurfaceCount,
+    required this.readySurfaceCount,
+    required this.detail,
+  });
+
+  final DateTime? generatedAt;
+  final PlatformReleaseReadinessStatus overallStatus;
+  final List<PlatformReleaseSurfaceReadiness> surfaces;
+  final int requiredSurfaceCount;
+  final int readySurfaceCount;
+  final String detail;
+
+  int get blockedSurfaceCount => surfaces
+      .where(
+        (surface) => surface.status == PlatformReleaseReadinessStatus.blocked,
+      )
+      .length;
+
+  factory PlatformReleaseReadinessResponse.fromJson(Map<String, dynamic> json) {
+    final surfaces = _readList(
+      json['surfaces'],
+    ).map((item) => PlatformReleaseSurfaceReadiness.fromJson(item)).toList();
+    return PlatformReleaseReadinessResponse(
+      generatedAt: _readDateTime(json['generated_at']),
+      overallStatus: PlatformReleaseReadinessStatusX.fromJson(
+        json['overall_status'] as String?,
+      ),
+      surfaces: surfaces,
+      requiredSurfaceCount:
+          (json['required_surface_count'] as num?)?.toInt() ?? surfaces.length,
+      readySurfaceCount:
+          (json['ready_surface_count'] as num?)?.toInt() ??
+          surfaces
+              .where(
+                (surface) =>
+                    surface.status == PlatformReleaseReadinessStatus.ready,
+              )
+              .length,
+      detail:
+          json['detail'] as String? ??
+          'Platform release readiness is not reported by this daemon.',
+    );
+  }
+}
+
 class EncryptionStatus {
   const EncryptionStatus({
     required this.databaseEncrypted,
@@ -811,6 +1425,38 @@ class BackupExportResult {
       bytesCopied: (json['bytes_copied'] as num?)?.toInt() ?? 0,
       modelFilesChecked: (json['model_files_checked'] as num?)?.toInt() ?? 0,
       missingModelPaths: _readStringList(json['missing_model_paths']),
+      ok: json['ok'] as bool? ?? false,
+    );
+  }
+}
+
+class SupportBundleExportResult {
+  const SupportBundleExportResult({
+    required this.exportedAt,
+    required this.exportRoot,
+    required this.bundlePath,
+    required this.sections,
+    required this.redactedFields,
+    required this.privateDataExcluded,
+    required this.ok,
+  });
+
+  final DateTime? exportedAt;
+  final String exportRoot;
+  final String bundlePath;
+  final List<String> sections;
+  final List<String> redactedFields;
+  final bool privateDataExcluded;
+  final bool ok;
+
+  factory SupportBundleExportResult.fromJson(Map<String, dynamic> json) {
+    return SupportBundleExportResult(
+      exportedAt: _readDateTime(json['exported_at']),
+      exportRoot: json['export_root'] as String? ?? '',
+      bundlePath: json['bundle_path'] as String? ?? '',
+      sections: _readStringList(json['sections']),
+      redactedFields: _readStringList(json['redacted_fields']),
+      privateDataExcluded: json['private_data_excluded'] as bool? ?? true,
       ok: json['ok'] as bool? ?? false,
     );
   }
@@ -2123,6 +2769,7 @@ class VaultFileEntry {
     required this.createdAt,
     required this.updatedAt,
     required this.trashedAt,
+    this.organization = const FileOrganizationHints(),
   });
 
   final String id;
@@ -2139,6 +2786,7 @@ class VaultFileEntry {
   final DateTime createdAt;
   final DateTime updatedAt;
   final DateTime? trashedAt;
+  final FileOrganizationHints organization;
 
   bool get isFolder => kind == VaultFileKind.folder;
   bool get isFile => kind == VaultFileKind.file;
@@ -2160,6 +2808,37 @@ class VaultFileEntry {
       createdAt: _readDateTime(json['created_at']) ?? DateTime.now().toUtc(),
       updatedAt: _readDateTime(json['updated_at']) ?? DateTime.now().toUtc(),
       trashedAt: _readDateTime(json['trashed_at']),
+      organization: FileOrganizationHints.fromJson(json['organization']),
+    );
+  }
+}
+
+class VaultFileDeviceSummary {
+  const VaultFileDeviceSummary({
+    required this.id,
+    required this.displayName,
+    required this.platform,
+    required this.revokedAt,
+  });
+
+  final String id;
+  final String displayName;
+  final String platform;
+  final DateTime? revokedAt;
+
+  String get label {
+    if (platform.trim().isEmpty || platform == 'unknown') {
+      return displayName;
+    }
+    return '$displayName ($platform)';
+  }
+
+  factory VaultFileDeviceSummary.fromJson(Map<String, dynamic> json) {
+    return VaultFileDeviceSummary(
+      id: json['id'].toString(),
+      displayName: json['display_name'] as String? ?? 'Device',
+      platform: json['platform'] as String? ?? 'unknown',
+      revokedAt: _readDateTime(json['revoked_at']),
     );
   }
 }
@@ -2169,11 +2848,17 @@ class VaultFileTreeResponse {
     required this.vaultId,
     required this.rootEntryIds,
     required this.entries,
+    required this.devices,
   });
 
   final String? vaultId;
   final List<String> rootEntryIds;
   final List<VaultFileEntry> entries;
+  final List<VaultFileDeviceSummary> devices;
+
+  Map<String, VaultFileDeviceSummary> get devicesById => {
+    for (final device in devices) device.id: device,
+  };
 
   List<VaultFileEntry> get roots {
     final rootIds = rootEntryIds.toSet();
@@ -2191,6 +2876,9 @@ class VaultFileTreeResponse {
       entries: _readList(
         json['entries'],
       ).map((item) => VaultFileEntry.fromJson(item)).toList(),
+      devices: _readList(
+        json['devices'],
+      ).map((item) => VaultFileDeviceSummary.fromJson(item)).toList(),
     );
   }
 }
@@ -2418,6 +3106,7 @@ class AssetMetadata {
     required this.sidecarDescription,
     required this.folderHint,
     required this.derived,
+    this.organization = const FileOrganizationHints(),
   });
 
   final String assetId;
@@ -2431,6 +3120,7 @@ class AssetMetadata {
   final String? sidecarTitle;
   final String? sidecarDescription;
   final String? folderHint;
+  final FileOrganizationHints organization;
   final ModelProvenance derived;
 
   factory AssetMetadata.fromJson(Map<String, dynamic> json) {
@@ -2457,6 +3147,7 @@ class AssetMetadata {
       sidecarDescription: json['sidecar_description'] as String?,
       folderHint: json['folder_hint'] as String?,
       derived: ModelProvenance.fromJson(json),
+      organization: FileOrganizationHints.fromJson(json['organization']),
     );
   }
 }
@@ -2477,6 +3168,7 @@ class Asset {
     required this.importedAt,
     required this.archived,
     required this.favorite,
+    this.manualTags = const [],
     required this.placeHint,
     required this.metadata,
     required this.variants,
@@ -2496,6 +3188,7 @@ class Asset {
   final DateTime importedAt;
   final bool archived;
   final bool favorite;
+  final List<String> manualTags;
   final String? placeHint;
   final AssetMetadata? metadata;
   final List<AssetVariant> variants;
@@ -2516,6 +3209,7 @@ class Asset {
       importedAt: _readDateTime(json['imported_at']) ?? DateTime.now().toUtc(),
       archived: json['archived'] as bool? ?? false,
       favorite: json['favorite'] as bool? ?? false,
+      manualTags: _readStringList(json['manual_tags']),
       placeHint: json['place_hint'] as String?,
       metadata: json['metadata'] is Map
           ? AssetMetadata.fromJson(
@@ -2729,6 +3423,48 @@ class JobLog {
   }
 }
 
+class AuditEvent {
+  const AuditEvent({
+    required this.id,
+    required this.action,
+    required this.targetKind,
+    required this.targetId,
+    required this.actorDeviceId,
+    required this.actorLabel,
+    required this.summary,
+    required this.payload,
+    required this.createdAt,
+  });
+
+  final String id;
+  final String action;
+  final String targetKind;
+  final String? targetId;
+  final String? actorDeviceId;
+  final String? actorLabel;
+  final String summary;
+  final Map<String, Object?> payload;
+  final DateTime createdAt;
+
+  factory AuditEvent.fromJson(Map<String, dynamic> json) {
+    final rawPayload = json['payload'];
+    final payload = rawPayload is Map
+        ? rawPayload.map((key, value) => MapEntry(key.toString(), value))
+        : const <String, Object?>{};
+    return AuditEvent(
+      id: json['id'].toString(),
+      action: json['action'] as String? ?? 'unknown',
+      targetKind: json['target_kind'] as String? ?? 'unknown',
+      targetId: json['target_id']?.toString(),
+      actorDeviceId: json['actor_device_id']?.toString(),
+      actorLabel: json['actor_label'] as String?,
+      summary: json['summary'] as String? ?? '',
+      payload: Map<String, Object?>.from(payload),
+      createdAt: _readDateTime(json['created_at']) ?? DateTime.now().toUtc(),
+    );
+  }
+}
+
 class TimelineBucket {
   const TimelineBucket({
     required this.label,
@@ -2834,7 +3570,14 @@ class SearchQuery {
     this.people,
     this.places,
     this.events,
+    this.workspace,
+    this.client,
+    this.project,
+    this.topic,
+    this.sourceFolder,
+    this.device,
     this.mediaKind,
+    this.tags,
     this.favorite,
     this.fromDate,
     this.toDate,
@@ -2846,7 +3589,14 @@ class SearchQuery {
   final String? people;
   final String? places;
   final String? events;
+  final String? workspace;
+  final String? client;
+  final String? project;
+  final String? topic;
+  final String? sourceFolder;
+  final String? device;
   final String? mediaKind;
+  final String? tags;
   final bool? favorite;
   final String? fromDate;
   final String? toDate;
@@ -2859,8 +3609,18 @@ class SearchQuery {
       if (people != null && people!.trim().isNotEmpty) 'people': people!.trim(),
       if (places != null && places!.trim().isNotEmpty) 'places': places!.trim(),
       if (events != null && events!.trim().isNotEmpty) 'events': events!.trim(),
+      if (workspace != null && workspace!.trim().isNotEmpty)
+        'workspace': workspace!.trim(),
+      if (client != null && client!.trim().isNotEmpty) 'client': client!.trim(),
+      if (project != null && project!.trim().isNotEmpty)
+        'project': project!.trim(),
+      if (topic != null && topic!.trim().isNotEmpty) 'topic': topic!.trim(),
+      if (sourceFolder != null && sourceFolder!.trim().isNotEmpty)
+        'source_folder': sourceFolder!.trim(),
+      if (device != null && device!.trim().isNotEmpty) 'device': device!.trim(),
       if (mediaKind != null && mediaKind!.trim().isNotEmpty)
         'media_kind': mediaKind!.trim(),
+      if (tags != null && tags!.trim().isNotEmpty) 'tags': tags!.trim(),
       if (favorite != null) 'favorite': '$favorite',
       if (fromDate != null && fromDate!.trim().isNotEmpty)
         'from_date': fromDate!.trim(),
@@ -2871,13 +3631,48 @@ class SearchQuery {
     };
   }
 
+  Map<String, dynamic> toJson() {
+    return {
+      if (text.trim().isNotEmpty) 'text': text.trim(),
+      if (people != null && people!.trim().isNotEmpty) 'people': people!.trim(),
+      if (places != null && places!.trim().isNotEmpty) 'places': places!.trim(),
+      if (events != null && events!.trim().isNotEmpty) 'events': events!.trim(),
+      if (workspace != null && workspace!.trim().isNotEmpty)
+        'workspace': workspace!.trim(),
+      if (client != null && client!.trim().isNotEmpty) 'client': client!.trim(),
+      if (project != null && project!.trim().isNotEmpty)
+        'project': project!.trim(),
+      if (topic != null && topic!.trim().isNotEmpty) 'topic': topic!.trim(),
+      if (sourceFolder != null && sourceFolder!.trim().isNotEmpty)
+        'source_folder': sourceFolder!.trim(),
+      if (device != null && device!.trim().isNotEmpty) 'device': device!.trim(),
+      if (mediaKind != null && mediaKind!.trim().isNotEmpty)
+        'media_kind': mediaKind!.trim(),
+      if (tags != null && tags!.trim().isNotEmpty) 'tags': tags!.trim(),
+      if (favorite != null) 'favorite': favorite,
+      if (fromDate != null && fromDate!.trim().isNotEmpty)
+        'from_date': fromDate!.trim(),
+      if (toDate != null && toDate!.trim().isNotEmpty)
+        'to_date': toDate!.trim(),
+      'include_archived': includeArchived,
+      if (limit != null) 'limit': limit,
+    };
+  }
+
   factory SearchQuery.fromJson(Map<String, dynamic> json) {
     return SearchQuery(
       text: json['text'] as String? ?? '',
       people: json['people'] as String?,
       places: json['places'] as String?,
       events: json['events'] as String?,
+      workspace: json['workspace'] as String?,
+      client: json['client'] as String?,
+      project: json['project'] as String?,
+      topic: json['topic'] as String?,
+      sourceFolder: json['source_folder'] as String?,
+      device: json['device'] as String?,
       mediaKind: json['media_kind'] as String?,
+      tags: json['tags'] as String?,
       favorite: json['favorite'] as bool?,
       fromDate: json['from_date'] as String?,
       toDate: json['to_date'] as String?,
@@ -2989,6 +3784,7 @@ class GalleryDashboardData {
     required this.people,
     required this.places,
     required this.events,
+    required this.auditEvents,
     required this.jobs,
     required this.models,
     required this.modelRuntimeStatus,
@@ -2999,6 +3795,7 @@ class GalleryDashboardData {
   final List<PersonCluster> people;
   final List<PlaceCluster> places;
   final List<EventCluster> events;
+  final List<AuditEvent> auditEvents;
   final List<JobRecord> jobs;
   final List<ModelArtifact> models;
   final ModelRuntimeStatus? modelRuntimeStatus;
@@ -3032,6 +3829,37 @@ class Album {
       title: json['title'] as String? ?? 'Untitled album',
       assetIds: _readStringList(json['asset_ids']),
       coverAssetId: json['cover_asset_id']?.toString(),
+      createdAt: _readDateTime(json['created_at']),
+      updatedAt: _readDateTime(json['updated_at']),
+    );
+  }
+}
+
+class SmartFolder {
+  const SmartFolder({
+    required this.id,
+    required this.title,
+    required this.query,
+    required this.createdAt,
+    required this.updatedAt,
+  });
+
+  final String id;
+  final String title;
+  final SearchQuery query;
+  final DateTime? createdAt;
+  final DateTime? updatedAt;
+
+  factory SmartFolder.fromJson(Map<String, dynamic> json) {
+    final queryJson = json['query'];
+    return SmartFolder(
+      id: json['id'].toString(),
+      title: json['title'] as String? ?? 'Untitled smart folder',
+      query: queryJson is Map
+          ? SearchQuery.fromJson(
+              queryJson.map((key, value) => MapEntry(key.toString(), value)),
+            )
+          : const SearchQuery(text: ''),
       createdAt: _readDateTime(json['created_at']),
       updatedAt: _readDateTime(json['updated_at']),
     );
@@ -3155,6 +3983,7 @@ class ImportCandidate {
     required this.destinationPath,
     required this.sidecarPaths,
     required this.safetyStatus,
+    this.organization = const FileOrganizationHints(),
   });
 
   final String id;
@@ -3173,6 +4002,7 @@ class ImportCandidate {
   final String? destinationPath;
   final List<String> sidecarPaths;
   final String safetyStatus;
+  final FileOrganizationHints organization;
 
   bool get isDuplicate => duplicateAssetId != null;
 
@@ -3194,6 +4024,7 @@ class ImportCandidate {
       destinationPath: json['destination_path'] as String?,
       sidecarPaths: _readStringList(json['sidecar_paths']),
       safetyStatus: json['safety_status'] as String? ?? 'ready',
+      organization: FileOrganizationHints.fromJson(json['organization']),
     );
   }
 }
@@ -3326,6 +4157,83 @@ class ImportSession {
           json['source_contains_managed_library'] as bool? ?? false,
       selectedOutsideSourceCount:
           (json['selected_outside_source_count'] as num?)?.toInt() ?? 0,
+    );
+  }
+}
+
+class DuplicateReviewEntry {
+  const DuplicateReviewEntry({
+    required this.assetId,
+    required this.mediaKind,
+    required this.originalBytes,
+    required this.duplicateCandidates,
+    required this.protectedBytes,
+    required this.firstSeenAt,
+    required this.lastSeenAt,
+    required this.importSessionIds,
+    required this.sourceKinds,
+  });
+
+  final String assetId;
+  final String mediaKind;
+  final int originalBytes;
+  final int duplicateCandidates;
+  final int protectedBytes;
+  final DateTime? firstSeenAt;
+  final DateTime? lastSeenAt;
+  final List<String> importSessionIds;
+  final List<String> sourceKinds;
+
+  factory DuplicateReviewEntry.fromJson(Map<String, dynamic> json) {
+    return DuplicateReviewEntry(
+      assetId: json['asset_id'].toString(),
+      mediaKind: json['media_kind'] as String? ?? 'other',
+      originalBytes: (json['original_bytes'] as num?)?.toInt() ?? 0,
+      duplicateCandidates: (json['duplicate_candidates'] as num?)?.toInt() ?? 0,
+      protectedBytes: (json['protected_bytes'] as num?)?.toInt() ?? 0,
+      firstSeenAt: _readDateTime(json['first_seen_at']),
+      lastSeenAt: _readDateTime(json['last_seen_at']),
+      importSessionIds: _readStringList(json['import_session_ids']),
+      sourceKinds: _readStringList(json['source_kinds']),
+    );
+  }
+}
+
+class DuplicateReviewSummary {
+  const DuplicateReviewSummary({
+    required this.generatedAt,
+    required this.duplicateAssets,
+    required this.duplicateCandidates,
+    required this.protectedBytes,
+    required this.sessionsWithDuplicates,
+    required this.entries,
+    required this.privacyDetail,
+  });
+
+  final DateTime? generatedAt;
+  final int duplicateAssets;
+  final int duplicateCandidates;
+  final int protectedBytes;
+  final int sessionsWithDuplicates;
+  final List<DuplicateReviewEntry> entries;
+  final String privacyDetail;
+
+  bool get hasDuplicates => duplicateCandidates > 0;
+
+  factory DuplicateReviewSummary.fromJson(Map<String, dynamic> json) {
+    return DuplicateReviewSummary(
+      generatedAt: _readDateTime(json['generated_at']),
+      duplicateAssets: (json['duplicate_assets'] as num?)?.toInt() ?? 0,
+      duplicateCandidates: (json['duplicate_candidates'] as num?)?.toInt() ?? 0,
+      protectedBytes: (json['protected_bytes'] as num?)?.toInt() ?? 0,
+      sessionsWithDuplicates:
+          (json['sessions_with_duplicates'] as num?)?.toInt() ?? 0,
+      entries: _readList(
+        json['entries'],
+      ).map((item) => DuplicateReviewEntry.fromJson(item)).toList(),
+      privacyDetail:
+          json['privacy_detail'] as String? ??
+          'Duplicate review is computed locally.',
     );
   }
 }
@@ -3480,12 +4388,16 @@ class WorkspaceSnapshot {
     required this.dashboard,
     required this.diagnostics,
     required this.privacyStatus,
+    required this.entitlementStatus,
+    required this.platformReleaseReadiness,
   });
 
   final LibraryStatus status;
   final GalleryDashboardData dashboard;
   final DaemonDiagnostics? diagnostics;
   final PrivacyStatus? privacyStatus;
+  final EntitlementStatusResponse? entitlementStatus;
+  final PlatformReleaseReadinessResponse? platformReleaseReadiness;
 
   LibrarySettings get settings => status.settings!;
   List<WatchFolder> get watchFolders => status.watchFolders;

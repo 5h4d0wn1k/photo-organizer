@@ -6,6 +6,7 @@ use crate::domain::NetworkPolicy;
 pub struct AppConfig {
     pub library_root: PathBuf,
     pub runtime_root: PathBuf,
+    pub local_web_root: Option<PathBuf>,
     pub bind_host: String,
     pub bind_port: u16,
     pub database_filename: String,
@@ -20,6 +21,7 @@ impl Default for AppConfig {
         Self {
             library_root: PathBuf::from("library"),
             runtime_root: PathBuf::from("runtime"),
+            local_web_root: None,
             bind_host: "127.0.0.1".to_string(),
             bind_port: 4821,
             database_filename: "gallery.sqlite3".to_string(),
@@ -44,6 +46,11 @@ impl AppConfig {
             && !value.trim().is_empty()
         {
             config.runtime_root = PathBuf::from(value);
+        }
+        if let Ok(value) = env::var("PRIVATE_GALLERY_LOCAL_WEB_ROOT")
+            && !value.trim().is_empty()
+        {
+            config.local_web_root = Some(PathBuf::from(value));
         }
         if let Ok(value) = env::var("PRIVATE_GALLERY_BIND_HOST")
             && !value.trim().is_empty()

@@ -102,6 +102,7 @@ mod tests {
             favorite: false,
             is_available: true,
             place_hint: place_hint.map(ToString::to_string),
+            manual_tags: Vec::new(),
             metadata: None,
             variants: Vec::new(),
         }

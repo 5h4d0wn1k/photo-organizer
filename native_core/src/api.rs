@@ -1,4 +1,9 @@
-use std::{net::SocketAddr, sync::Arc};
+use std::{
+    fs,
+    net::SocketAddr,
+    path::{Component, Path as FsPath, PathBuf},
+    sync::Arc,
+};
 
 use axum::{
     Json, Router,
@@ -7,7 +12,8 @@ use axum::{
     http::{
         HeaderMap, HeaderValue, Method, StatusCode,
         header::{
-            ACCEPT_RANGES, AUTHORIZATION, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, RANGE,
+            ACCEPT_RANGES, AUTHORIZATION, CACHE_CONTROL, CONTENT_LENGTH, CONTENT_RANGE,
+            CONTENT_TYPE, RANGE,
         },
     },
     middleware::{self, Next},
@@ -25,14 +31,15 @@ use crate::{
         BackupExportRequest, BackupRestorePlanRequest, BackupRestoreRunRequest,
         BackupVerifyRequest, CommitImportSessionRequest, CorrectDateRequest, CorrectPlaceRequest,
         CreateAlbumRequest, CreateDeviceRequest, CreateFileFolderRequest,
-        CreateManualPersonRequest, CreatePairingSessionRequest, CreateVaultRequest,
-        CreateWatchFolderRequest, EncryptionActivationRequest, EnrollDeviceRequest, FeedbackEvent,
-        HidePersonRequest, MergePersonRequest, MobilePairRequest, MobileReplicaReportRequest,
-        MobileStorageProfileUpdateRequest, MobileUploadRequest, ModelImportRequest,
-        ModelInstallRequest, MoveFileEntryRequest, RebuildRequest, RejectPersonMatchRequest,
-        RenameAlbumRequest, RenameFileEntryRequest, RenamePersonRequest, RevokeDeviceRequest,
-        RunSyncRequest, ScanImportSourceRequest, SearchQuery, SplitPersonRequest,
-        TitleEventRequest, UpdateAlbumAssetsRequest, UpdateAssetFlagsRequest,
+        CreateManualPersonRequest, CreatePairingSessionRequest, CreateSmartFolderRequest,
+        CreateVaultRequest, CreateWatchFolderRequest, EncryptionActivationRequest,
+        EnrollDeviceRequest, FeedbackEvent, HidePersonRequest, MergePersonRequest,
+        MobilePairRequest, MobileReplicaReportRequest, MobileStorageProfileUpdateRequest,
+        MobileUploadRequest, ModelImportRequest, ModelInstallRequest, MoveFileEntryRequest,
+        RebuildRequest, RejectPersonMatchRequest, RenameAlbumRequest, RenameFileEntryRequest,
+        RenamePersonRequest, RevokeDeviceRequest, RunSyncRequest, ScanImportSourceRequest,
+        SearchQuery, SplitPersonRequest, SupportBundleExportRequest, TitleEventRequest,
+        UpdateAlbumAssetsRequest, UpdateAssetFlagsRequest, UpdateAssetTagsRequest,
         UpdateAssetsFlagsRequest, UpdateLibrarySettingsRequest, UpdatePersonAssetsRequest,
         UpdateVaultStoragePolicyRequest,
     },
@@ -51,6 +58,9 @@ pub struct AppState {
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
+        .route("/local-web", get(local_web_index))
+        .route("/local-web/", get(local_web_index))
+        .route("/local-web/{*asset_path}", get(local_web_asset))
         .route("/library/status", get(library_status))
         .route(
             "/library/settings",
@@ -119,6 +129,10 @@ pub fn router(state: AppState) -> Router {
             post(update_mobile_asset_flags),
         )
         .route(
+            "/mobile/assets/{asset_id}/tags",
+            post(update_mobile_asset_tags),
+        )
+        .route(
             "/mobile/assets/{asset_id}/preview",
             get(mobile_asset_preview),
         )
@@ -169,6 +183,7 @@ pub fn router(state: AppState) -> Router {
         .route("/assets/archived", get(list_archived_assets))
         .route("/assets/flags/bulk", post(update_assets_flags))
         .route("/assets/{asset_id}/flags", post(update_asset_flags))
+        .route("/assets/{asset_id}/tags", post(update_asset_tags))
         .route("/assets/{asset_id}/original", get(asset_original))
         .route("/assets/{asset_id}/availability", get(asset_availability))
         .route("/assets/{asset_id}/pin-local", post(pin_local_asset))
@@ -184,11 +199,18 @@ pub fn router(state: AppState) -> Router {
             "/albums/{album_id}/assets/remove",
             post(remove_album_assets),
         )
+        .route(
+            "/smart-folders",
+            get(list_smart_folders).post(create_smart_folder),
+        )
+        .route("/smart-folders/{folder_id}", delete(delete_smart_folder))
+        .route("/smart-folders/{folder_id}/search", get(run_smart_folder))
         .route("/imports/assets", post(import_asset))
         .route("/imports/scan", post(scan_import_source))
         .route("/imports/commit", post(commit_import_session))
         .route("/imports/sessions", get(list_import_sessions))
         .route("/imports/sessions/{session_id}", get(get_import_session))
+        .route("/duplicates", get(duplicate_review_summary))
         .route("/metadata/rebuild", post(rebuild_metadata))
         .route("/metadata/assets/{asset_id}", get(get_asset_metadata))
         .route(
@@ -233,6 +255,11 @@ pub fn router(state: AppState) -> Router {
         .route("/ocr/assets/{asset_id}", get(get_asset_ocr_blocks))
         .route("/scenes/rebuild", post(rebuild_scenes))
         .route("/semantic/rebuild", post(rebuild_semantic))
+        .route("/audit/events", get(list_audit_events))
+        .route(
+            "/entitlements/status",
+            get(entitlement_status).post(update_entitlement_cache),
+        )
         .route("/jobs", get(list_jobs))
         .route("/jobs/{job_id}", get(get_job))
         .route("/jobs/{job_id}/logs", get(get_job_logs))
@@ -247,11 +274,13 @@ pub fn router(state: AppState) -> Router {
         .route("/backup/restore/plan", post(plan_restore_backup))
         .route("/backup/restore/run", post(run_restore_backup))
         .route("/backup/restore/verify", post(verify_restore_backup))
+        .route("/support/bundle", post(export_support_bundle))
         .route("/models", get(list_models))
         .route("/models/runtime-status", get(model_runtime_status))
         .route("/models/install", post(install_model))
         .route("/models/import-local", post(import_local_model))
         .route("/models/{model_id}/verify", post(verify_model))
+        .route("/release/readiness", get(platform_release_readiness))
         .route("/diagnostics", get(diagnostics))
         .with_state(state)
         .layer(DefaultBodyLimit::max(MOBILE_UPLOAD_BODY_LIMIT_BYTES))
@@ -282,10 +311,7 @@ async fn enforce_private_api_boundary(request: Request, next: Next) -> Response 
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
         .map(|info| info.0);
-    if is_desktop_api_client(remote, request.headers())
-        || path == "/health"
-        || path.starts_with("/mobile/")
-    {
+    if is_desktop_api_client(remote, request.headers()) || is_public_remote_route(&path) {
         return next.run(request).await;
     }
 
@@ -296,6 +322,13 @@ async fn enforce_private_api_boundary(request: Request, next: Next) -> Response 
         })),
     )
         .into_response()
+}
+
+fn is_public_remote_route(path: &str) -> bool {
+    path == "/health"
+        || path.starts_with("/mobile/")
+        || path == "/local-web"
+        || path.starts_with("/local-web/")
 }
 
 fn is_desktop_api_client(remote: Option<SocketAddr>, headers: &HeaderMap) -> bool {
@@ -461,6 +494,108 @@ fn response_with_body(
 
 async fn health() -> Json<serde_json::Value> {
     Json(json!({ "status": "ok" }))
+}
+
+async fn local_web_index(State(state): State<AppState>) -> Result<Response, ApiError> {
+    serve_local_web_asset(&state, "").await
+}
+
+async fn local_web_asset(
+    State(state): State<AppState>,
+    Path(asset_path): Path<String>,
+) -> Result<Response, ApiError> {
+    serve_local_web_asset(&state, &asset_path).await
+}
+
+async fn serve_local_web_asset(state: &AppState, asset_path: &str) -> Result<Response, ApiError> {
+    let root = state
+        .service
+        .config()
+        .local_web_root
+        .as_deref()
+        .ok_or_else(|| {
+            ApiError::Http(
+                StatusCode::NOT_FOUND,
+                "local web UI is not configured".to_string(),
+            )
+        })?;
+    let file_path = local_web_file_path(root, asset_path)?;
+    let bytes = fs::read(&file_path).map_err(|err| {
+        if err.kind() == std::io::ErrorKind::NotFound {
+            ApiError::Http(
+                StatusCode::NOT_FOUND,
+                "local web UI asset was not found".to_string(),
+            )
+        } else {
+            ServiceError::Io(err.to_string()).into()
+        }
+    })?;
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, local_web_content_type(&file_path))
+        .header(CACHE_CONTROL, HeaderValue::from_static("no-store"))
+        .body(Body::from(bytes))
+        .map_err(|err| ServiceError::Invalid(err.to_string()).into())
+}
+
+fn local_web_file_path(root: &FsPath, asset_path: &str) -> Result<PathBuf, ApiError> {
+    let relative = local_web_relative_path(asset_path).ok_or_else(|| {
+        ApiError::Http(
+            StatusCode::NOT_FOUND,
+            "local web UI asset path is not allowed".to_string(),
+        )
+    })?;
+    let candidate = root.join(&relative);
+    if candidate.is_file() {
+        return Ok(candidate);
+    }
+    let index = root.join("index.html");
+    if index.is_file() {
+        return Ok(index);
+    }
+    Err(ApiError::Http(
+        StatusCode::NOT_FOUND,
+        "local web UI index.html was not found".to_string(),
+    ))
+}
+
+fn local_web_relative_path(asset_path: &str) -> Option<PathBuf> {
+    let requested = asset_path.trim_start_matches('/');
+    let requested = if requested.is_empty() {
+        "index.html"
+    } else {
+        requested
+    };
+    let mut relative = PathBuf::new();
+    for component in FsPath::new(requested).components() {
+        match component {
+            Component::Normal(part) => relative.push(part),
+            Component::CurDir => {}
+            Component::Prefix(_) | Component::RootDir | Component::ParentDir => return None,
+        }
+    }
+    if relative.as_os_str().is_empty() {
+        relative.push("index.html");
+    }
+    Some(relative)
+}
+
+fn local_web_content_type(path: &FsPath) -> HeaderValue {
+    match path.extension().and_then(|value| value.to_str()) {
+        Some("css") => HeaderValue::from_static("text/css; charset=utf-8"),
+        Some("html") => HeaderValue::from_static("text/html; charset=utf-8"),
+        Some("ico") => HeaderValue::from_static("image/x-icon"),
+        Some("js") | Some("mjs") => {
+            HeaderValue::from_static("application/javascript; charset=utf-8")
+        }
+        Some("json") | Some("webmanifest") => {
+            HeaderValue::from_static("application/json; charset=utf-8")
+        }
+        Some("png") => HeaderValue::from_static("image/png"),
+        Some("svg") => HeaderValue::from_static("image/svg+xml"),
+        Some("wasm") => HeaderValue::from_static("application/wasm"),
+        _ => HeaderValue::from_static("application/octet-stream"),
+    }
 }
 
 async fn library_status(
@@ -769,6 +904,21 @@ async fn update_mobile_asset_flags(
         state
             .service
             .update_mobile_asset_flags(&token, asset_id, request)
+            .await?,
+    ))
+}
+
+async fn update_mobile_asset_tags(
+    State(state): State<AppState>,
+    Path(asset_id): Path<Uuid>,
+    headers: HeaderMap,
+    Json(request): Json<UpdateAssetTagsRequest>,
+) -> Result<Json<crate::domain::Asset>, ApiError> {
+    let token = mobile_bearer_token(&headers)?;
+    Ok(Json(
+        state
+            .service
+            .update_mobile_asset_tags(&token, asset_id, request)
             .await?,
     ))
 }
@@ -1138,6 +1288,12 @@ async fn list_import_sessions(
     Ok(Json(state.service.import_sessions().await))
 }
 
+async fn duplicate_review_summary(
+    State(state): State<AppState>,
+) -> Result<Json<crate::domain::DuplicateReviewSummary>, ApiError> {
+    Ok(Json(state.service.duplicate_review_summary().await))
+}
+
 async fn import_asset(
     State(state): State<AppState>,
     Json(request): Json<crate::domain::ImportAssetRequest>,
@@ -1209,6 +1365,16 @@ async fn update_asset_flags(
 ) -> Result<Json<crate::domain::Asset>, ApiError> {
     Ok(Json(
         state.service.update_asset_flags(asset_id, request).await?,
+    ))
+}
+
+async fn update_asset_tags(
+    State(state): State<AppState>,
+    Path(asset_id): Path<Uuid>,
+    Json(request): Json<UpdateAssetTagsRequest>,
+) -> Result<Json<crate::domain::Asset>, ApiError> {
+    Ok(Json(
+        state.service.update_asset_tags(asset_id, request).await?,
     ))
 }
 
@@ -1348,6 +1514,34 @@ async fn delete_album(
     Path(album_id): Path<Uuid>,
 ) -> Result<StatusCode, ApiError> {
     state.service.delete_album(album_id).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn list_smart_folders(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<crate::domain::SmartFolder>>, ApiError> {
+    Ok(Json(state.service.smart_folders().await))
+}
+
+async fn create_smart_folder(
+    State(state): State<AppState>,
+    Json(request): Json<CreateSmartFolderRequest>,
+) -> Result<Json<crate::domain::SmartFolder>, ApiError> {
+    Ok(Json(state.service.create_smart_folder(request).await?))
+}
+
+async fn run_smart_folder(
+    State(state): State<AppState>,
+    Path(folder_id): Path<Uuid>,
+) -> Result<Json<crate::domain::SearchResponse>, ApiError> {
+    Ok(Json(state.service.run_smart_folder(folder_id).await?))
+}
+
+async fn delete_smart_folder(
+    State(state): State<AppState>,
+    Path(folder_id): Path<Uuid>,
+) -> Result<StatusCode, ApiError> {
+    state.service.delete_smart_folder(folder_id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1573,6 +1767,32 @@ async fn rebuild_semantic(
     Ok(Json(state.service.rebuild_semantic().await?))
 }
 
+#[derive(Debug, Default, Deserialize)]
+struct AuditEventsQuery {
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+async fn list_audit_events(
+    State(state): State<AppState>,
+    Query(query): Query<AuditEventsQuery>,
+) -> Result<Json<Vec<crate::domain::AuditEvent>>, ApiError> {
+    Ok(Json(state.service.audit_events(query.limit).await))
+}
+
+async fn entitlement_status(
+    State(state): State<AppState>,
+) -> Result<Json<crate::domain::EntitlementStatusResponse>, ApiError> {
+    Ok(Json(state.service.entitlement_status().await))
+}
+
+async fn update_entitlement_cache(
+    State(state): State<AppState>,
+    Json(request): Json<crate::domain::UpdateEntitlementCacheRequest>,
+) -> Result<Json<crate::domain::EntitlementStatusResponse>, ApiError> {
+    Ok(Json(state.service.update_entitlement_cache(request).await?))
+}
+
 async fn list_jobs(
     State(state): State<AppState>,
 ) -> Result<Json<Vec<crate::domain::JobRecord>>, ApiError> {
@@ -1659,6 +1879,12 @@ async fn activate_encryption(
     Ok(Json(state.service.activate_encryption(request).await?))
 }
 
+async fn platform_release_readiness(
+    State(state): State<AppState>,
+) -> Result<Json<crate::domain::PlatformReleaseReadinessResponse>, ApiError> {
+    Ok(Json(state.service.platform_release_readiness().await))
+}
+
 async fn verify_backup(
     State(state): State<AppState>,
     Json(request): Json<BackupVerifyRequest>,
@@ -1694,17 +1920,30 @@ async fn run_restore_backup(
     Ok(Json(state.service.run_restore_backup(request).await?))
 }
 
+async fn export_support_bundle(
+    State(state): State<AppState>,
+    Json(request): Json<SupportBundleExportRequest>,
+) -> Result<Json<crate::domain::SupportBundleExportResult>, ApiError> {
+    Ok(Json(state.service.export_support_bundle(request).await?))
+}
+
 async fn diagnostics(State(state): State<AppState>) -> Result<Json<serde_json::Value>, ApiError> {
     Ok(Json(state.service.diagnostics().await))
 }
 
 #[cfg(test)]
 mod tests {
-    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::{
+        fs,
+        net::{IpAddr, Ipv4Addr, SocketAddr},
+    };
 
     use axum::http::{HeaderMap, HeaderValue};
+    use chrono::Utc;
 
-    use super::is_desktop_api_client;
+    use super::{
+        is_desktop_api_client, is_public_remote_route, local_web_file_path, local_web_relative_path,
+    };
 
     #[test]
     fn loopback_without_tailnet_headers_is_desktop_api_client() {
@@ -1732,5 +1971,53 @@ mod tests {
         let remote = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4821);
 
         assert!(!is_desktop_api_client(Some(remote), &headers));
+    }
+
+    #[test]
+    fn local_web_is_a_public_static_route_without_opening_desktop_routes() {
+        assert!(is_public_remote_route("/health"));
+        assert!(is_public_remote_route("/mobile/workspace"));
+        assert!(is_public_remote_route("/local-web"));
+        assert!(is_public_remote_route("/local-web/main.dart.js"));
+        assert!(!is_public_remote_route("/library/status"));
+        assert!(!is_public_remote_route("/assets/asset-1/original"));
+    }
+
+    #[test]
+    fn local_web_paths_reject_traversal_and_absolute_paths() {
+        assert_eq!(
+            local_web_relative_path("").expect("index"),
+            std::path::PathBuf::from("index.html")
+        );
+        assert_eq!(
+            local_web_relative_path("assets/app.js").expect("asset"),
+            std::path::PathBuf::from("assets/app.js")
+        );
+        assert!(local_web_relative_path("../private.db").is_none());
+        assert!(local_web_relative_path("/../private.db").is_none());
+        assert!(local_web_relative_path("/tmp/private.db").is_some());
+    }
+
+    #[test]
+    fn local_web_file_path_serves_assets_with_index_fallback() {
+        let root = std::env::temp_dir().join(format!(
+            "private-gallery-local-web-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        fs::create_dir_all(root.join("assets")).expect("create local web root");
+        fs::write(root.join("index.html"), b"index").expect("write index");
+        fs::write(root.join("assets/app.js"), b"app").expect("write asset");
+
+        assert_eq!(
+            local_web_file_path(&root, "assets/app.js").expect("asset"),
+            root.join("assets/app.js")
+        );
+        assert_eq!(
+            local_web_file_path(&root, "deep/client/route").expect("fallback"),
+            root.join("index.html")
+        );
+        assert!(local_web_file_path(&root, "../runtime/gallery.sqlite3").is_err());
+
+        fs::remove_dir_all(root).expect("remove local web root");
     }
 }

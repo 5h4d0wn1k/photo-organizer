@@ -34,6 +34,15 @@ CREATE TABLE IF NOT EXISTS assets (
   place_hint TEXT
 );
 
+CREATE TABLE IF NOT EXISTS asset_manual_tags (
+  asset_id TEXT NOT NULL,
+  tag TEXT NOT NULL,
+  position INTEGER NOT NULL,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (asset_id, tag),
+  FOREIGN KEY(asset_id) REFERENCES assets(id) ON DELETE CASCADE
+);
+
 CREATE TABLE IF NOT EXISTS vault_file_entries (
   id TEXT PRIMARY KEY,
   vault_id TEXT NOT NULL,
@@ -93,6 +102,7 @@ CREATE TABLE IF NOT EXISTS asset_metadata (
   sidecar_title TEXT,
   sidecar_description TEXT,
   folder_hint TEXT,
+  organization_hints_json TEXT NOT NULL DEFAULT '{}',
   model_name TEXT NOT NULL,
   model_version TEXT NOT NULL,
   model_hash TEXT,
@@ -117,6 +127,14 @@ CREATE TABLE IF NOT EXISTS album_assets (
   PRIMARY KEY (album_id, asset_id),
   FOREIGN KEY(album_id) REFERENCES albums(id) ON DELETE CASCADE,
   FOREIGN KEY(asset_id) REFERENCES assets(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS smart_folders (
+  id TEXT PRIMARY KEY,
+  title TEXT NOT NULL,
+  query_json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS person_clusters (
@@ -199,6 +217,33 @@ CREATE TABLE IF NOT EXISTS feedback_events (
   kind TEXT NOT NULL,
   payload_json TEXT NOT NULL,
   created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS audit_events (
+  id TEXT PRIMARY KEY,
+  action TEXT NOT NULL,
+  target_kind TEXT NOT NULL,
+  target_id TEXT,
+  actor_device_id TEXT,
+  actor_label TEXT,
+  summary TEXT NOT NULL,
+  payload_json TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS entitlement_cache (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  tier TEXT NOT NULL,
+  status TEXT NOT NULL,
+  account_id_hash TEXT,
+  plan_code TEXT,
+  limits_json TEXT NOT NULL,
+  checked_at TEXT NOT NULL,
+  expires_at TEXT,
+  offline_grace_expires_at TEXT,
+  source TEXT NOT NULL,
+  detail TEXT NOT NULL,
+  updated_at TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS vaults (
@@ -460,6 +505,7 @@ CREATE TABLE IF NOT EXISTS import_candidates (
   destination_path TEXT,
   sidecar_paths_json TEXT NOT NULL DEFAULT '[]',
   safety_status TEXT NOT NULL DEFAULT 'ready',
+  organization_hints_json TEXT NOT NULL DEFAULT '{}',
   FOREIGN KEY(session_id) REFERENCES import_sessions(id) ON DELETE CASCADE
 );
 

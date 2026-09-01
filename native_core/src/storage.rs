@@ -10,18 +10,19 @@ use uuid::Uuid;
 use crate::{
     config::AppConfig,
     domain::{
-        Album, Asset, AssetMetadata, AssetVariant, BlobChunk, BlobRecord, BlobReplica, CameraInfo,
-        CapabilityGrant, CorrectionRecord, DeviceIdentity, DevicePairing, EventCluster,
-        FaceTemplate, FeedbackEvent, GeoTag, ImportCandidate, ImportMode, ImportSession, JobLog,
-        JobRecord, LibrarySettings, MediaKind, MetadataSource, MobileSession, MobileUpload,
-        MobileUploadStatus, ModelProvenance, OcrBlock, OriginalStoragePolicy, PersonCluster,
-        PlaceCluster, RelayEndpoint, SceneTag, SyncConflict, SyncSession, SyncTransfer, Vault,
-        VaultFileEntry, VaultInvite, VaultKeyEnvelope, VaultMember, WatchFolder,
+        Album, Asset, AssetMetadata, AssetVariant, AuditEvent, BlobChunk, BlobRecord, BlobReplica,
+        CameraInfo, CapabilityGrant, CorrectionRecord, DeviceIdentity, DevicePairing,
+        EntitlementCache, EventCluster, FaceTemplate, FeedbackEvent, FileOrganizationHints, GeoTag,
+        ImportCandidate, ImportMode, ImportSession, JobLog, JobRecord, LibrarySettings, MediaKind,
+        MetadataSource, MobileSession, MobileUpload, MobileUploadStatus, ModelProvenance, OcrBlock,
+        OriginalStoragePolicy, PersonCluster, PlaceCluster, RelayEndpoint, SceneTag, SearchQuery,
+        SmartFolder, SyncConflict, SyncSession, SyncTransfer, Vault, VaultFileEntry, VaultInvite,
+        VaultKeyEnvelope, VaultMember, WatchFolder,
     },
     security,
 };
 
-const SCHEMA_VERSION: i64 = 15;
+const SCHEMA_VERSION: i64 = 20;
 
 #[derive(Debug, Clone)]
 pub struct StorageBootstrapReport {
@@ -35,11 +36,14 @@ pub struct PersistedLibraryState {
     pub assets: Vec<Asset>,
     pub file_entries: Vec<VaultFileEntry>,
     pub albums: Vec<Album>,
+    pub smart_folders: Vec<SmartFolder>,
     pub people: Vec<PersonCluster>,
     pub places: Vec<PlaceCluster>,
     pub events: Vec<EventCluster>,
     pub faces: Vec<FaceTemplate>,
     pub feedback: Vec<FeedbackEvent>,
+    pub audit_events: Vec<AuditEvent>,
+    pub entitlement_cache: Option<EntitlementCache>,
     pub vaults: Vec<Vault>,
     pub devices: Vec<DeviceIdentity>,
     pub vault_members: Vec<VaultMember>,
@@ -175,6 +179,38 @@ fn migrate_schema(connection: &Connection, from_version: i64) -> Result<(), rusq
         record_migration(connection, 15, "vault_file_namespace")?;
     }
 
+    if from_version < 16 {
+        add_column_if_missing(
+            connection,
+            "asset_metadata",
+            "organization_hints_json",
+            "organization_hints_json TEXT NOT NULL DEFAULT '{}'",
+        )?;
+        add_column_if_missing(
+            connection,
+            "import_candidates",
+            "organization_hints_json",
+            "organization_hints_json TEXT NOT NULL DEFAULT '{}'",
+        )?;
+        record_migration(connection, 16, "local_file_organization_hints")?;
+    }
+
+    if from_version < 17 {
+        record_migration(connection, 17, "saved_smart_folders")?;
+    }
+
+    if from_version < 18 {
+        record_migration(connection, 18, "manual_asset_tags")?;
+    }
+
+    if from_version < 19 {
+        record_migration(connection, 19, "local_admin_audit_events")?;
+    }
+
+    if from_version < 20 {
+        record_migration(connection, 20, "local_entitlement_cache")?;
+    }
+
     connection.pragma_update(None, "user_version", SCHEMA_VERSION)
 }
 
@@ -304,11 +340,14 @@ pub fn load_state(
     let assets = load_assets(&connection, library_settings.as_ref())?;
     let file_entries = load_file_entries(&connection)?;
     let albums = load_albums(&connection)?;
+    let smart_folders = load_smart_folders(&connection)?;
     let people = load_people(&connection)?;
     let places = load_places(&connection)?;
     let events = load_events(&connection)?;
     let faces = load_faces(&connection)?;
     let feedback = load_feedback(&connection)?;
+    let audit_events = load_audit_events(&connection)?;
+    let entitlement_cache = load_entitlement_cache(&connection)?;
     let vaults = load_vaults(&connection)?;
     let devices = load_devices(&connection)?;
     let vault_members = load_vault_members(&connection)?;
@@ -338,11 +377,14 @@ pub fn load_state(
         assets,
         file_entries,
         albums,
+        smart_folders,
         people,
         places,
         events,
         faces,
         feedback,
+        audit_events,
+        entitlement_cache,
         vaults,
         devices,
         vault_members,
@@ -380,6 +422,7 @@ pub fn save_state(
         r#"
         DELETE FROM asset_variants;
         DELETE FROM asset_metadata;
+        DELETE FROM asset_manual_tags;
         DELETE FROM ocr_blocks;
         DELETE FROM scene_tags;
         DELETE FROM face_templates;
@@ -404,6 +447,7 @@ pub fn save_state(
         DELETE FROM vaults;
         DELETE FROM sync_sessions;
         DELETE FROM device_pairings;
+        DELETE FROM smart_folders;
         DELETE FROM albums;
         DELETE FROM person_clusters;
         DELETE FROM event_clusters;
@@ -411,6 +455,8 @@ pub fn save_state(
         DELETE FROM job_logs;
         DELETE FROM correction_records;
         DELETE FROM feedback_events;
+        DELETE FROM audit_events;
+        DELETE FROM entitlement_cache;
         DELETE FROM import_sessions;
         DELETE FROM jobs;
         DELETE FROM watch_folders;
@@ -500,6 +546,22 @@ pub fn save_state(
             ],
         )?;
 
+        for (position, tag) in asset.manual_tags.iter().enumerate() {
+            transaction.execute(
+                r#"
+                INSERT INTO asset_manual_tags (
+                  asset_id, tag, position, created_at
+                ) VALUES (?1, ?2, ?3, ?4)
+                "#,
+                params![
+                    asset.id.to_string(),
+                    tag,
+                    position as i64,
+                    asset.imported_at.to_rfc3339(),
+                ],
+            )?;
+        }
+
         for variant in &asset.variants {
             transaction.execute(
                 r#"
@@ -533,9 +595,9 @@ pub fn save_state(
                   asset_id, captured_at, captured_at_source, timezone_offset_minutes,
                   width, height, camera_make, camera_model, lens_model,
                   latitude, longitude, altitude_meters, location_source, exact_gps_hidden,
-                  sidecar_title, sidecar_description, folder_hint,
+                  sidecar_title, sidecar_description, folder_hint, organization_hints_json,
                   model_name, model_version, model_hash, created_at, rebuildable
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)
                 "#,
                 params![
                     asset.id.to_string(),
@@ -559,6 +621,7 @@ pub fn save_state(
                     metadata.sidecar_title,
                     metadata.sidecar_description,
                     metadata.folder_hint,
+                    json_string(&metadata.organization)?,
                     metadata.derived.model_name,
                     metadata.derived.model_version,
                     metadata.derived.model_hash,
@@ -642,6 +705,23 @@ pub fn save_state(
                 params![album.id.to_string(), asset_id.to_string(), position as i64],
             )?;
         }
+    }
+
+    for folder in &state.smart_folders {
+        transaction.execute(
+            r#"
+            INSERT INTO smart_folders (
+              id, title, query_json, created_at, updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5)
+            "#,
+            params![
+                folder.id.to_string(),
+                folder.title,
+                json_string(&folder.query)?,
+                folder.created_at.to_rfc3339(),
+                folder.updated_at.to_rfc3339(),
+            ],
+        )?;
     }
 
     for person in &state.people {
@@ -769,6 +849,57 @@ pub fn save_state(
                 serde_json::to_string(&feedback.payload)
                     .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?,
                 feedback.created_at.to_rfc3339(),
+            ],
+        )?;
+    }
+
+    for event in &state.audit_events {
+        transaction.execute(
+            r#"
+            INSERT INTO audit_events (
+              id, action, target_kind, target_id, actor_device_id, actor_label,
+              summary, payload_json, created_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            "#,
+            params![
+                event.id.to_string(),
+                event.action,
+                event.target_kind,
+                event.target_id.map(|value| value.to_string()),
+                event.actor_device_id.map(|value| value.to_string()),
+                event.actor_label,
+                event.summary,
+                serde_json::to_string(&event.payload)
+                    .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?,
+                event.created_at.to_rfc3339(),
+            ],
+        )?;
+    }
+
+    if let Some(cache) = &state.entitlement_cache {
+        transaction.execute(
+            r#"
+            INSERT INTO entitlement_cache (
+              id, tier, status, account_id_hash, plan_code, limits_json,
+              checked_at, expires_at, offline_grace_expires_at, source, detail, updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+            "#,
+            params![
+                1_i64,
+                enum_string(&cache.tier)?,
+                enum_string(&cache.status)?,
+                cache.account_id_hash.as_deref(),
+                cache.plan_code.as_deref(),
+                json_string(&cache.limits)?,
+                cache.checked_at.to_rfc3339(),
+                cache.expires_at.as_ref().map(|value| value.to_rfc3339()),
+                cache
+                    .offline_grace_expires_at
+                    .as_ref()
+                    .map(|value| value.to_rfc3339()),
+                &cache.source,
+                &cache.detail,
+                cache.updated_at.to_rfc3339(),
             ],
         )?;
     }
@@ -1180,8 +1311,8 @@ pub fn save_state(
                 INSERT INTO import_candidates (
                   id, session_id, source_path, original_filename, media_kind, mime_type,
                   bytes, captured_at, place_hint, content_hash, duplicate_asset_id, selected, import_mode,
-                  destination_path, sidecar_paths_json, safety_status
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+                  destination_path, sidecar_paths_json, safety_status, organization_hints_json
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
                 "#,
                 params![
                     candidate.id.to_string(),
@@ -1200,6 +1331,7 @@ pub fn save_state(
                     candidate.destination_path,
                     string_vec_json(&candidate.sidecar_paths)?,
                     candidate.safety_status,
+                    json_string(&candidate.organization)?,
                 ],
             )?;
         }
@@ -1321,6 +1453,7 @@ fn load_assets(
     settings: Option<&LibrarySettings>,
 ) -> Result<Vec<Asset>, rusqlite::Error> {
     let mut metadata_by_asset = load_asset_metadata(connection)?;
+    let mut tags_by_asset = load_asset_manual_tags(connection)?;
     let mut variants_by_asset = HashMap::<Uuid, Vec<AssetVariant>>::new();
     let mut variant_statement = connection.prepare(
         r#"
@@ -1387,6 +1520,7 @@ fn load_assets(
             favorite: row.get(12)?,
             is_available: row.get(13)?,
             place_hint: row.get(14)?,
+            manual_tags: tags_by_asset.remove(&id).unwrap_or_default(),
             metadata: metadata_by_asset.remove(&id),
             variants: variants_by_asset.remove(&id).unwrap_or_default(),
         };
@@ -1394,6 +1528,30 @@ fn load_assets(
         Ok(asset)
     })?;
     rows.collect()
+}
+
+fn load_asset_manual_tags(
+    connection: &Connection,
+) -> Result<HashMap<Uuid, Vec<String>>, rusqlite::Error> {
+    let mut statement = connection.prepare(
+        r#"
+        SELECT asset_id, tag
+        FROM asset_manual_tags
+        ORDER BY asset_id ASC, position ASC, tag COLLATE NOCASE ASC
+        "#,
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            parse_uuid(&row.get::<_, String>(0)?)?,
+            row.get::<_, String>(1)?,
+        ))
+    })?;
+    let mut tags = HashMap::<Uuid, Vec<String>>::new();
+    for row in rows {
+        let (asset_id, tag) = row?;
+        tags.entry(asset_id).or_default().push(tag);
+    }
+    Ok(tags)
 }
 
 fn load_file_entries(connection: &Connection) -> Result<Vec<VaultFileEntry>, rusqlite::Error> {
@@ -1442,6 +1600,7 @@ fn load_file_entries(connection: &Connection) -> Result<Vec<VaultFileEntry>, rus
             created_at: parse_datetime(&row.get::<_, String>(11)?)?,
             updated_at: parse_datetime(&row.get::<_, String>(12)?)?,
             trashed_at,
+            organization: FileOrganizationHints::default(),
         })
     })?;
     rows.collect()
@@ -1455,7 +1614,7 @@ fn load_asset_metadata(
         SELECT asset_id, captured_at, captured_at_source, timezone_offset_minutes,
                width, height, camera_make, camera_model, lens_model,
                latitude, longitude, altitude_meters, location_source, exact_gps_hidden,
-               sidecar_title, sidecar_description, folder_hint,
+               sidecar_title, sidecar_description, folder_hint, organization_hints_json,
                model_name, model_version, model_hash, created_at, rebuildable
         FROM asset_metadata
         "#,
@@ -1490,12 +1649,13 @@ fn load_asset_metadata(
                 sidecar_title: row.get(14)?,
                 sidecar_description: row.get(15)?,
                 folder_hint: row.get(16)?,
+                organization: parse_json::<FileOrganizationHints>(&row.get::<_, String>(17)?)?,
                 derived: ModelProvenance {
-                    model_name: row.get(17)?,
-                    model_version: row.get(18)?,
-                    model_hash: row.get(19)?,
-                    created_at: parse_datetime(&row.get::<_, String>(20)?)?,
-                    rebuildable: row.get(21)?,
+                    model_name: row.get(18)?,
+                    model_version: row.get(19)?,
+                    model_hash: row.get(20)?,
+                    created_at: parse_datetime(&row.get::<_, String>(21)?)?,
+                    rebuildable: row.get(22)?,
                 },
             },
         ))
@@ -1522,6 +1682,26 @@ fn load_albums(connection: &Connection) -> Result<Vec<Album>, rusqlite::Error> {
                 .get::<_, Option<String>>(2)?
                 .map(|value| parse_uuid(&value))
                 .transpose()?,
+            created_at: parse_datetime(&row.get::<_, String>(3)?)?,
+            updated_at: parse_datetime(&row.get::<_, String>(4)?)?,
+        })
+    })?;
+    rows.collect()
+}
+
+fn load_smart_folders(connection: &Connection) -> Result<Vec<SmartFolder>, rusqlite::Error> {
+    let mut statement = connection.prepare(
+        r#"
+        SELECT id, title, query_json, created_at, updated_at
+        FROM smart_folders
+        ORDER BY updated_at DESC
+        "#,
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok(SmartFolder {
+            id: parse_uuid(&row.get::<_, String>(0)?)?,
+            title: row.get(1)?,
+            query: parse_json::<SearchQuery>(&row.get::<_, String>(2)?)?,
             created_at: parse_datetime(&row.get::<_, String>(3)?)?,
             updated_at: parse_datetime(&row.get::<_, String>(4)?)?,
         })
@@ -1752,6 +1932,84 @@ fn load_feedback(connection: &Connection) -> Result<Vec<FeedbackEvent>, rusqlite
         })
     })?;
     rows.collect()
+}
+
+fn load_audit_events(connection: &Connection) -> Result<Vec<AuditEvent>, rusqlite::Error> {
+    let mut statement = connection.prepare(
+        r#"
+        SELECT id, action, target_kind, target_id, actor_device_id, actor_label,
+               summary, payload_json, created_at
+        FROM audit_events
+        ORDER BY created_at DESC
+        "#,
+    )?;
+    let rows = statement.query_map([], |row| {
+        let target_id = row
+            .get::<_, Option<String>>(3)?
+            .map(|value| parse_uuid(&value))
+            .transpose()?;
+        let actor_device_id = row
+            .get::<_, Option<String>>(4)?
+            .map(|value| parse_uuid(&value))
+            .transpose()?;
+        Ok(AuditEvent {
+            id: parse_uuid(&row.get::<_, String>(0)?)?,
+            action: row.get(1)?,
+            target_kind: row.get(2)?,
+            target_id,
+            actor_device_id,
+            actor_label: row.get(5)?,
+            summary: row.get(6)?,
+            payload: serde_json::from_str(&row.get::<_, String>(7)?).map_err(|err| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    7,
+                    rusqlite::types::Type::Text,
+                    Box::new(err),
+                )
+            })?,
+            created_at: parse_datetime(&row.get::<_, String>(8)?)?,
+        })
+    })?;
+    rows.collect()
+}
+
+fn load_entitlement_cache(
+    connection: &Connection,
+) -> Result<Option<EntitlementCache>, rusqlite::Error> {
+    connection
+        .query_row(
+            r#"
+            SELECT tier, status, account_id_hash, plan_code, limits_json, checked_at,
+                   expires_at, offline_grace_expires_at, source, detail, updated_at
+            FROM entitlement_cache
+            WHERE id = 1
+            "#,
+            [],
+            |row| {
+                let expires_at = row
+                    .get::<_, Option<String>>(6)?
+                    .map(|value| parse_datetime(&value))
+                    .transpose()?;
+                let offline_grace_expires_at = row
+                    .get::<_, Option<String>>(7)?
+                    .map(|value| parse_datetime(&value))
+                    .transpose()?;
+                Ok(EntitlementCache {
+                    tier: parse_enum(&row.get::<_, String>(0)?)?,
+                    status: parse_enum(&row.get::<_, String>(1)?)?,
+                    account_id_hash: row.get(2)?,
+                    plan_code: row.get(3)?,
+                    limits: parse_json(&row.get::<_, String>(4)?)?,
+                    checked_at: parse_datetime(&row.get::<_, String>(5)?)?,
+                    expires_at,
+                    offline_grace_expires_at,
+                    source: row.get(8)?,
+                    detail: row.get(9)?,
+                    updated_at: parse_datetime(&row.get::<_, String>(10)?)?,
+                })
+            },
+        )
+        .optional()
 }
 
 fn load_vaults(connection: &Connection) -> Result<Vec<Vault>, rusqlite::Error> {
@@ -2211,7 +2469,7 @@ fn load_import_sessions(connection: &Connection) -> Result<Vec<ImportSession>, r
         r#"
         SELECT id, session_id, source_path, original_filename, media_kind, mime_type, bytes,
                captured_at, place_hint, content_hash, duplicate_asset_id, selected, import_mode,
-               destination_path, sidecar_paths_json, safety_status
+               destination_path, sidecar_paths_json, safety_status, organization_hints_json
         FROM import_candidates
         ORDER BY original_filename ASC
         "#,
@@ -2243,6 +2501,7 @@ fn load_import_sessions(connection: &Connection) -> Result<Vec<ImportSession>, r
                 destination_path: row.get(13)?,
                 sidecar_paths: parse_string_vec(&row.get::<_, String>(14)?)?,
                 safety_status: row.get(15)?,
+                organization: parse_json::<FileOrganizationHints>(&row.get::<_, String>(16)?)?,
             },
         ))
     })?;
@@ -2547,7 +2806,10 @@ mod tests {
 
     use crate::{
         config::AppConfig,
-        domain::{ImportMode, LibrarySettings, OriginalStoragePolicy},
+        domain::{
+            EntitlementCache, EntitlementCacheStatus, EntitlementLimits, EntitlementRelayPriority,
+            EntitlementTier, ImportMode, LibrarySettings, OriginalStoragePolicy,
+        },
     };
 
     use super::{PersistedLibraryState, SCHEMA_VERSION, bootstrap_storage, load_state, save_state};
@@ -2590,6 +2852,50 @@ mod tests {
                 .default_import_mode,
             ImportMode::Copy
         );
+    }
+
+    #[test]
+    fn saves_and_loads_entitlement_cache() {
+        let runtime_root = temp_runtime_root();
+        let config = AppConfig {
+            runtime_root: runtime_root.clone(),
+            ..AppConfig::default()
+        };
+        let report = bootstrap_storage(&config).expect("bootstrap storage");
+        let now = Utc::now();
+        let state = PersistedLibraryState {
+            entitlement_cache: Some(EntitlementCache {
+                tier: EntitlementTier::FamilyRemote,
+                status: EntitlementCacheStatus::Active,
+                account_id_hash: Some(
+                    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string(),
+                ),
+                plan_code: Some("family_2_usd".to_string()),
+                limits: EntitlementLimits {
+                    device_limit: 8,
+                    member_limit: 6,
+                    workspace_limit: 2,
+                    monthly_ocr_limit: 5000,
+                    relay_priority: EntitlementRelayPriority::Standard,
+                    advanced_admin_controls: false,
+                },
+                checked_at: now,
+                expires_at: Some(now + chrono::Duration::days(30)),
+                offline_grace_expires_at: Some(now + chrono::Duration::days(45)),
+                source: "unit_test".to_string(),
+                detail: "Cached active entitlement; no content metadata stored.".to_string(),
+                updated_at: now,
+            }),
+            ..PersistedLibraryState::default()
+        };
+
+        save_state(&report, &state).expect("save state");
+        let loaded = load_state(&report).expect("load state");
+        let cache = loaded.entitlement_cache.expect("entitlement cache");
+        assert_eq!(cache.tier, EntitlementTier::FamilyRemote);
+        assert_eq!(cache.status, EntitlementCacheStatus::Active);
+        assert_eq!(cache.limits.device_limit, 8);
+        assert_eq!(cache.plan_code.as_deref(), Some("family_2_usd"));
     }
 
     #[test]

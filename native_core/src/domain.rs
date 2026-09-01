@@ -75,6 +75,7 @@ pub enum FeedbackKind {
     TitleEvent,
     RejectMatch,
     SearchClick,
+    UpdateAssetTags,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -539,6 +540,17 @@ pub enum MetadataSource {
     Unknown,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct FileOrganizationHints {
+    pub source_folder: Option<String>,
+    pub workspace: Option<String>,
+    pub client: Option<String>,
+    pub project: Option<String>,
+    pub topic: Option<String>,
+    pub path_segments: Vec<String>,
+}
+
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum NetworkPolicy {
@@ -656,6 +668,8 @@ pub struct Asset {
     pub favorite: bool,
     pub is_available: bool,
     pub place_hint: Option<String>,
+    #[serde(default)]
+    pub manual_tags: Vec<String>,
     pub metadata: Option<AssetMetadata>,
     pub variants: Vec<AssetVariant>,
 }
@@ -676,6 +690,16 @@ pub struct VaultFileEntry {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub trashed_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub organization: FileOrganizationHints,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct VaultFileDeviceSummary {
+    pub id: Uuid,
+    pub display_name: String,
+    pub platform: String,
+    pub revoked_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -683,6 +707,8 @@ pub struct VaultFileTreeResponse {
     pub vault_id: Option<Uuid>,
     pub root_entry_ids: Vec<Uuid>,
     pub entries: Vec<VaultFileEntry>,
+    #[serde(default)]
+    pub devices: Vec<VaultFileDeviceSummary>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -714,6 +740,8 @@ pub struct AssetMetadata {
     pub sidecar_title: Option<String>,
     pub sidecar_description: Option<String>,
     pub folder_hint: Option<String>,
+    #[serde(default)]
+    pub organization: FileOrganizationHints,
     #[serde(flatten)]
     pub derived: ModelProvenance,
 }
@@ -724,6 +752,15 @@ pub struct Album {
     pub title: String,
     pub asset_ids: Vec<Uuid>,
     pub cover_asset_id: Option<Uuid>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SmartFolder {
+    pub id: Uuid,
+    pub title: String,
+    pub query: SearchQuery,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -782,6 +819,20 @@ pub struct FaceTemplate {
 pub struct FeedbackEvent {
     pub id: Uuid,
     pub kind: FeedbackKind,
+    pub payload: Value,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AuditEvent {
+    pub id: Uuid,
+    pub action: String,
+    pub target_kind: String,
+    pub target_id: Option<Uuid>,
+    pub actor_device_id: Option<Uuid>,
+    pub actor_label: Option<String>,
+    pub summary: String,
+    #[serde(default)]
     pub payload: Value,
     pub created_at: DateTime<Utc>,
 }
@@ -1020,6 +1071,8 @@ pub struct ImportCandidate {
     pub destination_path: Option<String>,
     pub sidecar_paths: Vec<String>,
     pub safety_status: String,
+    #[serde(default)]
+    pub organization: FileOrganizationHints,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1061,6 +1114,30 @@ pub struct ImportSession {
     pub selected_outside_source_count: usize,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DuplicateReviewEntry {
+    pub asset_id: Uuid,
+    pub media_kind: MediaKind,
+    pub original_bytes: u64,
+    pub duplicate_candidates: usize,
+    pub protected_bytes: u64,
+    pub first_seen_at: DateTime<Utc>,
+    pub last_seen_at: DateTime<Utc>,
+    pub import_session_ids: Vec<Uuid>,
+    pub source_kinds: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DuplicateReviewSummary {
+    pub generated_at: DateTime<Utc>,
+    pub duplicate_assets: usize,
+    pub duplicate_candidates: usize,
+    pub protected_bytes: u64,
+    pub sessions_with_duplicates: usize,
+    pub entries: Vec<DuplicateReviewEntry>,
+    pub privacy_detail: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SearchQuery {
     pub text: Option<String>,
@@ -1069,7 +1146,21 @@ pub struct SearchQuery {
     #[serde(default)]
     pub events: Option<String>,
     #[serde(default)]
+    pub workspace: Option<String>,
+    #[serde(default)]
+    pub client: Option<String>,
+    #[serde(default)]
+    pub project: Option<String>,
+    #[serde(default)]
+    pub topic: Option<String>,
+    #[serde(default)]
+    pub source_folder: Option<String>,
+    #[serde(default)]
+    pub device: Option<String>,
+    #[serde(default)]
     pub media_kind: Option<String>,
+    #[serde(default)]
+    pub tags: Option<String>,
     #[serde(default)]
     pub favorite: Option<bool>,
     pub from_date: Option<String>,
@@ -1094,6 +1185,12 @@ pub struct UpdateAssetsFlagsRequest {
     pub favorite: Option<bool>,
     #[serde(default)]
     pub archived: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UpdateAssetTagsRequest {
+    #[serde(default)]
+    pub tags: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1313,6 +1410,200 @@ pub struct PrivacyStatus {
     pub encryption: EncryptionStatus,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EntitlementTier {
+    PersonalCore,
+    FamilyRemote,
+    PowerWorkspace,
+    Business,
+}
+
+impl EntitlementTier {
+    pub fn default_limits(self) -> EntitlementLimits {
+        match self {
+            EntitlementTier::PersonalCore => EntitlementLimits {
+                device_limit: 3,
+                member_limit: 1,
+                workspace_limit: 1,
+                monthly_ocr_limit: 1_000,
+                relay_priority: EntitlementRelayPriority::None,
+                advanced_admin_controls: false,
+            },
+            EntitlementTier::FamilyRemote => EntitlementLimits {
+                device_limit: 8,
+                member_limit: 6,
+                workspace_limit: 2,
+                monthly_ocr_limit: 5_000,
+                relay_priority: EntitlementRelayPriority::Standard,
+                advanced_admin_controls: false,
+            },
+            EntitlementTier::PowerWorkspace => EntitlementLimits {
+                device_limit: 20,
+                member_limit: 12,
+                workspace_limit: 5,
+                monthly_ocr_limit: 20_000,
+                relay_priority: EntitlementRelayPriority::Priority,
+                advanced_admin_controls: true,
+            },
+            EntitlementTier::Business => EntitlementLimits {
+                device_limit: 100,
+                member_limit: 100,
+                workspace_limit: 25,
+                monthly_ocr_limit: 100_000,
+                relay_priority: EntitlementRelayPriority::Priority,
+                advanced_admin_controls: true,
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EntitlementRelayPriority {
+    None,
+    Standard,
+    Priority,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EntitlementCacheStatus {
+    Active,
+    PastDue,
+    Canceled,
+    Expired,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EntitlementEffectiveStatus {
+    Active,
+    OfflineGrace,
+    Expired,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EntitlementLimits {
+    pub device_limit: u32,
+    pub member_limit: u32,
+    pub workspace_limit: u32,
+    pub monthly_ocr_limit: u32,
+    pub relay_priority: EntitlementRelayPriority,
+    pub advanced_admin_controls: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct EntitlementCache {
+    pub tier: EntitlementTier,
+    pub status: EntitlementCacheStatus,
+    pub account_id_hash: Option<String>,
+    pub plan_code: Option<String>,
+    pub limits: EntitlementLimits,
+    pub checked_at: DateTime<Utc>,
+    pub expires_at: Option<DateTime<Utc>>,
+    pub offline_grace_expires_at: Option<DateTime<Utc>>,
+    pub source: String,
+    pub detail: String,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct EntitlementStatusResponse {
+    pub tier: EntitlementTier,
+    pub effective_status: EntitlementEffectiveStatus,
+    pub limits: EntitlementLimits,
+    pub cache: Option<EntitlementCache>,
+    pub offline_grace_active: bool,
+    pub paid_features_available: bool,
+    pub safe_local_access_allowed: bool,
+    pub content_exposure_prevented: bool,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateEntitlementCacheRequest {
+    pub tier: EntitlementTier,
+    pub status: EntitlementCacheStatus,
+    #[serde(default)]
+    pub account_id_hash: Option<String>,
+    #[serde(default)]
+    pub plan_code: Option<String>,
+    #[serde(default)]
+    pub limits: Option<EntitlementLimits>,
+    #[serde(default)]
+    pub checked_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub expires_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub offline_grace_expires_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub source: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PlatformReleaseSurface {
+    LinuxDesktop,
+    WindowsDesktop,
+    MacosDesktop,
+    AndroidPlayStore,
+    IosAppStore,
+    WebBrowser,
+    LocalWebUi,
+    DirectDesktopDistribution,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PlatformReleaseReadinessStatus {
+    Planned,
+    InProgress,
+    Blocked,
+    Ready,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PlatformReleaseEvidenceStatus {
+    Missing,
+    Partial,
+    Passed,
+    NotApplicable,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PlatformReleaseEvidence {
+    pub key: String,
+    pub label: String,
+    pub status: PlatformReleaseEvidenceStatus,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PlatformReleaseSurfaceReadiness {
+    pub surface: PlatformReleaseSurface,
+    pub label: String,
+    pub status: PlatformReleaseReadinessStatus,
+    pub distribution: String,
+    pub evidence: Vec<PlatformReleaseEvidence>,
+    pub blockers: Vec<String>,
+    pub next_step: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PlatformReleaseReadinessResponse {
+    pub generated_at: DateTime<Utc>,
+    pub overall_status: PlatformReleaseReadinessStatus,
+    pub surfaces: Vec<PlatformReleaseSurfaceReadiness>,
+    pub required_surface_count: usize,
+    pub ready_surface_count: usize,
+    pub detail: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct EncryptionStatus {
     pub database_encrypted: bool,
@@ -1383,6 +1674,12 @@ pub struct RenameAlbumRequest {
 pub struct UpdateAlbumAssetsRequest {
     #[serde(default)]
     pub asset_ids: Vec<Uuid>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CreateSmartFolderRequest {
+    pub title: String,
+    pub query: SearchQuery,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1465,6 +1762,28 @@ pub struct BackupExportResult {
     pub bytes_copied: u64,
     pub model_files_checked: usize,
     pub missing_model_paths: Vec<String>,
+    pub ok: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SupportBundleExportRequest {
+    pub export_root: String,
+    #[serde(default = "default_support_bundle_include_release_readiness")]
+    pub include_release_readiness: bool,
+}
+
+fn default_support_bundle_include_release_readiness() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SupportBundleExportResult {
+    pub exported_at: DateTime<Utc>,
+    pub export_root: String,
+    pub bundle_path: String,
+    pub sections: Vec<String>,
+    pub redacted_fields: Vec<String>,
+    pub private_data_excluded: bool,
     pub ok: bool,
 }
 

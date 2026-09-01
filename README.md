@@ -1,6 +1,29 @@
 # Private Gallery
 
-Private Gallery is a local-first, private-by-default photo and video organizer inspired by Google Photos while keeping all media intelligence on your own devices.
+Private Gallery is a local-first, private-by-default shared-storage cloud and
+smart organizer for photos, videos, documents, and work files. It is inspired by
+Google Photos-style organization while keeping media, file intelligence, and
+private storage on the user's own trusted devices.
+
+See [docs/product-vision.md](docs/product-vision.md) for the expanded
+cross-platform product vision, shared-storage goal, privacy promise, and pricing
+direction. The pasteable under-4,000-character Codex goal lives in
+[docs/product-goal-4000.md](docs/product-goal-4000.md). See
+[docs/platform-release-and-entitlements.md](docs/platform-release-and-entitlements.md)
+for the platform completion and subscription entitlement plan.
+The working product brief and workflow map live in
+[docs/product/prfaq.md](docs/product/prfaq.md) and
+[docs/product/critical-user-journeys.md](docs/product/critical-user-journeys.md).
+Business and sequencing details live in
+[docs/business/monetization-and-entitlements-template.md](docs/business/monetization-and-entitlements-template.md),
+[docs/business/unit-economics-scorecard-template.md](docs/business/unit-economics-scorecard-template.md),
+and
+[docs/roadmap/year-one-engineering-roadmap-template.md](docs/roadmap/year-one-engineering-roadmap-template.md).
+Operational ownership, rollout safety, and maturity tracking live in
+[docs/platform/service-ownership-template.md](docs/platform/service-ownership-template.md),
+[docs/platform/deploy-and-rollback-policy-template.md](docs/platform/deploy-and-rollback-policy-template.md),
+and
+[docs/platform/engineering-operating-system-scorecard-template.md](docs/platform/engineering-operating-system-scorecard-template.md).
 
 ## Current Status
 

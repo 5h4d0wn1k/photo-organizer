@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
 
 import '../../models/gallery_models.dart';
+import '../../widgets/app_ui.dart';
 import '../../widgets/empty_state_panel.dart';
 
 class SettingsScreen extends StatefulWidget {
@@ -13,6 +14,7 @@ class SettingsScreen extends StatefulWidget {
     required this.onVerifyModel,
     required this.onVerifyBackup,
     required this.onExportBackup,
+    required this.onExportSupportBundle,
     required this.onPlanRestoreBackup,
     required this.onRunRestoreBackup,
     required this.onSaveSettings,
@@ -28,23 +30,32 @@ class SettingsScreen extends StatefulWidget {
     required String localPath,
     String? expectedSha256,
     required bool confirmed,
-  }) onImportLocalModel;
+  })
+  onImportLocalModel;
   final Future<ModelArtifact> Function(String id) onVerifyModel;
   final Future<BackupVerification> Function({String? exportRoot})
-      onVerifyBackup;
+  onVerifyBackup;
   final Future<BackupExportResult> Function({
     required String exportRoot,
     bool includeModels,
-  }) onExportBackup;
+  })
+  onExportBackup;
+  final Future<SupportBundleExportResult> Function({
+    required String exportRoot,
+    bool includeReleaseReadiness,
+  })
+  onExportSupportBundle;
   final Future<BackupRestorePlan> Function({
     required String exportRoot,
     required String restoreRoot,
-  }) onPlanRestoreBackup;
+  })
+  onPlanRestoreBackup;
   final Future<BackupRestoreRunResult> Function({
     required String exportRoot,
     required String restoreRoot,
     bool confirmed,
-  }) onRunRestoreBackup;
+  })
+  onRunRestoreBackup;
   final Future<void> Function(LibrarySettingsDraft draft) onSaveSettings;
   final Future<void> Function(WatchFolderDraft draft) onAddWatchFolder;
   final Future<void> Function(String id) onDeleteWatchFolder;
@@ -72,10 +83,12 @@ class _SettingsScreenState extends State<SettingsScreen> {
   bool _verifyingModel = false;
   bool _verifyingBackup = false;
   bool _exportingBackup = false;
+  bool _exportingSupportBundle = false;
   bool _planningRestore = false;
   bool _runningRestore = false;
   BackupVerification? _backupVerification;
   BackupExportResult? _backupExport;
+  SupportBundleExportResult? _supportBundleExport;
   BackupRestorePlan? _restorePlan;
   BackupRestoreRunResult? _restoreRun;
   ModelArtifact? _modelActionResult;
@@ -127,16 +140,16 @@ class _SettingsScreenState extends State<SettingsScreen> {
       if (!mounted) {
         return;
       }
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Library settings saved.')),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('Library settings saved.')));
     } catch (error) {
       if (!mounted) {
         return;
       }
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('$error')),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('$error')));
     } finally {
       if (mounted) {
         setState(() => _savingSettings = false);
@@ -166,16 +179,16 @@ class _SettingsScreenState extends State<SettingsScreen> {
         return;
       }
       _watchFolderController.clear();
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Watch folder added.')),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('Watch folder added.')));
     } catch (error) {
       if (!mounted) {
         return;
       }
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('$error')),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('$error')));
     } finally {
       if (mounted) {
         setState(() => _savingWatchFolder = false);
@@ -226,9 +239,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
       if (!mounted) {
         return;
       }
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('$error')),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('$error')));
     } finally {
       if (mounted) {
         setState(() => _importingModel = false);
@@ -239,9 +252,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
   Future<void> _verifyModel() async {
     final id = _modelIdController.text.trim();
     if (id.isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Enter a model id first.')),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('Enter a model id first.')));
       return;
     }
 
@@ -252,16 +265,16 @@ class _SettingsScreenState extends State<SettingsScreen> {
         return;
       }
       setState(() => _modelActionResult = result);
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Model ${result.id} verified.')),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('Model ${result.id} verified.')));
     } catch (error) {
       if (!mounted) {
         return;
       }
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('$error')),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('$error')));
     } finally {
       if (mounted) {
         setState(() => _verifyingModel = false);
@@ -283,18 +296,20 @@ class _SettingsScreenState extends State<SettingsScreen> {
       setState(() => _backupVerification = result);
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
-          content: Text(result.ok
-              ? 'Backup verification passed.'
-              : 'Backup verification found missing files.'),
+          content: Text(
+            result.ok
+                ? 'Backup verification passed.'
+                : 'Backup verification found missing files.',
+          ),
         ),
       );
     } catch (error) {
       if (!mounted) {
         return;
       }
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('$error')),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('$error')));
     } finally {
       if (mounted) {
         setState(() => _verifyingBackup = false);
@@ -320,21 +335,65 @@ class _SettingsScreenState extends State<SettingsScreen> {
       setState(() => _backupExport = result);
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
-          content: Text(result.ok
-              ? 'Backup manifest exported.'
-              : 'Backup exported with missing file warnings.'),
+          content: Text(
+            result.ok
+                ? 'Backup manifest exported.'
+                : 'Backup exported with missing file warnings.',
+          ),
         ),
       );
     } catch (error) {
       if (!mounted) {
         return;
       }
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('$error')),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('$error')));
     } finally {
       if (mounted) {
         setState(() => _exportingBackup = false);
+      }
+    }
+  }
+
+  Future<void> _exportSupportBundle() async {
+    final exportRoot = _backupRootController.text.trim();
+    if (exportRoot.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Enter an export path first.')),
+      );
+      return;
+    }
+
+    setState(() => _exportingSupportBundle = true);
+    try {
+      final result = await widget.onExportSupportBundle(
+        exportRoot: exportRoot,
+        includeReleaseReadiness: true,
+      );
+      if (!mounted) {
+        return;
+      }
+      setState(() => _supportBundleExport = result);
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            result.privateDataExcluded
+                ? 'Redacted support bundle exported.'
+                : 'Support bundle exported; review before sharing.',
+          ),
+        ),
+      );
+    } catch (error) {
+      if (!mounted) {
+        return;
+      }
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('$error')));
+    } finally {
+      if (mounted) {
+        setState(() => _exportingSupportBundle = false);
       }
     }
   }
@@ -361,18 +420,20 @@ class _SettingsScreenState extends State<SettingsScreen> {
       setState(() => _restorePlan = result);
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
-          content: Text(result.ok
-              ? 'Restore plan is ready.'
-              : 'Restore plan found blockers.'),
+          content: Text(
+            result.ok
+                ? 'Restore plan is ready.'
+                : 'Restore plan found blockers.',
+          ),
         ),
       );
     } catch (error) {
       if (!mounted) {
         return;
       }
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('$error')),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('$error')));
     } finally {
       if (mounted) {
         setState(() => _planningRestore = false);
@@ -403,18 +464,20 @@ class _SettingsScreenState extends State<SettingsScreen> {
       setState(() => _restoreRun = result);
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
-          content: Text(result.ok
-              ? 'Restore staged for review.'
-              : 'Restore finished with warnings.'),
+          content: Text(
+            result.ok
+                ? 'Restore staged for review.'
+                : 'Restore finished with warnings.',
+          ),
         ),
       );
     } catch (error) {
       if (!mounted) {
         return;
       }
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('$error')),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('$error')));
     } finally {
       if (mounted) {
         setState(() => _runningRestore = false);
@@ -428,8 +491,11 @@ class _SettingsScreenState extends State<SettingsScreen> {
     final watchFolders = widget.workspace.watchFolders;
     final settings = widget.workspace.settings;
     final privacyStatus = widget.workspace.privacyStatus;
+    final entitlementStatus = widget.workspace.entitlementStatus;
+    final platformReleaseReadiness = widget.workspace.platformReleaseReadiness;
     final models = widget.workspace.dashboard.models;
     final runtimeStatus = widget.workspace.dashboard.modelRuntimeStatus;
+    final auditEvents = widget.workspace.dashboard.auditEvents;
     final formatter = DateFormat.yMMMd().add_jm();
 
     return ListView(
@@ -524,8 +590,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Text('Backup and restore readiness',
-                    style: theme.textTheme.titleLarge),
+                Text(
+                  'Backup and restore readiness',
+                  style: theme.textTheme.titleLarge,
+                ),
                 const SizedBox(height: 12),
                 const Text(
                   'This verifies the encrypted database, managed originals, encrypted vault chunks, and installed model files. Export writes a restorable local backup; restore stages into a separate folder without modifying the active library.',
@@ -576,6 +644,18 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       label: const Text('Export restorable backup'),
                     ),
                     OutlinedButton.icon(
+                      onPressed: _exportingSupportBundle
+                          ? null
+                          : _exportSupportBundle,
+                      icon: _exportingSupportBundle
+                          ? const SizedBox.square(
+                              dimension: 18,
+                              child: CircularProgressIndicator(strokeWidth: 2),
+                            )
+                          : const Icon(Icons.support_agent_outlined),
+                      label: const Text('Export support bundle'),
+                    ),
+                    OutlinedButton.icon(
                       onPressed: _planningRestore ? null : _planRestoreBackup,
                       icon: _planningRestore
                           ? const SizedBox.square(
@@ -586,7 +666,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       label: const Text('Plan restore'),
                     ),
                     FilledButton.tonalIcon(
-                      onPressed: _runningRestore ||
+                      onPressed:
+                          _runningRestore ||
                               (_restorePlan != null && !_restorePlan!.ok)
                           ? null
                           : _runRestoreBackup,
@@ -608,6 +689,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   const SizedBox(height: 16),
                   _BackupExportPanel(result: _backupExport!),
                 ],
+                if (_supportBundleExport != null) ...[
+                  const SizedBox(height: 16),
+                  _SupportBundleExportPanel(result: _supportBundleExport!),
+                ],
                 if (_restorePlan != null) ...[
                   const SizedBox(height: 16),
                   _BackupRestorePlanPanel(result: _restorePlan!),
@@ -616,6 +701,83 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   const SizedBox(height: 16),
                   _BackupRestoreRunPanel(result: _restoreRun!),
                 ],
+              ],
+            ),
+          ),
+        ),
+        const SizedBox(height: 24),
+        Card(
+          child: Padding(
+            padding: const EdgeInsets.all(24),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  'Platform release readiness',
+                  style: theme.textTheme.titleLarge,
+                ),
+                const SizedBox(height: 12),
+                if (platformReleaseReadiness == null)
+                  const EmptyStatePanel(
+                    icon: Icons.fact_check_outlined,
+                    title: 'Release readiness unavailable',
+                    message:
+                        'This daemon did not report platform release evidence. Treat all platform releases as incomplete until the checklist is recorded.',
+                  )
+                else
+                  _PlatformReleaseReadinessPanel(
+                    readiness: platformReleaseReadiness,
+                  ),
+              ],
+            ),
+          ),
+        ),
+        const SizedBox(height: 24),
+        Card(
+          child: Padding(
+            padding: const EdgeInsets.all(24),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  'Subscription and offline access',
+                  style: theme.textTheme.titleLarge,
+                ),
+                const SizedBox(height: 12),
+                if (entitlementStatus == null)
+                  const EmptyStatePanel(
+                    icon: Icons.workspace_premium_outlined,
+                    title: 'Entitlement status unavailable',
+                    message:
+                        'Local library access remains available while this daemon version or connection does not report entitlement state.',
+                  )
+                else
+                  _EntitlementStatusPanel(
+                    status: entitlementStatus,
+                    formatter: formatter,
+                  ),
+              ],
+            ),
+          ),
+        ),
+        const SizedBox(height: 24),
+        Card(
+          child: Padding(
+            padding: const EdgeInsets.all(24),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text('Admin audit log', style: theme.textTheme.titleLarge),
+                const SizedBox(height: 12),
+                if (auditEvents.isEmpty)
+                  const EmptyStatePanel(
+                    icon: Icons.manage_history_outlined,
+                    title: 'No admin events recorded yet',
+                    message:
+                        'Successful vault, device, sync, and storage actions will appear here after the daemon records them locally.',
+                  )
+                else
+                  _AuditLogPanel(events: auditEvents, formatter: formatter),
               ],
             ),
           ),
@@ -777,8 +939,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   if (!privacyStatus.encryption.sensitiveIndexingAllowed) ...[
                     const SizedBox(height: 12),
                     FilledButton.icon(
-                      onPressed:
-                          _activatingEncryption ? null : _activateEncryption,
+                      onPressed: _activatingEncryption
+                          ? null
+                          : _activateEncryption,
                       icon: _activatingEncryption
                           ? const SizedBox(
                               height: 18,
@@ -955,6 +1118,266 @@ class _SettingsScreenState extends State<SettingsScreen> {
   }
 }
 
+class _AuditLogPanel extends StatelessWidget {
+  const _AuditLogPanel({required this.events, required this.formatter});
+
+  final List<AuditEvent> events;
+  final DateFormat formatter;
+
+  @override
+  Widget build(BuildContext context) {
+    final visibleEvents = events.take(12).toList();
+    return Column(
+      children: [
+        for (var index = 0; index < visibleEvents.length; index++) ...[
+          ListTile(
+            contentPadding: EdgeInsets.zero,
+            leading: Icon(_auditIcon(visibleEvents[index].action)),
+            title: Text(
+              visibleEvents[index].summary.isEmpty
+                  ? visibleEvents[index].action
+                  : visibleEvents[index].summary,
+              maxLines: 2,
+              overflow: TextOverflow.ellipsis,
+            ),
+            subtitle: Text(
+              [
+                formatter.format(visibleEvents[index].createdAt.toLocal()),
+                visibleEvents[index].actorLabel ?? 'Local admin',
+                visibleEvents[index].action,
+                visibleEvents[index].targetKind,
+              ].join(' • '),
+            ),
+          ),
+          if (index != visibleEvents.length - 1) const Divider(),
+        ],
+      ],
+    );
+  }
+}
+
+class _PlatformReleaseReadinessPanel extends StatelessWidget {
+  const _PlatformReleaseReadinessPanel({required this.readiness});
+
+  final PlatformReleaseReadinessResponse readiness;
+
+  @override
+  Widget build(BuildContext context) {
+    final blocked = readiness.blockedSurfaceCount;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        ListTile(
+          contentPadding: EdgeInsets.zero,
+          leading: Icon(_platformReleaseStatusIcon(readiness.overallStatus)),
+          title: Text('Overall: ${readiness.overallStatus.label}'),
+          subtitle: Text(readiness.detail),
+        ),
+        const SizedBox(height: 12),
+        Wrap(
+          spacing: 12,
+          runSpacing: 12,
+          children: [
+            AppMetricChip(
+              icon: Icons.check_circle_outline,
+              label: 'Ready',
+              value:
+                  '${readiness.readySurfaceCount}/${readiness.requiredSurfaceCount}',
+            ),
+            AppMetricChip(
+              icon: Icons.block_outlined,
+              label: 'Blocked',
+              value: '$blocked',
+            ),
+            AppMetricChip(
+              icon: Icons.devices_other_outlined,
+              label: 'Surfaces',
+              value: '${readiness.surfaces.length}',
+            ),
+          ],
+        ),
+        const SizedBox(height: 12),
+        for (var index = 0; index < readiness.surfaces.length; index++) ...[
+          _PlatformReleaseSurfaceTile(surface: readiness.surfaces[index]),
+          if (index != readiness.surfaces.length - 1) const Divider(),
+        ],
+      ],
+    );
+  }
+}
+
+class _PlatformReleaseSurfaceTile extends StatelessWidget {
+  const _PlatformReleaseSurfaceTile({required this.surface});
+
+  final PlatformReleaseSurfaceReadiness surface;
+
+  @override
+  Widget build(BuildContext context) {
+    final missing = surface.missingEvidenceCount;
+    final blockers = surface.blockers.take(2).join(' • ');
+    return ListTile(
+      contentPadding: EdgeInsets.zero,
+      leading: Icon(_platformReleaseStatusIcon(surface.status)),
+      title: Text('${surface.label} • ${surface.status.label}'),
+      subtitle: Text(
+        [
+          surface.distribution,
+          if (missing > 0) '$missing missing evidence item(s)',
+          if (blockers.isNotEmpty) blockers,
+          surface.nextStep,
+        ].join('\n'),
+      ),
+    );
+  }
+}
+
+IconData _platformReleaseStatusIcon(PlatformReleaseReadinessStatus status) {
+  switch (status) {
+    case PlatformReleaseReadinessStatus.ready:
+      return Icons.verified_outlined;
+    case PlatformReleaseReadinessStatus.blocked:
+      return Icons.report_problem_outlined;
+    case PlatformReleaseReadinessStatus.planned:
+      return Icons.event_note_outlined;
+    case PlatformReleaseReadinessStatus.inProgress:
+      return Icons.pending_actions_outlined;
+  }
+}
+
+class _EntitlementStatusPanel extends StatelessWidget {
+  const _EntitlementStatusPanel({
+    required this.status,
+    required this.formatter,
+  });
+
+  final EntitlementStatusResponse status;
+  final DateFormat formatter;
+
+  @override
+  Widget build(BuildContext context) {
+    final cache = status.cache;
+    final dateParts = <String>[
+      if (cache?.checkedAt != null)
+        'Checked ${formatter.format(cache!.checkedAt!.toLocal())}',
+      if (cache?.expiresAt != null)
+        'Expires ${formatter.format(cache!.expiresAt!.toLocal())}',
+      if (cache?.offlineGraceExpiresAt != null)
+        'Grace until ${formatter.format(cache!.offlineGraceExpiresAt!.toLocal())}',
+    ];
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        ListTile(
+          contentPadding: EdgeInsets.zero,
+          leading: Icon(_entitlementIcon(status.effectiveStatus)),
+          title: Text('${status.tier.label} • ${status.effectiveStatus.label}'),
+          subtitle: Text(status.detail),
+        ),
+        const SizedBox(height: 12),
+        Wrap(
+          spacing: 12,
+          runSpacing: 12,
+          children: [
+            AppMetricChip(
+              icon: Icons.devices_other_outlined,
+              label: 'Devices',
+              value: '${status.limits.deviceLimit}',
+            ),
+            AppMetricChip(
+              icon: Icons.group_outlined,
+              label: 'Members',
+              value: '${status.limits.memberLimit}',
+            ),
+            AppMetricChip(
+              icon: Icons.workspaces_outlined,
+              label: 'Workspaces',
+              value: '${status.limits.workspaceLimit}',
+            ),
+            AppMetricChip(
+              icon: Icons.document_scanner_outlined,
+              label: 'Monthly OCR',
+              value: '${status.limits.monthlyOcrLimit}',
+            ),
+            AppMetricChip(
+              icon: Icons.hub_outlined,
+              label: 'Relay',
+              value: status.limits.relayPriority.label,
+            ),
+            AppMetricChip(
+              icon: Icons.admin_panel_settings_outlined,
+              label: 'Admin',
+              value: status.limits.advancedAdminControls ? 'Advanced' : 'Core',
+            ),
+          ],
+        ),
+        const SizedBox(height: 12),
+        ListTile(
+          contentPadding: EdgeInsets.zero,
+          leading: Icon(
+            status.safeLocalAccessAllowed
+                ? Icons.lock_open_outlined
+                : Icons.lock_clock_outlined,
+          ),
+          title: Text(
+            status.safeLocalAccessAllowed
+                ? 'Safe local access allowed'
+                : 'Local access limited',
+          ),
+          subtitle: Text(
+            [
+              if (status.offlineGraceActive) 'Offline grace active',
+              status.paidFeaturesAvailable
+                  ? 'Paid features available'
+                  : 'Paid features unavailable',
+              status.contentExposurePrevented
+                  ? 'No content sent to billing'
+                  : 'Content exposure review required',
+              if (cache?.planCode != null) 'Plan ${cache!.planCode}',
+              if (dateParts.isNotEmpty) dateParts.join(' • '),
+            ].join(' • '),
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+IconData _entitlementIcon(EntitlementEffectiveStatus status) {
+  switch (status) {
+    case EntitlementEffectiveStatus.offlineGrace:
+      return Icons.offline_bolt_outlined;
+    case EntitlementEffectiveStatus.expired:
+      return Icons.workspace_premium_outlined;
+    case EntitlementEffectiveStatus.unavailable:
+      return Icons.cloud_off_outlined;
+    case EntitlementEffectiveStatus.active:
+      return Icons.verified_user_outlined;
+  }
+}
+
+IconData _auditIcon(String action) {
+  if (action.startsWith('device.')) {
+    return Icons.devices_other_outlined;
+  }
+  if (action.startsWith('vault.')) {
+    return Icons.folder_shared_outlined;
+  }
+  if (action.startsWith('sync.network')) {
+    return Icons.hub_outlined;
+  }
+  if (action.startsWith('sync.')) {
+    return Icons.sync_alt_outlined;
+  }
+  if (action.startsWith('asset.')) {
+    return Icons.storage_outlined;
+  }
+  if (action.startsWith('pairing.')) {
+    return Icons.qr_code_2_outlined;
+  }
+  return Icons.manage_history_outlined;
+}
+
 class _BackupVerificationPanel extends StatelessWidget {
   const _BackupVerificationPanel({required this.result});
 
@@ -1016,12 +1439,15 @@ class _ModelResultPanel extends StatelessWidget {
                   model.installed
                       ? Icons.verified_outlined
                       : Icons.warning_amber_outlined,
-                  color:
-                      model.installed ? colorScheme.primary : colorScheme.error,
+                  color: model.installed
+                      ? colorScheme.primary
+                      : colorScheme.error,
                 ),
                 const SizedBox(width: 8),
-                Text(model.name,
-                    style: Theme.of(context).textTheme.titleMedium),
+                Text(
+                  model.name,
+                  style: Theme.of(context).textTheme.titleMedium,
+                ),
               ],
             ),
             const SizedBox(height: 10),
@@ -1127,8 +1553,9 @@ class _BackupExportPanel extends StatelessWidget {
   Widget build(BuildContext context) {
     return _BackupResultCard(
       ok: result.ok,
-      title:
-          result.ok ? 'Backup export written' : 'Backup exported with warnings',
+      title: result.ok
+          ? 'Backup export written'
+          : 'Backup exported with warnings',
       lines: [
         'Export root: ${result.exportRoot}',
         'Manifest: ${result.manifestPath}',
@@ -1142,6 +1569,34 @@ class _BackupExportPanel extends StatelessWidget {
         'Missing model files: ${result.missingModelPaths.length}',
         if (result.databaseSha256 != null)
           'Database SHA-256: ${result.databaseSha256}',
+      ],
+    );
+  }
+}
+
+class _SupportBundleExportPanel extends StatelessWidget {
+  const _SupportBundleExportPanel({required this.result});
+
+  final SupportBundleExportResult result;
+
+  @override
+  Widget build(BuildContext context) {
+    return _BackupResultCard(
+      ok: result.privateDataExcluded,
+      title: result.privateDataExcluded
+          ? 'Redacted support bundle written'
+          : 'Support bundle needs review',
+      lines: [
+        'Export root: ${result.exportRoot}',
+        'Bundle: ${result.bundlePath}',
+        'Sections: ${result.sections.join(', ')}',
+        'Redacted fields: ${result.redactedFields.length}',
+        result.privateDataExcluded
+            ? 'Private data excluded: yes'
+            : 'Private data excluded: review required',
+        result.ok
+            ? 'Backup health: ok'
+            : 'Backup health: warnings included without private paths',
       ],
     );
   }
@@ -1220,9 +1675,7 @@ class _BackupResultCard extends StatelessWidget {
     final colorScheme = Theme.of(context).colorScheme;
     return DecoratedBox(
       decoration: BoxDecoration(
-        border: Border.all(
-          color: ok ? colorScheme.primary : colorScheme.error,
-        ),
+        border: Border.all(color: ok ? colorScheme.primary : colorScheme.error),
         borderRadius: BorderRadius.circular(18),
       ),
       child: Padding(

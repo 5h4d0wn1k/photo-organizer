@@ -11,7 +11,8 @@ import 'package:share_plus/share_plus.dart';
 import 'package:video_player/video_player.dart';
 import 'package:video_trimmer/video_trimmer.dart' as vt;
 
-import '../../models/gallery_models.dart' show MobileAssetSummary;
+import '../../models/gallery_models.dart'
+    show AssetAvailability, AssetAvailabilityState, MobileAssetSummary;
 import '../../theme/app_theme.dart';
 
 class MobileMediaViewer extends StatefulWidget {
@@ -23,13 +24,15 @@ class MobileMediaViewer extends StatefulWidget {
   }) : localAsset = asset,
        groupAsset = null,
        loadOriginalFile = null,
-       saveOriginal = null;
+       saveOriginal = null,
+       loadAvailability = null;
 
   const MobileMediaViewer.group({
     super.key,
     required MobileAssetSummary asset,
     required this.loadOriginalFile,
     required this.saveOriginal,
+    this.loadAvailability,
   }) : groupAsset = asset,
        localAsset = null,
        canUpload = false,
@@ -41,6 +44,7 @@ class MobileMediaViewer extends StatefulWidget {
   final Future<void> Function()? onUpload;
   final Future<File> Function()? loadOriginalFile;
   final Future<File> Function()? saveOriginal;
+  final Future<AssetAvailability> Function()? loadAvailability;
 
   @override
   State<MobileMediaViewer> createState() => _MobileMediaViewerState();
@@ -48,6 +52,7 @@ class MobileMediaViewer extends StatefulWidget {
 
 class _MobileMediaViewerState extends State<MobileMediaViewer> {
   late Future<File?> _fileFuture;
+  Future<AssetAvailability>? _availabilityFuture;
   var _showDetails = false;
   var _busy = false;
   String? _status;
@@ -142,6 +147,35 @@ class _MobileMediaViewerState extends State<MobileMediaViewer> {
   void initState() {
     super.initState();
     _fileFuture = _resolveOriginalFile();
+    _availabilityFuture = _loadAvailability();
+  }
+
+  @override
+  void didUpdateWidget(covariant MobileMediaViewer oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    final oldAssetId = oldWidget.groupAsset?.assetId;
+    final assetId = widget.groupAsset?.assetId;
+    if (oldAssetId != assetId ||
+        oldWidget.loadAvailability != widget.loadAvailability) {
+      _fileFuture = _resolveOriginalFile();
+      _availabilityFuture = _loadAvailability();
+    }
+  }
+
+  Future<AssetAvailability>? _loadAvailability() {
+    if (widget.groupAsset == null || widget.loadAvailability == null) {
+      return null;
+    }
+    return widget.loadAvailability!();
+  }
+
+  void _refreshAvailability() {
+    if (widget.loadAvailability == null) {
+      return;
+    }
+    setState(() {
+      _availabilityFuture = widget.loadAvailability!();
+    });
   }
 
   Future<File?> _resolveOriginalFile() async {
@@ -500,6 +534,11 @@ class _MobileMediaViewerState extends State<MobileMediaViewer> {
           value: group.available ? 'Here' : 'Stored elsewhere',
         ),
         _DetailRow(label: 'Content hash', value: group.contentHash),
+        if (_availabilityFuture != null)
+          _MobileAvailabilityPanel(
+            future: _availabilityFuture!,
+            onRefresh: _refreshAvailability,
+          ),
       ],
       FutureBuilder<File?>(
         future: _fileFuture,
@@ -1077,6 +1116,150 @@ class _DetailRow extends StatelessWidget {
   }
 }
 
+class _MobileAvailabilityPanel extends StatelessWidget {
+  const _MobileAvailabilityPanel({
+    required this.future,
+    required this.onRefresh,
+  });
+
+  final Future<AssetAvailability> future;
+  final VoidCallback onRefresh;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return FutureBuilder<AssetAvailability>(
+      future: future,
+      builder: (context, snapshot) {
+        final availability = snapshot.data;
+        return Padding(
+          padding: const EdgeInsets.only(top: 12),
+          child: DecoratedBox(
+            decoration: BoxDecoration(
+              color: theme.colorScheme.surfaceContainerHighest,
+              borderRadius: BorderRadius.circular(8),
+              border: Border.all(color: theme.colorScheme.outlineVariant),
+            ),
+            child: Padding(
+              padding: const EdgeInsets.all(12),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  Row(
+                    children: [
+                      Expanded(
+                        child: Text(
+                          'Availability',
+                          style: theme.textTheme.titleSmall,
+                        ),
+                      ),
+                      IconButton(
+                        onPressed: onRefresh,
+                        icon: const Icon(Icons.refresh),
+                        tooltip: 'Refresh availability',
+                      ),
+                    ],
+                  ),
+                  if (snapshot.connectionState != ConnectionState.done &&
+                      availability == null)
+                    const LinearProgressIndicator(minHeight: 2)
+                  else if (snapshot.hasError && availability == null)
+                    Text(
+                      'Availability unavailable: ${snapshot.error}',
+                      style: theme.textTheme.bodySmall?.copyWith(
+                        color: theme.colorScheme.error,
+                      ),
+                    )
+                  else if (availability != null) ...[
+                    const SizedBox(height: 4),
+                    Wrap(
+                      spacing: 8,
+                      runSpacing: 8,
+                      children: [
+                        _AvailabilityChip(
+                          icon: _availabilityIcon(availability.state),
+                          label: _availabilityLabel(availability.state),
+                          color: _availabilityColor(theme, availability.state),
+                        ),
+                        _AvailabilityChip(
+                          icon: Icons.hub_outlined,
+                          label:
+                              '${availability.replicaCount}/${availability.requiredReplicaCount} replicas',
+                          color:
+                              availability.replicaCount >=
+                                  availability.requiredReplicaCount
+                              ? AppColors.active
+                              : AppColors.warning,
+                        ),
+                        if (availability.reachableReplicaDeviceIds.isNotEmpty)
+                          _AvailabilityChip(
+                            icon: Icons.lan_outlined,
+                            label:
+                                '${availability.reachableReplicaDeviceIds.length} reachable',
+                            color: AppColors.info,
+                          ),
+                        if (availability.offlineReplicaDeviceIds.isNotEmpty)
+                          _AvailabilityChip(
+                            icon: Icons.cloud_off_outlined,
+                            label:
+                                '${availability.offlineReplicaDeviceIds.length} offline',
+                            color: AppColors.warning,
+                          ),
+                      ],
+                    ),
+                    const SizedBox(height: 8),
+                    Text(availability.detail, style: theme.textTheme.bodySmall),
+                  ],
+                ],
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+}
+
+class _AvailabilityChip extends StatelessWidget {
+  const _AvailabilityChip({
+    required this.icon,
+    required this.label,
+    required this.color,
+  });
+
+  final IconData icon;
+  final String label;
+  final Color color;
+
+  @override
+  Widget build(BuildContext context) {
+    return DecoratedBox(
+      decoration: BoxDecoration(
+        color: color.withValues(alpha: 0.12),
+        borderRadius: BorderRadius.circular(999),
+        border: Border.all(color: color.withValues(alpha: 0.28)),
+      ),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(icon, color: color, size: 14),
+            const SizedBox(width: 6),
+            Text(
+              label,
+              style: Theme.of(context).textTheme.labelSmall?.copyWith(
+                color: color,
+                fontWeight: FontWeight.w800,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
 class _ViewerMessage extends StatelessWidget {
   const _ViewerMessage({
     required this.icon,
@@ -1118,6 +1301,42 @@ class _ViewerMessage extends StatelessWidget {
       ),
     );
   }
+}
+
+String _availabilityLabel(AssetAvailabilityState state) {
+  return switch (state) {
+    AssetAvailabilityState.localAvailable => 'Local',
+    AssetAvailabilityState.remoteAvailable => 'Remote reachable',
+    AssetAvailabilityState.remoteOffline => 'Remote offline',
+    AssetAvailabilityState.underReplicated => 'Under-replicated',
+    AssetAvailabilityState.missing => 'Missing',
+    AssetAvailabilityState.corrupt => 'Corrupt',
+    AssetAvailabilityState.transferPending => 'Transfer pending',
+  };
+}
+
+Color _availabilityColor(ThemeData theme, AssetAvailabilityState state) {
+  return switch (state) {
+    AssetAvailabilityState.localAvailable => AppColors.active,
+    AssetAvailabilityState.remoteAvailable => AppColors.info,
+    AssetAvailabilityState.remoteOffline => AppColors.warning,
+    AssetAvailabilityState.underReplicated => AppColors.warning,
+    AssetAvailabilityState.missing => theme.colorScheme.error,
+    AssetAvailabilityState.corrupt => theme.colorScheme.error,
+    AssetAvailabilityState.transferPending => AppColors.info,
+  };
+}
+
+IconData _availabilityIcon(AssetAvailabilityState state) {
+  return switch (state) {
+    AssetAvailabilityState.localAvailable => Icons.cloud_done_outlined,
+    AssetAvailabilityState.remoteAvailable => Icons.cloud_download_outlined,
+    AssetAvailabilityState.remoteOffline => Icons.cloud_off_outlined,
+    AssetAvailabilityState.underReplicated => Icons.warning_amber_outlined,
+    AssetAvailabilityState.missing => Icons.report_gmailerrorred_outlined,
+    AssetAvailabilityState.corrupt => Icons.gpp_bad_outlined,
+    AssetAvailabilityState.transferPending => Icons.sync_outlined,
+  };
 }
 
 String _formatBytes(int? bytes) {

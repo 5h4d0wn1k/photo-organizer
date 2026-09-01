@@ -33,7 +33,9 @@ import '../../models/gallery_models.dart'
         PersonCluster,
         PlaceCluster,
         SearchQuery,
-        SearchResponse;
+        SearchResponse,
+        VaultFileEntry,
+        VaultFileTreeResponse;
 import '../../services/cloud_bootstrap_service.dart';
 import '../../theme/app_theme.dart';
 import 'mobile_gallery_panel.dart';
@@ -42,7 +44,7 @@ import 'mobile_workspace_panel.dart';
 
 enum _MobileOnboardingMode { overview, join, paired }
 
-enum _MobilePairedTab { gallery, search, devices, settings }
+enum _MobilePairedTab { gallery, files, search, devices, settings }
 
 enum _MobileGalleryFilter {
   all,
@@ -101,18 +103,22 @@ class _MobilePairingScreenState extends State<MobilePairingScreen> {
   var _busy = false;
   var _pairingInFlight = false;
   var _loadingGallery = false;
+  var _loadingMobileFiles = false;
   var _loadingLocalMedia = false;
   var _pairedSearching = false;
   var _localOnlyMode = false;
   String? _bearerToken;
   String? _status;
   String? _galleryError;
+  String? _mobileFileError;
   String? _localMediaError;
   String? _pairedSearchError;
   DeviceGroupInvite? _pendingInvite;
   DeviceGroupInvite? _cloudInvite;
   CloudDeviceGroup? _cloudGroup;
   MobileWorkspaceSnapshot? _mobileWorkspace;
+  VaultFileTreeResponse? _mobileFileTree;
+  String? _mobileFileFolderId;
   SearchResponse? _pairedSearchResult;
   MobileUpload? _activeUpload;
   String? _activeUploadFilename;
@@ -577,6 +583,8 @@ class _MobilePairingScreenState extends State<MobilePairingScreen> {
       setState(() {
         _bearerToken = null;
         _mobileWorkspace = null;
+        _mobileFileTree = null;
+        _mobileFileFolderId = null;
         _mobileAssets = const [];
         _mode = _MobileOnboardingMode.overview;
         _status =
@@ -600,6 +608,8 @@ class _MobilePairingScreenState extends State<MobilePairingScreen> {
         setState(() {
           _bearerToken = null;
           _mobileWorkspace = null;
+          _mobileFileTree = null;
+          _mobileFileFolderId = null;
           _mobileAssets = const [];
           _mode = _MobileOnboardingMode.overview;
           _status =
@@ -994,20 +1004,36 @@ class _MobilePairingScreenState extends State<MobilePairingScreen> {
     final token = _requireBearerToken();
     setState(() {
       _loadingGallery = true;
+      _loadingMobileFiles = true;
       _galleryError = null;
+      _mobileFileError = null;
     });
     try {
-      final workspace = await _client().fetchMobileWorkspace(
-        bearerToken: token,
-      );
+      final client = _client();
+      final workspace = await client.fetchMobileWorkspace(bearerToken: token);
       final assets = _mobileAssetsFromWorkspace(workspace);
       assets.sort((left, right) => right.capturedAt.compareTo(left.capturedAt));
+      VaultFileTreeResponse? fileTree;
+      String? fileTreeError;
+      try {
+        fileTree = await client.fetchMobileFileTree(bearerToken: token);
+      } on ApiException catch (error) {
+        fileTreeError = _friendlyApiError(error);
+      } catch (error) {
+        fileTreeError = '$error';
+      }
       if (!mounted) {
         return;
       }
       setState(() {
         _mobileWorkspace = workspace;
         _mobileAssets = assets;
+        _mobileFileTree = fileTree;
+        _mobileFileFolderId = _validMobileFolderId(
+          fileTree,
+          _mobileFileFolderId,
+        );
+        _mobileFileError = fileTreeError;
       });
     } on ApiException catch (error) {
       if (!mounted) {
@@ -1024,8 +1050,11 @@ class _MobilePairingScreenState extends State<MobilePairingScreen> {
           _bearerToken = null;
           _mode = _MobileOnboardingMode.join;
           _mobileWorkspace = null;
+          _mobileFileTree = null;
+          _mobileFileFolderId = null;
           _mobileAssets = const [];
           _galleryError = null;
+          _mobileFileError = null;
           _status = 'The mobile session expired. Scan a fresh invite.';
         });
       } else {
@@ -1052,6 +1081,7 @@ class _MobilePairingScreenState extends State<MobilePairingScreen> {
       if (mounted) {
         setState(() {
           _loadingGallery = false;
+          _loadingMobileFiles = false;
         });
       }
     }
@@ -1065,8 +1095,51 @@ class _MobilePairingScreenState extends State<MobilePairingScreen> {
     }
     setState(() {
       _mobileWorkspace = null;
+      _mobileFileTree = null;
+      _mobileFileFolderId = null;
       _mobileAssets = assets;
     });
+  }
+
+  Future<void> _refreshMobileFiles() async {
+    final token = _requireBearerToken();
+    setState(() {
+      _loadingMobileFiles = true;
+      _mobileFileError = null;
+    });
+    try {
+      final fileTree = await _client().fetchMobileFileTree(bearerToken: token);
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _mobileFileTree = fileTree;
+        _mobileFileFolderId = _validMobileFolderId(
+          fileTree,
+          _mobileFileFolderId,
+        );
+      });
+    } on ApiException catch (error) {
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _mobileFileError = _friendlyApiError(error);
+      });
+    } catch (error) {
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _mobileFileError = '$error';
+      });
+    } finally {
+      if (mounted) {
+        setState(() {
+          _loadingMobileFiles = false;
+        });
+      }
+    }
   }
 
   Future<void> _refreshPairedSurfaces() async {
@@ -1201,6 +1274,29 @@ class _MobilePairingScreenState extends State<MobilePairingScreen> {
     );
   }
 
+  Future<File> _saveMobileFileOriginal(VaultFileEntry entry) async {
+    final token = _requireBearerToken();
+    final root = await getApplicationSupportDirectory();
+    final downloadDir = Directory('${root.path}/mobile_downloads/files');
+    await downloadDir.create(recursive: true);
+    final filename = _safeLocalFilename(entry.name);
+    final file = File('${downloadDir.path}/${entry.id}_$filename');
+    return _client().downloadMobileFileOriginalToFile(
+      bearerToken: token,
+      entryId: entry.id,
+      destination: file,
+    );
+  }
+
+  Future<void> _downloadMobileFile(VaultFileEntry entry) async {
+    await _runBusy(() async {
+      final file = await _saveMobileFileOriginal(entry);
+      setState(() {
+        _status = 'Downloaded ${entry.name} to ${file.path}.';
+      });
+    });
+  }
+
   Future<void> _openMobileAsset(MobileAssetSummary asset) async {
     await Navigator.of(context).push<void>(
       MaterialPageRoute(
@@ -1208,6 +1304,10 @@ class _MobilePairingScreenState extends State<MobilePairingScreen> {
           asset: asset,
           loadOriginalFile: () => _saveMobileOriginal(asset),
           saveOriginal: () => _saveMobileOriginal(asset),
+          loadAvailability: () => _client().fetchMobileAssetAvailability(
+            bearerToken: _requireBearerToken(),
+            assetId: asset.assetId,
+          ),
         ),
       ),
     );
@@ -1682,6 +1782,7 @@ class _MobilePairingScreenState extends State<MobilePairingScreen> {
               allLocalAssetCount: _localDeviceAssets.length,
               workspace: workspace,
             ),
+            _MobilePairedTab.files => _buildReferenceFiles(context),
             _MobilePairedTab.search => _buildReferenceSearch(context),
             _MobilePairedTab.devices => _buildReferenceDevices(
               context,
@@ -1831,6 +1932,118 @@ class _MobilePairingScreenState extends State<MobilePairingScreen> {
               );
             },
           ),
+        ],
+      ],
+    );
+  }
+
+  Widget _buildReferenceFiles(BuildContext context) {
+    final tree = _mobileFileTree;
+    final roots = tree?.roots ?? const <VaultFileEntry>[];
+    final root = roots.firstOrNull;
+    final current = tree == null
+        ? null
+        : _folderByIdMobileTree(tree, _mobileFileFolderId) ?? root;
+    final folders = tree?.entries.where((entry) => entry.isFolder).length ?? 0;
+    final files = tree?.entries.where((entry) => entry.isFile).length ?? 0;
+    final documents =
+        tree?.entries
+            .where((entry) => entry.isFile && entry.mediaKind == 'document')
+            .length ??
+        0;
+    final currentChildren = tree == null || current == null
+        ? const <VaultFileEntry>[]
+        : _childrenOfMobileTree(tree, current.id);
+
+    return ListView(
+      key: const PageStorageKey('mobile-reference-files'),
+      primary: false,
+      padding: const EdgeInsets.fromLTRB(16, 18, 16, 112),
+      children: [
+        Text(
+          'Files & Documents',
+          style: Theme.of(context).textTheme.headlineSmall,
+        ),
+        const SizedBox(height: 6),
+        Text(
+          'Browse shared vault files from trusted devices. Downloads stay on this phone.',
+          style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+            color: Theme.of(context).colorScheme.onSurfaceVariant,
+          ),
+        ),
+        const SizedBox(height: 16),
+        _ReferenceFileSummary(
+          folders: folders,
+          files: files,
+          documents: documents,
+          loading: _loadingMobileFiles,
+          onRefresh: _busy ? null : _refreshMobileFiles,
+        ),
+        if (_loadingMobileFiles) ...[
+          const SizedBox(height: 12),
+          const LinearProgressIndicator(minHeight: 2),
+        ],
+        if (_mobileFileError != null) ...[
+          const SizedBox(height: 12),
+          _ReferenceNotice(
+            icon: Icons.warning_amber_outlined,
+            title: 'Files unavailable',
+            message: _mobileFileError!,
+            action: OutlinedButton.icon(
+              onPressed: _busy ? null : _refreshMobileFiles,
+              icon: const Icon(Icons.refresh),
+              label: const Text('Retry'),
+            ),
+          ),
+        ],
+        const SizedBox(height: 16),
+        if (tree == null || current == null)
+          _ReferenceNotice(
+            icon: Icons.folder_open_outlined,
+            title: 'No shared files yet',
+            message: _bearerToken == null
+                ? 'Join a trusted group to browse documents, archives, audio, text files, and vault media.'
+                : 'Refresh when the desktop is reachable. Shared files appear here beside media originals.',
+            action: _bearerToken == null
+                ? OutlinedButton.icon(
+                    onPressed: _scanInviteQr,
+                    icon: const Icon(Icons.qr_code_scanner_outlined),
+                    label: const Text('Join group'),
+                  )
+                : null,
+          )
+        else ...[
+          _ReferenceBreadcrumbRow(
+            tree: tree,
+            current: current,
+            onOpen: (entry) {
+              setState(() => _mobileFileFolderId = entry.id);
+            },
+          ),
+          const SizedBox(height: 12),
+          if (currentChildren.isEmpty)
+            const _ReferenceNotice(
+              icon: Icons.inbox_outlined,
+              title: 'This folder is empty',
+              message:
+                  'Upload files from desktop or another trusted device to see them here.',
+            )
+          else
+            for (final entry in currentChildren) ...[
+              _ReferenceFileRow(
+                entry: entry,
+                disabled: _busy || _loadingMobileFiles,
+                onOpen: entry.isFolder
+                    ? () {
+                        setState(() => _mobileFileFolderId = entry.id);
+                      }
+                    : null,
+                onDownload: entry.isFile
+                    ? () => _downloadMobileFile(entry)
+                    : null,
+              ),
+              const SizedBox(height: 10),
+            ],
         ],
       ],
     );
@@ -2792,6 +3005,11 @@ class _MobilePairingScreenState extends State<MobilePairingScreen> {
           onOpenAsset: _openMobileAsset,
           previewImageFor: _previewImageFor,
           onSearch: _searchMobileWorkspace,
+          fileTree: _mobileFileTree,
+          fileTreeLoading: _loadingMobileFiles,
+          fileTreeError: _mobileFileError,
+          onRefreshFiles: _refreshMobileFiles,
+          onDownloadFile: _downloadMobileFile,
           onToggleFavorite: _toggleMobileFavorite,
           onToggleArchived: _toggleMobileArchived,
         );
@@ -3330,6 +3548,282 @@ IconData _assetKindIcon(String mediaKind, String mimeType) {
   return Icons.image_outlined;
 }
 
+String? _validMobileFolderId(
+  VaultFileTreeResponse? tree,
+  String? preferredFolderId,
+) {
+  if (tree == null) {
+    return null;
+  }
+  final preferred = _folderByIdMobileTree(tree, preferredFolderId);
+  if (preferred != null) {
+    return preferred.id;
+  }
+  return tree.roots.firstOrNull?.id;
+}
+
+VaultFileEntry? _folderByIdMobileTree(
+  VaultFileTreeResponse tree,
+  String? folderId,
+) {
+  if (folderId == null) {
+    return null;
+  }
+  for (final entry in tree.entries) {
+    if (entry.id == folderId && entry.isFolder) {
+      return entry;
+    }
+  }
+  return null;
+}
+
+List<VaultFileEntry> _childrenOfMobileTree(
+  VaultFileTreeResponse tree,
+  String parentId,
+) {
+  final children = tree.childrenOf(parentId);
+  children.sort((left, right) {
+    final kind = (left.isFile ? 1 : 0).compareTo(right.isFile ? 1 : 0);
+    if (kind != 0) {
+      return kind;
+    }
+    return left.name.toLowerCase().compareTo(right.name.toLowerCase());
+  });
+  return children;
+}
+
+List<VaultFileEntry> _mobileFilePathEntries(
+  VaultFileTreeResponse tree,
+  VaultFileEntry current,
+) {
+  final byId = {for (final entry in tree.entries) entry.id: entry};
+  final path = <VaultFileEntry>[];
+  var cursor = current;
+  while (true) {
+    path.insert(0, cursor);
+    final parentId = cursor.parentId;
+    if (parentId == null || !byId.containsKey(parentId)) {
+      break;
+    }
+    cursor = byId[parentId]!;
+  }
+  return path;
+}
+
+IconData _vaultFileIcon(VaultFileEntry entry) {
+  if (entry.isFolder) {
+    return Icons.folder_outlined;
+  }
+  return _assetKindIcon(
+    entry.mediaKind ?? 'other',
+    entry.mimeType ?? 'application/octet-stream',
+  );
+}
+
+String _vaultFileSubtitle(VaultFileEntry entry) {
+  if (entry.isFolder) {
+    return entry.isTrashed ? 'Folder - trash' : 'Folder';
+  }
+  return [
+    entry.mediaKind ?? 'file',
+    _formatBytes(entry.bytes),
+    if (entry.isTrashed) 'trash',
+  ].join(' - ');
+}
+
+class _ReferenceFileSummary extends StatelessWidget {
+  const _ReferenceFileSummary({
+    required this.folders,
+    required this.files,
+    required this.documents,
+    required this.loading,
+    required this.onRefresh,
+  });
+
+  final int folders;
+  final int files;
+  final int documents;
+  final bool loading;
+  final VoidCallback? onRefresh;
+
+  @override
+  Widget build(BuildContext context) {
+    return DecoratedBox(
+      decoration: BoxDecoration(
+        color: AppColors.panel,
+        border: Border.all(color: AppColors.border),
+        borderRadius: BorderRadius.circular(12),
+      ),
+      child: Padding(
+        padding: const EdgeInsets.all(14),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Wrap(
+              spacing: 10,
+              runSpacing: 10,
+              crossAxisAlignment: WrapCrossAlignment.center,
+              children: [
+                _ReferenceFileMetric(
+                  icon: Icons.folder_outlined,
+                  label: 'Folders',
+                  value: '$folders',
+                ),
+                _ReferenceFileMetric(
+                  icon: Icons.insert_drive_file_outlined,
+                  label: 'Files',
+                  value: '$files',
+                ),
+                _ReferenceFileMetric(
+                  icon: Icons.description_outlined,
+                  label: 'Docs',
+                  value: '$documents',
+                ),
+                OutlinedButton.icon(
+                  onPressed: loading ? null : onRefresh,
+                  icon: const Icon(Icons.refresh),
+                  label: const Text('Refresh'),
+                ),
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _ReferenceFileMetric extends StatelessWidget {
+  const _ReferenceFileMetric({
+    required this.icon,
+    required this.label,
+    required this.value,
+  });
+
+  final IconData icon;
+  final String label;
+  final String value;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return DecoratedBox(
+      decoration: BoxDecoration(
+        color: AppColors.canvas,
+        border: Border.all(color: AppColors.border),
+        borderRadius: BorderRadius.circular(10),
+      ),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 9),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(icon, size: 18, color: theme.colorScheme.primary),
+            const SizedBox(width: 8),
+            Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(label, style: theme.textTheme.labelSmall),
+                Text(value, style: theme.textTheme.titleSmall),
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _ReferenceBreadcrumbRow extends StatelessWidget {
+  const _ReferenceBreadcrumbRow({
+    required this.tree,
+    required this.current,
+    required this.onOpen,
+  });
+
+  final VaultFileTreeResponse tree;
+  final VaultFileEntry current;
+  final ValueChanged<VaultFileEntry> onOpen;
+
+  @override
+  Widget build(BuildContext context) {
+    final path = _mobileFilePathEntries(tree, current);
+    return SingleChildScrollView(
+      scrollDirection: Axis.horizontal,
+      child: Row(
+        children: [
+          for (var index = 0; index < path.length; index++) ...[
+            ActionChip(
+              avatar: Icon(
+                index == 0 ? Icons.cloud_queue : Icons.folder_outlined,
+                size: 18,
+              ),
+              label: Text(path[index].name),
+              onPressed: index == path.length - 1
+                  ? null
+                  : () => onOpen(path[index]),
+            ),
+            if (index < path.length - 1)
+              const Padding(
+                padding: EdgeInsets.symmetric(horizontal: 4),
+                child: Icon(Icons.chevron_right, size: 18),
+              ),
+          ],
+        ],
+      ),
+    );
+  }
+}
+
+class _ReferenceFileRow extends StatelessWidget {
+  const _ReferenceFileRow({
+    required this.entry,
+    required this.disabled,
+    this.onOpen,
+    this.onDownload,
+  });
+
+  final VaultFileEntry entry;
+  final bool disabled;
+  final VoidCallback? onOpen;
+  final VoidCallback? onDownload;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Material(
+      color: AppColors.panel,
+      shape: RoundedRectangleBorder(
+        side: const BorderSide(color: AppColors.border),
+        borderRadius: BorderRadius.circular(12),
+      ),
+      child: ListTile(
+        onTap: disabled ? null : onOpen,
+        leading: Icon(
+          _vaultFileIcon(entry),
+          color: entry.isFolder
+              ? theme.colorScheme.primary
+              : theme.colorScheme.onSurfaceVariant,
+        ),
+        title: Text(entry.name, maxLines: 1, overflow: TextOverflow.ellipsis),
+        subtitle: Text(
+          _vaultFileSubtitle(entry),
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+        ),
+        trailing: entry.isFile
+            ? IconButton(
+                onPressed: disabled ? null : onDownload,
+                icon: const Icon(Icons.download_outlined),
+                tooltip: 'Download file',
+              )
+            : const Icon(Icons.chevron_right),
+      ),
+    );
+  }
+}
+
 class _MobileReferenceBottomNav extends StatelessWidget {
   const _MobileReferenceBottomNav({
     required this.selected,
@@ -3366,6 +3860,13 @@ class _MobileReferenceBottomNav extends StatelessWidget {
                 label: 'Gallery',
                 selected: selected == _MobilePairedTab.gallery,
                 onTap: () => onSelected(_MobilePairedTab.gallery),
+              ),
+              _MobileReferenceNavItem(
+                icon: Icons.folder_outlined,
+                selectedIcon: Icons.folder,
+                label: 'Files',
+                selected: selected == _MobilePairedTab.files,
+                onTap: () => onSelected(_MobilePairedTab.files),
               ),
               _MobileReferenceNavItem(
                 icon: Icons.search,

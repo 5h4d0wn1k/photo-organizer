@@ -222,17 +222,17 @@ class _ImportScreenState extends State<ImportScreen> {
     final theme = Theme.of(context);
 
     return Scaffold(
-      appBar: AppBar(title: const Text('Import media')),
+      appBar: AppBar(title: const Text('Import files')),
       body: ListView(
         padding: const EdgeInsets.all(24),
         children: [
           Text(
-            'Preview and safely organize local media before committing changes.',
+            'Preview and safely organize local files before committing changes.',
             style: theme.textTheme.headlineSmall,
           ),
           const SizedBox(height: 12),
           Text(
-            'Scan is read-only. Move mode verifies file hashes before the old path is removed, keeps matching JSON sidecars with media, and avoids creating a duplicate archive.',
+            'Scan is read-only. Move mode verifies file hashes before the old path is removed, keeps matching JSON sidecars with files, and avoids creating a duplicate archive.',
             style: theme.textTheme.bodyLarge,
           ),
           const SizedBox(height: 16),
@@ -253,7 +253,7 @@ class _ImportScreenState extends State<ImportScreen> {
                   ),
                   _SafetyPill(
                     icon: Icons.rule_folder_outlined,
-                    label: 'Sidecars kept with media',
+                    label: 'Sidecars kept with files',
                   ),
                   _SafetyPill(
                     icon: Icons.verified_outlined,
@@ -656,7 +656,7 @@ class _ImportPreflightPanel extends StatelessWidget {
               spacing: 12,
               runSpacing: 12,
               children: [
-                _PreflightChip(label: '$selectedCandidateCount selected media'),
+                _PreflightChip(label: '$selectedCandidateCount selected files'),
                 _PreflightChip(
                   label: '${session.duplicateCount} duplicates skipped',
                 ),
@@ -855,6 +855,8 @@ class _ImportSessionResults extends StatelessWidget {
                     if (candidate.destinationPath != null)
                       'To ${candidate.destinationPath}',
                     if (candidate.placeHint != null) candidate.placeHint!,
+                    if (candidate.organization.summary.isNotEmpty)
+                      candidate.organization.summary,
                     if (candidate.capturedAt != null)
                       formatter.format(candidate.capturedAt!),
                     candidate.mimeType,
@@ -912,7 +914,7 @@ class _ImportWarningPanel extends StatelessWidget {
             ),
             const SizedBox(height: 6),
             const Text(
-              'These files are not photos/videos and will not be moved. JSON sidecars that match media are handled separately.',
+              'These files are not supported import types yet and will not be moved. JSON sidecars that match imported files are handled separately.',
             ),
             const SizedBox(height: 8),
             for (final path in shownPaths)

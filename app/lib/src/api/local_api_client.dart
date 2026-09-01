@@ -1,9 +1,10 @@
 import 'dart:async';
 import 'dart:convert';
-import 'dart:io';
 
 import 'package:http/http.dart' as http;
 
+import 'local_api_platform_io.dart'
+    if (dart.library.html) 'local_api_platform_web.dart';
 import '../models/gallery_models.dart';
 
 class ApiException implements Exception {
@@ -307,7 +308,7 @@ class LocalApiClient {
   Future<MobileUpload> uploadMobileOriginalFile({
     required String bearerToken,
     required String uploadId,
-    required File file,
+    required Object file,
     int chunkSize = 4 * 1024 * 1024,
     void Function(MobileUpload upload)? onProgress,
     FutureOr<bool> Function(MobileUpload upload)? shouldCancel,
@@ -315,7 +316,8 @@ class LocalApiClient {
     if (chunkSize <= 0) {
       throw ArgumentError.value(chunkSize, 'chunkSize', 'must be positive');
     }
-    final totalBytes = await file.length();
+    final localFile = localApiFileFromObject(file);
+    final totalBytes = await localApiFileLength(localFile);
     var upload = await fetchMobileUpload(
       bearerToken: bearerToken,
       uploadId: uploadId,
@@ -339,65 +341,57 @@ class LocalApiClient {
     }
 
     var offset = upload.bytesReceived;
-    final handle = await file.open();
-    try {
-      while (offset < totalBytes) {
-        if (await _mobileUploadCancelRequested(shouldCancel, upload)) {
-          final canceled = await cancelMobileUpload(
-            bearerToken: bearerToken,
-            uploadId: uploadId,
-          );
-          onProgress?.call(canceled);
-          return canceled;
-        }
-        await handle.setPosition(offset);
-        final remaining = totalBytes - offset;
-        final readLength = remaining < chunkSize ? remaining : chunkSize;
-        final chunk = await handle.read(readLength);
-        if (chunk.isEmpty) {
-          throw StateError(
-            'File ended before reserved mobile upload completed',
-          );
-        }
-        try {
-          upload = await uploadMobileOriginalChunk(
-            bearerToken: bearerToken,
-            uploadId: uploadId,
-            offset: offset,
-            bytes: chunk,
-          );
-        } on ApiException {
-          if (await _mobileUploadCancelRequested(shouldCancel, upload)) {
-            final canceled = await cancelMobileUpload(
-              bearerToken: bearerToken,
-              uploadId: uploadId,
-            );
-            onProgress?.call(canceled);
-            return canceled;
-          }
-          rethrow;
-        }
-        onProgress?.call(upload);
-        if (_isTerminalMobileUpload(upload)) {
-          return upload;
-        }
-        if (await _mobileUploadCancelRequested(shouldCancel, upload)) {
-          final canceled = await cancelMobileUpload(
-            bearerToken: bearerToken,
-            uploadId: uploadId,
-          );
-          onProgress?.call(canceled);
-          return canceled;
-        }
-        if (upload.bytesReceived <= offset) {
-          throw StateError(
-            'Mobile upload did not advance past byte offset $offset',
-          );
-        }
-        offset = upload.bytesReceived;
+    while (offset < totalBytes) {
+      if (await _mobileUploadCancelRequested(shouldCancel, upload)) {
+        final canceled = await cancelMobileUpload(
+          bearerToken: bearerToken,
+          uploadId: uploadId,
+        );
+        onProgress?.call(canceled);
+        return canceled;
       }
-    } finally {
-      await handle.close();
+      final remaining = totalBytes - offset;
+      final readLength = remaining < chunkSize ? remaining : chunkSize;
+      final chunk = await localApiReadFileChunk(localFile, offset, readLength);
+      if (chunk.isEmpty) {
+        throw StateError('File ended before reserved mobile upload completed');
+      }
+      try {
+        upload = await uploadMobileOriginalChunk(
+          bearerToken: bearerToken,
+          uploadId: uploadId,
+          offset: offset,
+          bytes: chunk,
+        );
+      } on ApiException {
+        if (await _mobileUploadCancelRequested(shouldCancel, upload)) {
+          final canceled = await cancelMobileUpload(
+            bearerToken: bearerToken,
+            uploadId: uploadId,
+          );
+          onProgress?.call(canceled);
+          return canceled;
+        }
+        rethrow;
+      }
+      onProgress?.call(upload);
+      if (_isTerminalMobileUpload(upload)) {
+        return upload;
+      }
+      if (await _mobileUploadCancelRequested(shouldCancel, upload)) {
+        final canceled = await cancelMobileUpload(
+          bearerToken: bearerToken,
+          uploadId: uploadId,
+        );
+        onProgress?.call(canceled);
+        return canceled;
+      }
+      if (upload.bytesReceived <= offset) {
+        throw StateError(
+          'Mobile upload did not advance past byte offset $offset',
+        );
+      }
+      offset = upload.bytesReceived;
     }
 
     final completed = await completeMobileUpload(
@@ -502,6 +496,20 @@ class LocalApiClient {
     return Asset.fromJson(response);
   }
 
+  Future<Asset> updateMobileAssetTags({
+    required String bearerToken,
+    required String assetId,
+    required List<String> tags,
+  }) async {
+    final response = await _postObject(
+      '/mobile/assets/$assetId/tags',
+      {'tags': tags},
+      headers: _mobileHeaders(bearerToken),
+      timeout: _heavyReadTimeout,
+    );
+    return Asset.fromJson(response);
+  }
+
   Future<List<int>> downloadMobileOriginal({
     required String bearerToken,
     required String assetId,
@@ -532,98 +540,30 @@ class LocalApiClient {
     return response.bodyBytes;
   }
 
-  Future<File> downloadMobileOriginalToFile({
+  Future<T> downloadMobileOriginalToFile<T extends Object>({
     required String bearerToken,
     required String assetId,
-    required File destination,
+    required T destination,
   }) async {
-    await destination.parent.create(recursive: true);
-    final path = '/mobile/assets/$assetId/original';
-    final temp = File('${destination.path}.part');
-    var offset = await temp.exists() ? await temp.length() : 0;
-    int? expectedTotal;
-    var restarted = false;
+    final downloaded = await _downloadMobilePathToFile(
+      bearerToken: bearerToken,
+      path: '/mobile/assets/$assetId/original',
+      destination: localApiFileFromObject(destination),
+    );
+    return downloaded as T;
+  }
 
-    try {
-      while (expectedTotal == null || offset < expectedTotal) {
-        final rangeEnd = offset + _mobileDownloadChunkBytes - 1;
-        final request = http.Request('GET', _resolve(path))
-          ..headers.addAll(_mobileHeaders(bearerToken))
-          ..headers['range'] = 'bytes=$offset-$rangeEnd';
-        late final http.StreamedResponse response;
-        try {
-          response = await _httpClient.send(request).timeout(_heavyReadTimeout);
-        } on TimeoutException {
-          throw SocketException('Timed out while reaching ${_resolve(path)}');
-        }
-
-        if (response.statusCode == HttpStatus.ok && offset == 0) {
-          await _writeStreamToFile(
-            response.stream,
-            temp,
-            mode: FileMode.write,
-            expectedBytes: response.contentLength,
-          );
-          expectedTotal = await temp.length();
-          offset = expectedTotal;
-          break;
-        }
-        if (response.statusCode == HttpStatus.ok && offset > 0 && !restarted) {
-          await response.stream.drain<List<int>>();
-          await temp.delete();
-          offset = 0;
-          expectedTotal = null;
-          restarted = true;
-          continue;
-        }
-        if (response.statusCode == HttpStatus.requestedRangeNotSatisfiable &&
-            offset > 0 &&
-            !restarted) {
-          await response.stream.drain<List<int>>();
-          await temp.delete();
-          offset = 0;
-          expectedTotal = null;
-          restarted = true;
-          continue;
-        }
-        if (response.statusCode != HttpStatus.partialContent) {
-          throw ApiException(
-            path: path,
-            statusCode: response.statusCode,
-            body: await response.stream.bytesToString(),
-          );
-        }
-
-        final contentRange = _parseContentRange(
-          response.headers['content-range'],
-        );
-        if (contentRange == null || contentRange.start != offset) {
-          throw SocketException(
-            'Unexpected content-range for $path: ${response.headers['content-range']}',
-          );
-        }
-        final received = await _writeStreamToFile(
-          response.stream,
-          temp,
-          mode: offset == 0 ? FileMode.write : FileMode.append,
-          expectedBytes: response.contentLength,
-        );
-        final expectedRangeBytes = contentRange.end - contentRange.start + 1;
-        if (received != expectedRangeBytes) {
-          throw SocketException(
-            'Downloaded $received bytes for $path, expected $expectedRangeBytes',
-          );
-        }
-        expectedTotal = contentRange.total;
-        offset = contentRange.end + 1;
-      }
-    } catch (_) {
-      rethrow;
-    }
-    if (await destination.exists()) {
-      await destination.delete();
-    }
-    return temp.rename(destination.path);
+  Future<T> downloadMobileFileOriginalToFile<T extends Object>({
+    required String bearerToken,
+    required String entryId,
+    required T destination,
+  }) async {
+    final downloaded = await _downloadMobilePathToFile(
+      bearerToken: bearerToken,
+      path: '/mobile/files/$entryId/original',
+      destination: localApiFileFromObject(destination),
+    );
+    return downloaded as T;
   }
 
   Future<List<int>> downloadMobilePreview({
@@ -657,6 +597,17 @@ class LocalApiClient {
   Future<PrivacyStatus> fetchPrivacyStatus() async {
     final response = await _getObject('/privacy/status');
     return PrivacyStatus.fromJson(response);
+  }
+
+  Future<EntitlementStatusResponse> fetchEntitlementStatus() async {
+    final response = await _getObject('/entitlements/status');
+    return EntitlementStatusResponse.fromJson(response);
+  }
+
+  Future<PlatformReleaseReadinessResponse>
+  fetchPlatformReleaseReadiness() async {
+    final response = await _getObject('/release/readiness');
+    return PlatformReleaseReadinessResponse.fromJson(response);
   }
 
   Future<List<ModelArtifact>> fetchModels() async {
@@ -731,6 +682,17 @@ class LocalApiClient {
       'include_models': includeModels,
     });
     return BackupExportResult.fromJson(response);
+  }
+
+  Future<SupportBundleExportResult> exportSupportBundle({
+    required String exportRoot,
+    bool includeReleaseReadiness = true,
+  }) async {
+    final response = await _postObject('/support/bundle', {
+      'export_root': exportRoot,
+      'include_release_readiness': includeReleaseReadiness,
+    });
+    return SupportBundleExportResult.fromJson(response);
   }
 
   Future<BackupRestorePlan> planRestoreBackup({
@@ -1034,6 +996,11 @@ class LocalApiClient {
     return response.map(ImportSession.fromJson).toList();
   }
 
+  Future<DuplicateReviewSummary> fetchDuplicateReviewSummary() async {
+    final response = await _getObject('/duplicates');
+    return DuplicateReviewSummary.fromJson(response);
+  }
+
   Future<TimelineResponse> fetchTimeline({
     int? limit,
     int? perBucket,
@@ -1062,6 +1029,14 @@ class LocalApiClient {
       if (favorite != null) 'favorite': favorite,
       if (archived != null) 'archived': archived,
     });
+    return Asset.fromJson(response);
+  }
+
+  Future<Asset> updateAssetTags(
+    String assetId, {
+    required List<String> tags,
+  }) async {
+    final response = await _postObject('/assets/$assetId/tags', {'tags': tags});
     return Asset.fromJson(response);
   }
 
@@ -1136,6 +1111,31 @@ class LocalApiClient {
 
   Future<void> deleteAlbum(String id) async {
     await _delete('/albums/$id');
+  }
+
+  Future<List<SmartFolder>> fetchSmartFolders() async {
+    final response = await _getList('/smart-folders');
+    return response.map(SmartFolder.fromJson).toList();
+  }
+
+  Future<SmartFolder> createSmartFolder({
+    required String title,
+    required SearchQuery query,
+  }) async {
+    final response = await _postObject('/smart-folders', {
+      'title': title,
+      'query': query.toJson(),
+    });
+    return SmartFolder.fromJson(response);
+  }
+
+  Future<SearchResponse> runSmartFolder(String id) async {
+    final response = await _getObject('/smart-folders/$id/search');
+    return SearchResponse.fromJson(response);
+  }
+
+  Future<void> deleteSmartFolder(String id) async {
+    await _delete('/smart-folders/$id');
   }
 
   Future<List<PersonCluster>> fetchPeople() async {
@@ -1306,6 +1306,15 @@ class LocalApiClient {
     return response.map(JobRecord.fromJson).toList();
   }
 
+  Future<List<AuditEvent>> fetchAuditEvents({int? limit}) async {
+    final response = await _getList(
+      '/audit/events',
+      queryParameters: {if (limit != null) 'limit': '$limit'},
+      timeout: _startupTimeout,
+    );
+    return response.map(AuditEvent.fromJson).toList();
+  }
+
   Future<JobRecord> fetchJob(String id) async {
     final response = await _getObject('/jobs/$id');
     return JobRecord.fromJson(response);
@@ -1389,11 +1398,15 @@ class LocalApiClient {
 
   Future<List<Map<String, dynamic>>> _getList(
     String path, {
+    Map<String, String>? queryParameters,
     Map<String, String>? headers,
     Duration? timeout,
   }) async {
     final response = await _request(
-      () => _httpClient.get(_resolve(path), headers: headers),
+      () => _httpClient.get(
+        _resolve(path, queryParameters: queryParameters),
+        headers: headers,
+      ),
       path,
       timeout: timeout,
     );
@@ -1484,28 +1497,100 @@ class LocalApiClient {
     return _decodeObject(response);
   }
 
-  Future<int> _writeStreamToFile(
-    Stream<List<int>> stream,
-    File file, {
-    required FileMode mode,
-    int? expectedBytes,
+  Future<LocalApiFile> _downloadMobilePathToFile({
+    required String bearerToken,
+    required String path,
+    required LocalApiFile destination,
   }) async {
-    var received = 0;
-    final sink = file.openWrite(mode: mode);
-    try {
-      await for (final chunk in stream.timeout(_heavyReadTimeout)) {
-        received += chunk.length;
-        sink.add(chunk);
+    await localApiCreateParent(destination);
+    final temp = localApiPartFile(destination);
+    var offset = await localApiFileExists(temp)
+        ? await localApiFileLength(temp)
+        : 0;
+    int? expectedTotal;
+    var restarted = false;
+
+    while (expectedTotal == null || offset < expectedTotal) {
+      final rangeEnd = offset + _mobileDownloadChunkBytes - 1;
+      final request = http.Request('GET', _resolve(path))
+        ..headers.addAll(_mobileHeaders(bearerToken))
+        ..headers['range'] = 'bytes=$offset-$rangeEnd';
+      late final http.StreamedResponse response;
+      try {
+        response = await _httpClient.send(request).timeout(_heavyReadTimeout);
+      } on TimeoutException {
+        throw localApiTimeoutException(_resolve(path));
       }
-    } finally {
-      await sink.close();
-    }
-    if (expectedBytes != null && received != expectedBytes) {
-      throw SocketException(
-        'Downloaded $received bytes, expected $expectedBytes',
+
+      if (response.statusCode == localHttpStatusOk && offset == 0) {
+        await localApiWriteStreamToFile(
+          response.stream,
+          temp,
+          append: false,
+          expectedBytes: response.contentLength,
+          timeout: _heavyReadTimeout,
+        );
+        expectedTotal = await localApiFileLength(temp);
+        offset = expectedTotal;
+        break;
+      }
+      if (response.statusCode == localHttpStatusOk &&
+          offset > 0 &&
+          !restarted) {
+        await response.stream.drain<List<int>>();
+        await localApiDeleteFile(temp);
+        offset = 0;
+        expectedTotal = null;
+        restarted = true;
+        continue;
+      }
+      if (response.statusCode == localHttpStatusRequestedRangeNotSatisfiable &&
+          offset > 0 &&
+          !restarted) {
+        await response.stream.drain<List<int>>();
+        await localApiDeleteFile(temp);
+        offset = 0;
+        expectedTotal = null;
+        restarted = true;
+        continue;
+      }
+      if (response.statusCode != localHttpStatusPartialContent) {
+        throw ApiException(
+          path: path,
+          statusCode: response.statusCode,
+          body: await response.stream.bytesToString(),
+        );
+      }
+
+      final contentRange = _parseContentRange(
+        response.headers['content-range'],
       );
+      if (contentRange == null || contentRange.start != offset) {
+        throw localApiTransferException(
+          'Unexpected content-range for $path: ${response.headers['content-range']}',
+        );
+      }
+      final received = await localApiWriteStreamToFile(
+        response.stream,
+        temp,
+        append: offset != 0,
+        expectedBytes: response.contentLength,
+        timeout: _heavyReadTimeout,
+      );
+      final expectedRangeBytes = contentRange.end - contentRange.start + 1;
+      if (received != expectedRangeBytes) {
+        throw localApiTransferException(
+          'Downloaded $received bytes for $path, expected $expectedRangeBytes',
+        );
+      }
+      expectedTotal = contentRange.total;
+      offset = contentRange.end + 1;
     }
-    return received;
+
+    if (await localApiFileExists(destination)) {
+      await localApiDeleteFile(destination);
+    }
+    return localApiRenameFile(temp, destination);
   }
 
   _ContentRange? _parseContentRange(String? value) {
@@ -1538,7 +1623,7 @@ class LocalApiClient {
     try {
       response = await send().timeout(timeout ?? _defaultTimeout);
     } on TimeoutException {
-      throw SocketException('Timed out while reaching ${_resolve(path)}');
+      throw localApiTimeoutException(_resolve(path));
     }
 
     if (response.statusCode < 200 || response.statusCode >= 300) {

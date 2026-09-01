@@ -10,7 +10,9 @@ use nom_exif::{
 use serde_json::Value;
 use uuid::Uuid;
 
-use crate::domain::{AssetMetadata, CameraInfo, GeoTag, MetadataSource, ModelProvenance};
+use crate::domain::{
+    AssetMetadata, CameraInfo, FileOrganizationHints, GeoTag, MetadataSource, ModelProvenance,
+};
 
 #[derive(Debug, Clone)]
 pub struct ExtractedMediaMetadata {
@@ -24,6 +26,7 @@ pub struct ExtractedMediaMetadata {
     pub sidecar_title: Option<String>,
     pub sidecar_description: Option<String>,
     pub folder_hint: Option<String>,
+    pub organization: FileOrganizationHints,
 }
 
 impl ExtractedMediaMetadata {
@@ -40,6 +43,7 @@ impl ExtractedMediaMetadata {
             sidecar_title: self.sidecar_title,
             sidecar_description: self.sidecar_description,
             folder_hint: self.folder_hint,
+            organization: self.organization,
             derived: ModelProvenance::local("metadata-extractor", "v1"),
         }
     }
@@ -77,6 +81,7 @@ pub fn extract_media_metadata(
         embedded.height = sidecar.height;
     }
 
+    let organization = derive_file_organization_hints(media_path, None);
     ExtractedMediaMetadata {
         captured_at: captured_at.0,
         captured_at_source: captured_at.1,
@@ -92,6 +97,7 @@ pub fn extract_media_metadata(
             .and_then(Path::file_name)
             .map(|value| value.to_string_lossy().to_string())
             .filter(|value| !value.trim().is_empty()),
+        organization,
     }
 }
 
@@ -106,6 +112,7 @@ pub fn extract_import_metadata(
             .captured_at
             .unwrap_or((filesystem_captured_at, MetadataSource::Filesystem, None));
 
+    let organization = derive_file_organization_hints(media_path, None);
     ExtractedMediaMetadata {
         captured_at: captured_at.0,
         captured_at_source: captured_at.1,
@@ -121,6 +128,98 @@ pub fn extract_import_metadata(
             .and_then(Path::file_name)
             .map(|value| value.to_string_lossy().to_string())
             .filter(|value| !value.trim().is_empty()),
+        organization,
+    }
+}
+
+pub fn derive_file_organization_hints(
+    file_path: &Path,
+    source_root: Option<&Path>,
+) -> FileOrganizationHints {
+    let parent = file_path.parent();
+    let source_folder = parent
+        .and_then(Path::file_name)
+        .map(clean_path_segment)
+        .filter(|value| !value.is_empty());
+    let path_segments = parent
+        .and_then(|parent| source_root.and_then(|root| relative_parent_segments(parent, root)))
+        .unwrap_or_else(|| source_folder.iter().cloned().collect::<Vec<_>>());
+
+    let workspace = find_labeled_segment(&path_segments, &["workspace", "ws"])
+        .or_else(|| fallback_segment(&path_segments, 3, 0));
+    let client = find_labeled_segment(&path_segments, &["client", "customer"])
+        .or_else(|| fallback_segment(&path_segments, 3, 1))
+        .or_else(|| fallback_segment(&path_segments, 2, 0));
+    let project = find_labeled_segment(&path_segments, &["project", "proj"])
+        .or_else(|| fallback_segment(&path_segments, 3, 2))
+        .or_else(|| fallback_segment(&path_segments, 2, 1))
+        .or_else(|| fallback_segment(&path_segments, 1, 0));
+    let topic = path_segments
+        .last()
+        .cloned()
+        .or_else(|| source_folder.clone());
+
+    FileOrganizationHints {
+        source_folder,
+        workspace,
+        client,
+        project,
+        topic,
+        path_segments,
+    }
+}
+
+fn relative_parent_segments(parent: &Path, source_root: &Path) -> Option<Vec<String>> {
+    let relative_parent = parent.strip_prefix(source_root).ok()?;
+    let segments = relative_parent
+        .components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(value) => Some(clean_path_segment(value)),
+            _ => None,
+        })
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    if segments.is_empty() {
+        None
+    } else {
+        Some(segments)
+    }
+}
+
+fn clean_path_segment(value: impl AsRef<std::ffi::OsStr>) -> String {
+    value
+        .as_ref()
+        .to_string_lossy()
+        .trim()
+        .trim_matches(&['/', '\\'][..])
+        .to_string()
+}
+
+fn find_labeled_segment(segments: &[String], labels: &[&str]) -> Option<String> {
+    for segment in segments {
+        let lower = segment.to_ascii_lowercase();
+        for label in labels {
+            for separator in [" ", "-", "_", ":"] {
+                let prefix = format!("{label}{separator}");
+                if lower.starts_with(&prefix) {
+                    let value = segment[prefix.len()..]
+                        .trim_matches(&[' ', '-', '_', ':'][..])
+                        .trim();
+                    if !value.is_empty() {
+                        return Some(value.to_string());
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn fallback_segment(segments: &[String], len: usize, index: usize) -> Option<String> {
+    if segments.len() == len {
+        segments.get(index).cloned()
+    } else {
+        None
     }
 }
 
@@ -369,7 +468,10 @@ mod tests {
 
     use chrono::{TimeZone, Utc};
 
-    use super::{extract_media_metadata, takeout_timestamp};
+    use super::{
+        derive_file_organization_hints, extract_import_metadata, extract_media_metadata,
+        takeout_timestamp,
+    };
 
     #[test]
     fn parses_takeout_timestamp_and_geo_sidecar() {
@@ -417,5 +519,56 @@ mod tests {
             takeout_timestamp(&json),
             Some(Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap())
         );
+    }
+
+    #[test]
+    fn derives_local_file_organization_hints_from_relative_path() {
+        let root = std::env::temp_dir().join(format!(
+            "private-gallery-org-hints-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let file = root
+            .join("Office")
+            .join("Client Acme")
+            .join("Project Launch")
+            .join("proposal.pdf");
+        fs::create_dir_all(file.parent().expect("parent")).expect("folders");
+        fs::write(&file, b"pdf").expect("file");
+
+        let hints = derive_file_organization_hints(&file, Some(&root));
+
+        assert_eq!(hints.source_folder.as_deref(), Some("Project Launch"));
+        assert_eq!(hints.workspace.as_deref(), Some("Office"));
+        assert_eq!(hints.client.as_deref(), Some("Acme"));
+        assert_eq!(hints.project.as_deref(), Some("Launch"));
+        assert_eq!(hints.topic.as_deref(), Some("Project Launch"));
+        assert_eq!(
+            hints.path_segments,
+            vec![
+                "Office".to_string(),
+                "Client Acme".to_string(),
+                "Project Launch".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn import_metadata_has_folder_hints_without_hosted_services() {
+        let root = std::env::temp_dir().join(format!(
+            "private-gallery-import-org-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let file = root.join("project-renewal").join("notes.md");
+        fs::create_dir_all(file.parent().expect("parent")).expect("folders");
+        fs::write(&file, b"notes").expect("file");
+
+        let extracted = extract_import_metadata(
+            &file,
+            &[],
+            Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
+        );
+
+        assert_eq!(extracted.folder_hint.as_deref(), Some("project-renewal"));
+        assert_eq!(extracted.organization.project.as_deref(), Some("renewal"));
     }
 }
