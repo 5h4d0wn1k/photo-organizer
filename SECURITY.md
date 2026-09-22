@@ -30,3 +30,19 @@ Before any beta build:
 - Mobile sessions must support expiry and revocation.
 - Remote clients must be limited to `/health` and authenticated `/mobile/*`.
 - Backup/restore verification must include encrypted vault chunks.
+
+## Disclosure Timeline
+
+We follow a coordinated disclosure process. Reported issues are acknowledged and
+handled within the following windows:
+
+| Step                     | Target window          |
+| ------------------------ | ---------------------- |
+| Initial acknowledgement  | Within 72 hours        |
+| Triage and status update | Within 5 business days |
+| Coordinated fix release  | Handled with reporter  |
+| Public disclosure        | After 90 days, unless agreed otherwise |
+
+Public disclosure happens only after a fix is available or the 90-day window
+elapses, whichever comes first, and only with the reporter's agreement where
+reasonable.

@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# Photo Organizer AppRun — launch wrapper for the packaged app.
+# Works from any flat bundle/AppImage dir: assumes galleryd, ml_sidecar/ and the
+# Flutter binary (private_gallery_app) live next to this script.
+set -euo pipefail
+
+SELF_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+APP_BIN="${PRIVATE_GALLERY_APP_BIN:-${SELF_DIR}/private_gallery_app}"
+DAEMON_BIN="${SELF_DIR}/galleryd"
+
+RUNTIME_BASE="${XDG_RUNTIME_DIR:-/tmp}/photo-organizer-$(id -u)"
+RUNTIME_DIR="${PRIVATE_GALLERY_RUNTIME_ROOT:-${RUNTIME_BASE}/runtime}"
+mkdir -p "${RUNTIME_DIR}"
+
+export PRIVATE_GALLERY_RUNTIME_ROOT="${RUNTIME_DIR}"
+export PRIVATE_GALLERY_DAEMON_BIN="${DAEMON_BIN}"
+if [[ -f "${SELF_DIR}/ml_sidecar/private_gallery_ml_sidecar.py" ]]; then
+  export PRIVATE_GALLERY_ML_SIDECAR="${SELF_DIR}/ml_sidecar/private_gallery_ml_sidecar.py"
+fi
+export PRIVATE_GALLERY_APP_LOG="${RUNTIME_DIR}/private-gallery-app.log"
+export PRIVATE_GALLERY_DAEMON_LOG="${RUNTIME_DIR}/galleryd.log"
+
+DAEMON_PID=""
+cleanup() {
+  if [[ -n "${DAEMON_PID}" ]] && kill -0 "${DAEMON_PID}" 2>/dev/null; then
+    kill "${DAEMON_PID}"
+  fi
+}
+trap cleanup EXIT INT TERM
+
+start_daemon() {
+  if [[ -x "${DAEMON_BIN}" ]] && ! "${DAEMON_BIN}" --check >/dev/null 2>&1; then
+    : # fall through
+  fi
+  if command -v pgrep >/dev/null 2>&1 && pgrep -f "galleryd" >/dev/null 2>&1; then
+    return 0
+  fi
+  if [[ ! -x "${DAEMON_BIN}" ]]; then
+    return 0
+  fi
+  "${DAEMON_BIN}" >>"${PRIVATE_GALLERY_DAEMON_LOG}" 2>&1 &
+  DAEMON_PID=$!
+}
+
+start_daemon
+exec "${APP_BIN}" "$@"

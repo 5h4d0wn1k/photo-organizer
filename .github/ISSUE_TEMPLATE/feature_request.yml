@@ -1,0 +1,49 @@
+name: Feature Request
+description: Propose a new capability for Photo Organizer.
+title: "feat: "
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for proposing. Photo Organizer is local-first and privacy-first;
+        explain how the feature preserves data on the user's devices.
+  - type: textarea
+    id: motivation
+    attributes:
+      label: Problem to solve
+      description: What can't you do today? Who is affected?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: Describe the feature and how you imagine using it.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Existing workarounds or other designs you evaluated.
+  - type: textarea
+    id: privacy
+    attributes:
+      label: Privacy / security implications
+      description: |
+        Does it touch biometrics, OCR text, metadata, keys, tokens, networking,
+        hosted services, or remote ML? How does data stay on-device by default?
+  - type: input
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: How would you verify this feature works?
+  - type: checkboxes
+    id: risk
+    attributes:
+      label: Risk area (if implemented)
+      options:
+        - label: Authentication, session, pairing, vault sync, secrets, backup/restore, or encryption
+        - label: Media import/upload/download paths
+        - label: Database schema or persisted API contracts

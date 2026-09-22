@@ -17,3 +17,9 @@
 - For Rust service changes, run the narrowest relevant `cargo test` first, then `cargo fmt --check` and `cargo clippy --all-targets --all-features -- -D warnings` when practical.
 - For Flutter changes, run `flutter analyze` and the relevant `flutter test` target from `app/`.
 - If a check is blocked by missing SDKs, network, keychain access, or platform tooling, report the blocker and the remaining risk.
+
+## Repository Notes
+
+- Repo brand = Photo Organizer.
+- Key docs = README.md, CONTRIBUTING.md, PRIVACY.md, SECURITY.md.
+- Structure = native_core (Rust daemon), app (Flutter), ml_sidecar (Python), tools/quick-face-sort (legacy face sorter).

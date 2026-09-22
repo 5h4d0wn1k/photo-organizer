@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=Photo Organizer
+Comment=Local-first photo organizer
+Exec=photo-organizer
+Icon=photo-organizer
+Type=Application
+Categories=Graphics;Photography;
+Terminal=false
+StartupWMClass=photo-organizer

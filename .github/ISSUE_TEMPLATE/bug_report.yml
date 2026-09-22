@@ -1,0 +1,56 @@
+name: Bug Report
+description: Report a defect in Photo Organizer (galleryd daemon, Flutter app, or tooling).
+title: "bug: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. Do **not** attach photos, videos, vault keys,
+        bearer tokens, pairing payloads, `.env` files, keychain dumps, or
+        production database copies.
+  - type: input
+    id: version
+    attributes:
+      label: Version / build
+      description: Git commit or release tag, and platform (Linux desktop, Android, host toolchain).
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: Describe the bug and what you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Start galleryd with ...
+        2. In the app, ...
+        3. Observe ...
+    validations:
+      required: true
+  - type: textarea
+    id: security
+    attributes:
+      label: Security impact (if any)
+      description: Could media, vault keys, bearer tokens, pairing tokens, OCR text, or metadata be exposed or modified?
+  - type: checkboxes
+    id: risk
+    attributes:
+      label: Risk area
+      options:
+        - label: Authentication, session, pairing, vault sync, secrets, backup/restore, or encryption
+        - label: Media import/upload/download paths
+        - label: Database schema or persisted API contracts
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Diagnostics already gathered
+      options:
+        - label: Daemon log excerpt (sanitized)
+        - label: 'curl http://127.0.0.1:4821/health output'
+        - label: Privacy/security status (/privacy/status, /security/encryption-status)
