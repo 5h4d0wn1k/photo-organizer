@@ -1,0 +1,20 @@
+pub mod api;
+pub mod config;
+pub mod domain;
+pub mod events;
+pub mod imports;
+pub mod metadata;
+pub mod ml_sidecar;
+pub mod model_registry;
+pub mod ocr;
+pub mod people;
+pub mod search;
+pub mod security;
+pub mod service;
+pub mod storage;
+pub mod sync_transport;
+pub mod vault_store;
+
+pub use api::{AppState, router};
+pub use config::AppConfig;
+pub use service::GalleryService;

@@ -1,0 +1,35 @@
+{
+    "name": "Private Gallery",
+    "short_name": "Private Gallery",
+    "start_url": ".",
+    "display": "standalone",
+    "background_color": "#F5F7F5",
+    "theme_color": "#172033",
+    "description": "Private Gallery browser client for trusted-device local cloud storage and smart organization.",
+    "orientation": "any",
+    "prefer_related_applications": false,
+    "icons": [
+        {
+            "src": "icons/Icon-192.png",
+            "sizes": "192x192",
+            "type": "image/png"
+        },
+        {
+            "src": "icons/Icon-512.png",
+            "sizes": "512x512",
+            "type": "image/png"
+        },
+        {
+            "src": "icons/Icon-maskable-192.png",
+            "sizes": "192x192",
+            "type": "image/png",
+            "purpose": "maskable"
+        },
+        {
+            "src": "icons/Icon-maskable-512.png",
+            "sizes": "512x512",
+            "type": "image/png",
+            "purpose": "maskable"
+        }
+    ]
+}

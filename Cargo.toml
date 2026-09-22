@@ -1,0 +1,4 @@
+[workspace]
+members = ["native_core"]
+resolver = "2"
+

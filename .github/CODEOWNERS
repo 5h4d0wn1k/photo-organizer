@@ -1,0 +1,6 @@
+* @shadowarch
+
+/native_core/ @shadowarch
+/app/ @shadowarch
+/supabase/ @shadowarch
+/.github/ @shadowarch

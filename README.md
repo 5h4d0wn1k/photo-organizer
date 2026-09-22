@@ -1,104 +1,210 @@
-# photo-organizer
+# Private Gallery
 
-## Overview
+Private Gallery is a local-first, private-by-default shared-storage cloud and
+smart organizer for photos, videos, documents, and work files. It is inspired by
+Google Photos-style organization while keeping media, file intelligence, and
+private storage on the user's own trusted devices.
 
-Photo organizer App is a Python tool that uses facial recognition to effortlessly organize your photo collection. Simply choose a reference photo, select the folder to sort, and designate a destination folder. The app leverages GPU acceleration for optimal speed, ensuring efficient photo management. Simplify your image sorting with it.
+See [docs/product-vision.md](docs/product-vision.md) for the expanded
+cross-platform product vision, shared-storage goal, privacy promise, and pricing
+direction. The pasteable under-4,000-character Codex goal lives in
+[docs/product-goal-4000.md](docs/product-goal-4000.md). See
+[docs/platform-release-and-entitlements.md](docs/platform-release-and-entitlements.md)
+for the platform completion and subscription entitlement plan.
+The working product brief and workflow map live in
+[docs/product/prfaq.md](docs/product/prfaq.md) and
+[docs/product/critical-user-journeys.md](docs/product/critical-user-journeys.md).
+Business and sequencing details live in
+[docs/business/monetization-and-entitlements-template.md](docs/business/monetization-and-entitlements-template.md),
+[docs/business/unit-economics-scorecard-template.md](docs/business/unit-economics-scorecard-template.md),
+and
+[docs/roadmap/year-one-engineering-roadmap-template.md](docs/roadmap/year-one-engineering-roadmap-template.md).
+Operational ownership, rollout safety, and maturity tracking live in
+[docs/platform/service-ownership-template.md](docs/platform/service-ownership-template.md),
+[docs/platform/deploy-and-rollback-policy-template.md](docs/platform/deploy-and-rollback-policy-template.md),
+and
+[docs/platform/engineering-operating-system-scorecard-template.md](docs/platform/engineering-operating-system-scorecard-template.md).
 
-## Table of Contents
+## Current Status
 
-- [Motivation](#motivation)
-- [Project Description](#project-description)
-- [Installation and Usage](#installation-and-usage)
-- [How to Run](#how-to-install-and-run)
-- [Features](#features)
-- [Credits](#credits)
-- [License](#license)
+This repository now contains a desktop-usable MVP for the first phase of the product:
 
-## Project Screenshot
+- Rust local daemon with persisted SQLite metadata.
+- Flutter desktop client with real startup, setup, import, settings, and live-data screens.
+- Cross-desktop runners for Linux, macOS, and Windows.
+- Android runner with mobile pairing, camera-roll access, local upload, and vault-original download actions.
+- Real folder and removable-drive scan/commit imports with copy/reference modes and checksum dedupe.
+- Live timeline, places, events, and jobs views backed by persisted API state.
+- Encrypted database activation, encrypted vault chunk storage, local-only OCR indexing/search, model governance, chunk-aware backup export/restore staging, and large-library timeline pagination.
 
-![GUI Preview](gui_preview.png)
+The codebase intentionally preserves API surfaces for people, scenes, semantic search, pairing, and distributed vault sync. The vault/device/sync control plane is typed and persisted, originals are sealed into authenticated encrypted chunks, desktop peers can move encrypted chunks over the Iroh transport, and Android can pair with a desktop daemon over LAN/Tailscale for authenticated upload/download and explicit encrypted storage contribution without hosted photo storage.
 
-## Motivation
+## What This Repository Contains
 
-The motivation behind this project is to simplify the process of organizing a vast number of images by automatically sorting them based on the face of a specified person.
+- `app/`: Flutter client and desktop runners.
+- `native_core/`: Rust core daemon and library for storage, import orchestration, and local APIs.
+- `docs/`: architecture, security, and delivery notes.
+- `scripts/`: lightweight local validation helpers.
 
-## Project Description
+## Product Principles
 
-This application offers a user-friendly GUI that allows users to:
+- Local-first, with the primary laptop as the authoritative library.
+- Native clients for desktop and mobile, not a web-only wrapper.
+- On-device ML only in v1.
+- Privacy-sensitive data such as face templates, sync keys, and feedback events are encrypted at rest.
+- The product learns through user correction loops instead of silent, irreversible automation.
 
-- Select the target person's photo.
-- Choose the folder containing unorganized images.
-- Specify the destination folder for matching images.
-- Set the tolerance or accuracy level for face matching.
+## Implemented In This Slice
 
-The app then processes the images, moving the matching ones to the specified output folder.
+- Library setup with persisted `library_root` and default import mode.
+- Watch-folder management.
+- Folder and removable-drive import scans.
+- Commit-time `copy` or `reference` import mode.
+- Checksum-based dedupe across scans and imports.
+- Timeline buckets derived from imported capture metadata.
+- Place clusters from EXIF/manual hints.
+- Event clusters from timestamps and place hints.
+- Live job history for scans and imports.
+- Desktop daemon bootstrap flow from the Flutter client.
+- Paginated timeline loading for large local libraries.
+- Local Tesseract OCR batches after encryption is active.
+- Backup readiness verification, restorable local export, and non-destructive restore staging.
+- Distributed vault state: vaults, enrolled devices, storage policies, content-addressed encrypted chunk records, local key envelopes, replica health, availability status, sync transfer planning, and retry/cancel controls.
+- Vaults desktop screen for device status, replica health, network status, and transfer queue actions.
+- Iroh-backed encrypted desktop P2P vault sync with durable transfer records, local endpoint payloads, storage-only replica support, and remote pull after local eviction.
+- Android mobile onboarding with create/join group choices, QR/manual invite capture, secure session storage, camera-roll access checks, upload of the newest local item to the paired vault, and download of an available vault original.
 
-## Installation and Usage
+## Intentionally Deferred
 
-### How to Install and Run
+- Face clustering and real biometric indexing providers.
+- Scene tagging, semantic search, and vector indexing providers.
+- Native Android Iroh transport and background chunk-level mobile sync; current Android storage contribution uses the authenticated desktop local API over Tailscale/HTTPS or an explicitly entered LAN development URL.
+- Hosted discovery/relay service deployment and internet NAT traversal validation.
+- File-picker based import selection.
+- In-place restore over the active library; restore is staged into a separate folder for review.
+- Cloud relay, public sharing, or remote ML.
 
-1. Python
-   If you don't have Python installed on your machine, follow these steps:
- For Windows:
-   Download the latest version of Python from python.org
-   During installation, make sure to check the box that says "Add Python to PATH.
- For macOS and Linux:
-   Python is usually pre-installed on macOS and many Linux distributions. Open a terminal and type python3 or python to
-   check if it's already installed.
-   If not installed, you can install it using the package manager for your system.
+## Local Development
 
-3. Clone the repository:
+Start the Rust daemon for desktop-only local development:
 
-    ```bash
-    git clone https://github.com/5h4d0wn1k/photo-organizer.git
-    cd photo-organizer
-    ```
+```bash
+cargo run --manifest-path native_core/Cargo.toml --bin galleryd
+```
 
-4. Install the required dependencies:
+For private beta mobile sync, prefer a Tailscale/HTTPS path that exposes only
+`/health` and `/mobile/*` while the daemon stays loopback-bound. Desktop control
+routes remain loopback-only, and the daemon treats Tailscale Serve identity
+headers as remote clients even when the proxy forwards to `127.0.0.1`.
 
-    ```bash
-    pip install -r requirements.txt
-    ```
+Plain hotspot/LAN HTTP is development mode. To use it, intentionally enable
+remote mobile mode and use the dedicated launcher. It binds `0.0.0.0:4821` only
+when `PRIVATE_GALLERY_ALLOW_REMOTE_MOBILE=1` is set:
 
-5. Run the application:
+```bash
+PRIVATE_GALLERY_ALLOW_REMOTE_MOBILE=1 scripts/private_gallery_mobile_lan_daemon.sh
+```
 
-    ```bash
-    python main.py
-    ```
-    
-### Requirements
- Only if you want to do it manually 
-- Python 3.6 or higher
-- OpenCV (`pip install opencv-python`)
-- Face Recognition (`pip install face-recognition`)
-- dlib (`pip install dlib`)
-- tqdm (`pip install tqdm`)
-- numpy (`pip install numpy`)
-- scikit-learn (`pip install scikit-learn`)
-- scikit-image (`pip install scikit-image`)
-- pillow (`pip install pillow`)
-- tkinter (`pip install tk`)
+For LAN development, connect each Android phone to the laptop hotspot or the
+same trusted LAN, then open the desktop app's Vaults screen. Create a device
+group if one does not exist, choose "Add Device", confirm the
+`http://<laptop-hotspot-ip>:4821` URL, and scan the generated QR from the
+Android app's "Join group" flow. Pair the phone, upload the newest camera item,
+then use "Download first original" to verify a vault original can round trip.
+The hotspot IP can change; when it does, create a fresh invite QR with the
+current URL.
 
-### How to Use the Project
+Flutter builds may optionally enable metadata-only group bootstrap with
+Supabase by passing `PRIVATE_GALLERY_SUPABASE_URL` and
+`PRIVATE_GALLERY_SUPABASE_ANON_KEY` as Flutter `--dart-define` values and
+installing `supabase/device_group_bootstrap.sql`. This uses anonymous Auth plus
+RLS-protected Postgres tables/RPC only, so it fits the free-tier feature set
+without Edge Functions. It stores group membership metadata only; originals,
+thumbnails, vault keys, desktop pairing tokens, and mobile bearer tokens remain
+local. Desktop "Join Group" accepts pasted cloud or hybrid invite JSON.
 
-1. Select the target person's photo.
-2. Choose the folder containing unorganized images.
-3. Specify the destination folder for matching images.
-4. Set the tolerance level (0.0 - 1.0) for face matching.
-5. Click the "Start Processing" button to initiate the image sorting process.
+Before pairing phones over LAN development mode, the expected remote boundary is:
 
-## Features
+```bash
+curl -fsS http://<laptop-hotspot-ip>:4821/health
+curl -i http://<laptop-hotspot-ip>:4821/library/status # 403
+```
 
-- Automatic image sorting based on face recognition.
-- User-friendly GUI for easy interaction.
-- Progress bar for tracking processing status.
-- Error handling for a smooth user experience.
+When using Tailscale Serve, keep the daemon on loopback and expose only
+`/mobile` and `/health`; desktop control routes should return `403` to
+tailnet-proxied clients.
 
-## Credits
+Run the Flutter desktop client once Flutter is installed and the host toolchain is available:
 
-- Developed by [Nikhil Nagpure]
+```bash
+cd app
+flutter run -d linux
+```
 
-## License
+Build a one-command Linux bundle with the Rust daemon copied beside the app:
 
-This project is licensed under the [Apache 2.0](LICENSE).
+```bash
+scripts/build_linux_release.sh
+scripts/private_gallery_linux_launcher.sh
+```
 
+Useful checks:
+
+```bash
+cargo test --manifest-path native_core/Cargo.toml
+cd app && flutter analyze && flutter test
+```
+
+When Android phones are attached over USB and a daemon is already running, run
+the deterministic real-device mobile API smoke. For hotspot/LAN mode, pass the
+URL that phones should use and require two authorized phones for final
+acceptance:
+
+```bash
+PRIVATE_GALLERY_SMOKE_DEVICE_BASE_URL=http://<laptop-hotspot-ip>:4821 \
+PRIVATE_GALLERY_SMOKE_REQUIRE_DEVICE_COUNT=2 \
+scripts/android_mobile_smoke.sh
+```
+
+For USB-only development against loopback, the default command still works with
+`adb reverse`:
+
+```bash
+scripts/android_mobile_smoke.sh
+```
+
+The API smoke installs a temporary Dex HTTP helper on each authorized phone,
+pairs all phones first, checks remote `/health` and desktop-route blocking for
+LAN URLs, uploads synthetic originals larger than Axum's historical default
+body limit through resumable chunks, proves duplicate/cancel handling, verifies
+cross-device visibility before revocation, downloads ranged originals/previews,
+checks SHA-256 hashes, verifies each phone can opt into encrypted storage chunk
+replicas, report proof of possession, and restore chunks, verifies bearer
+refresh rejects the previous token, and verifies session/device revocation. Use
+`PRIVATE_GALLERY_SMOKE_DEVICE_SERIALS="serial1 serial2"` to pin the exact phones.
+
+For a Flutter app-level pairing smoke, build/install the debug APK and load a
+debug-only local group session into each installed app:
+
+```bash
+PRIVATE_GALLERY_SMOKE_DEVICE_BASE_URL=http://<laptop-hotspot-ip>:4821 \
+PRIVATE_GALLERY_SMOKE_DEVICE_SERIALS="serial1 serial2" \
+scripts/android_mobile_app_smoke.sh
+```
+
+The app smoke defaults to `PRIVATE_GALLERY_APP_SMOKE_PAIR_MODE=direct`, which is
+debug-only and not compiled into release behavior. Use
+`PRIVATE_GALLERY_APP_SMOKE_PAIR_MODE=ui` to exercise the visible pairing flow,
+`PRIVATE_GALLERY_APP_SMOKE_PAIR_MODE=manual` for a manual checklist, or
+`PRIVATE_GALLERY_APP_SMOKE_UPLOAD_NEWEST=1` to attempt the real camera-roll
+upload button after pairing. See
+[docs/android-mobile-smoke.md](docs/android-mobile-smoke.md) for the full
+laptop-plus-two-phones runbook.
+
+Linux desktop builds require native host tools such as `cmake`, `ninja`, `g++`, and `gtk+-3.0` development headers. See [docs/desktop-development.md](/mnt/windows/transfer/Work/Projects/Personal%20Use%20Projects/photos%20and%20videos%20organizer/docs/desktop-development.md).
+
+Use the helper below to run the narrowest supported checks:
+
+```bash
+scripts/dev-check.sh
+```

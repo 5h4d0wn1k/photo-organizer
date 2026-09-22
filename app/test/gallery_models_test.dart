@@ -1,0 +1,715 @@
+import 'package:flutter_test/flutter_test.dart';
+import 'package:private_gallery_app/src/models/gallery_models.dart';
+
+void main() {
+  test('parses local admin audit event payloads', () {
+    final event = AuditEvent.fromJson({
+      'id': 'audit-1',
+      'action': 'vault.storage_policy.update',
+      'target_kind': 'vault',
+      'target_id': 'vault-1',
+      'actor_device_id': 'device-1',
+      'actor_label': 'Office desktop',
+      'summary': 'Updated storage policy for Family',
+      'payload': {
+        'vault_id': 'vault-1',
+        'storage_policy': {'mode': 'protected_min_2'},
+      },
+      'created_at': '2026-05-14T07:00:00Z',
+    });
+
+    expect(event.id, 'audit-1');
+    expect(event.action, 'vault.storage_policy.update');
+    expect(event.actorLabel, 'Office desktop');
+    expect(event.payload['vault_id'], 'vault-1');
+    expect(event.createdAt.toIso8601String(), '2026-05-14T07:00:00.000Z');
+  });
+
+  test('parses mobile role capabilities for storage-only workspaces', () {
+    final capabilities = MobileWorkspaceCapabilities.fromJson({
+      'can_browse_library': false,
+      'can_search': false,
+      'can_upload_camera_roll': false,
+      'can_download_originals': false,
+      'can_manage_storage': true,
+      'can_import_desktop_folders': false,
+      'can_run_models': false,
+      'role_detail':
+          'Storage-only mobile access cannot browse or download content.',
+    });
+
+    expect(capabilities.canBrowseLibrary, isFalse);
+    expect(capabilities.canSearch, isFalse);
+    expect(capabilities.canUploadCameraRoll, isFalse);
+    expect(capabilities.canDownloadOriginals, isFalse);
+    expect(capabilities.canManageStorage, isTrue);
+    expect(capabilities.roleDetail, contains('Storage-only'));
+  });
+
+  test('serializes explicit file organization search filters', () {
+    const query = SearchQuery(
+      text: 'report',
+      workspace: 'Office',
+      client: 'Acme',
+      project: 'Launch',
+      topic: 'Reports',
+      sourceFolder: 'Project Launch',
+      device: 'Office laptop',
+      mediaKind: 'document',
+      tags: 'invoice, client',
+      limit: 25,
+    );
+
+    expect(query.toQueryParameters(), {
+      'text': 'report',
+      'workspace': 'Office',
+      'client': 'Acme',
+      'project': 'Launch',
+      'topic': 'Reports',
+      'source_folder': 'Project Launch',
+      'device': 'Office laptop',
+      'media_kind': 'document',
+      'tags': 'invoice, client',
+      'include_archived': 'false',
+      'limit': '25',
+    });
+    expect(query.toJson(), {
+      'text': 'report',
+      'workspace': 'Office',
+      'client': 'Acme',
+      'project': 'Launch',
+      'topic': 'Reports',
+      'source_folder': 'Project Launch',
+      'device': 'Office laptop',
+      'media_kind': 'document',
+      'tags': 'invoice, client',
+      'include_archived': false,
+      'limit': 25,
+    });
+  });
+
+  test('parses saved smart folder search query', () {
+    final folder = SmartFolder.fromJson({
+      'id': 'smart-1',
+      'title': 'Client reports',
+      'query': {
+        'workspace': 'Office',
+        'client': 'Acme',
+        'topic': 'Reports',
+        'media_kind': 'document',
+        'tags': 'invoice',
+        'favorite': true,
+        'include_archived': true,
+        'limit': 80,
+      },
+      'created_at': '2026-05-12T10:00:00Z',
+      'updated_at': '2026-05-12T11:00:00Z',
+    });
+
+    expect(folder.id, 'smart-1');
+    expect(folder.title, 'Client reports');
+    expect(folder.query.workspace, 'Office');
+    expect(folder.query.client, 'Acme');
+    expect(folder.query.topic, 'Reports');
+    expect(folder.query.mediaKind, 'document');
+    expect(folder.query.tags, 'invoice');
+    expect(folder.query.favorite, isTrue);
+    expect(folder.query.includeArchived, isTrue);
+    expect(folder.query.limit, 80);
+  });
+
+  test('parses timeline response payload', () {
+    final response = TimelineResponse.fromJson({
+      'buckets': [
+        {
+          'label': 'January 2025',
+          'asset_ids': ['asset-1'],
+          'assets': [
+            {
+              'id': 'asset-1',
+              'original_filename': 'beach.jpg',
+              'relative_original_path': 'objects/a/b/beach.jpg',
+              'content_hash': 'hash',
+              'media_kind': 'photo',
+              'bytes': 100,
+              'mime_type': 'image/jpeg',
+              'captured_at': '2025-01-03T09:30:00Z',
+              'imported_at': '2025-01-03T10:30:00Z',
+              'archived': false,
+              'favorite': true,
+              'manual_tags': ['family', 'tax docs'],
+              'place_hint': 'Goa',
+              'metadata': {
+                'asset_id': 'asset-1',
+                'captured_at': '2025-01-03T09:30:00Z',
+                'captured_at_source': 'takeout_sidecar',
+                'width': 4000,
+                'height': 3000,
+                'camera': {'make': 'Google', 'model': 'Pixel'},
+                'organization': {
+                  'source_folder': 'Project Launch',
+                  'workspace': 'Office',
+                  'client': 'Client Acme',
+                  'project': 'Project Launch',
+                  'topic': 'Launch',
+                  'path_segments': ['Office', 'Client Acme', 'Project Launch'],
+                },
+                'geo': {
+                  'latitude': 15.2993,
+                  'longitude': 74.1240,
+                  'source': 'takeout_sidecar',
+                  'exact_hidden': false,
+                },
+                'model_name': 'metadata-extractor',
+                'model_version': 'v1',
+                'created_at': '2025-01-03T10:35:00Z',
+                'rebuildable': true,
+              },
+              'variants': [
+                {
+                  'id': 'variant-1',
+                  'kind': 'thumbnail',
+                  'relative_path': 'variants/thumbs/beach.webp',
+                  'mime_type': 'image/webp',
+                  'bytes': 10,
+                  'width': 480,
+                  'height': 480,
+                  'model_name': 'thumb',
+                  'model_version': 'v1',
+                  'created_at': '2025-01-03T10:35:00Z',
+                  'rebuildable': true,
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    });
+
+    expect(response.buckets.single.assets.single.originalFilename, 'beach.jpg');
+    expect(
+      response.buckets.single.assets.single.variants.single.kind,
+      'thumbnail',
+    );
+    expect(
+      response.buckets.single.assets.single.metadata?.capturedAtSource,
+      'takeout_sidecar',
+    );
+    expect(
+      response.buckets.single.assets.single.metadata?.geo?.latitude,
+      15.2993,
+    );
+    expect(
+      response.buckets.single.assets.single.metadata?.organization.client,
+      'Client Acme',
+    );
+    expect(response.buckets.single.assets.single.manualTags, [
+      'family',
+      'tax docs',
+    ]);
+  });
+
+  test('parses import session preflight fields with fallback safety', () {
+    final session = ImportSession.fromJson({
+      'id': 'session-1',
+      'source_kind': 'folder',
+      'source_path': '/tmp/source',
+      'import_mode': 'move',
+      'add_as_watch_folder': false,
+      'status': 'scanned',
+      'created_at': '2026-05-10T10:00:00Z',
+      'candidates': [
+        {
+          'id': 'candidate-1',
+          'session_id': 'session-1',
+          'source_path': '/tmp/source/a.jpg',
+          'original_filename': 'a.jpg',
+          'media_kind': 'photo',
+          'mime_type': 'image/jpeg',
+          'bytes': 100,
+          'content_hash': 'hash-a',
+          'selected': true,
+          'import_mode': 'move',
+          'sidecar_paths': ['/tmp/source/a.jpg.json'],
+          'safety_status': 'ready_to_move_verified_after_commit',
+          'organization': {
+            'workspace': 'Office',
+            'client': 'Client Acme',
+            'project': 'Project Launch',
+            'path_segments': ['Office', 'Client Acme', 'Project Launch'],
+          },
+        },
+        {
+          'id': 'candidate-2',
+          'session_id': 'session-1',
+          'source_path': '/tmp/source/b.pdf',
+          'original_filename': 'b.pdf',
+          'media_kind': 'document',
+          'mime_type': 'application/pdf',
+          'bytes': 200,
+          'content_hash': 'hash-b',
+          'duplicate_asset_id': 'asset-1',
+          'selected': true,
+          'import_mode': 'move',
+          'sidecar_paths': [],
+          'safety_status': 'duplicate_skip',
+        },
+      ],
+      'imported_asset_ids': [],
+      'duplicate_asset_ids': [],
+      'moved_asset_ids': [],
+      'skipped_duplicate_ids': [],
+      'failed_candidate_ids': [],
+      'sidecars_moved': 0,
+      'unsupported_file_paths': ['/tmp/source/desktop.ini'],
+      'destination_root': '/tmp/source/PrivateGalleryLibrary',
+      'requires_move_confirmation': true,
+      'source_contains_managed_library': true,
+    });
+
+    expect(session.selectedCandidateCount, 1);
+    expect(session.selectedBytes, 100);
+    expect(session.duplicateCount, 1);
+    expect(session.unsupportedCount, 1);
+    expect(session.sidecarCount, 1);
+    expect(session.requiresMoveConfirmation, isTrue);
+    expect(session.sourceContainsManagedLibrary, isTrue);
+    expect(session.candidates[1].mediaKind, 'document');
+    expect(session.candidates[0].organization.project, 'Project Launch');
+    expect(
+      session.candidates[0].organization.summary,
+      contains('Client: Client Acme'),
+    );
+  });
+
+  test('parses duplicate review summary payloads', () {
+    final summary = DuplicateReviewSummary.fromJson({
+      'generated_at': '2026-05-13T06:00:00Z',
+      'duplicate_assets': 1,
+      'duplicate_candidates': 2,
+      'protected_bytes': 4096,
+      'sessions_with_duplicates': 1,
+      'entries': [
+        {
+          'asset_id': 'asset-1',
+          'media_kind': 'document',
+          'original_bytes': 2048,
+          'duplicate_candidates': 2,
+          'protected_bytes': 4096,
+          'first_seen_at': '2026-05-13T06:00:00Z',
+          'last_seen_at': '2026-05-13T06:05:00Z',
+          'import_session_ids': ['session-1'],
+          'source_kinds': ['folder'],
+        },
+      ],
+      'privacy_detail': 'Computed locally.',
+    });
+
+    expect(summary.hasDuplicates, isTrue);
+    expect(summary.protectedBytes, 4096);
+    expect(summary.entries.single.mediaKind, 'document');
+    expect(summary.entries.single.importSessionIds, ['session-1']);
+  });
+
+  test('parses privacy status and model governance fields', () {
+    final status = PrivacyStatus.fromJson({
+      'network_policy': 'ask_before_download',
+      'daemon_bind_address': '127.0.0.1:4821',
+      'loopback_only': true,
+      'developer_mode': false,
+      'photo_processing_network_allowed': false,
+      'model_download_requires_confirmation': true,
+      'telemetry_enabled': false,
+      'analytics_enabled': false,
+      'cloud_ai_enabled': false,
+      'local_only_disclosure': 'Everything stays local.',
+      'installed_models': [
+        {
+          'id': 'scrfd-face-detector',
+          'name': 'SCRFD face detector candidate',
+          'version': 'onnx-personal-review',
+          'task': 'face_detection',
+          'license': 'review required',
+          'source_url': 'https://example.invalid/model.onnx',
+          'expected_sha256': 'abc123',
+          'installed_path': '/tmp/model.onnx',
+          'installed_sha256': 'abc123',
+          'install_status': 'installed',
+          'review_notes': 'Personal use only.',
+          'approved_for_personal_family_use': true,
+        },
+      ],
+    });
+
+    expect(status.localOnlyHealthy, isTrue);
+    expect(status.networkPolicy, NetworkPolicy.askBeforeDownload);
+    expect(status.installedModels.single.installed, isTrue);
+    expect(status.installedModels.single.task, ModelTask.faceDetection);
+    expect(
+      status.installedModels.single.installStatus,
+      ModelInstallStatus.installed,
+    );
+  });
+
+  test('parses entitlement status with offline grace limits', () {
+    final status = EntitlementStatusResponse.fromJson({
+      'tier': 'family_remote',
+      'effective_status': 'offline_grace',
+      'limits': {
+        'device_limit': 8,
+        'member_limit': 6,
+        'workspace_limit': 2,
+        'monthly_ocr_limit': 5000,
+        'relay_priority': 'standard',
+        'advanced_admin_controls': false,
+      },
+      'cache': {
+        'tier': 'family_remote',
+        'status': 'past_due',
+        'account_id_hash':
+            '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef',
+        'plan_code': 'family_remote.monthly',
+        'limits': {
+          'device_limit': 8,
+          'member_limit': 6,
+          'workspace_limit': 2,
+          'monthly_ocr_limit': 5000,
+          'relay_priority': 'standard',
+          'advanced_admin_controls': false,
+        },
+        'checked_at': '2026-05-14T07:00:00Z',
+        'expires_at': '2026-05-15T07:00:00Z',
+        'offline_grace_expires_at': '2026-06-14T07:00:00Z',
+        'source': 'local_entitlement_cache',
+        'detail': 'Cached past-due entitlement; no content metadata stored.',
+        'updated_at': '2026-05-14T07:00:00Z',
+      },
+      'offline_grace_active': true,
+      'paid_features_available': true,
+      'safe_local_access_allowed': true,
+      'content_exposure_prevented': true,
+      'detail': 'Offline grace is preserving paid features.',
+    });
+
+    expect(status.tier, EntitlementTier.familyRemote);
+    expect(status.effectiveStatus, EntitlementEffectiveStatus.offlineGrace);
+    expect(status.offlineGraceActive, isTrue);
+    expect(status.contentExposurePrevented, isTrue);
+    expect(status.limits.deviceLimit, 8);
+    expect(status.limits.relayPriority, EntitlementRelayPriority.standard);
+    expect(status.cache?.status, EntitlementCacheStatus.pastDue);
+    expect(status.cache?.hasAccountHash, isTrue);
+    expect(status.cache?.planCode, 'family_remote.monthly');
+  });
+
+  test('parses platform release readiness for all required surfaces', () {
+    final readiness = PlatformReleaseReadinessResponse.fromJson({
+      'generated_at': '2026-05-14T07:00:00Z',
+      'overall_status': 'in_progress',
+      'required_surface_count': 8,
+      'ready_surface_count': 0,
+      'detail': 'Cross-platform release is incomplete.',
+      'surfaces': [
+        _releaseSurface('linux_desktop', 'Linux desktop', 'in_progress'),
+        _releaseSurface('windows_desktop', 'Windows desktop', 'in_progress'),
+        _releaseSurface('macos_desktop', 'macOS desktop', 'in_progress'),
+        _releaseSurface(
+          'android_play_store',
+          'Android / Play Store',
+          'in_progress',
+        ),
+        _releaseSurface('ios_app_store', 'iOS / App Store', 'in_progress'),
+        _releaseSurface('web_browser', 'Web/browser', 'in_progress'),
+        _releaseSurface('local_web_ui', 'Local web UI', 'in_progress'),
+        _releaseSurface(
+          'direct_desktop_distribution',
+          'Direct desktop distribution',
+          'in_progress',
+        ),
+      ],
+    });
+
+    expect(readiness.overallStatus, PlatformReleaseReadinessStatus.inProgress);
+    expect(readiness.requiredSurfaceCount, 8);
+    expect(readiness.readySurfaceCount, 0);
+    expect(readiness.blockedSurfaceCount, 0);
+    expect(readiness.surfaces.map((surface) => surface.surface), [
+      PlatformReleaseSurface.linuxDesktop,
+      PlatformReleaseSurface.windowsDesktop,
+      PlatformReleaseSurface.macosDesktop,
+      PlatformReleaseSurface.androidPlayStore,
+      PlatformReleaseSurface.iosAppStore,
+      PlatformReleaseSurface.webBrowser,
+      PlatformReleaseSurface.localWebUi,
+      PlatformReleaseSurface.directDesktopDistribution,
+    ]);
+    expect(readiness.surfaces[4].missingEvidenceCount, 1);
+  });
+
+  test('parses search index OCR coverage fields with safe defaults', () {
+    final status = SearchIndexStatus.fromJson({
+      'filename_ready': true,
+      'metadata_ready': true,
+      'ocr_ready': true,
+      'ocr_text_block_count': 9,
+      'ocr_indexed_asset_count': 9,
+      'ocr_total_photo_count': 50434,
+      'ocr_remaining_photo_count': 50425,
+      'scene_ready': false,
+      'semantic_ready': false,
+      'updated_at': '2026-05-12T15:00:00Z',
+      'detail': 'OCR is partial.',
+    });
+
+    expect(status.ocrReady, isTrue);
+    expect(status.ocrTextBlockCount, 9);
+    expect(status.ocrIndexedAssetCount, 9);
+    expect(status.ocrTotalPhotoCount, 50434);
+    expect(status.ocrRemainingPhotoCount, 50425);
+    expect(status.ocrPartiallyIndexed, isTrue);
+  });
+
+  test('parses distributed vault sync and availability fields', () {
+    final vault = Vault.fromJson({
+      'id': 'vault-1',
+      'name': 'Family',
+      'storage_policy': {
+        'mode': 'protected_min_2',
+        'min_replicas': 2,
+        'preferred_device_ids': ['device-2'],
+        'excluded_device_ids': [],
+        'min_free_space_bytes': 1024,
+        'allow_metered_network': false,
+        'pause_on_low_battery': true,
+      },
+      'key_version': 1,
+      'deletion_grace_days': 30,
+      'created_at': '2026-05-13T06:00:00Z',
+      'updated_at': '2026-05-13T06:00:00Z',
+    });
+    final device = DeviceIdentity.fromJson({
+      'id': 'device-2',
+      'display_name': 'NAS',
+      'platform': 'linux',
+      'public_key': 'nas-key',
+      'trust_level': 'storage_only',
+      'storage_profile': {
+        'device_id': 'device-2',
+        'available_bytes': 90000,
+        'reserved_bytes': 1024,
+        'accepts_storage': true,
+        'battery_powered': false,
+        'metered_network': false,
+        'low_battery': false,
+      },
+      'enrolled_at': '2026-05-13T06:00:00Z',
+    });
+    final plan = SyncPlan.fromJson({
+      'generated_at': '2026-05-13T06:00:00Z',
+      'vault_ids': ['vault-1'],
+      'transfers': [
+        {
+          'id': 'transfer-1',
+          'vault_id': 'vault-1',
+          'blob_id': 'blob-1',
+          'from_device_id': 'device-1',
+          'to_device_id': 'device-2',
+          'status': 'pending',
+          'bytes_total': 100,
+          'bytes_completed': 0,
+          'updated_at': '2026-05-13T06:00:00Z',
+          'resumable_until': '2026-05-20T06:00:00Z',
+        },
+      ],
+      'conflicts': [],
+      'under_replicated_blob_ids': ['blob-1'],
+      'policy_satisfied': false,
+      'detail': 'pending transfer',
+    });
+    final availability = AssetAvailability.fromJson({
+      'asset_id': 'asset-1',
+      'vault_id': 'vault-1',
+      'state': 'under_replicated',
+      'local_replica': true,
+      'reachable_replica_device_ids': [],
+      'offline_replica_device_ids': [],
+      'replica_count': 1,
+      'required_replica_count': 2,
+      'detail': 'only one replica',
+    });
+
+    expect(vault.storagePolicy.mode, StoragePolicyMode.protectedMin2);
+    expect(vault.storagePolicy.preferredDeviceIds, ['device-2']);
+    expect(device.trustLevel, DeviceTrustLevel.storageOnly);
+    expect(device.storageProfile.acceptsStorage, isTrue);
+    expect(plan.transfers.single.toDeviceId, 'device-2');
+    expect(plan.underReplicatedBlobIds, ['blob-1']);
+    expect(availability.state, AssetAvailabilityState.underReplicated);
+    expect(availability.opensLocally, isTrue);
+  });
+
+  test('defaults missing storage capability to browsing-only', () {
+    final profile = DeviceStorageProfile.fromJson(const <String, dynamic>{});
+
+    expect(profile.acceptsStorage, isFalse);
+  });
+
+  test('parses vault file tree entries for file-manager views', () {
+    final tree = VaultFileTreeResponse.fromJson({
+      'vault_id': 'vault-1',
+      'root_entry_ids': ['root-1'],
+      'entries': [
+        {
+          'id': 'root-1',
+          'vault_id': 'vault-1',
+          'name': 'Family vault',
+          'kind': 'folder',
+          'bytes': 0,
+          'created_at': '2026-05-26T06:00:00Z',
+          'updated_at': '2026-05-26T06:00:00Z',
+        },
+        {
+          'id': 'file-1',
+          'vault_id': 'vault-1',
+          'parent_id': 'root-1',
+          'asset_id': 'asset-1',
+          'name': 'tax.pdf',
+          'kind': 'file',
+          'media_kind': 'document',
+          'mime_type': 'application/pdf',
+          'bytes': 4096,
+          'content_hash': 'hash',
+          'origin_device_id': 'device-1',
+          'created_at': '2026-05-26T06:01:00Z',
+          'updated_at': '2026-05-26T06:01:00Z',
+          'organization': {
+            'source_folder': 'Project Launch',
+            'workspace': 'Office',
+            'client': 'Acme',
+            'project': 'Launch',
+            'topic': 'Reports',
+            'path_segments': ['Office', 'Acme', 'Launch'],
+          },
+        },
+      ],
+      'devices': [
+        {
+          'id': 'device-1',
+          'display_name': 'Office laptop',
+          'platform': 'linux',
+        },
+      ],
+    });
+
+    expect(tree.vaultId, 'vault-1');
+    expect(tree.roots.single.id, 'root-1');
+    expect(tree.childrenOf('root-1').single.name, 'tax.pdf');
+    expect(tree.childrenOf('root-1').single.kind, VaultFileKind.file);
+    expect(tree.childrenOf('root-1').single.isFile, isTrue);
+    expect(tree.childrenOf('root-1').single.mediaKind, 'document');
+    expect(tree.childrenOf('root-1').single.originDeviceId, 'device-1');
+    expect(tree.childrenOf('root-1').single.organization.workspace, 'Office');
+    expect(tree.childrenOf('root-1').single.organization.client, 'Acme');
+    expect(tree.childrenOf('root-1').single.organization.project, 'Launch');
+    expect(tree.devices.single.label, 'Office laptop (linux)');
+    expect(tree.devicesById['device-1']?.displayName, 'Office laptop');
+  });
+
+  test('parses chunk-aware backup and restore fields', () {
+    final verification = BackupVerification.fromJson({
+      'checked_at': '2026-05-15T06:00:00Z',
+      'database_path': '/library/runtime/db/gallery.sqlite3',
+      'library_root': '/library',
+      'database_sha256': 'dbhash',
+      'assets_checked': 2,
+      'missing_asset_paths': [],
+      'vault_chunks_checked': 4,
+      'missing_vault_chunk_paths': ['/library/vaults/bad.pgblob'],
+      'model_files_checked': 1,
+      'missing_model_paths': [],
+      'ok': false,
+    });
+    final export = BackupExportResult.fromJson({
+      'exported_at': '2026-05-15T06:01:00Z',
+      'export_root': '/backup',
+      'manifest_path': '/backup/manifests/private-gallery-backup-manifest.json',
+      'database_copied_to': '/backup/database/gallery.sqlite3',
+      'database_sha256': 'dbhash',
+      'assets_checked': 2,
+      'missing_asset_paths': [],
+      'media_files_copied': 1,
+      'vault_chunks_copied': 4,
+      'bytes_copied': 4096,
+      'model_files_checked': 1,
+      'missing_model_paths': [],
+      'ok': true,
+    });
+    final supportBundle = SupportBundleExportResult.fromJson({
+      'exported_at': '2026-05-15T06:01:30Z',
+      'export_root': '/backup',
+      'bundle_path': '/backup/support/private-gallery-support-bundle.json',
+      'sections': ['summary', 'privacy', 'redaction'],
+      'redacted_fields': ['original_filename', 'account_id_hash'],
+      'private_data_excluded': true,
+      'ok': true,
+    });
+    final plan = BackupRestorePlan.fromJson({
+      'checked_at': '2026-05-15T06:02:00Z',
+      'export_root': '/backup',
+      'restore_root': '/restore',
+      'manifest_path': '/backup/manifests/private-gallery-backup-manifest.json',
+      'database_source_path': '/backup/database/gallery.sqlite3',
+      'database_target_path': '/restore/runtime/db/gallery.sqlite3',
+      'media_files_available': 1,
+      'vault_chunks_available': 4,
+      'missing_paths': [],
+      'destination_conflicts': [],
+      'requires_confirmation': true,
+      'ok': true,
+      'detail': 'Restore can be staged.',
+    });
+    final run = BackupRestoreRunResult.fromJson({
+      'restored_at': '2026-05-15T06:03:00Z',
+      'restore_root': '/restore',
+      'database_restored_to': '/restore/runtime/db/gallery.sqlite3',
+      'media_files_copied': 1,
+      'vault_chunks_copied': 4,
+      'bytes_copied': 4096,
+      'ok': true,
+      'detail': 'Restore staged.',
+    });
+
+    expect(verification.vaultChunksChecked, 4);
+    expect(verification.missingVaultChunkPaths.single, contains('bad.pgblob'));
+    expect(export.vaultChunksCopied, 4);
+    expect(export.bytesCopied, 4096);
+    expect(supportBundle.privateDataExcluded, isTrue);
+    expect(supportBundle.redactedFields, contains('account_id_hash'));
+    expect(plan.vaultChunksAvailable, 4);
+    expect(plan.requiresConfirmation, isTrue);
+    expect(run.databaseRestoredTo, '/restore/runtime/db/gallery.sqlite3');
+  });
+}
+
+Map<String, Object?> _releaseSurface(
+  String surface,
+  String label,
+  String status,
+) {
+  return {
+    'surface': surface,
+    'label': label,
+    'status': status,
+    'distribution': 'Release artifact',
+    'evidence': [
+      {
+        'key': '${surface}_evidence',
+        'label': 'Evidence',
+        'status': 'missing',
+        'detail': 'Missing release evidence.',
+      },
+    ],
+    'blockers': ['Missing release evidence.'],
+    'next_step': 'Record release evidence.',
+  };
+}

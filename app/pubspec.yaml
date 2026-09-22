@@ -1,0 +1,35 @@
+name: private_gallery_app
+description: Local-first gallery client for the Private Gallery project.
+publish_to: "none"
+version: 0.1.0+1
+
+environment:
+  sdk: ">=3.10.3 <4.0.0"
+  flutter: ">=3.38.4"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  cupertino_icons: ^1.0.8
+  http: ^1.2.1
+  intl: ^0.20.2
+  photo_manager: ^3.9.0
+  permission_handler: ^12.0.1
+  path_provider: ^2.1.5
+  flutter_secure_storage: ^10.2.0
+  mobile_scanner: ^7.2.0
+  qr_flutter: ^4.1.0
+  supabase_flutter: ^2.12.4
+  crypto: ^3.0.7
+  share_plus: ^13.1.0
+  video_player: ^2.11.1
+  video_trimmer: ^5.0.0
+  image: ^4.8.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^5.0.0
+
+flutter:
+  uses-material-design: true
