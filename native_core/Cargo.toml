@@ -11,7 +11,7 @@ iroh = "0.98.2"
 keyring = { version = "3", features = ["apple-native", "windows-native", "linux-native-sync-persistent", "crypto-rust"] }
 nom-exif = "3.4"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
-rusqlite = { version = "0.37", features = ["bundled-sqlcipher-vendored-openssl", "chrono", "serde_json"] }
+rusqlite = { version = "0.40", features = ["bundled-sqlcipher-vendored-openssl", "chrono", "serde_json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
