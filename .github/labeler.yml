@@ -1,45 +1,53 @@
 rust:
   - changed-files:
-      - "native_core/**"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - "rust-toolchain.toml"
+      - any-glob-to-any-file:
+          - "native_core/**"
+          - "Cargo.toml"
+          - "Cargo.lock"
+          - "rust-toolchain.toml"
 
 flutter:
   - changed-files:
-      - "app/**"
+      - any-glob-to-any-file:
+          - "app/**"
 
 python:
   - changed-files:
-      - "ml_sidecar/**"
-      - "scripts/**/*.py"
+      - any-glob-to-any-file:
+          - "ml_sidecar/**"
+          - "scripts/**/*.py"
 
 ci:
   - changed-files:
-      - ".github/workflows/*.yml"
+      - any-glob-to-any-file:
+          - ".github/workflows/*.yml"
 
 security:
   - changed-files:
-      - ".github/workflows/codeql-analysis.yml"
-      - ".github/workflows/dependency-review.yml"
-      - ".github/workflows/scorecard.yml"
-      - "docs/SECURITY_GATES_TRIAGE.md"
-      - "SECURITY.md"
+      - any-glob-to-any-file:
+          - ".github/workflows/codeql-analysis.yml"
+          - ".github/workflows/dependency-review.yml"
+          - ".github/workflows/scorecard.yml"
+          - "docs/SECURITY_GATES_TRIAGE.md"
+          - "SECURITY.md"
 
 docs:
   - changed-files:
-      - "*.md"
-      - "docs/**"
+      - any-glob-to-any-file:
+          - "*.md"
+          - "docs/**"
 
 deps:
   - changed-files:
-      - ".github/dependabot.yml"
-      - "**/Cargo.lock"
-      - "**/Cargo.toml"
-      - "app/pubspec.yaml"
-      - "app/pubspec.lock"
-      - "ml_sidecar/requirements*.txt"
+      - any-glob-to-any-file:
+          - ".github/dependabot.yml"
+          - "**/Cargo.lock"
+          - "**/Cargo.toml"
+          - "app/pubspec.yaml"
+          - "app/pubspec.lock"
+          - "ml_sidecar/requirements*.txt"
 
 devcontainer:
   - changed-files:
-      - ".devcontainer/**"
+      - any-glob-to-any-file:
+          - ".devcontainer/**"

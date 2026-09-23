@@ -97,6 +97,25 @@ secret scanning, cargo-audit, SBOM generation, and stale issue/PR cleanup.
   embeddings without a documented privacy review.
 - Keep the legacy face sorter in `tools/`; do not wire it into `galleryd`.
 
+## Feature Workflow
+
+New features are created as issues, not branches: open one with the
+feature-request template, which auto-labels it `enhancement` + `roadmap`. The
+GitHub Project board **Photo Organizer — Delivery & Roadmap** is the planning
+layer *above* issues — the same lanes track bugs, chores, and features.
+
+Flow: idea → open feature issue (template) → project **Backlog**
+(automatically) → triage sets **Priority** (Low/Medium/High/Urgent) and
+**Area** (Daemon/App/ml_sidecar/Security/Platform-CI/Docs) → Status
+**Planned** once scheduled → branch `feat/<name>` → PR (conventional title,
+`Closes #N`) → project auto-moves to **In review** → required checks pass →
+review → squash merge → project auto-moves to **Shipped** → milestone + tagged
+release (release notes auto-generated).
+
+Note: `.github/workflows/project.yml` keeps Status in sync with the issue and
+PR events; Status changes happen only through the board or that workflow,
+never manually.
+
 ## PR Checklist
 
 - [ ] Change addresses an open issue or documents a rationale.
