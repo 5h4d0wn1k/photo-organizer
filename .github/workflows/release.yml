@@ -111,7 +111,7 @@ jobs:
           dpkg-deb --build "${PKG}" "photo-organizer_${VERSION}_amd64.deb"
 
       - name: Upload Linux artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: linux-artifacts
           path: |
@@ -168,7 +168,7 @@ jobs:
           Write-Host "Note: unsigned build"
 
       - name: Upload Windows artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: windows-artifact
           path: photo-organizer-windows-x64-*.zip
@@ -226,7 +226,7 @@ jobs:
           echo "Note: unsigned build; no notarization performed."
 
       - name: Upload macOS artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: macos-artifact
           path: photo-organizer-macos-*.dmg
@@ -271,7 +271,7 @@ jobs:
         working-directory: app
 
       - name: Upload Android artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: android-artifact
           path: app/build/app/outputs/flutter-apk/app-release.apk
@@ -323,7 +323,7 @@ jobs:
           ditto -c -k --keepParent "${APP_PATH}" "photo-organizer-ios-${GITHUB_REF_NAME}.zip"
 
       - name: Upload iOS artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ios-artifact
           path: photo-organizer-ios-*.zip
