@@ -13,15 +13,15 @@ dependencies:
   cupertino_icons: ^1.0.8
   http: ^1.2.1
   intl: ^0.20.3
-  photo_manager: ^3.12.0
+  photo_manager: ^3.9.0
   permission_handler: ^12.0.1
-  path_provider: ^2.1.6
+  path_provider: ^2.1.5
   flutter_secure_storage: ^10.2.0
   mobile_scanner: ^7.4.2
   qr_flutter: ^4.1.0
   supabase_flutter: ^2.17.2
   crypto: ^3.0.7
-  share_plus: ^13.3.0
+  share_plus: ^13.1.0
   video_player: ^2.14.0
   video_trimmer: ^5.0.0
   image: ^4.10.1
