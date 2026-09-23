@@ -22,6 +22,8 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             cmake \
             ninja-build \
+            clang \
+            liblzma-dev \
             g++ \
             libgtk-3-dev \
             libwebkit2gtk-4.1-dev \
@@ -138,13 +140,6 @@ jobs:
         with:
           channel: stable
           cache: true
-
-      - name: Install OpenSSL (vcpkg)
-        shell: pwsh
-        run: |
-          $root = if ($env:VCPKG_ROOT) { $env:VCPKG_ROOT } else { "C:\vcpkg" }
-          & "$root\vcpkg.exe" install openssl:x64-windows-static-md
-          echo "VCPKG_ROOT=$root" | Out-File -Append $env:GITHUB_ENV
 
       - name: Build Rust daemon
         run: cargo build --manifest-path native_core/Cargo.toml --bin galleryd --release
