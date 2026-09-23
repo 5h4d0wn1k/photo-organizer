@@ -16,14 +16,14 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install dependencies
+      - name: Install hermetic toolchain (BEFORE flutter caches CMake)
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            cmake \
-            ninja-build \
             clang \
             liblzma-dev \
+            cmake \
+            ninja-build \
             g++ \
             libgtk-3-dev \
             libwebkit2gtk-4.1-dev \
@@ -46,8 +46,10 @@ jobs:
       - name: Build Rust daemon
         run: cargo build --manifest-path native_core/Cargo.toml --bin galleryd --release
 
-      - name: Build Flutter Linux
-        run: flutter build linux
+      - name: Hermetic CMake cache regen (drop stale CMAKE_CXX_COMPILER pin)
+        run: |
+          rm -rf app/build/linux
+          flutter build linux
         working-directory: app
 
       - name: Assemble release bundle with wrapper
@@ -145,6 +147,9 @@ jobs:
         run: cargo build --manifest-path native_core/Cargo.toml --bin galleryd --release
 
       - name: Build Flutter Windows
+        env:
+
+          CXXFLAGS: /D_SILENCE_EXPERIMENTAL_COROUTINE_DEPRECATION_WARNINGS
         run: flutter build windows
         working-directory: app
 
@@ -266,7 +271,7 @@ jobs:
         working-directory: app
 
       - name: Upload Android artifact
-        uses: actions/upload-artifact@v2
+        uses: actions/upload-artifact@v4
         with:
           name: android-artifact
           path: app/build/app/outputs/flutter-apk/app-release.apk
@@ -318,7 +323,7 @@ jobs:
           ditto -c -k --keepParent "${APP_PATH}" "photo-organizer-ios-${GITHUB_REF_NAME}.zip"
 
       - name: Upload iOS artifact
-        uses: actions/upload-artifact@v2
+        uses: actions/upload-artifact@v4
         with:
           name: ios-artifact
           path: photo-organizer-ios-*.zip
