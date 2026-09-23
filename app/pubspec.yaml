@@ -24,7 +24,7 @@ dependencies:
   share_plus: ^13.1.0
   video_player: ^2.14.0
   video_trimmer: ^5.0.0
-  image: ^4.8.0
+  image: ^4.10.1
 
 dev_dependencies:
   flutter_test:
