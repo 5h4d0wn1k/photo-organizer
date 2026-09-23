@@ -18,6 +18,8 @@ For private beta issues, report security problems directly to the repository own
 - Reproduction steps.
 - Whether media, vault keys, bearer tokens, device pairing tokens, OCR text, or metadata could be exposed or modified.
 
+Private vulnerability reports can also be filed via the GitHub Private Vulnerability Reporting form: <https://github.com/5h4d0wn1k/photo-organizer/security/advisories/new>
+
 Do not attach private photos, videos, vault keys, bearer tokens, pairing payloads, `.env` files, or production database copies to issue reports.
 
 ## Release Gate
