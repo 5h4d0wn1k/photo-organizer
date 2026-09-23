@@ -16,7 +16,7 @@ dependencies:
   photo_manager: ^3.9.0
   permission_handler: ^12.0.1
   path_provider: ^2.1.5
-  flutter_secure_storage: ^11.2.0
+  flutter_secure_storage: ^10.2.0
   mobile_scanner: ^7.4.2
   qr_flutter: ^4.1.0
   supabase_flutter: ^2.17.2

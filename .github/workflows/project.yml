@@ -1,0 +1,202 @@
+name: Project board
+
+on:
+  issues:
+    types: [opened]
+  pull_request:
+    types: [opened, ready_for_review, closed]
+
+concurrency:
+  group: project-board-${{ github.event_name }}-${{ github.event.action != 'closed' && github.event.pull_request.head.ref || github.event.issue.number || github.sha }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
+jobs:
+  board:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Sync project board
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          PROJECTS_TOKEN: ${{ secrets.PROJECTS_TOKEN }}
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const PROJECT_TITLE = "Photo Organizer — Delivery & Roadmap";
+            // GITHUB_TOKEN lacks `project` scope on user-owned Projects v2, so prefer a
+            // Projects-scoped PAT when the repository secret is configured. Falls back to
+            // the workflow token (org-owned boards) otherwise.
+            const gql = process.env.PROJECTS_TOKEN
+              ? github.graphql.withAuth(process.env.PROJECTS_TOKEN)
+              : github.graphql;
+            const STATUS_NAME = "Status";
+
+            async function findProject() {
+              const { user } = await gql(
+                `query($login: String!) {
+                   user(login: $login) {
+                     projectsV2(first: 20) { nodes { id title number } }
+                   }
+                 }`,
+                { login: owner }
+              );
+              const project = (user.projectsV2.nodes || []).find(
+                (n) => n.title === PROJECT_TITLE
+              );
+              if (!project) throw new Error(`Project "${PROJECT_TITLE}" not found for ${owner}`);
+              return project;
+            }
+
+            async function resolveStatusField(projectId) {
+              const { node } = await gql(
+                `query($id: ID!) {
+                   node(id: $id) {
+                     ... on ProjectV2 {
+                       fields(first: 30) {
+                         nodes {
+                           ... on ProjectV2SingleSelectField {
+                             id
+                             name
+                             options { id name }
+                           }
+                         }
+                       }
+                     }
+                   }
+                 }`,
+                { id: projectId }
+              );
+              const field = (node.fields.nodes || []).find((f) => f && f.name === STATUS_NAME);
+              if (!field) throw new Error("Status single-select field not found on project");
+              const optionId = (name) => {
+                const opt = (field.options || []).find((o) => o.name === name);
+                if (!opt) throw new Error(`Status option "${name}" not found`);
+                return opt.id;
+              };
+              return { field, optionId };
+            }
+
+            async function setStatus(projectId, itemId, fieldId, optionId) {
+              await gql(
+                `mutation($input: UpdateProjectV2ItemFieldValueInput!) {
+                   updateProjectV2ItemFieldValue(input: $input) { projectV2Item { id } }
+                 }`,
+                {
+                  input: {
+                    projectId,
+                    itemId,
+                    fieldId,
+                    value: { singleSelectOptionId: optionId }
+                  }
+                }
+              );
+            }
+
+            function issueNumbersFromBody(body) {
+              if (!body) return [];
+              const matches = (body.match(/#(\d+)/g) || []).map((m) => m.slice(1));
+              return [...new Set(matches)];
+            }
+
+            async function findItem(projectId, contentId) {
+              const { node } = await gql(
+                `query($id: ID!) {
+                   node(id: $id) {
+                     ... on ProjectV2 {
+                       items(first: 100) {
+                         nodes {
+                           id
+                           content {
+                             ... on Issue { id }
+                             ... on PullRequest { id }
+                             ... on DraftIssue { id }
+                           }
+                         }
+                       }
+                     }
+                   }
+                 }`,
+                { id: projectId }
+              );
+              const item = (node.items.nodes || []).find(
+                (i) => i.content && i.content.id === contentId
+              );
+              if (!item) throw new Error(`Item ${contentId} not found on project`);
+              return item.id;
+            }
+
+            async function ensureItem(projectId, contentId) {
+              try {
+                const res = await gql(
+                  `mutation($input: AddProjectV2ItemByIdInput!) {
+                     addProjectV2ItemById(input: $input) { item { id } }
+                   }`,
+                  { input: { projectId, contentId } }
+                );
+                return res.addProjectV2ItemById.item.id;
+              } catch (err) {
+                if (String(err).match(/already/i)) return await findItem(projectId, contentId);
+                throw err;
+              }
+            }
+
+            async function issueNodeId(number) {
+              const { repository } = await gql(
+                `query($owner: String!, $repo: String!, $number: Int!) {
+                   repository(owner: $owner, name: $repo) {
+                     issue(number: $number) { id }
+                   }
+                 }`,
+                { owner, repo, number }
+              );
+              if (!repository || !repository.issue) {
+                throw new Error(`Issue #${number} not found in ${owner}/${repo}`);
+              }
+              return repository.issue.id;
+            }
+
+            // issues.opened -> Backlog; PR opened/ready -> In review; PR merged -> Shipped
+            async function applyStatus(projectId, field, statusName, contentId) {
+              const itemId = await ensureItem(projectId, contentId);
+              await setStatus(projectId, itemId, field.id, field.optionId(statusName));
+            }
+
+            try {
+              const { eventName, payload } = context;
+
+              if (eventName === "issues" && payload.action === "opened") {
+                const project = await findProject();
+                const { field, optionId } = await resolveStatusField(project.id);
+                await applyStatus(project.id, { ...field, optionId }, "Backlog", payload.issue.node_id);
+                return;
+              }
+
+              if (eventName !== "pull_request") return;
+
+              const pr = payload.pull_request || {};
+              const actionable =
+                payload.action === "opened" ||
+                payload.action === "ready_for_review" ||
+                (payload.action === "closed" && pr.merged);
+              if (!actionable) return;
+
+              const statusName = payload.action === "closed" ? "Shipped" : "In review";
+              const project = await findProject();
+              const { field, optionId } = await resolveStatusField(project.id);
+
+              for (const number of issueNumbersFromBody(pr.body)) {
+                try {
+                  const contentId = await issueNodeId(Number(number));
+                  await applyStatus(project.id, { ...field, optionId }, statusName, contentId);
+                } catch (err) {
+                  core.warning(`project board: issue #${number}: ${err.message}`);
+                }
+              }
+            } catch (err) {
+              core.warning(`project board workflow: ${err.message}`);
+            }
