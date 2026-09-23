@@ -95,7 +95,7 @@ class AssetGrid extends StatelessWidget {
                           Image.file(
                             File(previewPath),
                             fit: BoxFit.cover,
-                            errorBuilder: (_, __, ___) =>
+                            errorBuilder: (_, _, _) =>
                                 const SizedBox.shrink(),
                           ),
                         DecoratedBox(
