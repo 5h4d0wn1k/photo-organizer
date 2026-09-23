@@ -3,3 +3,12 @@ contact_links:
   - name: GitHub profile
     url: https://github.com/5h4d0wn1k
     about: Questions or general discussion about the profile.
+  - name: README
+    url: https://github.com/5h4d0wn1k/photo-organizer#readme
+    about: Project overview, architecture, and feature list.
+  - name: CONTRIBUTING
+    url: https://github.com/5h4d0wn1k/photo-organizer/blob/main/CONTRIBUTING.md
+    about: Development and contribution guidelines.
+  - name: SECURITY
+    url: https://github.com/5h4d0wn1k/photo-organizer/security/policy
+    about: Report a security vulnerability.
