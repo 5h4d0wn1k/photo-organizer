@@ -1,0 +1,19 @@
+# cargo-audit ignore list (ci: `rustsec/audit-check@v2`)
+#
+# Tracked as non-applicable to this crate's dependency usage until iroh
+# un-pins its internal resolver stack. Each entry is re-audited on iroh bumps.
+#
+# RUSTSEC-2026-0120 / RUSTSEC-2026-0119 (hickory-net / hickory-proto):
+#   DNSSEC validation bugs. iroh's hickory-resolver is built without the
+#   `dnssec-ring` / `dnssec-aws-lc-rs` features, so DnssecDnsHandle (the
+#   affected code path) is never compiled or reachable. iroh 0.98.2 pins
+#   `hickory-resolver =0.26.0-beta.4` exactly; no patched release is allowed.
+[ignore]
+"RUSTSEC-2026-0120" = "iroh resolver built without DNSSEC features; affected DnssecDnsHandle path not compiled (iroh 0.98.2 pins hickory-net =0.26.0-beta.4)"
+"RUSTSEC-2026-0119" = "same iroh/hickory dependency pin; O(n^2) name-compression in hickory-proto encoding is local, not attacker-reachable from galleryd usage"
+# RUSTSEC-2026-0194 / RUSTSEC-2026-0195 (quick-xml via netdev/netwatch in iroh):
+#   quick-xml is pulled only by netdev for local network device enumeration
+#   (no untrusted XML input). iroh's netwatch pins netdev ^0.42 which pins
+#   quick-xml ^0.39; a patched quick-xml (>=0.41) is not resolvable.
+"RUSTSEC-2026-0194" = "netdev uses quick-xml on local sysfs/network data, not on network input; netdev ^0.42 pins quick-xml ^0.39, unresolvable via iroh 0.98"
+"RUSTSEC-2026-0195" = "same netdev/iroh pin; NsReader path not exercised by netdev device enumeration"

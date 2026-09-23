@@ -5144,6 +5144,7 @@ impl GalleryService {
         let mut logs = Vec::new();
         let mut skipped = 0_usize;
         let mut failed = 0_usize;
+        let mut first_failure: Option<String> = None;
 
         for asset in &assets {
             let path = asset_file_path(asset, &library_root);
@@ -5181,6 +5182,9 @@ impl GalleryService {
                             asset.original_filename
                         ),
                     ));
+                    if first_failure.is_none() {
+                        first_failure = Some(err);
+                    }
                 }
             }
         }
@@ -5203,6 +5207,11 @@ impl GalleryService {
         );
         if failed > 0 && processed_asset_count == 0 && !assets.is_empty() {
             job.status = JobStatus::Failed;
+            job.detail = Some(format!(
+                "Scene indexing failed: 0 of {} asset(s) tagged, skipped {skipped}, failed {failed}. First failure: {}",
+                assets.len(),
+                first_failure.unwrap_or_else(|| "unknown".to_string())
+            ));
         }
 
         let mut state = self.state.write().await;
@@ -14006,7 +14015,12 @@ mod tests {
             .await
             .expect("scene rebuild");
         if job.status == crate::domain::JobStatus::Failed
-            && job.detail.as_deref().unwrap_or_default().contains("Pillow")
+            && job
+                .detail
+                .as_deref()
+                .unwrap_or_default()
+                .to_lowercase()
+                .contains("pillow")
         {
             return;
         }
