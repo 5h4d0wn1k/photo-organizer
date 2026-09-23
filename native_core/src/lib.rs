@@ -13,6 +13,7 @@ pub mod security;
 pub mod service;
 pub mod storage;
 pub mod sync_transport;
+pub mod thumbnail;
 pub mod vault_store;
 
 pub use api::{AppState, router};
