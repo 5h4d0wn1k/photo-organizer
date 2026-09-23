@@ -23,3 +23,4 @@
 - Repo brand = Photo Organizer.
 - Key docs = README.md, CONTRIBUTING.md, PRIVACY.md, SECURITY.md.
 - Structure = native_core (Rust daemon), app (Flutter), ml_sidecar (Python), tools/quick-face-sort (legacy face sorter).
+- Dev entry points = Makefile (fmt/lint/test/check/audit/flutter-*/release-linux-local) and scripts/dev-check.sh.
