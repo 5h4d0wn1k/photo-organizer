@@ -58,6 +58,34 @@ scripts/dev-check.sh
 Privacy-sensitive / high-risk changes should also mention secret scanning
 (gitleaks) and the dependency audit that run in CI.
 
+## Contribution Workflow
+
+Every change to `main` lands through a tracked, reviewed pull request —
+never by pushing to `main` directly.
+
+1. **Issue first.** Open an issue (or claim an existing one) describing the
+   change and its rationale; reference it from the PR description so merging
+   closes it.
+2. **Focused branch.** Create a branch off `main` named after the change:
+   `feat/...`, `fix/...`, `ci/...`, `docs/...`, `chore/...`. One logical
+   change per PR; keep the diff as small as practical.
+3. **Conventional title.** Title the PR `type(scope): subject`
+   (`feat`, `fix`, `build`, `ci`, `docs`, `chore`, `refactor`, `perf`,
+   `test`, `style`). The semantic-PR check enforces this, and the title
+   becomes the squash-merge commit message.
+4. **Review before merge.** Merge only after all three required checks
+   (Rust service, Flutter app, Security gates) pass and the diff has been
+   formally reviewed — self-review with written comments on your own PR,
+   Copilot code review where available, and every review finding addressed.
+5. **Squash-merge.** Merge with the PR title; branch auto-deletes. Keep the
+   change history linear.
+
+Repo automation keeps the baseline consistent without manual process:
+PR labeler (`gha/**` → `rust`/`flutter`/`ci`/`docs`/`deps`/...), semantic-PR
+title validation, dependency review on every PR, dependabot security updates
+with grouped minor/patch bumps, CodeQL + Scorecard on `main`, gitleaks/GitGuardian
+secret scanning, cargo-audit, SBOM generation, and stale issue/PR cleanup.
+
 ## Architecture Pointers
 
 - Read `docs/architecture.md` before touching API routes or the data model.

@@ -1,0 +1,37 @@
+rust:
+  - "native_core/**"
+  - "Cargo.toml"
+  - "Cargo.lock"
+  - "rust-toolchain.toml"
+
+flutter:
+  - "app/**"
+
+python:
+  - "ml_sidecar/**"
+  - "scripts/**/*.py"
+
+ci:
+  - ".github/workflows/*.yml"
+
+security:
+  - ".github/workflows/codeql-analysis.yml"
+  - ".github/workflows/dependency-review.yml"
+  - ".github/workflows/scorecard.yml"
+  - "docs/SECURITY_GATES_TRIAGE.md"
+  - "SECURITY.md"
+
+docs:
+  - "*.md"
+  - "docs/**"
+
+deps:
+  - ".github/dependabot.yml"
+  - "**/Cargo.lock"
+  - "**/Cargo.toml"
+  - "app/pubspec.yaml"
+  - "app/pubspec.lock"
+  - "ml_sidecar/requirements*.txt"
+
+devcontainer:
+  - ".devcontainer/**"
