@@ -1217,7 +1217,8 @@ fn decode_hex_32(value: &str) -> Result<[u8; 32], SyncTransportError> {
             "stored Iroh secret key must be 32 bytes of hex".to_string(),
         ));
     }
-    for (index, chunk) in value.as_bytes().chunks_exact(2).enumerate() {
+    let (chunks, _remainder) = value.as_bytes().as_chunks::<2>();
+    for (index, chunk) in chunks.iter().enumerate() {
         let text = std::str::from_utf8(chunk)
             .map_err(|err| SyncTransportError::Invalid(err.to_string()))?;
         bytes[index] = u8::from_str_radix(text, 16)
