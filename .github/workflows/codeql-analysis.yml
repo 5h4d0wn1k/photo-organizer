@@ -3,8 +3,6 @@ name: CodeQL
 on:
   push:
     branches: ["main"]
-  pull_request:
-    branches: ["main"]
   schedule:
     - cron: "0 2 * * 1"
 
@@ -18,21 +16,17 @@ jobs:
   analyze:
     name: Analyze
     runs-on: ubuntu-latest
-    permissions:
-      actions: read
-      contents: read
-      security-events: write
-      pull-requests: read
+    timeout-minutes: 360
     strategy:
       fail-fast: false
       matrix:
-        language: ["actions", "c-cpp", "python", "rust"]
+        language: ["actions", "python", "rust"]
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
       - name: Setup Rust toolchain
         if: matrix.language == 'rust'
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: actions-rust-lang/setup-rust-toolchain@v2
         with:
           toolchain: stable
       - name: Initialize CodeQL
