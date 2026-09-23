@@ -22,14 +22,22 @@ jobs:
     steps:
       - name: Sync project board
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          PROJECTS_TOKEN: ${{ secrets.PROJECTS_TOKEN }}
         with:
           script: |
             const { owner, repo } = context.repo;
             const PROJECT_TITLE = "Photo Organizer — Delivery & Roadmap";
+            // GITHUB_TOKEN lacks `project` scope on user-owned Projects v2, so prefer a
+            // Projects-scoped PAT when the repository secret is configured. Falls back to
+            // the workflow token (org-owned boards) otherwise.
+            const gql = process.env.PROJECTS_TOKEN
+              ? github.graphql.withAuth(process.env.PROJECTS_TOKEN)
+              : github.graphql;
             const STATUS_NAME = "Status";
 
             async function findProject() {
-              const { user } = await github.graphql(
+              const { user } = await gql(
                 `query($login: String!) {
                    user(login: $login) {
                      projectsV2(first: 20) { nodes { id title number } }
@@ -45,7 +53,7 @@ jobs:
             }
 
             async function resolveStatusField(projectId) {
-              const { node } = await github.graphql(
+              const { node } = await gql(
                 `query($id: ID!) {
                    node(id: $id) {
                      ... on ProjectV2 {
@@ -74,7 +82,7 @@ jobs:
             }
 
             async function setStatus(projectId, itemId, fieldId, optionId) {
-              await github.graphql(
+              await gql(
                 `mutation($input: UpdateProjectV2ItemFieldValueInput!) {
                    updateProjectV2ItemFieldValue(input: $input) { projectV2Item { id } }
                  }`,
@@ -96,7 +104,7 @@ jobs:
             }
 
             async function findItem(projectId, contentId) {
-              const { node } = await github.graphql(
+              const { node } = await gql(
                 `query($id: ID!) {
                    node(id: $id) {
                      ... on ProjectV2 {
@@ -124,7 +132,7 @@ jobs:
 
             async function ensureItem(projectId, contentId) {
               try {
-                const res = await github.graphql(
+                const res = await gql(
                   `mutation($input: AddProjectV2ItemByIdInput!) {
                      addProjectV2ItemById(input: $input) { item { id } }
                    }`,
@@ -138,7 +146,7 @@ jobs:
             }
 
             async function issueNodeId(number) {
-              const { repository } = await github.graphql(
+              const { repository } = await gql(
                 `query($owner: String!, $repo: String!, $number: Int!) {
                    repository(owner: $owner, name: $repo) {
                      issue(number: $number) { id }
