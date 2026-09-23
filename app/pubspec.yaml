@@ -19,7 +19,7 @@ dependencies:
   flutter_secure_storage: ^10.2.0
   mobile_scanner: ^7.4.2
   qr_flutter: ^4.1.0
-  supabase_flutter: ^2.12.4
+  supabase_flutter: ^2.17.2
   crypto: ^3.0.7
   share_plus: ^13.1.0
   video_player: ^2.14.0

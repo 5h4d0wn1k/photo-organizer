@@ -70,7 +70,7 @@ class CloudBootstrapService implements CloudBootstrapGateway {
     }
     await Supabase.initialize(
       url: config.url,
-      anonKey: config.anonKey,
+      publishableKey: config.anonKey,
       authOptions: const FlutterAuthClientOptions(
         localStorage: _SecureSupabaseStorage(),
       ),
