@@ -22,6 +22,3 @@ ignore = [
     "RUSTSEC-2026-0194",
     "RUSTSEC-2026-0195",
 ]
-
-[database]
-# default advisory db refresh policy is retained
