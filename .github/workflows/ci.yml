@@ -9,7 +9,6 @@ on:
 permissions:
   contents: read
   security-events: write
-  checks: write
 
 jobs:
   rust:
@@ -62,10 +61,12 @@ jobs:
         uses: gitleaks/gitleaks-action@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      - name: Rust dependency audit
-        uses: rustsec/audit-check@v2
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@v2
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          tool: cargo-audit
+      - name: Rust dependency audit
+        run: cargo audit
       - name: Generate SBOM
         uses: anchore/sbom-action@v0
         with:
