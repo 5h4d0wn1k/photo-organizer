@@ -162,7 +162,7 @@ class _MobileAssetTile extends StatelessWidget {
                         Image(
                           image: preview,
                           fit: BoxFit.cover,
-                          errorBuilder: (_, __, ___) => _AssetTypeIcon(
+                          errorBuilder: (_, _, _) => _AssetTypeIcon(
                             icon: kindIcon,
                             colorScheme: colorScheme,
                           ),

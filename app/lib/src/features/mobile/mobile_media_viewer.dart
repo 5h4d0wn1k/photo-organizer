@@ -396,7 +396,7 @@ class _MobileMediaViewerState extends State<MobileMediaViewer> {
                 child: Image.file(
                   file,
                   fit: BoxFit.contain,
-                  errorBuilder: (_, __, ___) => _thumbnailFallback(),
+                  errorBuilder: (_, _, _) => _thumbnailFallback(),
                 ),
               ),
             );

@@ -534,7 +534,7 @@ class _PreviewPane extends StatelessWidget {
                 Image.file(
                   File(path!),
                   fit: BoxFit.contain,
-                  errorBuilder: (_, __, ___) => _PreviewFallback(asset: asset),
+                  errorBuilder: (_, _, _) => _PreviewFallback(asset: asset),
                 )
               else
                 _PreviewFallback(asset: asset),
