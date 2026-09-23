@@ -8,10 +8,15 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+
 jobs:
   linux:
     name: Linux (AppImage + .deb)
     runs-on: ubuntu-latest
+    timeout-minutes: 120
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -37,6 +42,9 @@ jobs:
         with:
           toolchain: stable
 
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
       - name: Set up Flutter
         uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2
         with:
@@ -44,7 +52,7 @@ jobs:
           cache: true
 
       - name: Build Rust daemon
-        run: cargo build --manifest-path native_core/Cargo.toml --bin galleryd --release
+        run: cargo build --manifest-path native_core/Cargo.toml --bin galleryd --release --locked
 
       - name: Hermetic CMake cache regen (drop stale CMAKE_CXX_COMPILER pin)
         run: |
@@ -66,6 +74,18 @@ jobs:
           cp assets/linux/AppRun "${BUNDLE_DIR}/AppRun"
           chmod +x "${BUNDLE_DIR}/AppRun"
 
+      - name: Download appimagetool
+        run: |
+          set -euo pipefail
+          wget -q https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage -O appimagetool-x86_64.AppImage
+          chmod +x appimagetool-x86_64.AppImage
+          # "continuous" is a rolling build (no versioned tags upstream): verify the
+          # artifact is a real ELF binary and record its digest for provenance.
+          test -s appimagetool-x86_64.AppImage
+          test "$(stat -c %s appimagetool-x86_64.AppImage)" -gt 1000000
+          file -b appimagetool-x86_64.AppImage | grep -qi 'elf'
+          sha256sum appimagetool-x86_64.AppImage
+
       - name: Package AppImage
         run: |
           set -euo pipefail
@@ -80,9 +100,6 @@ jobs:
           cp assets/linux/photo-organizer.desktop "${APPDIR}/photo-organizer.desktop"
           cp assets/linux/photo-organizer.png "${APPDIR}/photo-organizer.png"
           cp assets/linux/photo-organizer.png "${APPDIR}/.DirIcon"
-          # Download appimagetool
-          wget -q https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage -O appimagetool-x86_64.AppImage
-          chmod +x appimagetool-x86_64.AppImage
           APPIMAGE_EXTRACT_AND_RUN=1 ./appimagetool-x86_64.AppImage "${APPDIR}" "photo-organizer-linux-x86_64-${GITHUB_REF_NAME}.AppImage"
 
       - name: Package .deb
@@ -118,16 +135,25 @@ jobs:
             photo-organizer-linux-x86_64-*.AppImage
             photo-organizer_*_amd64.deb
 
+      - name: Generate SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
+        with:
+          path: .
+          format: spdx-json
+          output-file: sbom.spdx.json
+
       - name: Release Linux
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           files: |
             photo-organizer-linux-x86_64-*.AppImage
             photo-organizer_*_amd64.deb
+            sbom.spdx.json
 
   windows:
     name: Windows (ZIP)
     runs-on: windows-latest
+    timeout-minutes: 120
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -144,7 +170,7 @@ jobs:
           cache: true
 
       - name: Build Rust daemon
-        run: cargo build --manifest-path native_core/Cargo.toml --bin galleryd --release
+        run: cargo build --manifest-path native_core/Cargo.toml --bin galleryd --release --locked
 
       - name: Build Flutter Windows
         env:
@@ -183,6 +209,7 @@ jobs:
   macos:
     name: macOS (DMG)
     runs-on: macos-latest
+    timeout-minutes: 150
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -199,7 +226,7 @@ jobs:
           cache: true
 
       - name: Build Rust daemon
-        run: cargo build --manifest-path native_core/Cargo.toml --bin galleryd --release
+        run: cargo build --manifest-path native_core/Cargo.toml --bin galleryd --release --locked
 
       - name: Build Flutter macOS
         run: flutter build macos
@@ -240,6 +267,7 @@ jobs:
   android:
     name: Android (APK)
     runs-on: ubuntu-latest
+    timeout-minutes: 120
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -262,7 +290,7 @@ jobs:
           rustup target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-android
           cargo ndk -t arm64-v8a -t armeabi-v7a -t x86_64 \
             -o app/android/app/src/main/jniLibs \
-            build --manifest-path native_core/Cargo.toml --bin galleryd --release
+            build --manifest-path native_core/Cargo.toml --bin galleryd --release --locked
           mkdir -p app/android/app/src/main/assets
           cp -R ml_sidecar app/android/app/src/main/assets/ml_sidecar
 
@@ -288,6 +316,7 @@ jobs:
   ios:
     name: iOS (unsigned .app)
     runs-on: macos-latest
+    timeout-minutes: 150
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -307,7 +336,7 @@ jobs:
         run: |
           set -euo pipefail
           rustup target add aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios
-          cargo build --manifest-path native_core/Cargo.toml --bin galleryd --release --target aarch64-apple-ios
+          cargo build --manifest-path native_core/Cargo.toml --bin galleryd --release --target aarch64-apple-ios --locked
 
       - name: Build Flutter iOS (unsigned, no codesign)
         run: flutter build ios --release --no-codesign
