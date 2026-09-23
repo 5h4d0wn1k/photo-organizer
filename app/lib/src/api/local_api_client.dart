@@ -487,8 +487,8 @@ class LocalApiClient {
     final response = await _postObject(
       '/mobile/assets/$assetId/flags',
       {
-        if (favorite != null) 'favorite': favorite,
-        if (archived != null) 'archived': archived,
+        'favorite': ?favorite,
+        'archived': ?archived,
       },
       headers: _mobileHeaders(bearerToken),
       timeout: _heavyReadTimeout,
@@ -812,7 +812,7 @@ class LocalApiClient {
       'platform': platform,
       if (publicKey != null && publicKey.trim().isNotEmpty)
         'public_key': publicKey.trim(),
-      if (vaultId != null) 'vault_id': vaultId,
+      'vault_id': ?vaultId,
       if (trustLevel != null) 'trust_level': trustLevel.wireValue,
       if (role != null) 'role': role.wireValue,
       if (storageProfile != null) 'storage_profile': storageProfile.toJson(),
@@ -831,14 +831,14 @@ class LocalApiClient {
   Future<SyncPlan> fetchSyncPlan({String? vaultId}) async {
     final response = await _getObject(
       '/sync/plan',
-      queryParameters: {if (vaultId != null) 'vault_id': vaultId},
+      queryParameters: {'vault_id': ?vaultId},
     );
     return SyncPlan.fromJson(response);
   }
 
   Future<SyncPlan> runSync({String? vaultId, bool dryRun = false}) async {
     final response = await _postObject('/sync/run', {
-      if (vaultId != null) 'vault_id': vaultId,
+      'vault_id': ?vaultId,
       'dry_run': dryRun,
     });
     return SyncPlan.fromJson(response);
@@ -886,7 +886,7 @@ class LocalApiClient {
     final response = await _getObject(
       '/files/tree',
       queryParameters: {
-        if (vaultId != null) 'vault_id': vaultId,
+        'vault_id': ?vaultId,
         if (includeTrashed) 'include_trashed': 'true',
       },
       timeout: _heavyReadTimeout,
@@ -900,8 +900,8 @@ class LocalApiClient {
     required String name,
   }) async {
     final response = await _postObject('/files/folders', {
-      if (vaultId != null) 'vault_id': vaultId,
-      if (parentId != null) 'parent_id': parentId,
+      'vault_id': ?vaultId,
+      'parent_id': ?parentId,
       'name': name,
     });
     return VaultFileEntry.fromJson(response);
@@ -920,7 +920,7 @@ class LocalApiClient {
     String? parentId,
   }) async {
     final response = await _postObject('/files/$entryId/move', {
-      if (parentId != null) 'parent_id': parentId,
+      'parent_id': ?parentId,
     });
     return VaultFileEntry.fromJson(response);
   }
@@ -1012,7 +1012,7 @@ class LocalApiClient {
       queryParameters: {
         if (limit != null) 'limit': limit.toString(),
         if (perBucket != null) 'per_bucket': perBucket.toString(),
-        if (cursor != null) 'cursor': cursor,
+        'cursor': ?cursor,
         if (includeArchived) 'include_archived': 'true',
       },
       timeout: _heavyReadTimeout,
@@ -1026,8 +1026,8 @@ class LocalApiClient {
     bool? archived,
   }) async {
     final response = await _postObject('/assets/$assetId/flags', {
-      if (favorite != null) 'favorite': favorite,
-      if (archived != null) 'archived': archived,
+      'favorite': ?favorite,
+      'archived': ?archived,
     });
     return Asset.fromJson(response);
   }
@@ -1047,8 +1047,8 @@ class LocalApiClient {
   }) async {
     final response = await _postList('/assets/flags/bulk', {
       'asset_ids': assetIds,
-      if (favorite != null) 'favorite': favorite,
-      if (archived != null) 'archived': archived,
+      'favorite': ?favorite,
+      'archived': ?archived,
     });
     return response.map(Asset.fromJson).toList();
   }
@@ -1183,7 +1183,7 @@ class LocalApiClient {
   }) async {
     final response = await _postObject('/people/$id/hide', {
       'hidden': hidden,
-      if (reason != null) 'reason': reason,
+      'reason': ?reason,
     });
     return PersonCluster.fromJson(response);
   }
@@ -1195,9 +1195,9 @@ class LocalApiClient {
     String? reason,
   }) async {
     final response = await _postObject('/people/$id/reject-match', {
-      if (faceTemplateId != null) 'face_template_id': faceTemplateId,
-      if (assetId != null) 'asset_id': assetId,
-      if (reason != null) 'reason': reason,
+      'face_template_id': ?faceTemplateId,
+      'asset_id': ?assetId,
+      'reason': ?reason,
     });
     return PersonCluster.fromJson(response);
   }
@@ -1239,7 +1239,7 @@ class LocalApiClient {
   }) async {
     final response = await _postObject('/people/$id/split', {
       'face_template_ids': faceTemplateIds,
-      if (newDisplayName != null) 'new_display_name': newDisplayName,
+      'new_display_name': ?newDisplayName,
     });
     return PersonCluster.fromJson(response);
   }
@@ -1271,9 +1271,9 @@ class LocalApiClient {
   }) async {
     final response = await _postObject('/places/$id/correct', {
       'label': label,
-      if (latitude != null) 'latitude': latitude,
-      if (longitude != null) 'longitude': longitude,
-      if (hideExactGps != null) 'hide_exact_gps': hideExactGps,
+      'latitude': ?latitude,
+      'longitude': ?longitude,
+      'hide_exact_gps': ?hideExactGps,
       if (reason != null && reason.trim().isNotEmpty) 'reason': reason.trim(),
     });
     return PlaceCluster.fromJson(response);
@@ -1424,7 +1424,7 @@ class LocalApiClient {
         _resolve(path),
         headers: {
           'content-type': 'application/json',
-          if (headers != null) ...headers,
+          ...?headers,
         },
         body: jsonEncode(payload),
       ),
@@ -1445,7 +1445,7 @@ class LocalApiClient {
         _resolve(path),
         headers: {
           'content-type': 'application/json',
-          if (headers != null) ...headers,
+          ...?headers,
         },
         body: jsonEncode(payload),
       ),
@@ -1466,7 +1466,7 @@ class LocalApiClient {
         _resolve(path),
         headers: {
           'content-type': 'application/json',
-          if (headers != null) ...headers,
+          ...?headers,
         },
         body: jsonEncode(payload),
       ),
@@ -1487,7 +1487,7 @@ class LocalApiClient {
         _resolve(path),
         headers: {
           'content-type': 'application/octet-stream',
-          if (headers != null) ...headers,
+          ...?headers,
         },
         body: body,
       ),

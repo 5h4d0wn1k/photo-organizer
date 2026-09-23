@@ -47,10 +47,10 @@ void main() {
             onRemovePersonAssets: (_, {required List<String> assetIds}) async =>
                 _person(),
             onPeopleChanged: () async {},
-            onRenamePerson: (_, __) async {},
-            onHidePerson: (_, __) async {},
+            onRenamePerson: (_, _) async {},
+            onHidePerson: (_, _) async {},
             onRejectPersonMatch: (_) async {},
-            onMergePerson: (_, __) async {},
+            onMergePerson: (_, _) async {},
             onSplitPerson:
                 (_, {required faceTemplateIds, newDisplayName}) async {},
           ),
@@ -99,10 +99,10 @@ void main() {
             onPeopleChanged: () async {
               changedCalls += 1;
             },
-            onRenamePerson: (_, __) async {},
-            onHidePerson: (_, __) async {},
+            onRenamePerson: (_, _) async {},
+            onHidePerson: (_, _) async {},
             onRejectPersonMatch: (_) async {},
-            onMergePerson: (_, __) async {},
+            onMergePerson: (_, _) async {},
             onSplitPerson:
                 (_, {required faceTemplateIds, newDisplayName}) async {},
           ),
@@ -146,10 +146,10 @@ void main() {
             onRemovePersonAssets: (_, {required List<String> assetIds}) async =>
                 _person(),
             onPeopleChanged: () async {},
-            onRenamePerson: (_, __) async {},
-            onHidePerson: (_, __) async {},
+            onRenamePerson: (_, _) async {},
+            onHidePerson: (_, _) async {},
             onRejectPersonMatch: (_) async {},
-            onMergePerson: (_, __) async {},
+            onMergePerson: (_, _) async {},
             onSplitPerson:
                 (_, {required faceTemplateIds, newDisplayName}) async {},
           ),
@@ -193,9 +193,9 @@ void main() {
             onRenamePerson: (id, name) async {
               renamed = '$id:$name';
             },
-            onHidePerson: (_, __) async {},
+            onHidePerson: (_, _) async {},
             onRejectPersonMatch: (_) async {},
-            onMergePerson: (_, __) async {},
+            onMergePerson: (_, _) async {},
             onSplitPerson:
                 (_, {required faceTemplateIds, newDisplayName}) async {},
           ),
