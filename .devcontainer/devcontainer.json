@@ -1,0 +1,31 @@
+{
+  "name": "photo-organizer",
+  "build": { "dockerfile": "Dockerfile" },
+  "remoteUser": "vscode",
+  "postCreateCommand": "cargo --version && flutter --version",
+  "customizations": {
+    "vscode": {
+      "settings": {
+        "rust-analyzer.checkOnSave.overrideCommand": [
+          "cargo",
+          "clippy",
+          "--all-targets",
+          "--all-features",
+          "--locked",
+          "--",
+          "-D",
+          "warnings"
+        ],
+        "files.eol": "\n"
+      },
+      "extensions": [
+        "rust-lang.rust-analyzer",
+        "Dart-Code.flutter",
+        "ms-python.python",
+        "editorconfig.editorconfig",
+        "redhat.vscode-yaml",
+        "tamasfe.even-better-toml"
+      ]
+    }
+  }
+}
