@@ -1,7 +1,7 @@
 name: Feature Request
 description: Propose a new capability for Photo Organizer.
 title: "feat: "
-labels: [enhancement]
+labels: [enhancement, roadmap]
 body:
   - type: markdown
     attributes:
