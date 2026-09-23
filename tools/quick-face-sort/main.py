@@ -6,7 +6,6 @@ from tkinter import *
 from tkinter import filedialog
 from tkinter import messagebox
 from tkinter.ttk import Progressbar
-from io import StringIO
 import sys
 
 class FaceRecognitionApp:
@@ -168,5 +167,5 @@ class FaceRecognitionApp:
 
 if __name__ == "__main__":
     root = Tk()
-    app = FaceRecognitionApp(root)
+    FaceRecognitionApp(root)
     root.mainloop()
