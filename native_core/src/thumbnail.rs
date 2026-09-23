@@ -152,7 +152,6 @@ mod tests {
     use std::{fs, path::PathBuf};
 
     use chrono::Utc;
-    use uuid::Uuid;
 
     use crate::{
         domain::{ImportAssetRequest, ImportMode, MediaKind},
@@ -239,10 +238,14 @@ mod tests {
             decoded.dimensions().1 <= THUMB_MAX_DIMENSION,
             "longest side capped at max dimension"
         );
+        // image::resize_dimensions fits with `round()`, never truncation: for a
+        // 3:2 (1200x800) source capped at 256 wide, the matching height is
+        // round(800 * 256/1200) = round(170.67) = 171.
+        let expected_height = (THUMB_MAX_DIMENSION as f64 * 2.0 / 3.0).round() as u32;
         assert_eq!(
             decoded.dimensions(),
-            (THUMB_MAX_DIMENSION, (THUMB_MAX_DIMENSION * 2) / 3),
-            "aspect ratio is preserved for a 3:2 source"
+            (THUMB_MAX_DIMENSION, expected_height),
+            "3:2 aspect ratio preserved by resize_dimensions rounding"
         );
         assert_eq!(
             image::guess_format(&bytes).expect("format"),
