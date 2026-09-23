@@ -117,7 +117,7 @@ jobs:
             photo-organizer_*_amd64.deb
 
       - name: Release Linux
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: |
             photo-organizer-linux-x86_64-*.AppImage
@@ -169,7 +169,7 @@ jobs:
           path: photo-organizer-windows-x64-*.zip
 
       - name: Release Windows
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: photo-organizer-windows-x64-*.zip
           body: |
@@ -227,7 +227,7 @@ jobs:
           path: photo-organizer-macos-*.dmg
 
       - name: Release macOS
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: photo-organizer-macos-*.dmg
           body: |
@@ -272,7 +272,7 @@ jobs:
           path: app/build/app/outputs/flutter-apk/app-release.apk
 
       - name: Release Android
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: app/build/app/outputs/flutter-apk/app-release.apk
           body: |
@@ -324,7 +324,7 @@ jobs:
           path: photo-organizer-ios-*.zip
 
       - name: Release iOS
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: photo-organizer-ios-*.zip
           body: |
