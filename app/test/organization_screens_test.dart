@@ -82,7 +82,7 @@ void main() {
               return [_asset()];
             },
             onRebuildEvents: () async {},
-            onTitleEvent: (_, __) async {},
+            onTitleEvent: (_, _) async {},
           ),
         ),
       ),

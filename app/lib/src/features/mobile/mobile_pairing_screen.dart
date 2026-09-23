@@ -4357,7 +4357,7 @@ class _ReferenceMobileAssetTile extends StatelessWidget {
                 Image(
                   image: previewImage!,
                   fit: BoxFit.cover,
-                  errorBuilder: (_, __, ___) =>
+                  errorBuilder: (_, _, _) =>
                       _AssetFallback(isVideo: _isVideo, icon: _icon),
                 )
               else
@@ -4450,7 +4450,7 @@ class _ReferenceLocalAssetTile extends StatelessWidget {
                     bytes,
                     fit: BoxFit.cover,
                     gaplessPlayback: true,
-                    errorBuilder: (_, __, ___) =>
+                    errorBuilder: (_, _, _) =>
                         _AssetFallback(isVideo: isVideo),
                   );
                 },
@@ -5906,8 +5906,8 @@ class _ActionPanel extends StatelessWidget {
                       runSpacing: 12,
                       crossAxisAlignment: WrapCrossAlignment.center,
                       children: [
-                        if (action != null) action!,
-                        if (secondaryAction != null) secondaryAction!,
+                        ?action,
+                        ?secondaryAction,
                       ],
                     ),
                   ],
