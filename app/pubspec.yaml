@@ -22,7 +22,7 @@ dependencies:
   supabase_flutter: ^2.12.4
   crypto: ^3.0.7
   share_plus: ^13.1.0
-  video_player: ^2.14.0
+  video_player: ^2.11.1
   video_trimmer: ^5.0.0
   image: ^4.8.0
 
