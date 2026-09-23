@@ -232,3 +232,101 @@ jobs:
           files: photo-organizer-macos-*.dmg
           body: |
             macOS build (unsigned). No notarization performed.
+  android:
+    name: Android (APK)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2
+
+      - name: Set up Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Hermetic Android NDK cross-compile (cargo-ndk, vendored sqlcipher-openssl; no vcpkg)
+        run: |
+          set -euo pipefail
+          cargo install cargo-ndk --locked
+          rustup target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-android
+          cargo ndk -t arm64-v8a -t armeabi-v7a -t x86_64 \
+            -o app/android/app/src/main/jniLibs \
+            build --manifest-path native_core/Cargo.toml --bin galleryd --release
+          mkdir -p app/android/app/src/main/assets
+          cp -R ml_sidecar app/android/app/src/main/assets/ml_sidecar
+
+      - name: Build Flutter Android APK
+        run: flutter build apk --release
+        working-directory: app
+
+      - name: Upload Android artifact
+        uses: actions/upload-artifact@v2
+        with:
+          name: android-artifact
+          path: app/build/app/outputs/flutter-apk/app-release.apk
+
+      - name: Release Android
+        uses: softprops/action-gh-release@v2
+        with:
+          files: app/build/app/outputs/flutter-apk/app-release.apk
+          body: |
+            Android build (unsigned APK). Requires sideloading; signing left to the
+            app owner's own keystore intentionally — governance-first, no unsigned
+            Play Store claims.
+
+  ios:
+    name: iOS (unsigned .app)
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2
+
+      - name: Set up Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Hermetic iOS cross-compile (aarch64-apple-ios; vendored sqlcipher-openssl)
+        run: |
+          set -euo pipefail
+          rustup target add aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios
+          cargo build --manifest-path native_core/Cargo.toml --bin galleryd --release --target aarch64-apple-ios
+
+      - name: Build Flutter iOS (unsigned, no codesign)
+        run: flutter build ios --release --no-codesign
+        working-directory: app
+
+      - name: Package unsigned .app
+        run: |
+          set -euo pipefail
+          APP_PATH="app/build/ios/iphoneos/Runner.app"
+          mkdir -p "${APP_PATH}/Frameworks"
+          cp -R target/aarch64-apple-ios/release/galleryd "${APP_PATH}/Frameworks/race"
+          cp -R ml_sidecar "${APP_PATH}/ml_sidecar"
+          ditto -c -k --keepParent "${APP_PATH}" "photo-organizer-ios-${GITHUB_REF_NAME}.zip"
+
+      - name: Upload iOS artifact
+        uses: actions/upload-artifact@v2
+        with:
+          name: ios-artifact
+          path: photo-organizer-ios-*.zip
+
+      - name: Release iOS
+        uses: softprops/action-gh-release@v2
+        with:
+          files: photo-organizer-ios-*.zip
+          body: |
+            iOS build (unsigned .app; no codesign). Install via sideload tools or
+            sign with your own Apple identity. No notarization, no App Store claim.
