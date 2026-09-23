@@ -10,27 +10,34 @@ permissions:
   contents: read
   security-events: write
 
+concurrency:
+  group: ci-${{ github.event_name == 'pull_request' && github.head_ref || github.sha }}
+  cancel-in-progress: true
+
 jobs:
   rust:
     name: Rust service
     runs-on: ubuntu-latest
+    timeout-minutes: 50
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2
         with:
           components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libdbus-1-dev pkg-config libsecret-1-dev
       - name: Format
         run: cargo fmt --check
       - name: Clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
       - name: Test
-        run: cargo test
+        run: cargo test --locked
 
   flutter:
     name: Flutter app
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     defaults:
       run:
         working-directory: app
@@ -41,7 +48,7 @@ jobs:
           channel: stable
           cache: true
       - name: Dependencies
-        run: flutter pub get
+        run: flutter pub get --enforce-lockfile
       - name: Analyze
         run: flutter analyze
       - name: Test
@@ -53,6 +60,7 @@ jobs:
   security:
     name: Security gates
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
