@@ -4,18 +4,36 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+    groups:
+      github-actions:
+        patterns: ["*"]
 
   - package-ecosystem: "cargo"
     directory: "/native_core"
     schedule:
       interval: "weekly"
+    open-pull-requests-limit: 5
+    groups:
+      cargo-minor-patch:
+        update-types: ["minor", "patch"]
+        patterns: ["*"]
 
   - package-ecosystem: "pub"
     directory: "/app"
     schedule:
       interval: "weekly"
+    open-pull-requests-limit: 5
+    groups:
+      pub-minor-patch:
+        update-types: ["minor", "patch"]
+        patterns: ["*"]
 
   - package-ecosystem: "pip"
     directory: "/ml_sidecar"
     schedule:
       interval: "weekly"
+    open-pull-requests-limit: 3
+    groups:
+      pip-minor-patch:
+        update-types: ["minor", "patch"]
+        patterns: ["*"]
