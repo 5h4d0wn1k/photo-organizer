@@ -38,31 +38,43 @@ rationale.
   ignore entry in `.cargo/audit.toml` (RUSTSEC-2026-0120/-0119);
   re-audit on every iroh bump.
 
-### Open queued PRs
+### Merged this session
 
-Auto-merge queued (rebase + CI then merge):
-- `cmov 0.5.4` (PR #17), `image 4.10.1` (PR #12, Flutter package), `actions/checkout@7`
-  (PR #2), `actions-rust-lang/setup-rust-toolchain@2` (PR #3).
+- `cmov 0.5.4` (#17) — closes GHSA-3rjw-m598-pq24.
+- `image 4.10.1` (#12, Flutter package), `actions/checkout@7` (#2),
+  `actions-rust-lang/setup-rust-toolchain@2` (#3), `mobile_scanner 7.4.2` (#15),
+  `intl 0.20.3` (#13), `supabase_flutter 2.17.2` (#14).
+  #14 required a one-line migration shipped on the PR branch
+  (`Supabase.initialize` `anonKey:` -> `publishableKey:`, cloud_bootstrap_service.dart:73).
 
-Require a code migration, closed with rationale on next triage pass:
-- `chacha20poly1305` 0.10 -> 0.11, `sha2` 0.10 -> 0.11, `keyring` 3 -> 4,
-  `reqwest` 0.12 -> 0.13 (native_core `Cargo.toml` requirements). Each is an
-  API-breaking major bump with no forced driver (no advisory); defer until a
-  feature requires them.
-- `supabase_flutter` 2.12.4 -> 2.17.2, `mobile_scanner` 7.2.0 -> 7.4.2,
-  `intl` 0.20.2 -> 0.20.3 (`/app` pubspec) — evaluated on fresh rebase; merge
-  when checks go green.
+### Closed with rationale (no forcing advisory; dependabot will re-file)
+
+- `chacha20poly1305` 0.10 -> 0.11 — API breakage in the vault crypto path
+  (`aead::OsRng`/`RngCore` renamed, `Array::from_slice` deprecated); deliberately
+  deferred, it is security-sensitive code.
+- `sha2` 0.10 -> 0.11 — unresolvable while iroh pins `sha2 ==0.11.0-rc.5`;
+  blocked upstream, re-open on iroh bump.
+- `keyring` 3 -> 4 — API break; `apple-native` feature dropped upstream.
+- `reqwest` 0.12 -> 0.13 — API break; `rustls-tls` feature renamed upstream.
 
 ## Static analysis (CodeQL) triage
 
-Default-setup code scanning was silently removed from the repository (all
-`code-scanning` endpoints return 404) — the 71-alert set produced during the
-audit is not currently regenerable. A first-party
-`.github/workflows/codeql-analysis.yml` (PR #19) replaces it
-(security-and-quality, weekly + push/PR on main). When it runs, file the
-following classification against any regenerated alerts.
+GitHub default-setup was producing flaky, unbuildable scans (CodeQL cpp
+autobuild cannot build the Flutter-generated C/C++ boilerplate, failing the
+non-required `Analyze (c-cpp)` check on every PR-triggered run), so it was
+set to `not-configured`. It is replaced by the first-party
+`.github/workflows/codeql-analysis.yml` (this PR): security-and-quality,
+weekly scheduled + push-on-main triggers, languages `actions`/`python`/`rust`
+(c-cpp deliberately excluded — nothing buildable to scan). No PR trigger, so
+PRs cannot carry flaky red checks, and analysis results file in the Security
+tab as before.
 
-### Criticals (4) — all false positives, dismiss with `false_positive`
+The 71-alert set from the audit was dismissed via API in this session:
+4 criticals as `false positive`, 67 high path-injection as `won't fix`,
+each with a comment referencing this document. Classification below applies to
+any regenerated alerts.
+
+### Criticals (4) — false positives
 
 - `rust/command-line-injection` (native_core/src/ocr.rs:53, :80): the
   Tesseract subprocess is `Command::new(cmd).args(...)` — argv-based, never a

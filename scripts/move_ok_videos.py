@@ -123,6 +123,7 @@ def unique_destination(path: Path, digest: str) -> Path:
         if sha256_file(path) == digest:
             return path
     except OSError:
+        # Unreadable/missing file: content cannot be verified against this digest.
         pass
 
     suffix = path.suffix
