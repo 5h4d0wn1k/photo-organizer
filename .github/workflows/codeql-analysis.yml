@@ -34,13 +34,13 @@ jobs:
         with:
           toolchain: stable
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@3ea06614dafe36dec890db3446326e0d40ce53d4 # v3
+        uses: github/codeql-action/init@c23de5a82f64bb08c6d9f28844551440ca298e76 # v4
         with:
           languages: ${{ matrix.language }}
           queries: security-and-quality
       - name: Autobuild
-        uses: github/codeql-action/autobuild@3ea06614dafe36dec890db3446326e0d40ce53d4 # v3
+        uses: github/codeql-action/autobuild@c23de5a82f64bb08c6d9f28844551440ca298e76 # v4
       - name: Perform CodeQL Analysis
-        uses: github/codeql-action/analyze@3ea06614dafe36dec890db3446326e0d40ce53d4 # v3
+        uses: github/codeql-action/analyze@c23de5a82f64bb08c6d9f28844551440ca298e76 # v4
         with:
           category: "/language:${{matrix.language}}"
