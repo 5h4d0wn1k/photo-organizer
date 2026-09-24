@@ -428,12 +428,14 @@ impl GalleryService {
             return Err(ServiceError::NotFound(format!("vault {vault_id}")));
         }
 
+        let pairing_token = Uuid::new_v4().to_string();
         let pairing = DevicePairing {
             id: Uuid::new_v4(),
             device_name: request.device_name,
             platform: request.platform,
             vault_id: request.vault_id,
-            pairing_token: Uuid::new_v4().to_string(),
+            pairing_token_hash: hash_pairing_token(&pairing_token),
+            pairing_token,
             created_at: Utc::now(),
             expires_at: Utc::now() + chrono::Duration::minutes(10),
             approved_at: None,
@@ -474,10 +476,16 @@ impl GalleryService {
         let mut state = self.state.write().await;
         ensure_distributed_defaults(&mut state);
         let now = Utc::now();
+        let pairing_token_hash = hash_pairing_token(pairing_token);
         let pairing_index = state
             .pairings
             .iter()
-            .position(|pairing| pairing.pairing_token == pairing_token)
+            .position(|pairing| {
+                constant_time_eq(
+                    pairing.pairing_token_hash.as_bytes(),
+                    pairing_token_hash.as_bytes(),
+                )
+            })
             .ok_or_else(|| ServiceError::Invalid("pairing token was not found".to_string()))?;
         if state.pairings[pairing_index].expires_at < now {
             return Err(ServiceError::Invalid(
@@ -6934,7 +6942,7 @@ fn active_mobile_session_from_state(
     let session_index = state
         .mobile_sessions
         .iter()
-        .position(|session| session.token_hash == token_hash)
+        .position(|session| constant_time_eq(session.token_hash.as_bytes(), token_hash.as_bytes()))
         .ok_or_else(|| ServiceError::Invalid("mobile session was not found".to_string()))?;
     let session = state.mobile_sessions[session_index].clone();
     if session.revoked_at.is_some() {
@@ -7161,6 +7169,25 @@ fn hash_mobile_token(token: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(token.trim().as_bytes());
     hex_string(&hasher.finalize())
+}
+
+fn hash_pairing_token(token: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(token.trim().as_bytes());
+    hex_string(&hasher.finalize())
+}
+
+/// Compare two byte slices without branching on their contents, so request
+/// timing does not reveal a common prefix of a secret.
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (a, b) in left.iter().zip(right.iter()) {
+        diff |= a ^ b;
+    }
+    diff == 0
 }
 
 fn hex_string(bytes: &[u8]) -> String {
@@ -9604,8 +9631,9 @@ mod tests {
     };
 
     use super::{
-        ByteRangeRequest, GalleryService, effective_library_root, local_device_id,
-        mobile_replica_chunk_proof_hex, mobile_upload_dir, sha256_hex_bytes,
+        ByteRangeRequest, GalleryService, constant_time_eq, effective_library_root,
+        hash_pairing_token, local_device_id, mobile_replica_chunk_proof_hex, mobile_upload_dir,
+        sha256_hex_bytes,
     };
 
     fn temp_root(name: &str) -> PathBuf {
@@ -9966,6 +9994,92 @@ mod tests {
         assert_eq!(bundle["private_data_excluded"], true);
         assert_eq!(bundle["entitlements"]["account_identifier_redacted"], true);
         assert!(bundle["backup_health"]["missing_asset_count"].is_number());
+    }
+
+    #[test]
+    fn constant_time_eq_matches_only_identical_bytes() {
+        assert!(constant_time_eq(b"abc", b"abc"));
+        assert!(constant_time_eq(b"", b""));
+        assert!(!constant_time_eq(b"abc", b"abd"));
+        assert!(!constant_time_eq(b"abc", b"ab"));
+        assert!(!constant_time_eq(b"abc", b"abcd"));
+        assert!(!constant_time_eq(b"1234567890abcdef", b"1234567890abcdee"));
+    }
+
+    #[tokio::test]
+    async fn pairing_token_is_hashed_at_rest_and_matched_constant_time() {
+        let runtime_root = temp_root("pairing-hash");
+        let config = AppConfig {
+            runtime_root: runtime_root.clone(),
+            ..AppConfig::default()
+        };
+        let service = GalleryService::new(config.clone()).expect("service");
+        service
+            .update_library_settings(UpdateLibrarySettingsRequest {
+                library_root: runtime_root.join("library").to_string_lossy().to_string(),
+                default_import_mode: ImportMode::Copy,
+                original_storage_policy: None,
+            })
+            .await
+            .expect("settings");
+
+        let pairing = service
+            .create_pairing_session(CreatePairingSessionRequest {
+                device_name: "Pixel 8".to_string(),
+                platform: "android".to_string(),
+                vault_id: None,
+            })
+            .await
+            .expect("pairing session");
+
+        assert!(
+            !pairing.pairing_token.is_empty(),
+            "plaintext returned for QR"
+        );
+        assert_eq!(
+            pairing.pairing_token_hash,
+            hash_pairing_token(&pairing.pairing_token),
+            "response must carry the sha256 of the token"
+        );
+        assert_ne!(pairing.pairing_token_hash, pairing.pairing_token);
+
+        // The plaintext secret must never be persisted to the database.
+        let db_bytes = std::fs::read(config.database_path()).expect("read db file");
+        let plaintext = pairing.pairing_token.clone();
+        let insert = format!("'{}'", plaintext);
+        assert!(
+            !db_bytes
+                .windows(insert.len())
+                .any(|window| window == insert.as_bytes()),
+            "plaintext pairing token must not appear in the database"
+        );
+
+        let paired = service
+            .pair_mobile_device(MobilePairRequest {
+                pairing_token: plaintext.clone(),
+                device_name: "Pixel 8".to_string(),
+                platform: "android".to_string(),
+                vault_id: None,
+                storage_profile: None,
+            })
+            .await
+            .expect("pair mobile with correct token");
+        assert!(paired.bearer_token.starts_with("pgm_"));
+
+        let err = service
+            .pair_mobile_device(MobilePairRequest {
+                pairing_token: "wrong-token-value".to_string(),
+                device_name: "Pixel 8".to_string(),
+                platform: "android".to_string(),
+                vault_id: None,
+                storage_profile: None,
+            })
+            .await
+            .expect_err("pairing with wrong token must fail");
+        assert!(
+            err.to_string().contains("was not found"),
+            "wrong token must not match any pairing: {err}"
+        );
     }
 
     #[tokio::test]
