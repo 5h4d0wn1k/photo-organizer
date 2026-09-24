@@ -16,9 +16,13 @@ rationale.
   `Flutter app`, `Security gates`; `required_approving_review_count: 0`
   (solo maintainer cannot self-approve); `enforce_admins: true`;
   `allow_force_pushes: false`; `allow_deletions: false`.
-- Push-to-main is closed; all changes land via PR. `allow_auto_merge` and
-  `delete_branch_on_merge` enabled so green dependabot/PR flows merge
-  themselves.
+- Push-to-main is closed; all changes land via PR. `delete_branch_on_merge` enabled.
+- Repo-level `allow_auto_merge` was DISABLED on 2026-09-24 after the auto-merge
+  flow produced empty single-parent dependabot commits (e.g. `dde6176`, `fcefda6`
+  for #38/#39): strict status checks + `allow_update_branch` + auto-merge races
+  rebased dependabot branches onto main and merged empty results, so dependabot
+  believed PRs landed while no changes did (pub #47 and actions #50 bumps had to be
+  re-landed manually). Dependabot PRs now require a deliberate merge by a human.
 - CodeQL `Analyze (*)` checks are intentionally NOT required contexts:
   dependabot PRs report a neutral `CodeQL` state for them, which would
   deadlock auto-merge. Analysis still runs and alerts still file.
