@@ -5340,8 +5340,7 @@ impl GalleryService {
 
         let state = self.state.write().await;
         self.persist_locked_state(&state)?;
-        let backup_root = request.backup_root.as_deref().map(Path::new);
-        security::activate_encryption(&self.config, backup_root).map_err(security_error)
+        security::activate_encryption(&self.config).map_err(security_error)
     }
 
     pub async fn export_backup(
@@ -13705,7 +13704,7 @@ mod tests {
         assert!(result.status.sensitive_indexing_allowed);
         assert!(result.row_counts_verified);
         assert_eq!(result.integrity_check, "ok");
-        assert!(PathBuf::from(result.backup_path).exists());
+        assert!(result.backup_path.is_empty());
 
         let restarted = GalleryService::new(config).expect("restart encrypted service");
         assert!(restarted.encryption_status().await.database_encrypted);
