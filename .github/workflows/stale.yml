@@ -22,4 +22,9 @@ jobs:
           stale-pr-label: stale
           exempt-issue-labels: roadmap,security,help wanted,good first issue
           exempt-pr-labels: roadmap,security
+          exempt-draft-pr: true
+          stale-issue-message: This issue is stale because it has been open for 90 days with no activity. Remove the stale label or comment, or it will close in 30 days.
+          stale-pr-message: This pull request is stale because it has been open for 90 days with no activity. Remove the stale label or comment, or it will close in 30 days.
+          close-issue-message: This issue was closed because it has been inactive for 30 days after being marked stale.
+          close-pr-message: This pull request was closed because it has been inactive for 30 days after being marked stale.
           operations-per-run: 100

@@ -11,6 +11,15 @@ flutter:
       - any-glob-to-any-file:
           - "app/**"
 
+android:
+  - changed-files:
+      - any-glob-to-any-file:
+          - "app/android/**"
+          - "app/linux/**"
+          - "app/lib/**/*android*"
+          - "app/lib/**/*linux*"
+          - "app/lib/platform/**"
+
 python:
   - changed-files:
       - any-glob-to-any-file:
