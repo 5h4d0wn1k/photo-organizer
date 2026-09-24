@@ -5340,8 +5340,7 @@ impl GalleryService {
 
         let state = self.state.write().await;
         self.persist_locked_state(&state)?;
-        let backup_root = request.backup_root.as_deref().map(Path::new);
-        security::activate_encryption(&self.config, backup_root).map_err(security_error)
+        security::activate_encryption(&self.config).map_err(security_error)
     }
 
     pub async fn export_backup(

@@ -94,7 +94,6 @@ pub fn encryption_status(config: &AppConfig) -> EncryptionStatus {
 
 pub fn activate_encryption(
     config: &AppConfig,
-    backup_root: Option<&Path>,
 ) -> Result<EncryptionActivationResult, SecurityError> {
     if read_state(config)?.is_some() {
         return Ok(EncryptionActivationResult {
@@ -136,13 +135,14 @@ pub fn activate_encryption(
         ));
     }
 
-    let stamp = Utc::now().format("%Y%m%d%H%M%S").to_string();
-    let encrypted_temp = backup_root
-        .map(|root| root.join(format!("gallery.sqlite3.sqlcipher-{stamp}.tmp")))
-        .unwrap_or_else(|| database_path.with_extension(format!("sqlcipher-{stamp}.tmp")));
-    if encrypted_temp.exists() {
-        fs::remove_file(&encrypted_temp).map_err(io_error)?;
-    }
+    // Always create temp file in the same directory as the database to guarantee
+    // atomic rename on POSIX (same filesystem). The backup_root parameter is
+    // retained for API compatibility but no longer used for temp file location.
+    let db_dir = database_path.parent().ok_or_else(|| {
+        SecurityError::Invalid("database path has no parent directory".to_string())
+    })?;
+    let temp_name = format!("gallery.sqlite3.sqlcipher-{}.tmp", Uuid::new_v4());
+    let encrypted_temp = db_dir.join(temp_name);
 
     export_plaintext_to_encrypted(&database_path, &encrypted_temp, &key_hex)?;
     let (row_counts_verified, integrity_check) =
