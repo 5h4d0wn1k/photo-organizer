@@ -5,6 +5,7 @@ use std::{
 };
 
 use rusqlite::{Connection, OptionalExtension, params};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::{
@@ -22,7 +23,7 @@ use crate::{
     security,
 };
 
-const SCHEMA_VERSION: i64 = 20;
+const SCHEMA_VERSION: i64 = 21;
 
 fn sql_u64(row: &rusqlite::Row, index: usize) -> rusqlite::Result<u64> {
     let value: i64 = row.get(index)?;
@@ -220,7 +221,39 @@ fn migrate_schema(connection: &Connection, from_version: i64) -> Result<(), rusq
         record_migration(connection, 20, "local_entitlement_cache")?;
     }
 
+    if from_version < 21 {
+        // Pairing tokens used to be persisted as plaintext UUIDs (36 chars).
+        // Rewrite any remaining legacy values to their SHA-256 hex so no
+        // plaintext secret is stored at rest. Fresh values are already hashes.
+        let mut statement = connection.prepare(
+            "SELECT rowid, pairing_token FROM device_pairings WHERE length(pairing_token) < 64",
+        )?;
+        let rows: Vec<(i64, String)> = statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<Result<_, _>>()?;
+        drop(statement);
+        for (rowid, token) in rows {
+            let hash = hash_pairing_token_column(&token);
+            connection.execute(
+                "UPDATE device_pairings SET pairing_token = ?1 WHERE rowid = ?2",
+                params![hash, rowid],
+            )?;
+        }
+        record_migration(connection, 21, "pairing_tokens_hashed_at_rest")?;
+    }
+
     connection.pragma_update(None, "user_version", SCHEMA_VERSION)
+}
+
+fn hash_pairing_token_column(token: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(token.trim().as_bytes());
+    let digest = hasher.finalize();
+    let mut value = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        value.push_str(&format!("{byte:02x}"));
+    }
+    value
 }
 
 fn open_connection(path: &Path) -> Result<Connection, rusqlite::Error> {
@@ -1202,7 +1235,7 @@ pub fn save_state(
                 pairing.device_name,
                 pairing.platform,
                 pairing.vault_id.map(|value| value.to_string()),
-                pairing.pairing_token,
+                pairing.pairing_token_hash,
                 pairing.created_at.to_rfc3339(),
                 pairing.expires_at.to_rfc3339(),
                 pairing.approved_at.map(|value| value.to_rfc3339()),
@@ -2363,7 +2396,8 @@ fn load_pairings(connection: &Connection) -> Result<Vec<DevicePairing>, rusqlite
                 .get::<_, Option<String>>(3)?
                 .map(|value| parse_uuid(&value))
                 .transpose()?,
-            pairing_token: row.get(4)?,
+            pairing_token: String::new(),
+            pairing_token_hash: row.get(4)?,
             created_at: parse_datetime(&row.get::<_, String>(5)?)?,
             expires_at: parse_datetime(&row.get::<_, String>(6)?)?,
             approved_at: row
@@ -2821,7 +2855,10 @@ mod tests {
         },
     };
 
-    use super::{PersistedLibraryState, SCHEMA_VERSION, bootstrap_storage, load_state, save_state};
+    use super::{
+        PersistedLibraryState, SCHEMA_VERSION, bootstrap_storage, hash_pairing_token_column,
+        load_state, save_state,
+    };
 
     fn temp_runtime_root() -> PathBuf {
         let path = std::env::temp_dir().join(format!(
@@ -3084,6 +3121,71 @@ mod tests {
             .expect("user version");
 
         assert!(columns.iter().any(|column| column == "vault_id"));
+        assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn migration_hashes_legacy_plaintext_pairing_tokens() {
+        let runtime_root = temp_runtime_root();
+        let config = AppConfig {
+            runtime_root: runtime_root.clone(),
+            ..AppConfig::default()
+        };
+        let db_dir = runtime_root.join("db");
+        std::fs::create_dir_all(&db_dir).expect("create db dir");
+        let connection = Connection::open(config.database_path()).expect("open legacy db");
+        connection
+            .execute_batch(
+                r#"
+                CREATE TABLE device_pairings (
+                  id TEXT PRIMARY KEY,
+                  device_name TEXT NOT NULL,
+                  platform TEXT NOT NULL,
+                  pairing_token TEXT NOT NULL,
+                  created_at TEXT NOT NULL,
+                  expires_at TEXT NOT NULL,
+                  approved_at TEXT
+                );
+                PRAGMA user_version = 12;
+                "#,
+            )
+            .expect("create legacy pairing schema");
+        let legacy_token = "00000000-0000-4000-8000-000000000123";
+        connection
+            .execute(
+                "INSERT INTO device_pairings (id, device_name, platform, pairing_token, created_at, expires_at) VALUES (?1, 'Moto G', 'android', ?2, '2026-01-01T00:00:00Z', '2026-01-01T00:10:00Z')",
+                rusqlite::params![
+                    "00000000-0000-4000-8000-000000000111",
+                    legacy_token,
+                ],
+            )
+            .expect("insert legacy pairing");
+        drop(connection);
+
+        let report = bootstrap_storage(&config).expect("migrate storage");
+        let connection = Connection::open(&report.database_path).expect("open migrated db");
+        let stored_token: String = connection
+            .query_row(
+                "SELECT pairing_token FROM device_pairings WHERE id = '00000000-0000-4000-8000-000000000111'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("stored pairing token");
+        // Migration must never leave the plaintext secret at rest.
+        assert_ne!(stored_token, legacy_token);
+        assert_eq!(
+            stored_token.len(),
+            64,
+            "expected sha256 hex: {stored_token}"
+        );
+        assert_eq!(
+            stored_token,
+            hash_pairing_token_column(legacy_token),
+            "stored value must be the sha256 of the legacy token"
+        );
+        let version: i64 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("user version");
         assert_eq!(version, SCHEMA_VERSION);
     }
 }

@@ -863,7 +863,12 @@ pub struct DevicePairing {
     pub device_name: String,
     pub platform: String,
     pub vault_id: Option<Uuid>,
+    /// Plaintext pairing secret, returned to the desktop for the invite QR and
+    /// otherwise kept only in memory once the pairing is persisted.
     pub pairing_token: String,
+    /// SHA-256 hex of `pairing_token`. This is what is stored at rest and what
+    /// mobile pairing requests are matched against.
+    pub pairing_token_hash: String,
     pub created_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
     pub approved_at: Option<DateTime<Utc>>,
