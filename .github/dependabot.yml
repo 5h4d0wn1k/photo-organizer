@@ -4,6 +4,9 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+    labels:
+      - deps
+      - ci
     groups:
       github-actions:
         patterns: ["*"]
@@ -13,6 +16,9 @@ updates:
     schedule:
       interval: "weekly"
     open-pull-requests-limit: 5
+    labels:
+      - deps
+      - rust
     groups:
       cargo-minor-patch:
         update-types: ["minor", "patch"]
@@ -23,6 +29,9 @@ updates:
     schedule:
       interval: "weekly"
     open-pull-requests-limit: 5
+    labels:
+      - deps
+      - flutter
     groups:
       pub-minor-patch:
         update-types: ["minor", "patch"]
@@ -33,6 +42,9 @@ updates:
     schedule:
       interval: "weekly"
     open-pull-requests-limit: 3
+    labels:
+      - deps
+      - python
     groups:
       pip-minor-patch:
         update-types: ["minor", "patch"]

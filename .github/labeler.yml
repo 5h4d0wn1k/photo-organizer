@@ -11,6 +11,17 @@ flutter:
       - any-glob-to-any-file:
           - "app/**"
 
+android:
+  - changed-files:
+      - any-glob-to-any-file:
+          - "app/android/**"
+
+linux:
+  - changed-files:
+      - any-glob-to-any-file:
+          - "app/linux/**"
+          - "app/lib/src/api/local_api_platform_io.dart"
+
 python:
   - changed-files:
       - any-glob-to-any-file:
@@ -40,7 +51,7 @@ docs:
 deps:
   - changed-files:
       - any-glob-to-any-file:
-          - ".github/dependabot.yml"
+          - ".github/**"
           - "**/Cargo.lock"
           - "**/Cargo.toml"
           - "app/pubspec.yaml"

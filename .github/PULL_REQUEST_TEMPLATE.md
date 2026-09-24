@@ -1,6 +1,15 @@
-## Summary
+<!--
+  One PR, one tracked issue. Reference it in the title (e.g. "fix(security): ... (#58)") and link the issue below.
+  Delete the issue line below if no issue exists (dependabot-style bumps).
+-->
 
--
+## Issue
+
+Closes #
+
+## What changed
+
+<!-- Brief, factual summary. No travelogues. -->
 
 ## Risk
 
@@ -10,13 +19,12 @@
 
 ## Verification
 
-- [ ] `cargo fmt --check`
-- [ ] `cargo clippy --all-targets --all-features -- -D warnings`
-- [ ] `cargo test`
-- [ ] `flutter analyze` from `app/`
-- [ ] `flutter test` from `app/`
+- [ ] `cargo test --locked` (narrowest relevant target first)
+- [ ] `cargo fmt --check` and `cargo clippy --all-targets --all-features -- -D warnings`
+- [ ] `flutter analyze` and relevant `flutter test`
 - [ ] Secret scan
 - [ ] Dependency audit / SBOM
+- [ ] CI: Rust service / Flutter app / Security gates green
 
 ## Security Checklist
 
@@ -27,4 +35,4 @@
 
 ## Rollback
 
--
+<!-- Schema/API migrations and where the canary lives; how to revert safely if this ships broken. -->

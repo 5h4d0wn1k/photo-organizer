@@ -9,17 +9,24 @@ permissions:
   pull-requests: write
 
 jobs:
-  stale:
-    name: Close stale items
+  mark:
+    name: Mark stale items
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/stale@4391f3da665fdf50b6810c1a66712fb9ba21aa93 # v11.0.0
         with:
-          days-before-stale: 90
-          days-before-close: 30
+          # Open issues and PRs are closed only when the underlying work is
+          # solved (or deliberately triaged). The bot may tag items as stale
+          # as a reminder. Auto-close is disabled via days-before-close: -1;
+          # do not replace that value without an explicit policy decision.
+          days-before-stale: 180
+          days-before-close: -1
           stale-issue-label: stale
           stale-pr-label: stale
           exempt-issue-labels: roadmap,security,help wanted,good first issue
           exempt-pr-labels: roadmap,security
+          exempt-draft-pr: true
+          stale-issue-message: This issue has been open for 180 days with no activity. If it is still planned, remove the stale label. If it is no longer relevant, close it deliberately.
+          stale-pr-message: This pull request has been open for 180 days with no activity. If it is still in progress, remove the stale label. Otherwise, close it deliberately.
           operations-per-run: 100
