@@ -136,15 +136,10 @@ pub fn activate_encryption(
         ));
     }
 
-    let backup_dir = backup_root
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| config.runtime_root.join("db").join("backups"));
-    fs::create_dir_all(&backup_dir).map_err(io_error)?;
     let stamp = Utc::now().format("%Y%m%d%H%M%S").to_string();
-    let backup_path = backup_dir.join(format!("gallery.sqlite3.plaintext-backup-{stamp}"));
-    fs::copy(&database_path, &backup_path).map_err(io_error)?;
-
-    let encrypted_temp = database_path.with_extension(format!("sqlcipher-{stamp}.tmp"));
+    let encrypted_temp = backup_root
+        .map(|root| root.join(format!("gallery.sqlite3.sqlcipher-{stamp}.tmp")))
+        .unwrap_or_else(|| database_path.with_extension(format!("sqlcipher-{stamp}.tmp")));
     if encrypted_temp.exists() {
         fs::remove_file(&encrypted_temp).map_err(io_error)?;
     }
@@ -159,7 +154,7 @@ pub fn activate_encryption(
         )));
     }
 
-    replace_database_with_encrypted(&database_path, &encrypted_temp, &backup_path)?;
+    replace_database_with_encrypted(&database_path, &encrypted_temp)?;
     let activated_at = Utc::now();
     write_state(
         config,
@@ -169,14 +164,14 @@ pub fn activate_encryption(
             key_id,
             key_storage,
             activated_at,
-            backup_path: backup_path.to_string_lossy().to_string(),
+            backup_path: String::new(),
         },
     )?;
     write_encryption_settings_row(config)?;
 
     Ok(EncryptionActivationResult {
         status: encryption_status(config),
-        backup_path: backup_path.to_string_lossy().to_string(),
+        backup_path: String::new(),
         activated_at,
         row_counts_verified,
         integrity_check,
@@ -240,15 +235,10 @@ fn verify_encrypted_database(
 fn replace_database_with_encrypted(
     database_path: &Path,
     encrypted_temp: &Path,
-    backup_path: &Path,
 ) -> Result<(), SecurityError> {
     remove_sidecar(database_path, "wal")?;
     remove_sidecar(database_path, "shm")?;
-    fs::remove_file(database_path).map_err(io_error)?;
-    if let Err(error) = fs::rename(encrypted_temp, database_path) {
-        let _ = fs::copy(backup_path, database_path);
-        return Err(SecurityError::Io(error.to_string()));
-    }
+    fs::rename(encrypted_temp, database_path).map_err(io_error)?;
     Ok(())
 }
 
