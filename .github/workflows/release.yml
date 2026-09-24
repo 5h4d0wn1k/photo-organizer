@@ -6,9 +6,7 @@ on:
       - 'v*'
 
 permissions:
-  contents: write
-  id-token: write
-  attestations: write
+  contents: read
 
 concurrency:
   group: release-${{ github.ref_name }}
@@ -19,6 +17,10 @@ jobs:
     name: Linux (AppImage + .deb)
     runs-on: ubuntu-latest
     timeout-minutes: 120
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -79,14 +81,15 @@ jobs:
       - name: Download appimagetool
         run: |
           set -euo pipefail
-          wget -q https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage -O appimagetool-x86_64.AppImage
+          # Pinned to the 1.9.1 release (not the rolling "continuous" tag) and
+          # verified against its published sha256: record the digest for provenance.
+          wget -q https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-x86_64.AppImage -O appimagetool-x86_64.AppImage
+          echo "ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0  appimagetool-x86_64.AppImage" | sha256sum -c -
           chmod +x appimagetool-x86_64.AppImage
-          # "continuous" is a rolling build (no versioned tags upstream): verify the
-          # artifact is a real ELF binary and record its digest for provenance.
+          # Sanity: artifact is a real ELF binary and has meaningful size.
           test -s appimagetool-x86_64.AppImage
           test "$(stat -c %s appimagetool-x86_64.AppImage)" -gt 1000000
           file -b appimagetool-x86_64.AppImage | grep -qi 'elf'
-          sha256sum appimagetool-x86_64.AppImage
 
       - name: Package AppImage
         run: |
@@ -164,6 +167,8 @@ jobs:
     name: Windows (ZIP)
     runs-on: windows-latest
     timeout-minutes: 120
+    permissions:
+      contents: write
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -221,6 +226,8 @@ jobs:
     name: macOS (DMG)
     runs-on: macos-latest
     timeout-minutes: 150
+    permissions:
+      contents: write
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -280,6 +287,8 @@ jobs:
     name: Android (APK)
     runs-on: ubuntu-latest
     timeout-minutes: 120
+    permissions:
+      contents: write
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -330,6 +339,8 @@ jobs:
     name: iOS (unsigned .app)
     runs-on: macos-latest
     timeout-minutes: 150
+    permissions:
+      contents: write
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
