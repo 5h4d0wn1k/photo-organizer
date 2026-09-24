@@ -24,6 +24,15 @@ use crate::{
 
 const SCHEMA_VERSION: i64 = 20;
 
+fn sql_u64(row: &rusqlite::Row, index: usize) -> rusqlite::Result<u64> {
+    let value: i64 = row.get(index)?;
+    u64::try_from(value).map_err(|_| rusqlite::Error::IntegralValueOutOfRange(index, value))
+}
+
+fn u64_to_sql(value: u64) -> rusqlite::Result<i64> {
+    i64::try_from(value).map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))
+}
+
 #[derive(Debug, Clone)]
 pub struct StorageBootstrapReport {
     pub database_path: PathBuf,
@@ -535,7 +544,7 @@ pub fn save_state(
                 asset.content_hash,
                 enum_string(&asset.media_kind)?,
                 enum_string(&asset.import_mode)?,
-                asset.bytes,
+                u64_to_sql(asset.bytes)?,
                 asset.mime_type,
                 asset.captured_at.to_rfc3339(),
                 asset.imported_at.to_rfc3339(),
@@ -576,7 +585,7 @@ pub fn save_state(
                     enum_string(&variant.kind)?,
                     variant.relative_path,
                     variant.mime_type,
-                    variant.bytes,
+                    u64_to_sql(variant.bytes)?,
                     variant.width,
                     variant.height,
                     variant.derived.model_name,
@@ -962,7 +971,7 @@ pub fn save_state(
                 enum_string(&entry.kind)?,
                 entry.media_kind.as_ref().map(enum_string).transpose()?,
                 entry.mime_type,
-                entry.bytes,
+                u64_to_sql(entry.bytes)?,
                 entry.content_hash,
                 entry.origin_device_id.map(|value| value.to_string()),
                 entry.created_at.to_rfc3339(),
@@ -1006,7 +1015,7 @@ pub fn save_state(
                 blob.asset_id.to_string(),
                 blob.content_hash,
                 blob.encrypted_hash,
-                blob.bytes,
+                u64_to_sql(blob.bytes)?,
                 blob.chunk_count,
                 blob.encryption_key_version,
                 blob.created_at.to_rfc3339(),
@@ -1029,8 +1038,8 @@ pub fn save_state(
                 chunk.chunk_index,
                 chunk.content_hash,
                 chunk.encrypted_hash,
-                chunk.bytes,
-                chunk.encrypted_bytes,
+                u64_to_sql(chunk.bytes)?,
+                u64_to_sql(chunk.encrypted_bytes)?,
                 chunk.local_path,
                 chunk.nonce_hex,
                 chunk.aad,
@@ -1050,7 +1059,7 @@ pub fn save_state(
                 replica.blob_id.to_string(),
                 replica.device_id.to_string(),
                 enum_string(&replica.health)?,
-                replica.bytes_present,
+                u64_to_sql(replica.bytes_present)?,
                 replica.verified_at.map(|value| value.to_rfc3339()),
                 replica.transfer_id.map(|value| value.to_string()),
             ],
@@ -1072,8 +1081,8 @@ pub fn save_state(
                 transfer.from_device_id.map(|value| value.to_string()),
                 transfer.to_device_id.to_string(),
                 enum_string(&transfer.status)?,
-                transfer.bytes_total,
-                transfer.bytes_completed,
+                u64_to_sql(transfer.bytes_total)?,
+                u64_to_sql(transfer.bytes_completed)?,
                 transfer.started_at.map(|value| value.to_rfc3339()),
                 transfer.updated_at.to_rfc3339(),
                 transfer.resumable_until.to_rfc3339(),
@@ -1262,8 +1271,8 @@ pub fn save_state(
                 upload.original_filename,
                 enum_string(&upload.media_kind)?,
                 upload.mime_type,
-                upload.bytes_total,
-                upload.bytes_received,
+                u64_to_sql(upload.bytes_total)?,
+                u64_to_sql(upload.bytes_received)?,
                 upload.content_hash,
                 upload.captured_at.map(|value| value.to_rfc3339()),
                 upload.place_hint,
@@ -1321,7 +1330,7 @@ pub fn save_state(
                     candidate.original_filename,
                     enum_string(&candidate.media_kind)?,
                     candidate.mime_type,
-                    candidate.bytes,
+                    u64_to_sql(candidate.bytes)?,
                     candidate.captured_at.map(|value| value.to_rfc3339()),
                     candidate.place_hint,
                     candidate.content_hash,
@@ -1472,7 +1481,7 @@ fn load_assets(
                 kind: parse_enum(&row.get::<_, String>(2)?)?,
                 relative_path: row.get(3)?,
                 mime_type: row.get(4)?,
-                bytes: row.get(5)?,
+                bytes: sql_u64(row, 5)?,
                 width: row.get(6)?,
                 height: row.get(7)?,
                 derived: ModelProvenance {
@@ -1512,7 +1521,7 @@ fn load_assets(
             content_hash: row.get(4)?,
             media_kind: parse_enum(&row.get::<_, String>(5)?)?,
             import_mode,
-            bytes: row.get(7)?,
+            bytes: sql_u64(row, 7)?,
             mime_type: row.get(8)?,
             captured_at: parse_datetime(&row.get::<_, String>(9)?)?,
             imported_at: parse_datetime(&row.get::<_, String>(10)?)?,
@@ -1594,7 +1603,7 @@ fn load_file_entries(connection: &Connection) -> Result<Vec<VaultFileEntry>, rus
             kind: parse_enum(&row.get::<_, String>(5)?)?,
             media_kind,
             mime_type: row.get(7)?,
-            bytes: row.get(8)?,
+            bytes: sql_u64(row, 8)?,
             content_hash: row.get(9)?,
             origin_device_id,
             created_at: parse_datetime(&row.get::<_, String>(11)?)?,
@@ -2107,7 +2116,7 @@ fn load_blob_records(connection: &Connection) -> Result<Vec<BlobRecord>, rusqlit
             asset_id: parse_uuid(&row.get::<_, String>(2)?)?,
             content_hash: row.get(3)?,
             encrypted_hash: row.get(4)?,
-            bytes: row.get(5)?,
+            bytes: sql_u64(row, 5)?,
             chunk_count: row.get(6)?,
             encryption_key_version: row.get(7)?,
             created_at: parse_datetime(&row.get::<_, String>(8)?)?,
@@ -2136,8 +2145,8 @@ fn load_blob_chunks(connection: &Connection) -> Result<Vec<BlobChunk>, rusqlite:
             chunk_index: row.get(2)?,
             content_hash: row.get(3)?,
             encrypted_hash: row.get(4)?,
-            bytes: row.get(5)?,
-            encrypted_bytes: row.get(6)?,
+            bytes: sql_u64(row, 5)?,
+            encrypted_bytes: sql_u64(row, 6)?,
             local_path: row.get(7)?,
             nonce_hex: row.get(8)?,
             aad: row.get(9)?,
@@ -2160,7 +2169,7 @@ fn load_blob_replicas(connection: &Connection) -> Result<Vec<BlobReplica>, rusql
             blob_id: parse_uuid(&row.get::<_, String>(1)?)?,
             device_id: parse_uuid(&row.get::<_, String>(2)?)?,
             health: parse_enum(&row.get::<_, String>(3)?)?,
-            bytes_present: row.get(4)?,
+            bytes_present: sql_u64(row, 4)?,
             verified_at: row
                 .get::<_, Option<String>>(5)?
                 .map(|value| parse_datetime(&value))
@@ -2194,8 +2203,8 @@ fn load_sync_transfers_v2(connection: &Connection) -> Result<Vec<SyncTransfer>, 
                 .transpose()?,
             to_device_id: parse_uuid(&row.get::<_, String>(4)?)?,
             status: parse_enum(&row.get::<_, String>(5)?)?,
-            bytes_total: row.get(6)?,
-            bytes_completed: row.get(7)?,
+            bytes_total: sql_u64(row, 6)?,
+            bytes_completed: sql_u64(row, 7)?,
             started_at: row
                 .get::<_, Option<String>>(8)?
                 .map(|value| parse_datetime(&value))
@@ -2446,8 +2455,8 @@ fn load_mobile_uploads(connection: &Connection) -> Result<Vec<MobileUpload>, rus
             original_filename: row.get(5)?,
             media_kind: parse_enum::<MediaKind>(&row.get::<_, String>(6)?)?,
             mime_type: row.get(7)?,
-            bytes_total: row.get(8)?,
-            bytes_received: row.get(9)?,
+            bytes_total: sql_u64(row, 8)?,
+            bytes_received: sql_u64(row, 9)?,
             content_hash: row.get(10)?,
             captured_at: row
                 .get::<_, Option<String>>(11)?
@@ -2485,7 +2494,7 @@ fn load_import_sessions(connection: &Connection) -> Result<Vec<ImportSession>, r
                 original_filename: row.get(3)?,
                 media_kind: parse_enum(&row.get::<_, String>(4)?)?,
                 mime_type: row.get(5)?,
-                bytes: row.get(6)?,
+                bytes: sql_u64(row, 6)?,
                 captured_at: row
                     .get::<_, Option<String>>(7)?
                     .map(|value| parse_datetime(&value))
