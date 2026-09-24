@@ -141,7 +141,7 @@ jobs:
             photo-organizer_*_amd64.deb
 
       - name: Generate SBOM
-        uses: anchore/sbom-action@006b7ce8314066bdf1765b4500370d40fa6917a3 # v0.24.2
+        uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
         with:
           path: .
           format: spdx-json
@@ -155,7 +155,7 @@ jobs:
             photo-organizer_*_amd64.deb
 
       - name: Release Linux
-        uses: softprops/action-gh-release@e598afbe1493e6b1bafb1f389cabb956eab91231 # v3
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
         with:
           files: |
             photo-organizer-linux-x86_64-*.AppImage
@@ -215,7 +215,7 @@ jobs:
           path: photo-organizer-windows-x64-*.zip
 
       - name: Release Windows
-        uses: softprops/action-gh-release@e598afbe1493e6b1bafb1f389cabb956eab91231 # v3
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
         with:
           files: photo-organizer-windows-x64-*.zip
           generate_release_notes: true
@@ -277,7 +277,7 @@ jobs:
           path: photo-organizer-macos-*.dmg
 
       - name: Release macOS
-        uses: softprops/action-gh-release@e598afbe1493e6b1bafb1f389cabb956eab91231 # v3
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
         with:
           files: photo-organizer-macos-*.dmg
           generate_release_notes: true
@@ -326,7 +326,7 @@ jobs:
           path: app/build/app/outputs/flutter-apk/app-release.apk
 
       - name: Release Android
-        uses: softprops/action-gh-release@e598afbe1493e6b1bafb1f389cabb956eab91231 # v3
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
         with:
           files: app/build/app/outputs/flutter-apk/app-release.apk
           generate_release_notes: true
@@ -382,7 +382,7 @@ jobs:
           path: photo-organizer-ios-*.zip
 
       - name: Release iOS
-        uses: softprops/action-gh-release@e598afbe1493e6b1bafb1f389cabb956eab91231 # v3
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
         with:
           files: photo-organizer-ios-*.zip
           generate_release_notes: true
