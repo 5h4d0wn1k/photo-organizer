@@ -289,9 +289,11 @@ jobs:
     timeout-minutes: 120
     permissions:
       contents: write
+    outputs:
+      signing_mode: ${{ steps.signing_mode.outputs.mode }}
     steps:
       - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        uses: actions/checkout@3d3d42e5aac5ba805825da76410c181273ba90b1 # v7 
 
       - name: Set up Rust
         uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2
@@ -315,25 +317,172 @@ jobs:
           mkdir -p app/android/app/src/main/assets
           cp -R ml_sidecar app/android/app/src/main/assets/ml_sidecar
 
-      - name: Build Flutter Android APK
-        run: flutter build apk --release
+      - name: Materialize release signing keystore from secrets
+        id: signing_mode
+        # Signing material is OPTIONAL: if the owner has not configured the four
+        # ANDROID_* secrets we fall back to a CI debug key so the emitted APK is
+        # still installable (an unsigned APK is rejected by stock Android with
+        # "App not installed" — the exact #97 failure). The release body reports
+        # the real signing mode so a debug-signed artifact is never mislabeled.
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/keystore"
+          if [ -n "${ANDROID_KEYSTORE_BASE64:-}" ]; then
+            echo "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/keystore/release.jks"
+            echo "::notice::Using owner-provided release keystore."
+            echo "mode=release" >> "$GITHUB_OUTPUT"
+          else
+            keytool -genkeypair -v \
+              -keystore "$RUNNER_TEMP/keystore/ci-debug.jks" \
+              -storepass android -keypass android \
+              -alias ci-debug-key -keyalg RSA -keysize 2048 -validity 10000 \
+              -dname "CN=CI Debug, OU=CI, O=Photo Organizer CI, L=NA, ST=NA, C=NA" >/dev/null 2>&1
+            echo "::warning::No release keystore secret configured; signing the APK with an ephemeral CI debug key so it is installable. Configure ANDROID_KEYSTORE_BASE64 / _PASSWORD / _ALIAS for an upgrade-stable distributable artifact."
+            echo "mode=ci-debug" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build Flutter Android APK (signed)
+        env:
+          ANDROID_KEYSTORE_FILE: ${{ runner.temp }}/keystore/release.jks
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          SIGNING_MODE: ${{ steps.signing_mode.outputs.mode }}
+        run: |
+          set -euo pipefail
+          if [ "$SIGNING_MODE" = "ci-debug" ]; then
+            export ANDROID_KEYSTORE_FILE="$RUNNER_TEMP/keystore/ci-debug.jks"
+            export ANDROID_KEYSTORE_PASSWORD=android
+            export ANDROID_KEY_ALIAS=ci-debug-key
+            export ANDROID_KEY_PASSWORD=android
+          fi
+          flutter build apk --release
         working-directory: app
+
+      - name: Verify APK signature (hard gate)
+        # Fail the release if the emitted APK is unsigned or signature-scheme-incomplete.
+        # apksigner is the tool that proves installability before it reaches a device.
+        run: |
+          set -euo pipefail
+          APKSIGNER=$(ls "$ANDROID_HOME"/build-tools/*/apksigner | sort -V | tail -1)
+          "$APKSIGNER" verify --verbose --print-certs \
+            app/build/app/outputs/flutter-apk/app-release.apk \
+            | tee apksigner-verify.txt
+          grep -q "Verifies" apksigner-verify.txt \
+            || { echo "::error::APK signature verification failed"; exit 1; }
 
       - name: Upload Android artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: android-artifact
           path: app/build/app/outputs/flutter-apk/app-release.apk
+          if-no-files-found: error
+
+      # NOTE: publication is intentionally NOT done here. This job only builds and
+      # uploads the APK; the `android-publish` job (needs: [android, android-smoke])
+      # releases it, and only after the install+launch gate has passed.
+
+  # Installability + launchability gate for the Android artifact. Runs the EXACT
+  # APK that will be published, on a stock Android emulator, before any release is
+  # cut. Any install/launch/crash failure exits non-zero and blocks the release.
+  android-smoke:
+    name: Android (install + launch smoke)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    needs: android
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3d42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Enable KVM group perms
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Download built APK artifact
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4
+        with:
+          name: android-artifact
+          path: apk
+
+      - name: Install + cold-launch + screenshot on emulator
+        uses: reactivecircus/android-emulator-runner@495861ab5d138c61f1b002f606e6225e366c1ff7 # v2.34.0
+        with:
+          api-level: 30
+          arch: x86_64
+          target: default
+          profile: pixel_2
+          disable-animations: true
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
+          script: |
+            set -euo pipefail
+            # 1) Install the exact release artifact. A missing/bad signature, ABI or
+            #    minSdk mismatch fails here with a non-zero exit ("App not installed").
+            adb install -r --no-streaming apk/app-release.apk
+            # 2) Cold-launch the main activity and wait for the launch to complete.
+            adb shell am start -W -n com.privategallery.app/.MainActivity
+            sleep 20
+            # 3) Screenshot as install+launch evidence.
+            adb exec-out screencap -p > android-home.png
+            test -s android-home.png
+            # 4) Crash / ANR detection: fail if the process died or the runtime threw.
+            if ! adb shell pidof com.privategallery.app; then
+              echo "::error::App process is not running after launch (crash-on-start)."
+              adb logcat -d -t 500 || true
+              exit 1
+            fi
+            adb logcat -d -t 800 > android-launch.log
+            if grep -E "FATAL EXCEPTION|AndroidRuntime.*FATAL|ANR in com.privategallery.app" android-launch.log; then
+              echo "::error::Fatal crash/ANR detected during launch."
+              exit 1
+            fi
+
+      - name: Upload smoke evidence (screenshot + launch log)
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: android-smoke-evidence
+          path: |
+            android-home.png
+            android-launch.log
+          if-no-files-found: warn
+
+  # Publish the Android APK only after BOTH the signed build and the install+launch
+  # gate are green. This is the actual "no un-installable APK ships" guarantee (#97).
+  android-publish:
+    name: Android (publish APK)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [android, android-smoke]
+    permissions:
+      contents: write
+    steps:
+      - name: Download built APK artifact
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4
+        with:
+          name: android-artifact
+          path: apk
 
       - name: Release Android
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
         with:
-          files: app/build/app/outputs/flutter-apk/app-release.apk
+          files: apk/app-release.apk
           generate_release_notes: true
           body: |
-            Android build (unsigned APK). Requires sideloading; signing left to the
-            app owner's own keystore intentionally — governance-first, no unsigned
-            Play Store claims.
+            Android build. Install via sideload (enable "install unknown apps" for your
+            file manager), then launch normally.
+
+            Signature: this artifact was verified signed (V1+V2+V3) by CI before
+            publication. ${{ needs.android.outputs.signing_mode == 'release' && 'It is signed with the project release key, so future versions install over this one.' || 'It is signed with an ephemeral CI debug key (no release keystore is configured), so a future version will require uninstalling this one first.' }}
+
+            Installability was additionally proven on a stock Android emulator in CI
+            (install + cold launch + screenshot) before this release was published.
 
   ios:
     name: iOS (unsigned .app)
