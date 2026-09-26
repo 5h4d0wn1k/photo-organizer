@@ -136,8 +136,19 @@ If any owner is missing, do not call the release public-production ready.
 The Android release APK is signed, and the signing key is the artifact's
 identity: lose it and users can never install an upgrade over an existing copy.
 CI therefore refuses to publish a release APK unless signing material is
-configured. It never falls back to a debug key, and it never silently downgrades
-the guarantee.
+configured. It never falls back to a debug key, and a degraded signing mode is
+never silent: it needs an explicit opt-in variable and is called out in the
+release notes.
+
+Two operational rules follow from this. First, keep the keystore backed up
+somewhere that is not this repository — and note that a root-level `release.jks`
+is covered by `.gitignore`, but a keystore under any *other* name is not
+guarded, so keep it outside the tree entirely. Second, turn
+`PRIVATE_GALLERY_RELEASE_ALLOW_EPHEMERAL_SIGNING` back off as soon as the
+throwaway tag is cut: a release pipeline does not currently compare the signing
+certificate against the previous release, so a variable left switched on would
+make the second consecutive ephemeral release indistinguishable from the first,
+and that release would be uninstallable.
 
 ### One-time setup
 

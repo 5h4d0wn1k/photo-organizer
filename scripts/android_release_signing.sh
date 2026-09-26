@@ -24,8 +24,16 @@
 # the user has to uninstall. Uninstalling wipes flutter_secure_storage, which
 # holds the mobile bearer token and cloud group/device identity, forcing a full
 # re-pair with the desktop daemon. "Always installable but never upgradeable" is
-# a worse user outcome than a release that refuses to publish, and a silent
-# downgrade is not acceptable at all.
+# a worse user outcome than a release that refuses to publish.
+#
+# What is actually enforced here: ephemeral signing requires the explicit opt-in
+# variable, and the release notes say so on every release that uses it, so the
+# downgrade is never silent. What is NOT yet enforced: that a release is signed
+# with the same key as the previous one. A repository variable that is switched
+# on and then left on would make the *second* consecutive ephemeral release look
+# like the first. Closing that needs a cross-release fingerprint check (the
+# certificate digest is already extracted by android_release_verify_signature.sh)
+# and is tracked as issue #101 rather than claimed here.
 #
 # Usage:
 #   android_release_signing.sh mode         # prints "release" or "ephemeral"
@@ -38,6 +46,13 @@
 #                ANDROID_KEY_ALIAS, ANDROID_KEY_PASSWORD  (written to $GITHUB_ENV)
 
 set -euo pipefail
+
+# Signing material and the environment file that carries its passwords are
+# created 0600 rather than the default 0644. On a single-tenant ephemeral CI
+# runner this is defence in depth, but the same script is used on a developer's
+# machine and on a release host, where a keystore readable by other local users
+# is a real problem.
+umask 077
 
 EPHEMERAL_KEY_ALIAS="ci-ephemeral-key"
 EPHEMERAL_KEY_PASSWORD="ephemeral-ci-only-not-a-secret"
@@ -130,12 +145,29 @@ resolve_mode() {
 keystore_destination() {
   local temp_dir="${RUNNER_TEMP:-${TMPDIR:-/tmp}}"
   mkdir -p "${temp_dir}"
-  printf '%s' "${temp_dir}/private-gallery-release.jks"
+  # A per-run random name. The Gradle JVM learns this path from the environment
+  # (ANDROID_KEYSTORE_FILE), so nothing depends on it being predictable, and a
+  # fixed name would hand any code running in that JVM a known target.
+  printf '%s' "${temp_dir}/private-gallery-release-${RANDOM}-${RANDOM}.jks"
 }
 
+# Refuse to write signing material into the repository working tree.
+#
+# The comparison is done on canonical paths, not on string prefixes. A prefix
+# test alone is wrong in both directions: a path such as
+# "${GITHUB_WORKSPACE}/./sub/keystore.jks" does not textually start with the
+# workspace string yet is inside it (under-refusal: the write is allowed), and a
+# sibling directory such as "${GITHUB_WORKSPACE}-backup" is not inside it
+# (over-refusal: safe, but wrong). realpath -m canonicalises without requiring
+# the path to exist yet.
 assert_outside_workspace() {
   local destination="$1"
-  if [[ -n "${GITHUB_WORKSPACE:-}" && "${destination}" == "${GITHUB_WORKSPACE}"* ]]; then
+  [[ -n "${GITHUB_WORKSPACE:-}" ]] || return 0
+  local canonical_destination canonical_workspace
+  canonical_workspace="$(realpath -m "${GITHUB_WORKSPACE}" 2>/dev/null || printf '%s' "${GITHUB_WORKSPACE}")"
+  canonical_destination="$(realpath -m "${destination}" 2>/dev/null || printf '%s' "${destination}")"
+  if [[ "${canonical_destination}" == "${canonical_workspace}" ||
+    "${canonical_destination}" == "${canonical_workspace}/"* ]]; then
     echo "ERROR: refusing to write signing material inside the repository working tree (${destination})." >&2
     exit 1
   fi
@@ -158,7 +190,12 @@ materialize_release_keystore() {
   fi
   # Fail fast, with a readable message, instead of letting Gradle report an
   # opaque keystore error after a long NDK cross-compile.
-  if ! keytool -list -keystore "${destination}" -storepass "${ANDROID_KEYSTORE_PASSWORD}" >/dev/null 2>&1; then
+  #
+  # -storepass:env keeps the store password out of keytool's argv, where any
+  # other process on the machine could read it from /proc/<pid>/cmdline. On a
+  # single-tenant ephemeral runner that is not a practical exposure, but it is
+  # free to avoid and there is no reason to hand the value out.
+  if ! keytool -list -keystore "${destination}" -storepass:env ANDROID_KEYSTORE_PASSWORD >/dev/null 2>&1; then
     echo "ERROR: the decoded keystore could not be opened with ANDROID_KEYSTORE_PASSWORD." >&2
     echo "Check that the base64 blob and the store password belong to the same keystore." >&2
     rm -f "${destination}"

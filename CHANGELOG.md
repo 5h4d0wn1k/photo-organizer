@@ -24,7 +24,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   publishing an unsigned APK. A throwaway per-run key is possible only via the
   explicit `PRIVATE_GALLERY_RELEASE_ALLOW_EPHEMERAL_SIGNING` repository
   variable, and the release notes say so when it is used.
-- `scripts/tests/` — device-free tests for the release gate itself (91
+- `scripts/tests/` — device-free tests for the release gate itself (109
   assertions), run in CI via the "Release gate" job and locally with
   `make release-gate`. `release_workflow_test.sh` asserts the release
   workflow's safety properties structurally, so the guarantee cannot be removed
@@ -32,6 +32,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Android SDK for the signature test) is reported as degraded and fails the run
   rather than passing quietly.
 - The published APK now ships a `app-release.apk.sha256` checksum alongside it.
+
+### Security
+
+- `*.jks` and `*.keystore` are now ignored at the repository root. They were
+  only ignored under `app/android/`, while the release runbook tells the
+  maintainer to create `release.jks` in the working directory — one `git add .`
+  from publishing the signing key to a public repository, permanently and
+  irrecoverably. `scripts/tests/release_workflow_test.sh` now verifies this with
+  `git check-ignore` and fails if any keystore is tracked.
+- The CI keystore is written under a per-run random filename instead of a fixed
+  one, and with `umask 077` so it is owner-only.
+- The keystore store password is passed to `keytool` via `-storepass:env` rather
+  than on the command line, where another local process could read it from
+  `/proc/<pid>/cmdline`.
+- The "never write signing material into the working tree" check compares
+  canonical paths instead of string prefixes. A prefix test under-refuses for a
+  path that leaves the workspace and returns (`…/elsewhere/../workspace/…`),
+  which would have placed the keystore in the tree that later steps upload
+  artifacts from.
+- Removed a duplicate definition of `is_enabled` in
+  `scripts/production-readiness-check.sh`; the second, narrower-looking copy was
+  dead code that silently lost to the first.
 
 ### Fixed
 

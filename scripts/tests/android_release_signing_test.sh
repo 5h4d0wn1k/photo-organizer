@@ -171,10 +171,14 @@ done
 echo " materializing the release keystore"
 : >"${GITHUB_ENV_FILE}"
 expect_out "materialize reports release mode" "release" with_secrets_run_materialize materialize
-if [[ -f "${WORK_DIR}/runner/private-gallery-release.jks" ]]; then
+# Read the keystore location back through the interface Gradle actually consumes
+# (ANDROID_KEYSTORE_FILE in GITHUB_ENV) rather than assuming a filename, so
+# hardening the path does not silently invalidate these assertions.
+RELEASE_KEYSTORE="$(grep -E '^ANDROID_KEYSTORE_FILE=' "${GITHUB_ENV_FILE}" 2>/dev/null | head -n 1 | cut -d= -f2- || true)"
+if [[ -n "${RELEASE_KEYSTORE}" && -f "${RELEASE_KEYSTORE}" ]]; then
   ok "the keystore is written under RUNNER_TEMP"
 else
-  bad "the keystore is written under RUNNER_TEMP"
+  bad "the keystore is written under RUNNER_TEMP" "ANDROID_KEYSTORE_FILE=${RELEASE_KEYSTORE:-<unset>}"
 fi
 for variable in ANDROID_KEYSTORE_FILE ANDROID_KEYSTORE_PASSWORD ANDROID_KEY_ALIAS ANDROID_KEY_PASSWORD; do
   if grep -q "^${variable}=" "${GITHUB_ENV_FILE}"; then
@@ -183,13 +187,13 @@ for variable in ANDROID_KEYSTORE_FILE ANDROID_KEYSTORE_PASSWORD ANDROID_KEY_ALIA
     bad "GITHUB_ENV carries ${variable}"
   fi
 done
-if keytool -list -keystore "${WORK_DIR}/runner/private-gallery-release.jks" \
+if [[ -n "${RELEASE_KEYSTORE}" ]] && keytool -list -keystore "${RELEASE_KEYSTORE}" \
   -storepass "${STORE_PASSWORD}" -alias "${ALIAS}" >/dev/null 2>&1; then
   ok "the materialized keystore opens with the configured alias and password"
 else
-  bad "the materialized keystore opens with the configured alias and password"
+  bad "the materialized keystore opens with the configured alias and password" "path: ${RELEASE_KEYSTORE:-<unset>}"
 fi
-if [[ "${WORK_DIR}/runner/private-gallery-release.jks" == "${WORK_DIR}/workspace"* ]]; then
+if [[ "${RELEASE_KEYSTORE}" == "${WORK_DIR}/workspace"* ]]; then
   bad "signing material is kept out of the working tree"
 else
   ok "signing material is kept out of the working tree"
@@ -199,16 +203,17 @@ echo " materializing the ephemeral keystore"
 : >"${GITHUB_ENV_FILE}"
 expect_out "materialize reports ephemeral mode when opted in" "ephemeral" \
   run_materialize PRIVATE_GALLERY_RELEASE_ALLOW_EPHEMERAL_SIGNING=true
-if [[ -f "${WORK_DIR}/runner/private-gallery-release.jks" ]]; then
+EPHEMERAL_KEYSTORE="$(grep -E '^ANDROID_KEYSTORE_FILE=' "${GITHUB_ENV_FILE}" 2>/dev/null | head -n 1 | cut -d= -f2- || true)"
+if [[ -n "${EPHEMERAL_KEYSTORE}" && -f "${EPHEMERAL_KEYSTORE}" ]]; then
   ok "the ephemeral keystore is created"
 else
-  bad "the ephemeral keystore is created"
+  bad "the ephemeral keystore is created" "ANDROID_KEYSTORE_FILE=${EPHEMERAL_KEYSTORE:-<unset>}"
 fi
-if keytool -list -keystore "${WORK_DIR}/runner/private-gallery-release.jks" \
+if [[ -n "${EPHEMERAL_KEYSTORE}" ]] && keytool -list -keystore "${EPHEMERAL_KEYSTORE}" \
   -storepass "ephemeral-ci-only-not-a-secret" >/dev/null 2>&1; then
   ok "the ephemeral keystore is a real, openable keystore"
 else
-  bad "the ephemeral keystore is a real, openable keystore"
+  bad "the ephemeral keystore is a real, openable keystore" "path: ${EPHEMERAL_KEYSTORE:-<unset>}"
 fi
 
 echo " corrupt secret handling"
@@ -231,11 +236,12 @@ expect_out "CRLF-wrapped base64 materializes cleanly" "release" \
   bash -c "export ANDROID_KEYSTORE_BASE64=\"\$(printf '%s' '${KEYSTORE_B64_CRLF}')\" ANDROID_KEYSTORE_PASSWORD='${STORE_PASSWORD}' ANDROID_KEY_ALIAS='${ALIAS}' ANDROID_KEY_PASSWORD='${KEY_PASSWORD}'
     export RUNNER_TEMP='${WORK_DIR}/runner' GITHUB_WORKSPACE='${WORK_DIR}/workspace' GITHUB_ENV='${GITHUB_ENV_FILE}'
     bash '${SCRIPT}' materialize"
-if keytool -list -keystore "${WORK_DIR}/runner/private-gallery-release.jks" \
+CRLF_KEYSTORE="$(grep -E '^ANDROID_KEYSTORE_FILE=' "${GITHUB_ENV_FILE}" 2>/dev/null | head -n 1 | cut -d= -f2- || true)"
+if [[ -n "${CRLF_KEYSTORE}" ]] && keytool -list -keystore "${CRLF_KEYSTORE}" \
   -storepass "${STORE_PASSWORD}" >/dev/null 2>&1; then
   ok "the CRLF-decoded keystore is intact"
 else
-  bad "the CRLF-decoded keystore is intact"
+  bad "the CRLF-decoded keystore is intact" "path: ${CRLF_KEYSTORE:-<unset>}"
 fi
 
 echo " refuses to write secrets into the repository"
@@ -244,6 +250,109 @@ expect_fail "writing signing material into the working tree is refused" "refusin
   bash -c "export ANDROID_KEYSTORE_BASE64='${KEYSTORE_B64}' ANDROID_KEYSTORE_PASSWORD='${STORE_PASSWORD}' ANDROID_KEY_ALIAS='${ALIAS}' ANDROID_KEY_PASSWORD='${KEY_PASSWORD}'
     export RUNNER_TEMP='${WORK_DIR}/workspace/nested' GITHUB_WORKSPACE='${WORK_DIR}/workspace' GITHUB_ENV='${GITHUB_ENV_FILE}'
     bash '${SCRIPT}' materialize"
+
+# The check must compare canonical paths, not string prefixes. A prefix test
+# under-refuses for a path that leaves the workspace and comes back: it does not
+# textually start with the workspace string, yet it lands inside it, so a
+# keystore would be written into the tree that later steps upload from.
+#
+# These spellings are chosen to actually defeat a `"${dest}" == "${workspace}"*`
+# test. A path like "workspace/./nested" does NOT: it already starts with the
+# workspace string, so a prefix test catches it and the assertion would be
+# vacuous. Each spelling below has to go via a sibling segment.
+for sneaky in \
+  'elsewhere/../workspace/nested' \
+  './elsewhere/../workspace/nested' \
+  'workspace/../workspace/deep' \
+  'elsewhere/./../workspace/nested'; do
+  expect_fail "an in-workspace path spelled ${sneaky} is still refused" "refusing to write signing material" \
+    bash -c "export ANDROID_KEYSTORE_BASE64='${KEYSTORE_B64}' ANDROID_KEYSTORE_PASSWORD='${STORE_PASSWORD}' ANDROID_KEY_ALIAS='${ALIAS}' ANDROID_KEY_PASSWORD='${KEY_PASSWORD}'
+      export RUNNER_TEMP='${WORK_DIR}/${sneaky}' GITHUB_WORKSPACE='${WORK_DIR}/workspace' GITHUB_ENV='${GITHUB_ENV_FILE}'
+      bash '${SCRIPT}' materialize"
+done
+
+# Confirm the fixture is meaningful: each spelling really does canonicalise
+# inside the workspace. If this ever stopped holding, the assertions above would
+# be passing for the wrong reason.
+for sneaky in 'elsewhere/../workspace/nested' './elsewhere/../workspace/nested' 'workspace/../workspace/deep'; do
+  resolved="$(realpath -m "${WORK_DIR}/${sneaky}")"
+  if [[ "${resolved}" == "${WORK_DIR}/workspace/"* ]]; then
+    ok "the fixture ${sneaky} really resolves inside the workspace"
+  else
+    bad "the fixture ${sneaky} really resolves inside the workspace" "resolved to ${resolved}"
+  fi
+done
+
+# The mirror image: a directory whose name merely starts with the workspace name
+# is NOT inside it, and refusing it would break a legitimate layout (for example
+# a temp dir checked out next to the repo).
+expect_out "a sibling directory that shares the workspace prefix is allowed" "allowed" \
+  bash -c "export ANDROID_KEYSTORE_BASE64='${KEYSTORE_B64}' ANDROID_KEYSTORE_PASSWORD='${STORE_PASSWORD}' ANDROID_KEY_ALIAS='${ALIAS}' ANDROID_KEY_PASSWORD='${KEY_PASSWORD}'
+    export RUNNER_TEMP='${WORK_DIR}/workspace-backup' GITHUB_WORKSPACE='${WORK_DIR}/workspace' GITHUB_ENV='${GITHUB_ENV_FILE}'
+    bash '${SCRIPT}' materialize >/dev/null 2>&1 && echo allowed || echo refused"
+
+echo " keystore handling"
+# A fixed, guessable filename in the runner temp dir would hand any code running
+# in the Gradle JVM a known path to the signing key. Checked behaviourally: two
+# runs must not land on the same path.
+: >"${GITHUB_ENV_FILE}"
+env -u PRIVATE_GALLERY_RELEASE_ALLOW_EPHEMERAL_SIGNING \
+  RUNNER_TEMP="${WORK_DIR}/runner" GITHUB_WORKSPACE="${WORK_DIR}/workspace" \
+  GITHUB_ENV="${GITHUB_ENV_FILE}" bash -c "
+    export ANDROID_KEYSTORE_BASE64='${KEYSTORE_B64}' ANDROID_KEYSTORE_PASSWORD='${STORE_PASSWORD}' ANDROID_KEY_ALIAS='${ALIAS}' ANDROID_KEY_PASSWORD='${KEY_PASSWORD}'
+    bash '${SCRIPT}' materialize" >/dev/null 2>&1
+first_path="$(grep -E '^ANDROID_KEYSTORE_FILE=' "${GITHUB_ENV_FILE}" | head -n 1 | cut -d= -f2-)"
+: >"${GITHUB_ENV_FILE}"
+env -u PRIVATE_GALLERY_RELEASE_ALLOW_EPHEMERAL_SIGNING \
+  RUNNER_TEMP="${WORK_DIR}/runner" GITHUB_WORKSPACE="${WORK_DIR}/workspace" \
+  GITHUB_ENV="${GITHUB_ENV_FILE}" bash -c "
+    export ANDROID_KEYSTORE_BASE64='${KEYSTORE_B64}' ANDROID_KEYSTORE_PASSWORD='${STORE_PASSWORD}' ANDROID_KEY_ALIAS='${ALIAS}' ANDROID_KEY_PASSWORD='${KEY_PASSWORD}'
+    bash '${SCRIPT}' materialize" >/dev/null 2>&1
+second_path="$(grep -E '^ANDROID_KEYSTORE_FILE=' "${GITHUB_ENV_FILE}" | head -n 1 | cut -d= -f2-)"
+if [[ -n "${first_path}" && -n "${second_path}" && "${first_path}" != "${second_path}" ]]; then
+  ok "the keystore path is randomised per run"
+else
+  bad "the keystore path is randomised per run" "both runs used: ${first_path:-<unset>} / ${second_path:-<unset>}"
+fi
+if [[ -n "${second_path}" && "${second_path}" == "${WORK_DIR}/runner/"* ]]; then
+  ok "the randomised keystore still lives under RUNNER_TEMP"
+else
+  bad "the randomised keystore still lives under RUNNER_TEMP" "path: ${second_path:-<unset>}"
+fi
+
+# The store password must not appear in keytool's argv, where any local process
+# could read it from /proc/<pid>/cmdline.
+if grep -q '\-storepass "\${ANDROID_KEYSTORE_PASSWORD}"' "${SCRIPT}"; then
+  bad "the store password is passed to keytool via the environment, not argv" \
+    "found -storepass with the password inline"
+else
+  ok "the store password is passed to keytool via the environment, not argv"
+fi
+if grep -q 'storepass:env ANDROID_KEYSTORE_PASSWORD' "${SCRIPT}"; then
+  ok "keytool reads the store password from the environment"
+else
+  bad "keytool reads the store password from the environment" "storepass:env is not used"
+fi
+
+# umask 077 keeps the keystore we create owner-only. (GITHUB_ENV itself is
+# created by the Actions runner, not by us, so its mode is not ours to assert.)
+: >"${GITHUB_ENV_FILE}"
+env -u PRIVATE_GALLERY_RELEASE_ALLOW_EPHEMERAL_SIGNING \
+  RUNNER_TEMP="${WORK_DIR}/runner" GITHUB_WORKSPACE="${WORK_DIR}/workspace" \
+  GITHUB_ENV="${GITHUB_ENV_FILE}" bash -c "
+    export ANDROID_KEYSTORE_BASE64='${KEYSTORE_B64}' ANDROID_KEYSTORE_PASSWORD='${STORE_PASSWORD}' ANDROID_KEY_ALIAS='${ALIAS}' ANDROID_KEY_PASSWORD='${KEY_PASSWORD}'
+    bash '${SCRIPT}' materialize" >/dev/null 2>&1
+produced="$(grep -E '^ANDROID_KEYSTORE_FILE=' "${GITHUB_ENV_FILE}" 2>/dev/null | head -n 1 | cut -d= -f2- || true)"
+if [[ -n "${produced}" && -f "${produced}" ]]; then
+  perms="$(stat -c '%a' "${produced}")"
+  if [[ "${perms}" == "600" ]]; then
+    ok "the materialized keystore is owner-only (0600)"
+  else
+    bad "the materialized keystore is owner-only (0600)" "mode was ${perms}"
+  fi
+else
+  bad "the materialized keystore is owner-only (0600)" "materialize produced no keystore"
+fi
 
 echo " usage"
 expect_fail "an unknown subcommand is a usage error" "usage" bash "${SCRIPT}" nonsense

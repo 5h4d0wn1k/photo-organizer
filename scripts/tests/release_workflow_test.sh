@@ -273,6 +273,26 @@ else
   bad "the runner includes apksigner_gate_test.sh, so the signature gate is covered"
 fi
 
+echo " the signing key cannot be committed by accident"
+# The release runbook tells the maintainer to create release.jks in the working
+# directory. If git does not ignore it, a routine `git add .` publishes the
+# signing key to a public repository -- irreversibly, since it stays in history
+# after deletion, and it destroys the artifact's upgrade path. Verified with
+# `git check-ignore` rather than by grepping the ignore file, so a rule that
+# exists but does not actually work still fails here.
+for name in release.jks upload.keystore keystore.p12 server.pem; do
+  if (cd "${ROOT_DIR}" && git check-ignore -q "${name}"); then
+    ok "${name} is ignored at the repository root"
+  else
+    bad "${name} is ignored at the repository root" "git would track ${name}; 'git add .' would commit the signing key"
+  fi
+done
+if (cd "${ROOT_DIR}" && git ls-files --error-unmatch release.jks >/dev/null 2>&1); then
+  bad 'no keystore is tracked in git' 'a keystore is tracked; see git ls-files'
+else
+  ok 'no keystore is tracked in git'
+fi
+
 echo " the emulator-runner script stays a single line in the committed script too"
 # The committed script is invoked as `bash <file>`, so multi-line control flow is
 # safe there. The only thing that must not leak back into the workflow is a
