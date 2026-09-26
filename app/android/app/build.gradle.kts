@@ -31,9 +31,35 @@ val storePasswordValue = signingValue("storePassword", "ANDROID_KEYSTORE_PASSWOR
 val keyAliasValue = signingValue("keyAlias", "ANDROID_KEY_ALIAS")
 val keyPasswordValue = signingValue("keyPassword", "ANDROID_KEY_PASSWORD")
 
-val hasReleaseSigning =
+// All-or-nothing. A half-configured keystore is a mistake, and quietly ignoring
+// the part that is missing is exactly how issue #97 shipped an unsigned APK: the
+// local properties file simply did not exist in CI, so signing silently became
+// null. The CI signing script refuses partial configuration too; this is the
+// second line of defence, for local builds.
+val suppliedSigningValues =
     listOf(storeFileValue, storePasswordValue, keyAliasValue, keyPasswordValue)
-        .all { !it.isNullOrBlank() }
+val hasReleaseSigning = suppliedSigningValues.all { !it.isNullOrBlank() }
+
+if (suppliedSigningValues.any { !it.isNullOrBlank() } && !hasReleaseSigning) {
+    throw GradleException(
+        "Android release signing is only partially configured. Supply all of " +
+            "storeFile/ANDROID_KEYSTORE_FILE, storePassword/ANDROID_KEYSTORE_PASSWORD, " +
+            "keyAlias/ANDROID_KEY_ALIAS and keyPassword/ANDROID_KEY_PASSWORD, or none of them."
+    )
+}
+
+// rootProject.file() resolves a relative path against the android/ root project
+// (matching the documented private-gallery-release.properties convention) and
+// returns an absolute path unchanged, which is what CI passes in.
+val releaseStoreFile = storeFileValue?.let { rootProject.file(it) }
+
+if (hasReleaseSigning && releaseStoreFile?.isFile != true) {
+    throw GradleException(
+        "Android release keystore not found at ${releaseStoreFile?.absolutePath}. Release " +
+            "builds are signed; check ANDROID_KEYSTORE_FILE, or storeFile in " +
+            "private-gallery-release.properties."
+    )
+}
 
 android {
     namespace = "com.privategallery.app"
@@ -60,14 +86,15 @@ android {
     signingConfigs {
         if (hasReleaseSigning) {
             create("release") {
-                storeFile = rootProject.file(storeFileValue)
+                storeFile = releaseStoreFile
                 storePassword = storePasswordValue
                 keyAlias = keyAliasValue
                 keyPassword = keyPasswordValue
-                // Ship V1+V2+V3 so the APK installs on legacy sideload-capable Android
-                // as well as modern devices. Without V1 some stock installers reject
-                // the package outright ("App not installed").
-                enableV1Signing = true
+                // v2 and v3 cover every device this app supports. v1 (JAR signing)
+                // is off because minSdk is 24 and pre-24 installers do not
+                // understand v2 at all; it is switched on automatically if minSdk
+                // ever drops below 24 so the two never drift apart.
+                enableV1Signing = flutter.minSdkVersion < 24
                 enableV2Signing = true
                 enableV3Signing = true
             }
