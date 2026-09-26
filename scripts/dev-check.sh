@@ -25,3 +25,12 @@ if command -v flutter >/dev/null 2>&1; then
 else
   echo "flutter not available; skipping Flutter validation."
 fi
+
+# The Android release gate is the code that decides whether an artifact users
+# cannot install can be published. It is fast and device-free, so it always runs.
+echo
+echo "[release-gate] artifact + signing policy tests"
+if ! bash "${ROOT_DIR}/scripts/tests/run_release_gate_tests.sh"; then
+  echo "release gate tests FAILED" >&2
+  exit 1
+fi

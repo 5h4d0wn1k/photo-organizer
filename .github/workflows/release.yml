@@ -161,7 +161,18 @@ jobs:
             photo-organizer-linux-x86_64-*.AppImage
             photo-organizer_*_amd64.deb
             sbom.spdx.json
+          # Every platform job publishes into the same release, and a later job
+          # replaces the body unless it appends. Without `append_body: true`,
+          # whichever job finishes last silently deletes every other platform's
+          # signing warning — a security-disclosure regression, not cosmetics.
+          append_body: true
+          # This job owns the generated changelog. `generate_release_notes` is
+          # re-applied on every update, so exactly one job may set it or the
+          # changelog is duplicated once per platform.
           generate_release_notes: true
+          body: |
+            Linux build (AppImage + .deb). Unsigned: no GPG signature and no Debian
+            package signing were performed.
 
   windows:
     name: Windows (ZIP)
@@ -218,7 +229,7 @@ jobs:
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
         with:
           files: photo-organizer-windows-x64-*.zip
-          generate_release_notes: true
+          append_body: true
           body: |
             Windows build (unsigned). No code signing performed.
 
@@ -280,7 +291,7 @@ jobs:
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
         with:
           files: photo-organizer-macos-*.dmg
-          generate_release_notes: true
+          append_body: true
           body: |
             macOS build (unsigned). No notarization performed.
   android:
@@ -288,10 +299,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 120
     permissions:
-      contents: write
+      # This job only builds and uploads; `android-publish` owns the release.
+      contents: read
+    outputs:
+      signing_mode: ${{ steps.signing.outputs.mode }}
     steps:
       - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        uses: actions/checkout@3d3d42e5aac5ba805825da76410c181273ba90b1 # v7 
 
       - name: Set up Rust
         uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2
@@ -315,25 +329,183 @@ jobs:
           mkdir -p app/android/app/src/main/assets
           cp -R ml_sidecar app/android/app/src/main/assets/ml_sidecar
 
-      - name: Build Flutter Android APK
+      - name: Resolve Android release signing material
+        id: signing
+        # The signing policy lives in exactly one place
+        # (scripts/android_release_signing.sh) so the workflow, the local
+        # readiness check and the tests cannot drift apart.
+        #
+        # Without signing material this step FAILS the release. That is the whole
+        # point of #97: the previous workflow happily published a completely
+        # unsigned APK, which stock Android refuses with "App not installed".
+        # A throwaway key is available, but only when the repository variable
+        # PRIVATE_GALLERY_RELEASE_ALLOW_EPHEMERAL_SIGNING is explicitly enabled,
+        # because an ephemeral key cannot install over a previous release.
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          PRIVATE_GALLERY_RELEASE_ALLOW_EPHEMERAL_SIGNING: ${{ vars.PRIVATE_GALLERY_RELEASE_ALLOW_EPHEMERAL_SIGNING }}
+        run: |
+          set -euo pipefail
+          # The script writes ANDROID_KEYSTORE_* into $GITHUB_ENV and prints the
+          # resolved mode on stdout (release | ephemeral).
+          mode="$(bash scripts/android_release_signing.sh materialize | tail -n 1)"
+          case "${mode}" in
+            release) ;;
+            ephemeral)
+              echo "::warning::Signing with an ephemeral per-run CI key. This artifact installs, but a future release cannot install over it without an uninstall, which discards the paired-device identity."
+              ;;
+            *)
+              echo "::error::Unexpected signing mode '${mode}'"
+              exit 1
+              ;;
+          esac
+          echo "mode=${mode}" >> "$GITHUB_OUTPUT"
+
+      - name: Build Flutter Android APK (signed)
+        # Signing material arrives via $GITHUB_ENV from the step above, so no
+        # secret is referenced here and none can be echoed into the log.
         run: flutter build apk --release
         working-directory: app
+
+      - name: Verify APK signature (hard gate)
+        # Fail the release if the emitted APK is unsigned or signature-scheme
+        # incomplete. A signed-but-incomplete APK installs on a modern phone and
+        # fails on an older one, so the schemes are asserted explicitly instead
+        # of trusting the exit status alone: `apksigner verify` returns 0 for a
+        # v2-only APK, which the release notes would still describe as v3.
+        #
+        # The logic lives in a committed script so it is reviewable, testable
+        # and shared with scripts/tests/apksigner_gate_test.sh, which runs these
+        # exact assertions against real signed APKs.
+        run: |
+          set -euo pipefail
+          APK="app/build/app/outputs/flutter-apk/app-release.apk"
+          bash scripts/android_release_verify_signature.sh \
+            "${APK}" apksigner-verify.txt app-release.apk.sha256
 
       - name: Upload Android artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: android-artifact
-          path: app/build/app/outputs/flutter-apk/app-release.apk
+          path: |
+            app/build/app/outputs/flutter-apk/app-release.apk
+            app-release.apk.sha256
+            apksigner-verify.txt
+          if-no-files-found: error
+
+      # NOTE: publication is intentionally NOT done here. This job only builds and
+      # uploads the APK; the `android-publish` job (needs: [android, android-smoke])
+      # releases it, and only after the install+launch gate has passed.
+
+  # Installability + launchability gate for the Android artifact. Runs the EXACT
+  # APK that will be published, on a real Android system image, before any release
+  # is cut. Any install/launch/crash/render failure exits non-zero and blocks the
+  # release.
+  android-smoke:
+    name: Android install+launch smoke (API ${{ matrix.api-level }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    needs: android
+    permissions:
+      contents: read
+    strategy:
+      # One leg failing must not cancel the other: both results are evidence, and
+      # a partial matrix is more useful for diagnosis than a cancelled one.
+      fail-fast: false
+      matrix:
+        # API 30 exercises the legacy permission/storage path near minSdk 24;
+        # API 35 exercises the modern (Android 13+ granular media permission) path
+        # that most current phones actually run, close to targetSdk 36.
+        api-level: [30, 35]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3d42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Enable KVM group perms
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Download built APK artifact
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4
+        with:
+          name: android-artifact
+          path: apk
+
+      - name: Install, cold-launch, detect crash, capture evidence
+        uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2.38.0
+        with:
+          api-level: ${{ matrix.api-level }}
+          arch: x86_64
+          # google_apis (not AOSP) because the app ships mobile_scanner, which is
+          # backed by ML Kit and needs Google Play services — matching real phones.
+          target: google_apis
+          profile: pixel_2
+          disable-animations: true
+          working-directory: ${{ github.workspace }}
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
+          env:
+            ANDROID_SMOKE_NAME: android-smoke-api${{ matrix.api-level }}
+            ANDROID_SMOKE_EVIDENCE_DIR: ${{ github.workspace }}/android-smoke-evidence
+          # MUST stay a single line. This action splits its `script` input on
+          # newlines and runs each line as an independent `sh -c`, which breaks
+          # control flow, drops variables between lines, and cannot use
+          # `set -o pipefail` (dash has no pipefail). All logic therefore lives in
+          # a committed, locally tested bash script.
+          script: bash "$GITHUB_WORKSPACE/scripts/android_release_artifact_smoke.sh" "$GITHUB_WORKSPACE/apk/app-release.apk"
+
+      - name: Upload smoke evidence (screenshot, crash buffer, exit-info, logs)
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: android-smoke-evidence-api${{ matrix.api-level }}
+          path: android-smoke-evidence/
+          if-no-files-found: warn
+
+  # Publish the Android APK only after BOTH the signed build and the install+launch
+  # gate are green. This is the actual "no un-installable APK ships" guarantee (#97).
+  android-publish:
+    name: Android (publish APK)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [android, android-smoke]
+    permissions:
+      contents: write
+    steps:
+      - name: Download built APK artifact
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4
+        with:
+          name: android-artifact
+          path: apk
 
       - name: Release Android
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
         with:
-          files: app/build/app/outputs/flutter-apk/app-release.apk
-          generate_release_notes: true
+          files: |
+            apk/app-release.apk
+            apk/app-release.apk.sha256
+          # `generate_release_notes` is intentionally NOT set here: that input is
+          # re-applied on every update, so more than one job setting it would
+          # duplicate the changelog once per platform job. The `linux` job owns it.
+          append_body: true
           body: |
-            Android build (unsigned APK). Requires sideloading; signing left to the
-            app owner's own keystore intentionally — governance-first, no unsigned
-            Play Store claims.
+            Android build. Install via sideload (enable "install unknown apps" for your
+            file manager), then launch normally. Verify the download with the attached
+            app-release.apk.sha256.
+
+            Signature: verified signed by CI with `apksigner` (APK Signature Scheme v2
+            and v3) before publication. v1/JAR signing is off because minSdk is 24.
+            ${{ needs.android.outputs.signing_mode == 'release' && 'This artifact is signed with the project release key, so future versions install over it without an uninstall.' || 'This artifact is signed with an ephemeral per-run CI key, so it installs once but a future version will require uninstalling it first — which discards this device’s paired identity.' }}
+
+            Installability was additionally proven in CI on real Android system images
+            (API 30 and API 35): install, cold launch, first-frame render, and a clean
+            crash buffer / ApplicationExitInfo, with screenshots as evidence. A build
+            that failed any of those checks could not have been published.
 
   ios:
     name: iOS (unsigned .app)
@@ -385,7 +557,7 @@ jobs:
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
         with:
           files: photo-organizer-ios-*.zip
-          generate_release_notes: true
+          append_body: true
           body: |
             iOS build (unsigned .app; no codesign). Install via sideload tools or
             sign with your own Apple identity. No notarization, no App Store claim.

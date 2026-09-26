@@ -37,9 +37,12 @@
 - Repo brand = Photo Organizer.
 - Key docs = README.md, CONTRIBUTING.md, PRIVACY.md, SECURITY.md.
 - Structure = native_core (Rust daemon), app (Flutter), ml_sidecar (Python), tools/quick-face-sort (legacy face sorter).
-- Dev entry points = Makefile (fmt/lint/test/check/audit/flutter-*/release-linux-local) and scripts/dev-check.sh.
+- Dev entry points = Makefile (fmt/lint/test/check/audit/flutter-*/release-gate/release-linux-local) and scripts/dev-check.sh.
+
 ## Artifact QA (thanks to research sess-2026-09-25, applied as drop-gate)
 
 - Every release artifact must be **installed, cold-launched, non-crash-verified, and evidenced (screenshot/log artifact on the runner harness)** on at least the targets that free runners can prove (Android emulator, iOS simulator, Linux Xvfb, Windows native, macOS `.app`). Fail on install/launch/crash; any failure blocks the release tag.
 - Gates are hard (non-zero) OR explicitly degraded with reported cause — never silently skipped. If a runner cannot prove a surface (physical device, paid signing, Metal/GPU), document that it is manual/managed, do not fake it.
 - Reference OSS that already do this and are approval-compatible: LocalSend, FlClash, SQLDelight (PR.yml emulator matrix), flutter's own engine test harness (Xvfb 1280x800x24), and the iOS/Android `integration_test` screenshot carriers.
+- Current coverage: **Android is implemented and blocking.** `scripts/android_release_artifact_smoke.sh` installs the exact artifact, cold-launches it, proves a real first frame rendered, and fails on a non-empty crash buffer (Java or native `galleryd` tombstone) or an adverse `ApplicationExitInfo` reason — on API 30 and API 35. `scripts/android_release_verify_signature.sh` asserts the APK is signed with v2 **and** v3 (apksigner alone accepts a v2-only APK, so the exit status is not enough), and `scripts/android_release_signing.sh` owns the all-or-nothing signing policy. The iOS/Linux/Windows/macOS artifact gates are **not** implemented and are tracked in issue #98; never describe them as gated.
+- The gate's own logic runs on every CI run (`make release-gate`), and `scripts/tests/release_workflow_test.sh` asserts the release workflow's safety properties structurally, so the guarantee cannot be quietly removed by an unrelated edit.

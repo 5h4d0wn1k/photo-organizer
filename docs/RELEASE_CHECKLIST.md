@@ -46,6 +46,9 @@
 - `scripts/android_mobile_app_smoke.sh` installs the debug app on both phones and confirms the visible pairing workspace.
 - Profile/release APKs do not accept the `private_gallery_mobile_bearer_token` debug launch extra.
 - Release APK/AAB signing does not fall back to the debug key; release signing material is supplied through ignored local properties or external CI secrets, and `PRIVATE_GALLERY_READINESS_REQUIRE_RELEASE_SIGNING=1` passes on the release machine/CI job.
+- Android release signing is all-or-nothing: CI refuses to publish unless all four `ANDROID_KEYSTORE_*` secrets are present. A throwaway per-run key is only used when the repository variable `PRIVATE_GALLERY_RELEASE_ALLOW_EPHEMERAL_SIGNING` is explicitly enabled, and the release notes say so. There is no silent fallback, because a release that silently loses its signing key forces users to uninstall — which discards their paired-device identity.
+- The published APK is signature-verified with `apksigner` (APK Signature Scheme v2 and v3 asserted explicitly) before it can be published. v1/JAR signing is off because minSdk is 24.
+- The exact published APK is installed, cold-launched, and proven to render a first frame on real Android system images (API 30 and API 35) with a clean crash buffer and no adverse `ApplicationExitInfo`, before the release is cut. Screenshot, crash buffer, exit-info and logcat are retained as release evidence.
 - One real camera-roll item per phone is intentionally uploaded and visible from the other phone and laptop.
 
 ## Data Protection

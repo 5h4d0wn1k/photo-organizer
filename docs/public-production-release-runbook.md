@@ -131,6 +131,103 @@ If any owner is missing, do not call the release public-production ready.
    for Android release evidence and record equivalent evidence for other
    release-scoped platforms.
 
+## Android Release Signing
+
+The Android release APK is signed, and the signing key is the artifact's
+identity: lose it and users can never install an upgrade over an existing copy.
+CI therefore refuses to publish a release APK unless signing material is
+configured. It never falls back to a debug key, and it never silently downgrades
+the guarantee.
+
+### One-time setup
+
+Create the key once and keep it somewhere private and backed up:
+
+```bash
+keytool -genkeypair -v \
+  -keystore release.jks -storetype PKCS12 \
+  -keyalg RSA -keysize 4096 -validity 10000 \
+  -alias photo-organizer \
+  -storepass '<store password>' -keypass '<key password>' \
+  -dname "CN=Photo Organizer, O=Photo Organizer, C=NA"
+```
+
+Then publish it to the repository as four secrets:
+
+```bash
+gh secret set ANDROID_KEYSTORE_BASE64   < <(base64 -w0 release.jks)
+gh secret set ANDROID_KEYSTORE_PASSWORD -- '<store password>'
+gh secret set ANDROID_KEY_ALIAS         -- 'photo-organizer'
+gh secret set ANDROID_KEY_PASSWORD      -- '<key password>'
+```
+
+`release.jks` itself stays local and is never committed. The CI job decodes the
+keystore into the runner's temp directory, never into the working tree, and
+validates that it opens with the configured password before Gradle runs.
+
+Verify locally without publishing anything:
+
+```bash
+PRIVATE_GALLERY_READINESS_REQUIRE_RELEASE_SIGNING=1 \
+ANDROID_KEYSTORE_FILE="$PWD/release.jks" \
+ANDROID_KEYSTORE_PASSWORD='<store password>' \
+ANDROID_KEY_ALIAS=photo-organizer \
+ANDROID_KEY_PASSWORD='<key password>' \
+  bash scripts/production-readiness-check.sh
+```
+
+### Policy
+
+`scripts/android_release_signing.sh` is the single source of truth, and it is
+strict on purpose:
+
+| Secrets present | Result |
+| --- | --- |
+| all four | `release` — upgrade-stable artifact |
+| none | release **fails** with setup instructions |
+| some but not all | release **always fails**; a half-configured keystore is a mistake, never a fallback |
+| none, with `PRIVATE_GALLERY_RELEASE_ALLOW_EPHEMERAL_SIGNING=true` | `ephemeral` — installable, but a throwaway per-run key |
+
+The ephemeral mode exists for deliberate throwaway tags only. Because the key
+is regenerated every run, the next release cannot install over it, so Android
+requires an uninstall first — and uninstalling discards `flutter_secure_storage`,
+which holds the mobile bearer token and cloud group/device identity, forcing a
+full re-pair with the desktop daemon. The release notes state this in as many
+words whenever ephemeral signing is used.
+
+### What the release pipeline proves
+
+Before a tag can publish an APK, all of the following must pass:
+
+1. `scripts/android_release_verify_signature.sh` succeeds, which means
+   `apksigner verify` passed **and** APK Signature Scheme **v2 and v3** were both
+   asserted present. The schemes are asserted explicitly because `apksigner`
+   itself returns 0 for a v2-only APK — trusting the exit status alone would let
+   an artifact ship that the release notes describe as v3. (v1/JAR signing is
+   off because minSdk is 24; the Gradle config turns it on automatically if
+   minSdk ever drops below 24, and the gate would then correctly reject a build
+   with no v2 signature.)
+2. The exact APK is installed on Android system images at **API 30 and API 35**,
+   cold-launched, and proven to have rendered a real first frame.
+3. The Android crash buffer is empty afterwards — which also catches a native
+   SIGSEGV in the Rust `galleryd` daemon, since a native crash never appears as a
+   Java `FATAL EXCEPTION`.
+4. Android recorded no adverse `ApplicationExitInfo` (crash, native crash, ANR,
+   or initialization failure) relative to a pre-launch baseline.
+5. Screenshot, crash buffer, exit-info dump, `apksigner` transcript and a
+   `sha256` checksum are uploaded as evidence, and the checksum records the bare
+   filename so a user can verify it with `sha256sum -c`.
+
+Any failure blocks the release. Both gates are committed scripts rather than
+inline workflow logic, and both are covered on every CI run by
+`make release-gate`: `apksigner_gate_test.sh` links real APKs with `aapt2`, signs
+them with a throwaway key and runs the real signature gate over an unsigned, a
+v1-only, a v2-only and a correct v2+v3 artifact, while
+`android_release_artifact_smoke_test.sh` does the same for the emulator gate.
+`release_workflow_test.sh` additionally asserts structurally that the workflow
+still delegates to those scripts, so the guarantee cannot be removed by an
+unrelated edit.
+
 ## Remote Boundary Verification
 
 Use Tailscale/HTTPS for private mobile/local-web sync where available. Expose
