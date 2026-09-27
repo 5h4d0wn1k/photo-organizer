@@ -218,16 +218,27 @@ Before a tag can publish an APK, all of the following must pass:
    off because minSdk is 24; the Gradle config turns it on automatically if
    minSdk ever drops below 24, and the gate would then correctly reject a build
    with no v2 signature.)
-2. The exact APK is installed on Android system images at **API 30 and API 35**,
-   cold-launched, and proven to have rendered a real first frame.
-3. The Android crash buffer is empty afterwards — which also catches a native
+2. The APK carries native libraries for **arm64-v8a** and **armeabi-v7a**. This is
+   checked structurally, by reading the archive, *before* the device is touched —
+   see the limitation in point 7 for why it cannot be left to the emulator.
+3. The exact APK is installed on Android system images at **API 30 and API 35**,
+   cold-launched, and a window is proven to have rendered a stable, non-blank
+   frame: a capture must be visually complex *and* byte-identical across two
+   consecutive captures, which rejects a blank screen and a screen mid-transition.
+4. The Android crash buffer is empty afterwards — which also catches a native
    SIGSEGV in the Rust `galleryd` daemon, since a native crash never appears as a
    Java `FATAL EXCEPTION`.
-4. Android recorded no adverse `ApplicationExitInfo` (crash, native crash, ANR,
-   or initialization failure) relative to a pre-launch baseline.
-5. Screenshot, crash buffer, exit-info dump, `apksigner` transcript and a
+5. Android recorded no adverse `ApplicationExitInfo` (crash, native crash, ANR,
+   or initialization failure) relative to a pre-launch baseline. If the baseline
+   itself could not be read, the comparison is replaced by the strictly stronger
+   requirement of *zero* adverse entries, so an unreadable baseline can only ever
+   make this check harder to pass.
+6. Screenshot, crash buffer, exit-info dump, `apksigner` transcript and a
    `sha256` checksum are uploaded as evidence, and the checksum records the bare
-   filename so a user can verify it with `sha256sum -c`.
+   filename so a user can verify it with `sha256sum -c`. The job that publishes
+   the APK re-derives the checksum and re-asserts the v2+v3 signature on exactly
+   the file it attaches, and the materialized signing key is removed from the
+   runner afterwards — including when the build fails.
 
 Any failure blocks the release. Both gates are committed scripts rather than
 inline workflow logic, and both are covered on every CI run by
@@ -238,6 +249,28 @@ v1-only, a v2-only and a correct v2+v3 artifact, while
 `release_workflow_test.sh` additionally asserts structurally that the workflow
 still delegates to those scripts, so the guarantee cannot be removed by an
 unrelated edit.
+
+### What this does not prove
+
+Stated explicitly, because a gate that overstates itself is worse than no gate:
+
+- **The rendered frame came from the app, not from the launch theme.** On API 31+
+  the system splash is drawn *inside the app's own window*, so it is focused, it
+  is far above the colour threshold, and it is perfectly stable across captures.
+  The render check therefore cannot distinguish the two. Excluding it requires a
+  Flutter-owned surface from `dumpsys SurfaceFlinger --list`, or the semantics
+  tree via `uiautomator`, which requires an accessibility service and is
+  unavailable in CI. This is a known, unmitigated false pass.
+- **The APK installs on an arm device.** The matrix runs x86_64 images because
+  there is no free hosted arm64 emulator. Point 2 is the structural substitute,
+  and it checks *packaging*, not that the libraries load or link correctly on
+  real hardware.
+- **The app works.** The gate proves it installs, launches, does not crash, and
+  draws something. It says nothing about whether the UI is correct, whether
+  features work, or whether the daemon is reachable.
+- **The signing key is the same one as the last release.** #101 tracks that. The
+  pipeline records the certificate digest in the evidence so the comparison *can*
+  be made, but it does not fail when the digest changes.
 
 ## Remote Boundary Verification
 

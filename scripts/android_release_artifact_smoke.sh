@@ -35,8 +35,30 @@
 #
 #   * "Launched" is not the same as "rendered". `am start -W` and a live PID
 #     both succeed while the app is still showing its launch theme, or stuck on
-#     a blank frame. The gate therefore decodes the screenshot and requires real
-#     image complexity, which proves pixels were drawn by the app.
+#     a blank frame. The gate therefore decodes the screenshot and requires a
+#     frame that is visually complex AND byte-identical across two consecutive
+#     captures, which rejects a blank screen, a screen mid-transition, and a
+#     screen that never settles.
+#
+#   * LIMITATION, stated rather than papered over: on API 31+ the system splash
+#     screen is drawn *inside the app's own window*, so it is focused, and a
+#     launcher icon on a background is far above the colour threshold. A splash is
+#     also perfectly stable, so the two-consecutive-capture check does not
+#     exclude it either. This gate therefore cannot prove the pixels came from
+#     the app's own UI rather than from the launch theme. Excluding it needs a
+#     Flutter-owned surface identified via `dumpsys SurfaceFlinger --list`, or
+#     the semantics tree via `uiautomator`, which needs an accessibility service
+#     and is therefore unavailable in CI. A colour threshold loose enough to
+#     catch the splash would be wrong in the lenient direction, which is the same
+#     false pass the gate exists to prevent, so the limitation is recorded
+#     instead of guessed at.
+#
+#   * The smoke matrix runs x86_64 system images only, because there is no free
+#     hosted arm64 emulator. The emulator can therefore only ever prove the
+#     x86_64 slice of the APK. Native ABIs are checked structurally from the
+#     archive before the device is touched, because an APK carrying only the
+#     emulator's ABI installs perfectly on the runner and fails on every real
+#     phone.
 #
 #   * Flutter only populates the accessibility tree when an accessibility
 #     service is active, so `uiautomator dump` cannot be relied on to assert on
@@ -68,6 +90,30 @@ MIN_DISTINCT_COLORS="${ANDROID_SMOKE_MIN_DISTINCT_COLORS:-32}"
 EVIDENCE_DIR="${ANDROID_SMOKE_EVIDENCE_DIR:-.}"
 SMOKE_NAME="${ANDROID_SMOKE_NAME:-android-smoke}"
 POLL_INTERVAL_SECONDS="${ANDROID_SMOKE_POLL_INTERVAL_SECONDS:-2}"
+
+# Native ABIs the release APK must carry, so it installs on real hardware.
+#
+# arm64-v8a is every current phone; armeabi-v7a is the 32-bit ABI Android still
+# requires a build to support down to API 24 (minSdk here), and it is the one most
+# likely to be dropped by an over-eager cross-compile change, because 64-bit-only
+# builds are the norm. x86_64 is in the list only because the smoke matrix runs
+# x86_64 images -- it is not a shipping target, and its presence here is not
+# evidence that it works.
+#
+# Overridable so the structural test can exercise the failure path without
+# building a real multi-ABI APK, and so a platform that genuinely drops an ABI can
+# say so in one place instead of by deleting the assertion.
+#
+# Read as a space-separated string and split deliberately, so the whole default
+# arrives as a single argument (quoting the default inside the `:-` would make it
+# one ABI literally named "arm64-v8a armeabi-v7a"). The split is on whitespace via
+# an unquoted expansion, which is the one place in this script where that is the
+# intended behaviour.
+read -r -a REQUIRED_ABIS <<<"${ANDROID_SMOKE_REQUIRED_ABIS:-arm64-v8a armeabi-v7a}"
+if ((${#REQUIRED_ABIS[@]} == 0)); then
+  echo "ERROR: ANDROID_SMOKE_REQUIRED_ABIS is set but empty; refusing to check no ABIs at all" >&2
+  exit 2
+fi
 
 # Runtime permissions the app can ask for. Granting them up front keeps a system
 # permission dialog from stealing window focus during the launch assertion. The
@@ -611,6 +657,46 @@ await_settled_app_frame() {
   return 1
 }
 
+assert_native_abis_present() {
+  local apk="$1" abi
+  # The smoke matrix runs on x86_64 emulator images only -- there is no free
+  # hosted arm64 emulator -- so the emulator can only ever prove the x86_64 slice
+  # of the APK. An APK carrying only x86_64 libraries installs perfectly on that
+  # image and fails on every real phone, which is the exact class of bug this gate
+  # exists to catch. The native half therefore has to be checked structurally,
+  # from the archive itself, or it is not checked at all.
+  #
+  # The APK is a zip. `unzip -Z1` lists the archive without extracting it, so this
+  # costs nothing on a device-free runner. When `unzip` is unavailable the check
+  # is skipped with a warning rather than failing: an absent tool is a degraded
+  # verification, and it is reported as one instead of being silently skipped.
+  if ! command -v unzip >/dev/null 2>&1; then
+    printf '::warning::unzip is not available; cannot verify the APK contains native libraries for real devices\n'
+    return 0
+  fi
+  local entries
+  entries="$(unzip -Z1 "${apk}" 2>/dev/null)" || {
+    printf '::warning::could not list the APK archive; cannot verify native ABIs\n'
+    return 0
+  }
+  # An APK with no lib/ entries at all is a Java-only build and genuinely has no
+  # ABI problem, so this is not itself a failure. The daemon ships native code, so
+  # the gate also says so when it finds none, which turns a silent packaging
+  # regression (a dropped jniLibs) into a visible warning.
+  if ! grep -q '^lib/' <<<"${entries}"; then
+    log "::warning::the APK contains no lib/ entries; it is a Java-only build with no native ABI to verify"
+    return 0
+  fi
+  for abi in "${REQUIRED_ABIS[@]}"; do
+    if grep -q "^lib/${abi}/" <<<"${entries}"; then
+      log "native ABI present: ${abi}"
+    else
+      printf '::error::the APK contains no lib/%s/ entries. The emulator matrix only runs x86_64 images, so this cannot be caught by installing it: on a real arm device the install would fail with INSTALL_FAILED_NO_MATCHING_ABIS. The native libraries are cross-compiled by the cargo-ndk step in the android job.\n' "${abi}" >&2
+      fail "the APK is missing native libraries for ${abi}"
+    fi
+  done
+}
+
 main() {
   local apk="${1:-}" baseline
   if [[ -z "${apk}" ]]; then
@@ -619,6 +705,11 @@ main() {
   fi
   [[ -f "${apk}" ]] || fail "APK not found: ${apk}"
   [[ -s "${apk}" ]] || fail "APK is empty: ${apk}"
+
+  # Before the device is touched, so a packaging regression is reported as
+  # "wrong ABIs" rather than as a mysterious install failure twenty minutes
+  # after the emulator boots.
+  assert_native_abis_present "${apk}"
 
   require_tool "${ADB}"
   require_tool python3

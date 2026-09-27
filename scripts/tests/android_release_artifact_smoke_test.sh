@@ -363,6 +363,24 @@ run_smoke_missing_apk() {
     bash "${SCRIPT}" "${WORK_DIR}/does-not-exist.apk"
 }
 
+run_smoke_on() {
+  local apk="$1"
+  shift
+  env \
+    ANDROID_SMOKE_ADB="${WORK_DIR}/adb" \
+    SMOKE_WORK_DIR="${WORK_DIR}" \
+    ANDROID_SMOKE_EVIDENCE_DIR="${WORK_DIR}/evidence" \
+    ANDROID_SMOKE_NAME="case" \
+    ANDROID_SMOKE_BOOT_TIMEOUT_SECONDS="${SMOKE_BOOT_TIMEOUT:-10}" \
+    ANDROID_SMOKE_LAUNCH_TIMEOUT_SECONDS="${SMOKE_LAUNCH_TIMEOUT:-10}" \
+    ANDROID_SMOKE_RENDER_TIMEOUT_SECONDS="${SMOKE_RENDER_TIMEOUT:-6}" \
+    ANDROID_SMOKE_POLL_INTERVAL_SECONDS=1 \
+    FAKE_ADB_SCENARIO="${SCENARIO}" \
+    FAKE_ADB_STATE="${FAKE_STATE}" \
+    "$@" \
+    bash "${SCRIPT}" "${apk}"
+}
+
 run_smoke_no_args() {
   env ANDROID_SMOKE_ADB="${WORK_DIR}/adb" FAKE_ADB_SCENARIO="${SCENARIO}" bash "${SCRIPT}"
 }
@@ -377,7 +395,47 @@ make_png "${WORK_DIR}/blank.png" 1
 # blank and the stability check would never be exercised.
 make_png "${WORK_DIR}/rich-drift.png" 41
 printf 'not a png at all' >"${WORK_DIR}/garbage.png"
-printf 'fake apk bytes\n' >"${WORK_DIR}/app-release.apk"
+
+# The gate reads the APK's native ABIs out of the archive before it touches the
+# device, so the fixture has to be a real zip rather than arbitrary bytes --
+# `unzip -Z1` on a non-archive either errors or prints nothing, and the check
+# would then be skipped in every test rather than exercised.
+#
+# Built with Python's stdlib zipfile so the suite needs no `zip` tool. The
+# three variants are the packaging regressions the check exists for: both real
+# device ABIs present, only the emulator's ABI (installs on CI, fails on every
+# real phone), and no native code at all (a dropped jniLibs step).
+make_apk() {
+  python3 - "$1" "${@:2}" <<'PY'
+import sys
+import zipfile
+
+path = sys.argv[1]
+abis = sys.argv[2:]
+with zipfile.ZipFile(path, "w") as archive:
+    archive.writestr("AndroidManifest.xml", "<manifest package='com.privategallery.app'/>")
+    archive.writestr("classes.dex", "fake dex")
+    for abi in abis:
+        archive.writestr(f"lib/{abi}/libgalleryd.so", f"fake native library for {abi}")
+PY
+}
+
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "SKIP: the APK ABI check needs python3 (also needed by the gate's PNG decoder)"
+  exit 0
+fi
+make_apk "${WORK_DIR}/app-release.apk" arm64-v8a armeabi-v7a x86_64
+make_apk "${WORK_DIR}/apk-x86-only.apk" x86_64
+make_apk "${WORK_DIR}/apk-no-native.apk"
+
+# The fixture must really contain what the passing test assumes, or every ABI
+# assertion below would be satisfied by an empty archive.
+if unzip -Z1 "${WORK_DIR}/app-release.apk" 2>/dev/null | grep -q '^lib/arm64-v8a/libgalleryd.so$'; then
+  ok "the default APK fixture is a real archive carrying an arm64-v8a library"
+else
+  bad "the default APK fixture is a real archive carrying an arm64-v8a library" \
+    "unzip cannot see the entry the ABI check is supposed to find"
+fi
 
 : >"${WORK_DIR}/empty-exit-info.txt"
 
@@ -447,6 +505,65 @@ expect_pass "installs, cold-launches, renders, and passes" run_smoke
 echo " argument and input validation"
 expect_fail "no APK argument is a usage error" "usage" run_smoke_no_args
 expect_fail "a missing APK file fails fast" "APK not found" run_smoke_missing_apk
+
+echo " native ABIs (the emulator matrix is x86_64-only, so this cannot be caught by installing)"
+# Both smoke legs run x86_64 system images, because there is no free hosted arm64
+# emulator. So the emulator can only ever prove the x86_64 slice: an APK carrying
+# just that slice installs perfectly on the runner and fails on every real phone
+# with INSTALL_FAILED_NO_MATCHING_ABIS. The archive is therefore checked directly.
+if run_smoke_on "${WORK_DIR}/apk-x86-only.apk" >"${WORK_DIR}/abi.log" 2>&1; then
+  bad "an APK with only the emulator's ABI is rejected" \
+    "the gate passed an APK that cannot install on any real device"
+else
+  if grep -q "missing native libraries for arm64-v8a" "${WORK_DIR}/abi.log"; then
+    ok "an APK with only the emulator's ABI is rejected"
+  else
+    bad "an APK with only the emulator's ABI is rejected" \
+      "it failed, but not for the ABI reason: $(tr '\n' '|' <"${WORK_DIR}/abi.log")"
+  fi
+fi
+# The failure has to name the ABI that is missing, or whoever reads the log cannot
+# tell which cross-compile target to add back.
+if grep -q "missing native libraries for armeabi-v7a" \
+  <(ANDROID_SMOKE_REQUIRED_ABIS="armeabi-v7a" run_smoke_on "${WORK_DIR}/apk-x86-only.apk" 2>&1); then
+  ok "the ABI failure names the missing ABI, not just 'install failed'"
+else
+  bad "the ABI failure names the missing ABI, not just 'install failed'" \
+    "the message did not identify armeabi-v7a"
+fi
+# The 32-bit ABI is the one a cross-compile change drops first, so assert it
+# individually rather than only as part of the combined default.
+if ANDROID_SMOKE_REQUIRED_ABIS="armeabi-v7a" \
+  run_smoke_on "${WORK_DIR}/app-release.apk" >/dev/null 2>&1; then
+  ok "an APK carrying both real device ABIs passes the ABI check"
+else
+  bad "an APK carrying both real device ABIs passes the ABI check" "the good fixture was rejected"
+fi
+# A Java-only build has no ABI problem, so it must not fail -- but a dropped
+# jniLibs step is exactly that regression, and it has to be visible rather than
+# silently accepted. Asserted as a warning, not an error.
+if run_smoke_on "${WORK_DIR}/apk-no-native.apk" >"${WORK_DIR}/no-native.log" 2>&1; then
+  if grep -q "no lib/ entries" "${WORK_DIR}/no-native.log"; then
+    ok "an APK with no native code passes but is reported as a packaging warning"
+  else
+    bad "an APK with no native code passes but is reported as a packaging warning" \
+      "passed with no warning; a dropped jniLibs step would be invisible"
+  fi
+else
+  bad "an APK with no native code passes but is reported as a packaging warning" \
+    "a Java-only build must not be a failure; $(tr '\n' '|' <"${WORK_DIR}/no-native.log")"
+fi
+# A passing run must say which ABIs it found, not just that nothing was missing.
+# A reader diagnosing "does this build support my phone?" should be able to answer
+# from the log without unzipping the artifact themselves.
+if run_smoke_on "${WORK_DIR}/app-release.apk" >"${WORK_DIR}/abi-pass.log" 2>&1 &&
+  grep -q "native ABI present: arm64-v8a" "${WORK_DIR}/abi-pass.log" &&
+  grep -q "native ABI present: armeabi-v7a" "${WORK_DIR}/abi-pass.log"; then
+  ok "the ABI check reports each ABI it found"
+else
+  bad "the ABI check reports each ABI it found" \
+    "a passing run did not name both ABIs: $(tr '\n' '|' <"${WORK_DIR}/abi-pass.log")"
+fi
 
 echo " install failures (the issue #97 class of failure)"
 scenario_with "INSTALL_OUTPUT=Failure [INSTALL_PARSE_FAILED_NO_CERTIFICATES]"

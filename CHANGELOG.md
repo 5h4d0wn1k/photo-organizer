@@ -24,7 +24,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   publishing an unsigned APK. A throwaway per-run key is possible only via the
   explicit `PRIVATE_GALLERY_RELEASE_ALLOW_EPHEMERAL_SIGNING` repository
   variable, and the release notes say so when it is used.
-- `scripts/tests/` — device-free tests for the release gate itself (168
+- `scripts/tests/` — device-free tests for the release gate itself (174
   assertions), run in CI via the "Release gate" job and locally with
   `make release-gate`. `release_workflow_test.sh` asserts the release
   workflow's safety properties structurally, so the guarantee cannot be removed
@@ -112,6 +112,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The keystore size check and the permission assertion used `stat -c`, which is
   GNU coreutils and does not exist on macOS or BSD. Both use POSIX equivalents
   (`wc -c` and `ls -l`).
+- The emulator matrix runs x86_64 images — there is no free hosted arm64 emulator
+  — so it could only ever prove the x86_64 slice of the APK. An APK carrying only
+  that slice installs perfectly on the runner and fails on every real phone with
+  `INSTALL_FAILED_NO_MATCHING_ABIS`, and nothing in the pipeline would have
+  noticed. The gate now reads the archive and requires `arm64-v8a` and
+  `armeabi-v7a` before the device is touched, so the diagnosis is the packaging
+  regression rather than an install failure minutes after boot. A Java-only APK
+  still passes, but is reported: a dropped `jniLibs` step is visible instead of
+  silent.
+- The runbook and `AGENTS.md` now state plainly what the render gate does **not**
+  prove. On API 31+ the system splash is drawn inside the app's own window, so it
+  is focused, visually complex and stable — indistinguishable from the app's first
+  frame by this method. That false pass is documented rather than papered over
+  with a threshold loose enough to be wrong in the lenient direction.
 - Values written to `$GITHUB_ENV` are rejected if they contain a newline or a
   carriage return. `GITHUB_ENV` is a newline-delimited `KEY=VALUE` file, so an
   embedded line break turns a value into additional environment variables for
