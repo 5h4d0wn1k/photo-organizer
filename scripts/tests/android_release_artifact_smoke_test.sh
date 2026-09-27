@@ -95,6 +95,62 @@ value_or() {
   scenario_value "$1" || printf '%s' "${2:-}"
 }
 
+# True when haystack contains, contiguously, any of the ';'-separated patterns held
+# in the named scenario variable. The haystack is passed in rather than read from
+# "$*", because inside this function "$*" is the helper's own argument list -- the
+# one key name -- not the adb command line being matched. Patterns contain spaces
+# ("dumpsys activity exit-info"), so the split is done with IFS=';' rather than a
+# bare unquoted expansion, which would also split on those spaces and never match a
+# multi-word pattern.
+matches_failure_pattern() {
+  local key="$1" haystack="$2" list pattern
+  list="$(scenario_value "${key}" 2>/dev/null || printf '')"
+  [[ -n "${list}" ]] || return 1
+  local IFS=';'
+  # shellcheck disable=SC2086 # the split on ';' is the point; IFS is set above
+  for pattern in ${list}; do
+    [[ -n "${pattern}" ]] || continue
+    if [[ "${haystack}" == *" ${pattern} "* ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Models a device that cannot answer: the emulator died, or the adb server was lost
+# mid-run. The caller then sees an empty stdout and a non-zero status, which is
+# exactly what a dead adb looks like.
+#
+# This is the case that used to be indistinguishable from a clean device. Both
+# crash gates parse a string, and an empty string parses as "zero adverse exits" and
+# "empty crash buffer" -- so a lost adb reported a *passing* crash check.
+adb_should_fail() {
+  # The launch boundary is the buffer clear the real gate makes immediately before
+  # `am start`. ADB_FAIL_AFTER_LAUNCH_ONLY and ADB_FAIL_BEFORE_LAUNCH_ONLY hold
+  # ';'-separated patterns scoped to one side of it, so the pre-launch and
+  # post-launch halves of the exit-info gate can be broken independently to test
+  # the baseline fallback. Scoping must be pattern-based: failing *every* command
+  # after launch would break the focus and screenshot reads first, and the run
+  # would fail long before the gate the scenario is meant to exercise.
+  # "$*" here is the adb command line, which is what the pattern is matched
+  # against. The leading and trailing spaces turn the match into a whole-token one.
+  # Each arm ends in an explicit `return`, never a bare status: a trailing
+  # `return 1` after the last call would silently discard the match it just made,
+  # and the scenario would then be indistinguishable from the passing case.
+  if [[ -f "${FAKE_ADB_STATE}" ]]; then
+    if matches_failure_pattern ADB_FAIL " $* "; then
+      return 0
+    fi
+    matches_failure_pattern ADB_FAIL_AFTER_LAUNCH_ONLY " $* "
+    return $?
+  fi
+  if matches_failure_pattern ADB_FAIL " $* "; then
+    return 0
+  fi
+  matches_failure_pattern ADB_FAIL_BEFORE_LAUNCH_ONLY " $* "
+  return $?
+}
+
 args=("$@")
 verb=""
 for candidate in shell exec-out logcat install getprop pidof pm; do
@@ -105,6 +161,11 @@ for candidate in shell exec-out logcat install getprop pidof pm; do
   fi
 done
 
+if adb_should_fail "$@"; then
+  printf 'adb: device offline (simulated)\n' >&2
+  exit 1
+fi
+
 emit_exit_info() {
   if [[ -f "${FAKE_ADB_STATE}" ]]; then
     local after
@@ -114,8 +175,7 @@ emit_exit_info() {
       return 0
     fi
   fi
-  local before
-  before="$(scenario_value EXIT_INFO || true)"
+  local before  before="$(scenario_value EXIT_INFO || true)"
   if [[ -n "${before}" && -f "${before}" ]]; then
     cat "${before}"
   fi
@@ -343,6 +403,24 @@ cat >"${WORK_DIR}/crash-other-app.txt" <<'EOF'
 09-26 00:00:03.000  500  500 E AndroidRuntime: Process: com.android.systemui, PID: 500
 EOF
 
+# A realistic exit-info dump that is *not* blank and contains no adverse reason.
+# This is the case that exercises the baseline comparison: an empty file is
+# indistinguishable from the service being absent, and the gate returns early for
+# that. Without this fixture the "no baseline available, so zero is required"
+# fallback is only ever reachable on a device that has no exit-info at all, which
+# would make the fallback path untested.
+cat >"${WORK_DIR}/clean-exit-info.txt" <<'EOF'
+ACTIVITY MANAGER LRU PROCESSES (dumpsys activity exit-info)
+  Historical Process Exit for com.privategallery.app
+    ApplicationExitInfo #0:
+      timestamp=2026-09-26T00:00:01.000Z
+      reason=1 (REASON_USER_REQUESTED)
+      status=0
+      importance=1000
+      pss=0KB
+      rss=0KB
+EOF
+
 cat >"${SCENARIO}" <<EOF
 BOOTED=1
 PACKAGE=com.privategallery.app
@@ -449,6 +527,69 @@ scenario_with "EXIT_INFO=${WORK_DIR}/anr-exit-info.txt" \
   "EXIT_INFO_AFTER=${WORK_DIR}/anr-exit-info.txt"
 expect_pass "a pre-existing adverse entry does not fail the gate" run_smoke
 scenario_with "EXIT_INFO=${WORK_DIR}/empty-exit-info.txt"
+
+echo " a device that cannot answer is not a clean device"
+# Both crash gates parse a string. An adb that died mid-run returns an empty string
+# with a non-zero status, and empty parses as "zero adverse exits" and "empty crash
+# buffer" -- so a lost adb used to produce a *passing* crash check. These are the
+# two gates in the whole script whose failure direction is the dangerous one, so
+# they must distinguish "the device said nothing is wrong" from "I could not ask".
+scenario_with "ADB_FAIL=logcat -b crash"
+expect_fail "an unreadable crash buffer fails the gate rather than reporting clean" \
+  "refusing to report a crash check that never ran" run_smoke
+scenario_with "ADB_FAIL="
+
+scenario_with "ADB_FAIL=dumpsys activity exit-info"
+expect_fail "an unreadable ApplicationExitInfo fails the gate rather than reporting clean" \
+  "refusing to report a crash check that never ran" run_smoke
+scenario_with "ADB_FAIL="
+
+# Losing the device before the render wait must also fail rather than being read as
+# "the app never took focus" -- it does fail, but for the right reason only if the
+# focus check propagates the adb status instead of treating the empty dump as an
+# unfocused window. Same verdict either way, so this asserts the status is
+# propagated, not just that something failed.
+scenario_with "ADB_FAIL=dumpsys window"
+expect_fail "a failed focus probe does not read as a focused app" "never took window focus" run_smoke
+scenario_with "ADB_FAIL="
+
+# With the pre-launch read broken but the post-launch read working, the gate must
+# fall back to the *stronger* requirement (zero adverse entries outright) rather
+# than comparing against a baseline that was never taken. ADB_FAIL_BEFORE_LAUNCH_ONLY
+# is what makes this case reachable: failing both reads would exercise the
+# unreadable-dump path instead, and failing only the post-launch read has nothing to
+# do with the baseline.
+scenario_with "EXIT_INFO_AFTER=${WORK_DIR}/anr-exit-info.txt" \
+  "ADB_FAIL_BEFORE_LAUNCH_ONLY=dumpsys activity exit-info"
+expect_fail "an adverse exit with no baseline is not excused" \
+  "no pre-launch baseline" run_smoke
+scenario_with "EXIT_INFO_AFTER=${WORK_DIR}/clean-exit-info.txt" \
+  "ADB_FAIL_BEFORE_LAUNCH_ONLY=dumpsys activity exit-info"
+expect_pass "an unavailable baseline with no adverse entries still passes" run_smoke
+scenario_with "ADB_FAIL_BEFORE_LAUNCH_ONLY="
+scenario_with "EXIT_INFO_AFTER=${WORK_DIR}/empty-exit-info.txt"
+
+# ...and that fallback must actually be reachable, i.e. a working post-launch read
+# with a broken pre-launch read must not be reported as a clean comparison. The
+# exit-info fixture is set on both sides so the post-launch dump is real rather
+# than blank: a blank dump is a different case (the API level has no exit-info) and
+# would return before the baseline is ever consulted.
+scenario_with "EXIT_INFO=${WORK_DIR}/clean-exit-info.txt" \
+  "EXIT_INFO_AFTER=${WORK_DIR}/clean-exit-info.txt" \
+  "ADB_FAIL_BEFORE_LAUNCH_ONLY=dumpsys activity exit-info"
+if run_smoke >"${WORK_DIR}/baseline-lost.log" 2>&1; then
+  if grep -q "no baseline available so zero is required" "${WORK_DIR}/baseline-lost.log"; then
+    ok "a lost pre-launch baseline is stated in the run log, not silently treated as zero"
+  else
+    bad "a lost pre-launch baseline is stated in the run log, not silently treated as zero" \
+      "the run passed without saying the baseline was unavailable; log: $(tr '\n' '|' <"${WORK_DIR}/baseline-lost.log")"
+  fi
+else
+  bad "a lost pre-launch baseline is stated in the run log, not silently treated as zero" \
+    "the run failed, so the fallback path is unreachable; log: $(tr '\n' '|' <"${WORK_DIR}/baseline-lost.log")"
+fi
+scenario_with "ADB_FAIL_BEFORE_LAUNCH_ONLY="
+scenario_with "EXIT_INFO_AFTER=${WORK_DIR}/empty-exit-info.txt"
 
 echo " rendering"
 # A blank (single-colour) screen is never accepted, however long it persists: two

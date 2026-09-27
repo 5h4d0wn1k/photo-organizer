@@ -190,7 +190,10 @@ materialize_release_keystore() {
     rm -f "${destination}"
     exit 1
   }
-  if [[ ! -s "${destination}" || "$(stat -c %s "${destination}")" -lt "${MIN_KEYSTORE_BYTES}" ]]; then
+  # `wc -c` rather than `stat -c %s`: the `-c` form is GNU coreutils and does not
+  # exist on BSD/macOS, where this script is also used to prepare a local release.
+  # `wc -c` is POSIX and prints the same byte count on both.
+  if [[ ! -s "${destination}" || "$(wc -c <"${destination}" | tr -d '[:space:]')" -lt "${MIN_KEYSTORE_BYTES}" ]]; then
     echo "ERROR: the decoded keystore is empty or implausibly small; the secret is truncated or corrupt." >&2
     rm -f "${destination}"
     exit 1
@@ -283,6 +286,11 @@ main() {
       local mode destination
       mode="$(resolve_mode)"
       destination="$(keystore_destination)"
+      # The key deliberately outlives this process: `materialize` writes the path to
+      # GITHUB_ENV and a *later* process -- the Gradle build -- is what reads it. An
+      # EXIT trap that removed the file would delete the signing key between
+      # materialize and the build, so cleanup belongs to the build job, after the
+      # build, where it is guarded by `if: always()`.
       if [[ "${mode}" == "release" ]]; then
         materialize_release_keystore "${destination}"
         export_to_github_env "${destination}" "${ANDROID_KEYSTORE_PASSWORD}" "${ANDROID_KEY_ALIAS}" "${ANDROID_KEY_PASSWORD}"

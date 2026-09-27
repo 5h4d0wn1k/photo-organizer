@@ -484,6 +484,186 @@ else
     "nothing references apk/app-release.apk; the consumers and the upload disagree"
 fi
 
+echo " the job that publishes re-verifies what it publishes"
+# The build job runs the signature gate and the smoke job installs the APK, so
+# publication is already downstream of two checks. This asserts the third,
+# independent one: the publish job -- the last thing that runs before the bytes
+# become a download, on its own runner, with its own checkout of the gate script --
+# re-derives the checksum and the signature from the artifact it is about to
+# attach. Without it, a mismatch between what was verified and what is published
+# would be invisible until a user hit "App not installed" again.
+publish_checks="$(python3 - "${WORKFLOW}" <<'PYTHON'
+import sys
+
+import yaml
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    workflow = yaml.safe_load(handle)
+steps = workflow["jobs"]["android-publish"].get("steps", []) or []
+
+reverify_index = None
+release_index = None
+results = {}
+for index, step in enumerate(steps):
+    if not isinstance(step, dict):
+        continue
+    name = str(step.get("name", ""))
+    run = str(step.get("run", ""))
+    if "action-gh-release" in str(step.get("uses", "")):
+        release_index = index
+        # The whole point of re-verifying is that the *published* bytes are the
+        # verified ones. If the release attached a different path, the gate would
+        # be checking a file nobody downloads. Found by mutation: dropping the APK
+        # from `files:` left every check green.
+        attached = str(step.get("with", {}).get("files", ""))
+        results["attaches"] = "apk/app-release.apk\n" in f"{attached}\n"
+    if "Re-verify" in name:
+        reverify_index = index
+        # Comments are stripped before matching. A comment explaining *why* a
+        # command runs usually quotes the command, so a naive substring search
+        # over the raw block is satisfied by the explanation alone -- the same
+        # string that was just deleted from the script. This was found by
+        # mutation: replacing the `sha256sum -c` line with `echo` left the check
+        # green.
+        code = "\n".join(
+            line
+            for line in run.splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        )
+        results["checksum"] = "sha256sum -c" in code
+        results["signature"] = "android_release_verify_signature.sh" in code
+        results["empty-input"] = "::error::refusing to publish" in code
+
+results["present"] = reverify_index is not None
+# The guarantee, stated once: the re-verification has to come before the step that
+# makes the bytes downloadable. `False` when either step is missing, because an
+# absent step cannot be ordered correctly.
+results["ordered"] = (
+    reverify_index is not None
+    and release_index is not None
+    and reverify_index < release_index
+)
+for key, value in results.items():
+    print(f"{key}\t{'yes' if value else 'no'}")
+PYTHON
+)"
+for required in present checksum signature empty-input ordered attaches; do
+  value="$(printf '%s\n' "${publish_checks}" | grep "^${required}	" | cut -f2 | head -n 1)"
+  case "${required}" in
+    ordered)
+      if [[ "${value}" == "yes" ]]; then
+        ok "the publish job re-verifies before it publishes"
+      else
+        bad "the publish job re-verifies before it publishes" \
+          "the release step runs before any re-verification, so nothing checks the bytes that get attached"
+      fi
+      ;;
+    attaches)
+      if [[ "${value}" == "yes" ]]; then
+        ok "the release attaches the same APK the publish job re-verified"
+      else
+        bad "the release attaches the same APK the publish job re-verified" \
+          "apk/app-release.apk is verified but not in the release file list, so the check covers a file nobody downloads"
+      fi
+      ;;
+    present)
+      if [[ "${value}" == "yes" ]]; then
+        ok "the publish job has a re-verification step"
+      else
+        bad "the publish job has a re-verification step" "no step named 'Re-verify' in android-publish"
+      fi
+      ;;
+    *)
+      if [[ "${value}" == "yes" ]]; then
+        ok "the publish job re-verifies the ${required} of the artifact it attaches"
+      else
+        bad "the publish job re-verifies the ${required} of the artifact it attaches" \
+          "the re-verification step does not check the ${required}"
+      fi
+      ;;
+  esac
+done
+
+echo " the materialized signing key is removed from the runner"
+# `materialize` has to leave the keystore on disk -- the Gradle build is a later
+# process and reads it through GITHUB_ENV -- so the key outlives the script that
+# wrote it. The removal therefore has to live in the build job, and it has to be
+# guarded by `if: always()`, or it is skipped in precisely the cases that matter: a
+# failed or cancelled build.
+key_cleanup="$(python3 - "${WORKFLOW}" <<'PYTHON'
+import sys
+
+import yaml
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    workflow = yaml.safe_load(handle)
+steps = workflow["jobs"]["android"].get("steps", []) or []
+for step in steps:
+    if not isinstance(step, dict):
+        continue
+    if "Remove the materialized signing key" not in str(step.get("name", "")):
+        continue
+    print(f"condition\t{str(step.get('if', '')).strip()}")
+    print(f"present\tyes")
+    # The step body is written to stdout so the test can *run* it rather than
+    # grep it. Grepping the text only proves the string `rm -f` appears somewhere,
+    # which is satisfied by a branch that is never taken -- caught by mutation.
+    sys.stdout.write("---SCRIPT---\n")
+    sys.stdout.write(str(step.get("run", "")))
+    sys.stdout.write("\n")
+    break
+else:
+    print("present\tno")
+PYTHON
+)"
+if [[ "$(printf '%s\n' "${key_cleanup}" | grep '^present	')" != "present	yes" ]]; then
+  bad "the signing key is removed from the runner after the build" \
+    "no step in the android job removes the materialized keystore"
+else
+  ok "the signing key is removed from the runner after the build"
+  condition="$(printf '%s\n' "${key_cleanup}" | grep '^condition	' | cut -f2)"
+  # `always()` and `success() || failure()` are equivalent; only the first is
+  # spelled the way this workflow spells conditions, and requiring it keeps the
+  # assertion about the *guarantee* rather than about one spelling of it.
+  if [[ "${condition}" == "always()" ]]; then
+    ok "the key removal runs even when the build fails (if: always())"
+  else
+    bad "the key removal runs even when the build fails (if: always())" \
+      "if: was '${condition}', so a failed build skips the cleanup"
+  fi
+
+  # Run the step for real against a throwaway keystore.
+  cleanup_script="${WORK_DIR}/key-cleanup.sh"
+  printf '%s\n' "${key_cleanup}" | sed -n '/^---SCRIPT---$/,$p' | tail -n +2 >"${cleanup_script}"
+  probe="${WORK_DIR}/fake-keystore.jks"
+  : >"${probe}"
+  if ANDROID_KEYSTORE_FILE="${probe}" bash "${cleanup_script}" >"${WORK_DIR}/cleanup.log" 2>&1 &&
+    [[ ! -e "${probe}" ]]; then
+    ok "the key removal step, executed, actually deletes the keystore"
+  else
+    bad "the key removal step, executed, actually deletes the keystore" \
+      "the file survived: $(tr '\n' '|' <"${WORK_DIR}/cleanup.log")"
+  fi
+  # ...and it must not fail when there is nothing to remove, or `if: always()`
+  # would turn every failed build into a second failure that masks the first.
+  if env -u ANDROID_KEYSTORE_FILE bash "${cleanup_script}" >"${WORK_DIR}/cleanup-none.log" 2>&1; then
+    ok "the key removal step is a no-op when no key was materialized"
+  else
+    bad "the key removal step is a no-op when no key was materialized" \
+      "$(tr '\n' '|' <"${WORK_DIR}/cleanup-none.log")"
+  fi
+  # ...and it must not report success while leaving the key in place, which is the
+  # failure mode a `set -e`-free step with a wrong path would have.
+  : >"${probe}"
+  if ANDROID_KEYSTORE_FILE="${probe}" bash "${cleanup_script}" >/dev/null 2>&1 &&
+    [[ -e "${probe}" ]]; then
+    bad "the key removal step does not report success while leaving the key" \
+      "the step exited 0 with the keystore still on disk"
+  else
+    ok "the key removal step does not report success while leaving the key"
+  fi
+fi
+
 echo " the emulator-runner script stays a single line in the committed script too"
 # The committed script is invoked as `bash <file>`, so multi-line control flow is
 # safe there. The only thing that must not leak back into the workflow is a

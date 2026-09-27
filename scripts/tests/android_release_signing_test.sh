@@ -520,11 +520,14 @@ env -u PRIVATE_GALLERY_RELEASE_ALLOW_EPHEMERAL_SIGNING \
     bash '${SCRIPT}' materialize" >/dev/null 2>&1
 produced="$(grep -E '^ANDROID_KEYSTORE_FILE=' "${GITHUB_ENV_FILE}" 2>/dev/null | head -n 1 | cut -d= -f2- || true)"
 if [[ -n "${produced}" && -f "${produced}" ]]; then
-  perms="$(stat -c '%a' "${produced}")"
-  if [[ "${perms}" == "600" ]]; then
+  # `ls -l` rather than `stat -c '%a'`: the `-c` form is GNU-only and this suite
+  # has to run on the same machines as the script it tests, including macOS. The
+  # permission bits are the last field of `ls -l` for a regular file.
+  perms="$(ls -l "${produced}" | cut -c1-10)"
+  if [[ "${perms}" == "-rw-------" ]]; then
     ok "the materialized keystore is owner-only (0600)"
   else
-    bad "the materialized keystore is owner-only (0600)" "mode was ${perms}"
+    bad "the materialized keystore is owner-only (0600)" "mode was '${perms}'"
   fi
 else
   bad "the materialized keystore is owner-only (0600)" "materialize produced no keystore"

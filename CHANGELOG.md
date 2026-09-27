@@ -24,7 +24,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   publishing an unsigned APK. A throwaway per-run key is possible only via the
   explicit `PRIVATE_GALLERY_RELEASE_ALLOW_EPHEMERAL_SIGNING` repository
   variable, and the release notes say so when it is used.
-- `scripts/tests/` — device-free tests for the release gate itself (146
+- `scripts/tests/` — device-free tests for the release gate itself (168
   assertions), run in CI via the "Release gate" job and locally with
   `make release-gate`. `release_workflow_test.sh` asserts the release
   workflow's safety properties structurally, so the guarantee cannot be removed
@@ -83,6 +83,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stable, complex, and focused. That is stated in the gate and the runbook rather
   than papered over with a colour threshold that would be wrong in the lenient
   direction — the same false pass the gate exists to prevent.
+- A lost adb connection was reported as a clean crash check. `adb_shell` ended in
+  `|| true`, so an emulator that died mid-run produced an empty `dumpsys` and an
+  empty crash buffer — and an empty string parses as "zero adverse exits" and "no
+  FATAL EXCEPTION". The two gates whose failure direction is the dangerous one
+  were therefore the two that could silently pass. The adb exit status is now
+  propagated, and a dump that could not be read fails the gate rather than
+  reporting nothing wrong. Three states are now distinguished that were
+  previously collapsed into one: adverse, clean, and *could not ask*.
+- When the pre-launch `ApplicationExitInfo` baseline could not be read, the
+  comparison silently degraded to "no worse than zero". The baseline is now
+  recorded as `unavailable` and the gate applies the strictly stronger
+  requirement of zero adverse entries outright, so a lost baseline can never make
+  a check easier to pass.
+- The signing key is now removed from the runner once the build no longer needs
+  it. `materialize` deliberately leaves the keystore on disk — the Gradle build is
+  a later process and reads it through `$GITHUB_ENV` — so the removal is an
+  `if: always()` step in the build job, which also runs on a failed or cancelled
+  build. It is a no-op when no key was materialized, so a failed build is not
+  replaced by a confusing second failure.
+- The job that publishes the APK now re-verifies it. That job is the last thing to
+  run before the bytes become a download, on its own runner, with its own checkout
+  of the gate script, so it re-derives the checksum (`sha256sum -c`) and
+  re-asserts the v2+v3 signature on exactly the file it attaches. Its evidence is
+  written to a scratch directory: the gate is verifying, not regenerating, and
+  must not be able to make a bad artifact look attested by replacing the file a
+  reader is told to trust.
+- The keystore size check and the permission assertion used `stat -c`, which is
+  GNU coreutils and does not exist on macOS or BSD. Both use POSIX equivalents
+  (`wc -c` and `ls -l`).
 - Values written to `$GITHUB_ENV` are rejected if they contain a newline or a
   carriage return. `GITHUB_ENV` is a newline-delimited `KEY=VALUE` file, so an
   embedded line break turns a value into additional environment variables for

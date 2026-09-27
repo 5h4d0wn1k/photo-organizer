@@ -112,8 +112,31 @@ contains() {
   [[ "${haystack}" == *"${needle}"* ]]
 }
 
+# Runs a command on the device and prints its stdout.
+#
+# The exit status is propagated, deliberately. This used to end in `|| true`, which
+# made a dead adb server indistinguishable from a device that had nothing to
+# report: `dumpsys` returned empty, the adverse-exit count came out as 0, and the
+# crash buffer came back empty. Both of those are the two gates that must never
+# fail open, and both reported "clean" without ever having been asked. Every caller
+# that is a gate now distinguishes "the device said there is nothing wrong" from
+# "the question could not be delivered". Callers that genuinely do not care
+# opt out explicitly at the call site.
 adb_shell() {
-  "${ADB}" shell "$@" 2>/dev/null || true
+  "${ADB}" shell "$@" 2>/dev/null
+}
+
+# `dumpsys activity exit-info` only exists on API 30+. On an older system image the
+# service answers with one of these instead of exiting non-zero, so a blank or
+# complaining dump is a *missing feature*, not a failure to ask. Distinguishing the
+# two matters: treating an adb failure as "unavailable" would silently disable the
+# crash check, which is the same false pass the gate exists to prevent.
+exit_info_unsupported() {
+  local dump="$1"
+  contains "Unknown command" "${dump}" ||
+    contains "Can't find service" "${dump}" ||
+    contains "No service" "${dump}" ||
+    contains "not found" "${dump}"
 }
 
 trim() {
@@ -170,7 +193,11 @@ first_line() {
 
 focused_window() {
   local dump line
-  dump="$(adb_shell dumpsys window)"
+  # A failed `dumpsys` is not an unfocused window, it is an unanswered question.
+  # Returning non-zero here makes the focus check fail closed, which is the
+  # direction that errs; the launch gate reports the timeout and the real cause
+  # stays visible in the adb output.
+  dump="$(adb_shell dumpsys window)" || return 1
   while IFS= read -r line; do
     if [[ "${line}" == *"mCurrentFocus"* || "${line}" == *"mFocusedApp"* ]]; then
       first_line "${line}"
@@ -240,22 +267,41 @@ install_apk() {
   log "installed $(basename "${apk}"): $(trim "${output}")"
 }
 
+# Writes the run summary that is uploaded as release evidence. This is
+# informational rather than a gate, so an unreadable property does not fail the
+# run -- but a silently empty field in published evidence is exactly the kind of
+# claim a reader cannot check, so each one is annotated when it cannot be read.
 record_installed_version() {
-  local dump version_name version_code abi api
-  dump="$(adb_shell dumpsys package "${PACKAGE}")"
+  local apk="$1" dump version_name version_code abi api release
+  dump="$(adb_shell dumpsys package "${PACKAGE}")" || dump=""
   version_name="$(first_line "$(printf '%s' "${dump}" | sed -n 's/.*versionName=\([^ ]*\).*/\1/p')")"
   version_code="$(first_line "$(printf '%s' "${dump}" | sed -n 's/.*versionCode=\([^ ]*\).*/\1/p')")"
-  abi="$(trim "$(adb_shell getprop ro.product.cpu.abi)")"
-  api="$(trim "$(adb_shell getprop ro.build.version.sdk)")"
+  abi="$(device_property ro.product.cpu.abi || printf 'unknown')"
+  api="$(device_property ro.build.version.sdk || printf 'unknown')"
+  release="$(device_property ro.build.version.release || printf 'unknown')"
   {
     printf 'package: %s\n' "${PACKAGE}"
-    printf 'apk: %s\n' "$1"
-    printf 'apk sha256: %s\n' "$(sha256_of "$1")"
-    printf 'device: API %s (Android %s), abi %s\n' "${api}" "$(trim "$(adb_shell getprop ro.build.version.release)")" "${abi}"
-    printf 'installed versionName: %s\n' "${version_name}"
-    printf 'installed versionCode: %s\n' "${version_code}"
+    printf 'apk: %s\n' "${apk}"
+    printf 'apk sha256: %s\n' "$(sha256_of "${apk}")"
+    printf 'device: API %s (Android %s), abi %s\n' "${api}" "${release}" "${abi}"
+    printf 'installed versionName: %s\n' "${version_name:-unknown}"
+    printf 'installed versionCode: %s\n' "${version_code:-unknown}"
   } >"${SUMMARY_PATH}"
   cat "${SUMMARY_PATH}"
+}
+
+# Reads a `getprop` value, printing "unknown" and annotating if adb could not
+# answer. Used only for evidence, never for a gate decision.
+device_property() {
+  local value
+  value="$(adb_shell getprop "$1")" || value=""
+  value="$(trim "${value}")"
+  if [[ -z "${value}" ]]; then
+    printf '::warning::could not read device property %s; recorded as unknown in the evidence\n' "$1" >&2
+    printf 'unknown'
+    return 0
+  fi
+  printf '%s' "${value}"
 }
 
 sha256_of() {
@@ -284,10 +330,22 @@ cold_launch() {
   log "launch requested: $(trim "$(printf '%s' "${output}" | tr '\n' ' ')")"
 }
 
+# Prints the number of adverse ApplicationExitInfo entries recorded *before* the
+# launch, or the literal string "unavailable" when the device could not be asked.
+# The two are not interchangeable: an unavailable baseline must not be read as
+# zero, or the post-launch comparison silently degrades into "no adverse exits"
+# for a device that never answered in the first place.
 capture_crash_baseline() {
-  local dump
-  dump="$(adb_shell dumpsys activity exit-info "${PACKAGE}")"
+  local dump rc=0
+  dump="$(adb_shell dumpsys activity exit-info "${PACKAGE}")" || rc=$?
   printf '%s' "${dump}" >"${EXIT_INFO_PATH}"
+  if ((rc != 0)); then
+    return 1
+  fi
+  if is_blank "${dump}" || exit_info_unsupported "${dump}"; then
+    printf '%s' "unavailable"
+    return 0
+  fi
   adverse_exit_reason_count "${dump}"
 }
 
@@ -308,14 +366,31 @@ adverse_exit_reason_count() {
 }
 
 assert_no_adverse_exits() {
-  local baseline="$1" dump after
-  dump="$(adb_shell dumpsys activity exit-info "${PACKAGE}")"
+  local baseline="$1" dump after rc=0
+  dump="$(adb_shell dumpsys activity exit-info "${PACKAGE}")" || rc=$?
   printf '%s\n' "${dump}" >"${EXIT_INFO_PATH}"
-  if is_blank "${dump}"; then
+  if ((rc != 0)); then
+    # The dump could not be read. Counting adverse exits in an empty string yields
+    # zero, and zero would read as "clean" -- so refuse instead. A crash check that
+    # could not run is not a passing crash check.
+    fail "could not read ApplicationExitInfo (adb exit ${rc}); refusing to report a crash check that never ran"
+  fi
+  if is_blank "${dump}" || exit_info_unsupported "${dump}"; then
     log "exit-info unavailable on this API level; relying on the crash buffer"
     return 0
   fi
   after="$(adverse_exit_reason_count "${dump}")"
+  if [[ "${baseline}" == "unavailable" ]]; then
+    # No usable pre-launch baseline, so the comparison cannot be made and the
+    # stronger of the two readings applies: zero adverse entries, outright. This is
+    # strictly harder to satisfy than "no worse than before", never easier.
+    if ((after > 0)); then
+      printf '%s\n' "${dump}" >&2
+      fail "adverse ApplicationExitInfo entries: ${after} recorded, with no pre-launch baseline to attribute them to"
+    fi
+    log "exit-info clean (${after} adverse entries, no baseline available so zero is required)"
+    return 0
+  fi
   if ((after > baseline)); then
     printf '%s\n' "Android recorded an abnormal exit of ${PACKAGE} (crash, native crash, ANR, or init failure):" >&2
     printf '%s\n' "${dump}" >&2
@@ -325,9 +400,16 @@ assert_no_adverse_exits() {
 }
 
 assert_crash_buffer_clean() {
-  local crash
-  crash="$("${ADB}" logcat -b crash -d 2>/dev/null || true)"
+  local crash rc=0
+  crash="$("${ADB}" logcat -b crash -d 2>/dev/null)" || rc=$?
   printf '%s\n' "${crash}" >"${CRASH_BUFFER_PATH}"
+  if ((rc != 0)); then
+    # Same reasoning as above, and this is the primary crash gate: `logcat -b crash`
+    # works on every API level the matrix covers, so a non-zero exit means the
+    # buffer could not be read, not that the feature is missing. Reporting "clean"
+    # here would be reporting the absence of a question.
+    fail "could not read the Android crash buffer (adb exit ${rc}); refusing to report a crash check that never ran"
+  fi
   if ! crash_buffer_is_clean "${crash}"; then
     printf '%s\n' "The Android crash buffer is not empty after launch:" >&2
     printf '%s\n' "${crash}" >&2
@@ -557,7 +639,15 @@ main() {
   record_installed_version "${apk}"
   pregrant_runtime_permissions
 
-  baseline="$(capture_crash_baseline)"
+  if ! baseline="$(capture_crash_baseline)"; then
+    # The pre-launch read failed. Recording it as "unavailable" keeps the gate
+    # running with the stronger requirement (zero adverse entries outright) rather
+    # than dropping the check. Emitted as a workflow annotation rather than through
+    # `log`, which prefixes the smoke name and would stop GitHub from parsing it.
+    printf '::warning::could not read ApplicationExitInfo before launch; requiring zero adverse entries after launch instead of a comparison\n'
+    printf 'pre-launch ApplicationExitInfo: unavailable (adb failed)\n' >>"${SUMMARY_PATH}"
+    baseline="unavailable"
+  fi
   clear_log_buffers
   cold_launch
 
@@ -586,7 +676,7 @@ main() {
     printf 'screenshot: %s\n' "${SCREENSHOT_PATH}"
   } >>"${SUMMARY_PATH}"
 
-  log "PASS: the release artifact installed, cold-launched and rendered on Android $(trim "$(adb_shell getprop ro.build.version.release)") (API $(trim "$(adb_shell getprop ro.build.version.sdk)"))"
+  log "PASS: the release artifact installed, cold-launched and rendered on Android $(device_property ro.build.version.release) (API $(device_property ro.build.version.sdk))"
   log "evidence: ${SUMMARY_PATH}, ${SCREENSHOT_PATH}, ${CRASH_BUFFER_PATH}, ${EXIT_INFO_PATH}, ${LOGCAT_PATH}"
 }
 

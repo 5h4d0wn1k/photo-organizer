@@ -430,6 +430,41 @@ jobs:
           path: dist
           if-no-files-found: error
 
+      # Remove the materialized signing key from the runner.
+      #
+      # `materialize` deliberately leaves the keystore on disk -- the Gradle build
+      # is a later process and reads it via ANDROID_KEYSTORE_FILE from $GITHUB_ENV
+      # -- so deleting it there would break the build. The runner is ephemeral, but
+      # "ephemeral" is a weaker guarantee than it sounds: the file survives a
+      # cancelled run's diagnostic steps, a failed build, and any later step that
+      # can read RUNNER_TEMP. It is the release key when the four secrets are
+      # configured, so it is removed as soon as the build no longer needs it.
+      #
+      # `if: always()` so it also runs on a failed or cancelled build, which is
+      # exactly when a naive `rm` after the build would be skipped. Not
+      # `continue-on-error`: a keystore that cannot be removed is worth seeing.
+      - name: Remove the materialized signing key
+        if: always()
+        run: |
+          set -euo pipefail
+          if [[ -z "${ANDROID_KEYSTORE_FILE:-}" ]]; then
+            echo "no signing key was materialized; nothing to remove"
+            exit 0
+          fi
+          if [[ -e "${ANDROID_KEYSTORE_FILE}" ]]; then
+            # Overwrite before unlinking so the key bytes are not left recoverable
+            # in free space. `shred` is unavailable on some runners, so this is
+            # best-effort: the unlink is the part that must happen.
+            if command -v shred >/dev/null 2>&1; then
+              shred --force --remove "${ANDROID_KEYSTORE_FILE}" 2>/dev/null || rm -f "${ANDROID_KEYSTORE_FILE}"
+            else
+              rm -f "${ANDROID_KEYSTORE_FILE}"
+            fi
+            echo "removed the materialized signing key"
+          else
+            echo "the signing key was already absent"
+          fi
+
       # NOTE: publication is intentionally NOT done here. This job only builds and
       # uploads the APK; the `android-publish` job (needs: [android, android-smoke])
       # releases it, and only after the install+launch gate has passed.
@@ -509,13 +544,71 @@ jobs:
     timeout-minutes: 15
     needs: [android, android-smoke]
     permissions:
+      # Build inputs only. The token needs `contents: write` for the release step,
+      # but the verification steps below run first and must not need it; a job
+      # cannot drop permissions mid-run, so the narrowness that matters is that no
+      # verification step can publish anything.
       contents: write
     steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
       - name: Download built APK artifact
         uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4
         with:
           name: android-artifact
           path: apk
+
+      # Re-verify the artifact in the job that actually publishes it.
+      #
+      # The build job already runs the signature gate and the smoke job already
+      # installed the APK, so this is a *third* independent check. That redundancy
+      # is the point: the publish job is the last thing that runs before the bytes
+      # become a download, and it is a different job on a different runner with a
+      # different checkout of the gate script. If the artifact store were ever
+      # wrong, truncated, or replaced, this is the step that notices, and it
+      # notices before the release exists.
+      #
+      # The checksum is verified first because it is the cheap, total check on the
+      # bytes: it fails if the file was modified, truncated, or is not the file the
+      # build produced. The signature gate then re-asserts v2+v3 on exactly those
+      # bytes. Nothing here is a substitute for the build-job checks; it is the
+      # narrowest possible proof that what is about to be published is what was
+      # verified.
+      - name: Re-verify the artifact being published
+        run: |
+          set -euo pipefail
+          APK="apk/app-release.apk"
+          if [[ ! -s "${APK}" ]]; then
+            echo "::error::refusing to publish: ${APK} is missing or empty" >&2
+            exit 1
+          fi
+          if [[ ! -s "apk/app-release.apk.sha256" ]]; then
+            echo "::error::refusing to publish: the checksum file is missing or empty" >&2
+            exit 1
+          fi
+          # `sha256sum -c` needs the file to be named exactly as the digest line
+          # says, which it is: the build job writes the bare filename precisely so
+          # a user can run the same command.
+          ( cd apk && sha256sum -c app-release.apk.sha256 )
+          # The gate re-derives its own evidence and checksum into a scratch
+          # directory rather than over the published ones: it is verifying, not
+          # regenerating, so it must not be able to make a bad artifact look
+          # attested by replacing the file a reader is told to trust. The build
+          # job's `apksigner-verify.txt` is the one that ships.
+          scratch="$(mktemp -d)"
+          bash scripts/android_release_verify_signature.sh \
+            "${APK}" "${scratch}/reverify.txt" "${scratch}/reverify.sha256"
+          # Assert the re-verification actually reached the certificate rather than
+          # stopping at "Verifies": the digest is what a reader uses to compare
+          # this release against the last one, so its absence must be a failure
+          # here and not a surprise for whoever tries that comparison.
+          if ! grep -qE 'certificate SHA-256 digest' "${scratch}/reverify.txt"; then
+            echo "::error::re-verification produced no signing certificate digest" >&2
+            exit 1
+          fi
+          rm -rf "${scratch}"
+          echo "re-verified the artifact about to be published"
 
       - name: Release Android
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
