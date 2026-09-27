@@ -127,6 +127,32 @@ case "${verb}" in
       # Not `local`: this heredoc body runs at the top level of the fake device,
       # so `local` would print "can only be used in a function" and leak a global.
       shot="$(scenario_value SCREENSHOT || true)"
+      # Two visually complex but *different* frames, so no two consecutive
+      # captures agree. This models a screen stuck mid-transition, which the gate
+      # must reject: accepting the first complex frame is how a half-drawn screen
+      # gets published.
+      #
+      # The fake device is a fresh process per adb call, so alternation needs state
+      # on disk. Without it the two frames would never differ and this scenario
+      # would be indistinguishable from the passing case.
+      if [[ "$(scenario_value SCREENSHOT_DRIFT || true)" == "1" ]]; then
+        # State has to live on disk: the fake device is a fresh process per adb
+        # call, so an in-memory counter would reset every time and the two frames
+        # would never differ.
+        counter="${SMOKE_WORK_DIR:-/tmp}/.smoke-drift-counter"
+        n=0
+        if [[ -f "${counter}" ]]; then
+          n="$(cat "${counter}" 2>/dev/null || printf 0)"
+        fi
+        printf '%s' "$((n + 1))" >"${counter}"
+        if ((n % 2 == 1)); then
+          drift_shot="${shot%.png}-drift.png"
+          if [[ -f "${drift_shot}" ]]; then
+            cat "${drift_shot}"
+            exit 0
+          fi
+        fi
+      fi
       [[ -n "${shot}" && -f "${shot}" ]] && cat "${shot}"
     fi
     exit 0
@@ -146,7 +172,21 @@ case "${verb}" in
         exit 0
         ;;
       *"dumpsys window"*)
-        printf '  mCurrentFocus=Window{deadbeef u0 %s/.MainActivity}\n' "$(value_or FOCUS com.privategallery.app)"
+        # By default the app holds focus for the whole run. With
+        # FOCUS_AFTER_FIRST_CHECK set, focus is held only for the first lookup and
+        # is then stolen -- which is the case a single pre-loop focus check misses,
+        # because the gate has already observed focus by the time it is stolen.
+        focus_after="${SMOKE_WORK_DIR:-/tmp}/.focus-probe"
+        probes=0
+        [[ -f "${focus_after}" ]] && probes="$(cat "${focus_after}" 2>/dev/null || printf 0)"
+        probes=$((probes + 1))
+        printf '%s' "${probes}" >"${focus_after}"
+        if [[ "$(scenario_value FOCUS_AFTER_FIRST_CHECK || true)" == "1" ]] && ((probes > 1)); then
+          focus="com.android.permissioncontroller"
+        else
+          focus="$(value_or FOCUS com.privategallery.app)"
+        fi
+        printf '  mCurrentFocus=Window{deadbeef u0 %s/.MainActivity}\n' "${focus}"
         exit 0
         ;;
       *"dumpsys activity exit-info"*) emit_exit_info; exit 0 ;;
@@ -230,6 +270,10 @@ scenario_with() {
   local line key work
   cp "${BASE_SCENARIO}" "${SCENARIO}"
   rm -f "${FAKE_STATE}"
+  # The fake device keeps its call counters on disk (it is a fresh process per adb
+  # call). Reset them per case, or a counter left over from an earlier case makes
+  # this one behave differently depending on test order.
+  rm -f "${WORK_DIR}/.smoke-drift-counter" "${WORK_DIR}/.focus-probe"
   for line in "$@"; do
     key="${line%%=*}"
     work="${WORK_DIR}/scenario.work"
@@ -242,6 +286,7 @@ scenario_with() {
 run_smoke() {
   env \
     ANDROID_SMOKE_ADB="${WORK_DIR}/adb" \
+    SMOKE_WORK_DIR="${WORK_DIR}" \
     ANDROID_SMOKE_EVIDENCE_DIR="${WORK_DIR}/evidence" \
     ANDROID_SMOKE_NAME="case" \
     ANDROID_SMOKE_BOOT_TIMEOUT_SECONDS="${SMOKE_BOOT_TIMEOUT:-10}" \
@@ -267,6 +312,10 @@ run_smoke_no_args() {
 install_fake_adb
 make_png "${WORK_DIR}/rich.png" 40
 make_png "${WORK_DIR}/blank.png" 1
+# A second complex frame, for the never-settling scenario. It must be complex
+# enough to clear the threshold -- otherwise the gate would reject it for being
+# blank and the stability check would never be exercised.
+make_png "${WORK_DIR}/rich-drift.png" 41
 printf 'not a png at all' >"${WORK_DIR}/garbage.png"
 printf 'fake apk bytes\n' >"${WORK_DIR}/app-release.apk"
 
@@ -402,13 +451,45 @@ expect_pass "a pre-existing adverse entry does not fail the gate" run_smoke
 scenario_with "EXIT_INFO=${WORK_DIR}/empty-exit-info.txt"
 
 echo " rendering"
+# A blank (single-colour) screen is never accepted, however long it persists: two
+# identical blank captures are stable but not visually complex.
 scenario_with "SCREENSHOT=${WORK_DIR}/blank.png"
-expect_fail "a blank screen counts as never rendered" "no real frame rendered" run_smoke
+expect_fail "a blank screen counts as never rendered" "no settled app frame" run_smoke
 scenario_with "SCREENSHOT=${WORK_DIR}/rich.png"
 
+# An undecodable capture is not a frame. The old code retried on a decode failure
+# and eventually reported a timeout, which is the right outcome but for the wrong
+# reason; the message now names the real condition.
 scenario_with "SCREENSHOT=${WORK_DIR}/garbage.png"
-expect_fail "an undecodable screenshot counts as never rendered" "no real frame rendered" run_smoke
+expect_fail "an undecodable screenshot counts as never rendered" "no settled app frame" run_smoke
 scenario_with "SCREENSHOT=${WORK_DIR}/rich.png"
+
+# A screen that never settles -- every capture differs -- must fail. A gate that
+# accepts the first complex frame is accepting whatever the engine happened to be
+# drawing mid-transition. DRIFT_A/DRIFT_B alternate, so no two consecutive
+# captures ever agree and the frame is permanently unstable.
+scenario_with "SCREENSHOT_DRIFT=1"
+expect_fail "a frame that never settles fails the gate" "no settled app frame" run_smoke
+scenario_with "SCREENSHOT_DRIFT="
+
+# The two drift frames must genuinely differ, or the scenario above would be
+# indistinguishable from the passing case and would prove nothing.
+if cmp -s "${WORK_DIR}/rich.png" "${WORK_DIR}/rich-drift.png"; then
+  bad "the never-settling fixture really alternates between two different frames" \
+    "rich.png and rich-drift.png are byte-identical"
+else
+  ok "the never-settling fixture really alternates between two different frames"
+fi
+
+# Focus is checked *inside* the render loop, so a dialog that steals focus after
+# the app has already taken it must fail the gate. Checking focus only once,
+# before the loop, is exactly what let a stolen window pass.
+#
+# The fake device takes focus on its first `dumpsys window` call and loses it on
+# the second, so the loss lands after the gate has already observed focus.
+scenario_with "FOCUS_AFTER_FIRST_CHECK=1"
+expect_fail "focus stolen during the render wait fails the gate" "lost window focus" run_smoke
+scenario_with "FOCUS_AFTER_FIRST_CHECK="
 
 echo " evidence"
 expect_pass "a passing run writes evidence" run_smoke
@@ -494,6 +575,20 @@ if decode_colors "${WORK_DIR}/garbage.png" >/dev/null 2>&1; then
 else
   ok "a non-PNG file is rejected by the decoder"
 fi
+
+# The gate's complexity threshold is 32. Both drift fixtures must clear it, or the
+# never-settling scenario would be rejected for looking blank and the stability
+# check would never actually be exercised. Asserted here, where the decoder the
+# gate uses is available.
+for frame in rich.png rich-drift.png; do
+  colors="$(decode_colors "${WORK_DIR}/${frame}" 2>/dev/null || printf -1)"
+  if [[ "${colors}" =~ ^[0-9]+$ ]] && ((colors >= 32)); then
+    ok "${frame} clears the gate's 32-colour threshold (${colors}), so stability is what is under test"
+  else
+    bad "${frame} clears the gate's 32-colour threshold, so stability is what is under test" \
+      "decoded ${colors} colours; too simple to exercise the stability check"
+  fi
+done
 
 printf '\n%s passed, %s failed\n' "${PASS_COUNT}" "${FAIL_COUNT}"
 if ((FAIL_COUNT > 0)); then

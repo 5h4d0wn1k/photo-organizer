@@ -24,7 +24,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   publishing an unsigned APK. A throwaway per-run key is possible only via the
   explicit `PRIVATE_GALLERY_RELEASE_ALLOW_EPHEMERAL_SIGNING` repository
   variable, and the release notes say so when it is used.
-- `scripts/tests/` — device-free tests for the release gate itself (141
+- `scripts/tests/` — device-free tests for the release gate itself (146
   assertions), run in CI via the "Release gate" job and locally with
   `make release-gate`. `release_workflow_test.sh` asserts the release
   workflow's safety properties structurally, so the guarantee cannot be removed
@@ -32,9 +32,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Android SDK for the signature test) is reported as degraded and fails the run
   rather than passing quietly. The assertions exercise behaviour rather than
   source text wherever that is possible: a `keytool` shim records the real argv
-  to prove the store password never reaches the command line, the real runner is
-  executed to prove it fails when a suite fails, and the workflow parser is fed
-  a mutated YAML to prove the structural checks actually bite.
+  to prove the store password never reaches the command line, the real gate
+  runner is executed to prove it fails when a suite fails, and every new
+  assertion was mutation-tested — each was confirmed to fail when the code it
+  protects is broken, and to pass when restored.
 - The published APK now ships a `app-release.apk.sha256` checksum alongside it.
   It records the bare filename, not the CI build path, so a user who downloads
   the APK and the sidecar into one directory can verify it with `sha256sum -c`.
@@ -60,6 +61,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Removed a duplicate definition of `is_enabled` in
   `scripts/production-readiness-check.sh`; the second, narrower-looking copy was
   dead code that silently lost to the first.
+- The Android artifact was staged for upload as a multi-path list. That does not
+  produce a flat artifact: `actions/upload-artifact` documents that "if multiple
+  paths are provided as input, the least common ancestor of all the search paths
+  will be used as the root directory of the artifact", so the APK was archived at
+  its full build path while the smoke gate and the publish step both looked for
+  it at the artifact root. Every release would have failed the smoke gate on a
+  missing file. The three files are now staged into one directory and that
+  directory is uploaded, so the layout is exactly what was staged and no longer
+  depends on the action's path-hierarchy rules.
+- The launch gate accepted the first screenshot that looked visually complex.
+  Window focus was checked once *before* the render loop and never re-checked, so
+  a window that lost focus mid-wait still passed; and a screen caught mid-
+  transition was accepted as "rendered". Focus is now re-asserted inside the
+  loop, and a frame must be visually complex *and* identical across two
+  consecutive captures before it counts as rendered. Both new behaviours are
+  mutation-tested.
+
+  The gate still cannot distinguish the system splash screen (drawn inside the
+  app's own window on API 31+) from the app's own first frame, because both are
+  stable, complex, and focused. That is stated in the gate and the runbook rather
+  than papered over with a colour threshold that would be wrong in the lenient
+  direction — the same false pass the gate exists to prevent.
 - Values written to `$GITHUB_ENV` are rejected if they contain a newline or a
   carriage return. `GITHUB_ENV` is a newline-delimited `KEY=VALUE` file, so an
   embedded line break turns a value into additional environment variables for
@@ -98,6 +121,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   signing warnings. Exactly one job generates the changelog, so it is no longer
   duplicated once per platform.
 - Build-only release jobs no longer hold `contents: write`.
+- The Android artifact was staged for upload as a multi-path list. That does not
+  produce a flat artifact: `actions/upload-artifact` documents that "if multiple
+  paths are provided as input, the least common ancestor of all the search paths
+  will be used as the root directory of the artifact", so the APK was archived
+  at its full build path while the smoke gate and the publish step both looked
+  for it at the artifact root. Every release would have failed the smoke gate on
+  a missing file. The three files are now staged into one directory, and that
+  directory is uploaded, so the layout is exactly what was staged and no longer
+  depends on the action's path-hierarchy rules. The staging step refuses to copy
+  a missing or empty file, so a bad input fails at the point of the mistake.
+- The launch gate accepted the first screenshot that looked visually complex.
+  Window focus was checked once *before* the render loop and never re-checked, so
+  a window that lost focus mid-wait still passed, and a screen caught mid-
+  transition counted as rendered. Focus is now re-asserted inside the loop, and a
+  frame must be visually complex *and* identical across two consecutive captures
+  before it counts as rendered. Both behaviours are mutation-tested: reverting
+  either one fails a test.
+
+  The gate still cannot distinguish the system splash screen — drawn inside the
+  app's own window on API 31+ — from the app's own first frame, because both are
+  stable, complex and focused. That limitation is now stated in the gate and the
+  runbook instead of being papered over with a colour threshold that would be
+  wrong in the lenient direction, which is the same false pass the gate exists to
+  prevent.
 
 ## [0.1.0] - 2026-09-22
 

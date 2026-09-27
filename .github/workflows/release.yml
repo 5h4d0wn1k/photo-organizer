@@ -386,14 +386,48 @@ jobs:
           bash scripts/android_release_verify_signature.sh \
             "${APK}" apksigner-verify.txt app-release.apk.sha256
 
+      # Stage the three files into ONE directory, then upload that directory.
+      #
+      # Listing the files separately does not produce a flat artifact.
+      # actions/upload-artifact documents that "if multiple paths are provided as
+      # input, the least common ancestor of all the search paths will be used as
+      # the root directory of the artifact". The LCA of
+      # `app/build/app/outputs/flutter-apk/app-release.apk` and the two bare
+      # filenames at the workspace root is the workspace root, so the APK lands at
+      # `apk/app/build/app/outputs/flutter-apk/app-release.apk` after download --
+      # not `apk/app-release.apk`, which is what the smoke gate and the publish
+      # step both use. Every release would have failed the smoke gate on a missing
+      # file. Uploading a single directory removes the ambiguity entirely: the
+      # artifact root is that directory, so the layout is exactly what is staged.
+      #
+      # The copy is verified rather than trusted, so a missing or empty input fails
+      # here instead of surfacing later as a confusing downstream error.
+      - name: Stage Android artifact
+        run: |
+          set -euo pipefail
+          APK="app/build/app/outputs/flutter-apk/app-release.apk"
+          mkdir -p dist
+          for pair in \
+            "${APK}:app-release.apk" \
+            "app-release.apk.sha256:app-release.apk.sha256" \
+            "apksigner-verify.txt:apksigner-verify.txt"; do
+            src="${pair%%:*}"
+            dst="dist/${pair##*:}"
+            if [[ ! -s "${src}" ]]; then
+              echo "::error::refusing to stage a missing or empty file: ${src}" >&2
+              exit 1
+            fi
+            cp "${src}" "${dst}"
+          done
+          ls -l dist
+
       - name: Upload Android artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: android-artifact
-          path: |
-            app/build/app/outputs/flutter-apk/app-release.apk
-            app-release.apk.sha256
-            apksigner-verify.txt
+          # A single directory, so the artifact root is `dist` and the files land
+          # flat. Do not "simplify" this back to a multi-path list.
+          path: dist
           if-no-files-found: error
 
       # NOTE: publication is intentionally NOT done here. This job only builds and

@@ -449,21 +449,83 @@ print(len(seen))
 PY
 }
 
-await_rendered_frame() {
+# Wait for a settled, app-owned frame.
+#
+# What this actually proves, precisely -- the distinction matters because the
+# previous version of this check claimed more than it could deliver.
+#
+# It requires THREE independent things:
+#   1. the app's window still holds focus *at the moment of capture*, not merely
+#      at some earlier point (a permission dialog can steal focus mid-wait);
+#   2. the frame is visually complex (>= MIN_DISTINCT_COLOURS), which rules out a
+#      solid-colour blank screen and an undecodable capture;
+#   3. the frame is *stable* -- two consecutive captures agree -- which rules out
+#      a screen caught mid-transition while the engine is still starting.
+#
+# What it does NOT prove, and must not be claimed: that the pixels came from the
+# app's own UI rather than from the system splash screen. On API 31+ the splash
+# is drawn *inside* the app's own window by the SplashScreen API, so it satisfies
+# all three conditions above while the app has rendered nothing of its own. A
+# splash screen is also a stable image, so condition 3 does not exclude it.
+#
+# Distinguishing the two needs a signal that only app content produces -- a
+# Flutter-owned surface from `dumpsys SurfaceFlinger --list`, or the semantics
+# tree, which needs an accessibility service and so is unavailable here. Tracked
+# as a follow-up rather than guessed at, because a heuristic colour or layout
+# threshold that is wrong in the *lenient* direction reintroduces exactly the
+# false pass this gate exists to prevent. See docs/public-production-release-runbook.md.
+#
+# The check is deliberately biased against false PASSES rather than against false
+# failures: it can only make the release block, never let a broken artifact ship.
+# Requiring stability is what makes it safe to bias that way.
+await_settled_app_frame() {
   local deadline=$((SECONDS + RENDER_TIMEOUT_SECONDS)) colors=-1
+  local previous="" current="" stable_captures=0
+  local last_focus_error=""
+
   while ((SECONDS < deadline)); do
+    # Re-assert focus inside the loop. Checking it only before this loop let a
+    # dialog that appeared afterwards satisfy the gate.
+    if ! is_app_focused; then
+      last_focus_error="$(focused_window)"
+      log "lost window focus while waiting for a frame; focused window is now: ${last_focus_error}"
+      previous=""
+      stable_captures=0
+      sleep "${POLL_INTERVAL_SECONDS}"
+      continue
+    fi
+
     if capture_screenshot "${SCREENSHOT_PATH}"; then
       if colors="$(png_distinct_colors "${SCREENSHOT_PATH}" "${MIN_DISTINCT_COLORS}" 2>/dev/null)"; then
         if [[ "${colors}" =~ ^[0-9]+$ ]] && ((colors >= MIN_DISTINCT_COLORS)); then
-          log "rendered a real frame (${colors}+ distinct colours in screenshot)"
-          return 0
+          current="$(sha256sum <"${SCREENSHOT_PATH}" | cut -d' ' -f1)"
+          if [[ -n "${current}" && "${current}" == "${previous}" ]]; then
+            stable_captures=$((stable_captures + 1))
+          else
+            stable_captures=0
+          fi
+          if ((stable_captures >= 1)); then
+            log "settled app frame: ${colors}+ distinct colours, identical across two consecutive captures"
+            return 0
+          fi
+          previous="${current}"
+        else
+          log "frame is not yet visually complex (${colors} distinct colours); retrying"
+          previous=""
+          stable_captures=0
         fi
       else
         log "screenshot could not be decoded yet; retrying"
+        previous=""
+        stable_captures=0
       fi
     fi
     sleep "${POLL_INTERVAL_SECONDS}"
   done
+
+  if [[ -n "${last_focus_error}" ]]; then
+    fail "lost window focus while waiting for a settled frame; focused window was: ${last_focus_error}"
+  fi
   return 1
 }
 
@@ -507,9 +569,9 @@ main() {
     fail "${PACKAGE} never took window focus; focused window was: $(focused_window)"
   log "window focused: $(focused_window)"
 
-  if ! await_rendered_frame; then
+  if ! await_settled_app_frame; then
     collect_logs
-    fail "no real frame rendered within ${RENDER_TIMEOUT_SECONDS}s (a blank or launch-theme-only screen is treated as a failure)"
+    fail "no settled app frame within ${RENDER_TIMEOUT_SECONDS}s (a blank, launch-theme-only or never-settling screen is a failure)"
   fi
 
   is_app_running || fail "${PACKAGE} died while rendering"

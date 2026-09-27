@@ -391,6 +391,99 @@ else
   ok 'no keystore is tracked in git'
 fi
 
+echo " the Android artifact reaches the smoke gate and the release at the path they look for"
+# This is a real bug that shipped in review: the upload listed three separate
+# paths, and actions/upload-artifact documents that with multiple paths "the least
+# common ancestor of all the search paths will be used as the root directory of
+# the artifact". The LCA of a deep build path and two filenames at the workspace
+# root is the workspace root, so the APK was archived as
+# `apk/app/build/app/outputs/flutter-apk/app-release.apk` while both consumers
+# read `apk/app-release.apk`. Every release would have failed on a missing file.
+#
+# The structural property that prevents a recurrence: exactly one file is
+# uploaded, and it is a directory, so the artifact root is unambiguous. A
+# multi-path list is rejected outright rather than reasoned about, because the
+# resulting layout depends on the action's undocumented-for-our-case hierarchy
+# rules.
+upload_path="$(python3 - "${WORKFLOW}" <<'PYTHON'
+import sys
+import yaml
+
+with open(sys.argv[1]) as handle:
+    workflow = yaml.safe_load(handle)
+paths = []
+for job in workflow["jobs"].values():
+    for step in job.get("steps", []) or []:
+        if not isinstance(step, dict):
+            continue
+        if "upload-artifact" not in str(step.get("uses", "")):
+            continue
+        # Match the artifact by its exact name. A substring test for "android" also
+        # matches `android-smoke-evidence`, which is a different artifact with a
+        # different layout, so asserting against that one would prove nothing.
+        if str(step.get("with", {}).get("name", "")) != "android-artifact":
+            continue
+        raw = step["with"].get("path", "")
+        paths = [p.strip() for p in str(raw).splitlines() if p.strip()]
+if len(paths) == 1:
+    print(paths[0])
+PYTHON
+)"
+if [[ -z "${upload_path}" ]]; then
+  bad "the Android artifact is uploaded as a single path" \
+    "no android-artifact upload step, or it lists several paths (see the LCA note in the workflow)"
+else
+  # A single path that is a directory makes the artifact root that directory, so
+  # the layout is exactly what the staging step produced. A single *file* would
+  # work too, but a directory is what we stage, and the two are not equivalent if
+  # the staged set ever grows.
+  if [[ -d "${ROOT_DIR}/${upload_path}" ]] || grep -qE "^[[:space:]]*mkdir -p ${upload_path}\$" "${WORKFLOW}"; then
+    ok "the Android artifact is uploaded as a directory, so its root is unambiguous (${upload_path})"
+  else
+    bad "the Android artifact is uploaded as a directory, so its root is unambiguous" \
+      "'${upload_path}' is neither a tracked directory nor a directory the staging step creates"
+  fi
+fi
+
+# The staging step must copy every file the consumers reference, so the artifact
+# cannot silently lose its checksum or its signature evidence. Matched on the
+# *destination* of each "source:destination" pair rather than on a whole line, so
+# the assertion does not depend on which entry happens to be last in the list (the
+# last one carries no line-continuation backslash) or on how it is indented.
+for required in app-release.apk app-release.apk.sha256 apksigner-verify.txt; do
+  # Assign from a command substitution, not a `while read` loop over a process
+  # substitution: the loop would run in a subshell and the variable it set would be
+  # lost, silently reporting every name as unstaged.
+  staged_destination=no
+  staged_pairs="$(grep -oE '"[^"]+:[^"]+"' "${WORKFLOW}" 2>/dev/null || true)"
+  for pair in ${staged_pairs}; do
+    # Strip the surrounding quotes grep kept: the match is a quoted YAML/shell
+    # token, so "${pair##*:}" alone would end in a literal `"` and never equal the
+    # bare filename.
+    destination="${pair##*:}"
+    destination="${destination%\"}"
+    destination="${destination#\"}"
+    if [[ "${destination}" == "${required}" ]]; then
+      staged_destination=yes
+      break
+    fi
+  done
+  if [[ "${staged_destination}" == "yes" ]]; then
+    ok "the staging step copies ${required} into the uploaded directory"
+  else
+    bad "the staging step copies ${required} into the uploaded directory" \
+      "not staged; it would be missing from the artifact"
+  fi
+done
+
+# ...and the consumers must all look for the APK at the artifact root.
+if grep -qF 'apk/app-release.apk' "${WORKFLOW}"; then
+  ok "the smoke gate and the publish step read the APK from the artifact root"
+else
+  bad "the smoke gate and the publish step read the APK from the artifact root" \
+    "nothing references apk/app-release.apk; the consumers and the upload disagree"
+fi
+
 echo " the emulator-runner script stays a single line in the committed script too"
 # The committed script is invoked as `bash <file>`, so multi-line control flow is
 # safe there. The only thing that must not leak back into the workflow is a
