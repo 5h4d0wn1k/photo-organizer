@@ -144,11 +144,18 @@ resolve_mode() {
 
 keystore_destination() {
   local temp_dir="${RUNNER_TEMP:-${TMPDIR:-/tmp}}"
+  # Refuse before creating anything: a rejected run must not have already made a
+  # directory inside the tree it just declared off-limits. The directory is what
+  # gets checked here because the keystore file does not exist yet.
+  assert_outside_workspace "${temp_dir}"
   mkdir -p "${temp_dir}"
-  # A per-run random name. The Gradle JVM learns this path from the environment
-  # (ANDROID_KEYSTORE_FILE), so nothing depends on it being predictable, and a
-  # fixed name would hand any code running in that JVM a known target.
-  printf '%s' "${temp_dir}/private-gallery-release-${RANDOM}-${RANDOM}.jks"
+  # mktemp rather than $RANDOM: the name is then both unpredictable enough not to
+  # be a known target for anything running in the Gradle JVM, and collision-free,
+  # so a rerun can never silently overwrite a previous keystore.
+  #
+  # The path reaches Gradle through ANDROID_KEYSTORE_FILE, so nothing depends on
+  # what it happens to be.
+  mktemp "${temp_dir}/private-gallery-release-XXXXXXXXXXXXXXXX.jks"
 }
 
 # Refuse to write signing material into the repository working tree.
@@ -219,12 +226,35 @@ materialize_ephemeral_keystore() {
     -dname "${EPHEMERAL_KEY_DNAME}" >/dev/null 2>&1
 }
 
+# Refuse a signing value that would corrupt $GITHUB_ENV.
+#
+# GitHub parses $GITHUB_ENV one line at a time, so a value containing a newline
+# does not stay one variable: every line after the embedded break becomes a
+# brand-new environment variable for every later step in the job. A pasted alias
+# or password carrying a stray newline would therefore silently inject e.g.
+# GITHUB_TOKEN_LEAK=... into the build, with no error and a zero exit status.
+# Rejecting newlines (and CR) is the whole defence; there is no escaping
+# mechanism in this file format.
+assert_single_line_value() {
+  local name="$1" value="$2"
+  if [[ "${value}" == *$'\n'* || "${value}" == *$'\r'* ]]; then
+    echo "ERROR: ${name} must not contain a newline." >&2
+    echo "It would be parsed as extra variables in \$GITHUB_ENV, not as one value." >&2
+    echo "Re-create the secret without embedded line breaks." >&2
+    exit 1
+  fi
+}
+
 export_to_github_env() {
   local destination="$1" store_password="$2" alias_name="$3" key_password="$4"
   if [[ -z "${GITHUB_ENV:-}" ]]; then
     echo "GITHUB_ENV is not set; run this inside GitHub Actions or export the variables yourself." >&2
     return 0
   fi
+  assert_single_line_value ANDROID_KEYSTORE_FILE "${destination}"
+  assert_single_line_value ANDROID_KEYSTORE_PASSWORD "${store_password}"
+  assert_single_line_value ANDROID_KEY_ALIAS "${alias_name}"
+  assert_single_line_value ANDROID_KEY_PASSWORD "${key_password}"
   {
     echo "ANDROID_KEYSTORE_FILE=${destination}"
     echo "ANDROID_KEYSTORE_PASSWORD=${store_password}"

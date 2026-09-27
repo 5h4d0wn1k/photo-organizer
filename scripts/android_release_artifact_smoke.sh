@@ -128,6 +128,26 @@ is_blank() {
   [[ -z "$(trim "${1:-}")" ]]
 }
 
+# Is a logcat *crash buffer* free of actual crashes?
+#
+# Not the same question as "is it blank". `adb logcat -b crash -d` can print a
+# buffer header ("--------- beginning of crash") even when the buffer holds no
+# entries, and whether it does varies between platform versions. A header is not
+# a crash: treating it as one would fail every release, which is exactly the kind
+# of false positive that trains people to ignore a red build. Real content --
+# a Java "FATAL EXCEPTION" or a native tombstone -- is still a failure, including
+# a SIGSEGV in the Rust galleryd daemon, which never appears as a Java exception.
+crash_buffer_is_clean() {
+  local line
+  while IFS= read -r line; do
+    line="$(trim "${line}")"
+    [[ -z "${line}" ]] && continue
+    [[ "${line}" == *"beginning of "* ]] && continue
+    return 1
+  done <<<"${1:-}"
+  return 0
+}
+
 is_device_booted() {
   [[ "$(trim "$(adb_shell getprop sys.boot_completed)")" == "1" ]]
 }
@@ -272,7 +292,7 @@ capture_crash_baseline() {
 }
 
 adverse_exit_reason_count() {
-  local dump="$1" line count=0 reason
+  local dump="$1" line count=0 reason candidate
   while IFS= read -r line; do
     if [[ "${line}" =~ reason=([0-9]+) ]]; then
       reason="${BASH_REMATCH[1]}"
@@ -308,7 +328,7 @@ assert_crash_buffer_clean() {
   local crash
   crash="$("${ADB}" logcat -b crash -d 2>/dev/null || true)"
   printf '%s\n' "${crash}" >"${CRASH_BUFFER_PATH}"
-  if ! is_blank "${crash}"; then
+  if ! crash_buffer_is_clean "${crash}"; then
     printf '%s\n' "The Android crash buffer is not empty after launch:" >&2
     printf '%s\n' "${crash}" >&2
     fail "crash/ANR detected during launch (includes native galleryd crashes)"

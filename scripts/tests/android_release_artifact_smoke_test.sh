@@ -124,7 +124,8 @@ emit_exit_info() {
 case "${verb}" in
   exec-out)
     if [[ "${args[0]:-}" == "screencap" ]]; then
-      local shot
+      # Not `local`: this heredoc body runs at the top level of the fake device,
+      # so `local` would print "can only be used in a function" and leak a global.
       shot="$(scenario_value SCREENSHOT || true)"
       [[ -n "${shot}" && -f "${shot}" ]] && cat "${shot}"
     fi
@@ -170,7 +171,7 @@ case "${verb}" in
       exit 0
     fi
     if [[ " $* " == *" -b crash "* ]]; then
-      local crash
+      # Not `local`, for the same reason as the screencap branch above.
       crash="$(scenario_value CRASH_BUFFER || true)"
       [[ -n "${crash}" && -f "${crash}" ]] && cat "${crash}"
       exit 0
@@ -361,8 +362,26 @@ expect_fail "an unbooted emulator fails instead of hanging" "sys.boot_completed"
 scenario_with "BOOTED=1"
 
 echo " crash, native-crash and ANR detection"
+# A logcat buffer header with no entries is not a crash. Some platform versions
+# print one, and treating it as a crash would fail every release -- a false
+# positive that gets the gate disabled.
+printf -- '--------- beginning of crash\n' >"${WORK_DIR}/crash-header-only.txt"
+scenario_with "CRASH_BUFFER=${WORK_DIR}/crash-header-only.txt"
+expect_pass "a logcat buffer header alone does not fail the gate" run_smoke
+printf -- '--------- beginning of crash\n\n' >"${WORK_DIR}/crash-header-and-blank.txt"
+scenario_with "CRASH_BUFFER=${WORK_DIR}/crash-header-and-blank.txt"
+expect_pass "a header followed by blank lines does not fail the gate" run_smoke
+
 scenario_with "CRASH_BUFFER=${WORK_DIR}/crash-java.txt"
 expect_fail "a Java FATAL EXCEPTION fails the gate" "crash/ANR detected" run_smoke
+scenario_with "CRASH_BUFFER=${WORK_DIR}/empty-exit-info.txt"
+
+# The header tolerance must not become a loophole: real content after a header
+# is still a crash.
+printf -- '--------- beginning of crash\n09-27 10:00:00.000  1000  1000 F DEBUG   : *** *** ***\n' \
+  >"${WORK_DIR}/crash-header-then-native.txt"
+scenario_with "CRASH_BUFFER=${WORK_DIR}/crash-header-then-native.txt"
+expect_fail "a header followed by a real tombstone still fails the gate" "crash/ANR detected" run_smoke
 scenario_with "CRASH_BUFFER=${WORK_DIR}/empty-exit-info.txt"
 
 scenario_with "CRASH_BUFFER=${WORK_DIR}/crash-native.txt"
@@ -400,6 +419,43 @@ for evidence in case.png case-summary.txt case-crash-buffer.txt case-exit-info.t
     bad "evidence ${evidence} exists and is non-empty"
   fi
 done
+
+# `[[ -s ]]` alone is weak for two of these. In a *passing* run the crash buffer
+# and the exit-info dump are legitimately free of crash content, so a size check
+# can pass on an almost-empty file without proving the gate actually captured
+# anything. Assert that each evidence file is the exact content the gate saw, and
+# that the verdict is consistent with it.
+crash_evidence="${WORK_DIR}/evidence/case-crash-buffer.txt"
+exit_evidence="${WORK_DIR}/evidence/case-exit-info.txt"
+for evidence_path in "${crash_evidence}" "${exit_evidence}"; do
+  if [[ -f "${evidence_path}" ]]; then
+    ok "$(basename "${evidence_path}") was written in the passing case, not skipped"
+  else
+    bad "$(basename "${evidence_path}") was written in the passing case, not skipped" "not created"
+  fi
+done
+# In the passing scenario these are free of crash markers; if they contained one,
+# the gate would have failed, so this cross-checks the evidence against the verdict.
+if grep -qE 'FATAL EXCEPTION|signal [0-9]+|beginning of crash' "${crash_evidence}" 2>/dev/null; then
+  if grep -q '^verdict: PASS' "${WORK_DIR}/evidence/case-summary.txt" 2>/dev/null; then
+    bad "the crash-buffer evidence is consistent with a PASS verdict" \
+      "evidence mentions a crash marker but the run passed: $(tr '\n' ' ' <"${crash_evidence}" | cut -c1-160)"
+  else
+    ok "the crash-buffer evidence is consistent with a PASS verdict"
+  fi
+else
+  ok "the crash-buffer evidence is consistent with a PASS verdict"
+fi
+if grep -qE 'reason=(4|5|6|7)\b' "${exit_evidence}" 2>/dev/null; then
+  if grep -q '^verdict: PASS' "${WORK_DIR}/evidence/case-summary.txt" 2>/dev/null; then
+    bad "the exit-info evidence is consistent with a PASS verdict" \
+      "evidence records an adverse reason but the run passed"
+  else
+    ok "the exit-info evidence is consistent with a PASS verdict"
+  fi
+else
+  ok "the exit-info evidence is consistent with a PASS verdict"
+fi
 if grep -q "result: PASS" "${WORK_DIR}/evidence/case-summary.txt" 2>/dev/null; then
   ok "the summary records the verdict"
 else

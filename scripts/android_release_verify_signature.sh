@@ -76,12 +76,25 @@ fi
 
 printf 'Verifying %s with %s\n' "${APK}" "${APKSIGNER}"
 
+# Create the evidence directory up front. Without this, a redirect into a
+# missing directory fails indistinguishably from a signature failure, and the
+# operator is sent to hunt a signing problem that does not exist.
+evidence_dir="$(dirname "${EVIDENCE}")"
+mkdir -p "${evidence_dir}" 2>/dev/null ||
+  die "could not create the evidence directory: ${evidence_dir}"
+if [[ ! -w "${evidence_dir}" ]]; then
+  die "evidence directory is not writable: ${evidence_dir}"
+fi
+
 # Always keep the full transcript: it is the release evidence, and when this
 # gate fails it is the only thing that explains why.
 verify_rc=0
 "${APKSIGNER}" verify --verbose --print-certs "${APK}" >"${EVIDENCE}" 2>&1 || verify_rc=$?
 
 if ((verify_rc != 0)); then
+  if [[ ! -s "${EVIDENCE}" ]]; then
+    die "apksigner produced no output (exit ${verify_rc}); the evidence file is empty"
+  fi
   # apksigner prints "DOES NOT VERIFY" followed by a reason (for example
   # "Target SDK version 36 requires a minimum of signature scheme v2").
   # Note that this failure text does NOT contain the token "Verifies", so the

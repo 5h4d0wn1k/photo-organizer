@@ -22,9 +22,16 @@ SUITES=(
   android_release_artifact_smoke_test.sh
 )
 
+# Suites print this exact string when an assertion could not run. Keep it in sync
+# with the DEGRADED_MARKER each suite defines.
+DEGRADED_MARKER='RELEASE_GATE_SUITE_DEGRADED:'
+
 failed=0
 degraded=0
 declare -a results=()
+# A Ctrl-C mid-suite would otherwise leave the log behind in /tmp.
+suite_log=""
+trap '[[ -n "${suite_log}" ]] && rm -f "${suite_log}"' EXIT INT TERM
 
 for suite in "${SUITES[@]}"; do
   printf '\n==> %s\n' "${suite}"
@@ -33,7 +40,10 @@ for suite in "${SUITES[@]}"; do
     # A suite that could not run its assertions still exits 0 (an unavailable
     # emulator SDK is not a code defect). Reporting that as a plain PASS would
     # let a real gap hide behind a green build, so degrade it loudly instead.
-    if grep -q 'DEGRADED' "${suite_log}"; then
+    # Anchored to a marker the suites emit, not the bare word: the log also
+    # contains human prose, including assertion names, and prose that happens to
+    # say "DEGRADED" must not be read as a skipped suite.
+    if grep -qF "${DEGRADED_MARKER}" "${suite_log}"; then
       results+=("DEGRADED ${suite} (see the SKIP output above -- assertions did NOT run)")
       degraded=1
     else

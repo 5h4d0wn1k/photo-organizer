@@ -42,7 +42,9 @@ bad() {
 }
 
 if ! python3 -c "import yaml" >/dev/null 2>&1; then
-  python3 -m pip install --quiet pyyaml >/dev/null 2>&1 || true
+  # Pinned so a future PyYAML release cannot change the assertions' behaviour,
+  # and best-effort: the next check fails loudly if it did not work.
+  python3 -m pip install --quiet "pyyaml==6.0.2" >/dev/null 2>&1 || true
 fi
 if ! python3 -c "import yaml" >/dev/null 2>&1; then
   echo "PyYAML is required to run these tests" >&2
@@ -267,10 +269,106 @@ for suite in android_release_signing_test.sh apksigner_gate_test.sh android_rele
     bad "${suite} exists"
   fi
 done
-if grep -q 'apksigner_gate_test.sh' "${ROOT_DIR}/scripts/tests/run_release_gate_tests.sh"; then
-  ok "the runner includes apksigner_gate_test.sh, so the signature gate is covered"
+
+# The runner is what CI actually executes, so its suite list is parsed rather than
+# grepped. A text grep cannot tell an active entry from a commented-out one, so
+# commenting a suite out used to leave this test green.
+runner="${ROOT_DIR}/scripts/tests/run_release_gate_tests.sh"
+if [[ -f "${runner}" ]]; then
+  ok "run_release_gate_tests.sh exists"
+  runner_suites="$(sed -n '/^SUITES=(/,/^)/p' "${runner}" |
+    sed 's/#.*//' | grep -oE '[A-Za-z0-9_]+_test\.sh' | sort -u)"
+  for suite in android_release_signing_test.sh apksigner_gate_test.sh android_release_artifact_smoke_test.sh; do
+    if printf '%s\n' "${runner_suites}" | grep -qx "${suite}"; then
+      ok "the runner actively lists ${suite} (not just mentions it)"
+    else
+      bad "the runner actively lists ${suite} (not just mentions it)" \
+        "parsed suite list: $(printf '%s' "${runner_suites}" | tr '\n' ' ')"
+    fi
+  done
+
+  # And the runner must actually fail when a suite fails. Neutering its failure
+  # handling used to go unnoticed, because nothing exercised it.
+  probe_root="$(mktemp -d)"
+  mkdir -p "${probe_root}/tests"
+  printf '#!/usr/bin/env bash\necho "boom"\nexit 1\n' >"${probe_root}/tests/deliberately_failing_test.sh"
+  chmod +x "${probe_root}/tests/deliberately_failing_test.sh"
+  # The runner must actually fail when a suite fails, or CI reports a red suite
+  # as a green build.
+  #
+  # This runs the REAL runner rather than a reimplementation of it. A hand-rolled
+  # mini-runner would only prove that the pattern works in general, which says
+  # nothing about the committed file. The copy differs from the real runner in
+  # exactly one way: its SUITES list is narrowed to the probe suite, so the
+  # assertion is not masked by the other three. Every line that decides the exit
+  # status is the committed code, verbatim.
+  probe_root="$(mktemp -d)"
+  mkdir -p "${probe_root}/scripts/tests"
+  cp "${runner}" "${probe_root}/scripts/tests/run_release_gate_tests.sh"
+  if python3 - "${probe_root}/scripts/tests/run_release_gate_tests.sh" <<'PYTHON'
+import re
+import sys
+
+path = sys.argv[1]
+with open(path) as handle:
+    source = handle.read()
+narrowed, count = re.subn(
+    r"SUITES=\(\n(?:  \S+\n)+\)",
+    "SUITES=(\n  probe_suite_test.sh\n)",
+    source,
+)
+if count != 1:
+    sys.exit("could not narrow the SUITES list; the runner's shape changed")
+with open(path, "w") as handle:
+    handle.write(narrowed)
+PYTHON
+  then
+    probe_runner="${probe_root}/scripts/tests/run_release_gate_tests.sh"
+    printf '#!/usr/bin/env bash\nprintf "%%s failed, 0 passed\n" probe\nexit 1\n' \
+      >"${probe_root}/scripts/tests/probe_suite_test.sh"
+    chmod +x "${probe_root}/scripts/tests/probe_suite_test.sh"
+    if bash "${probe_runner}" >/dev/null 2>&1; then
+      bad "the committed runner propagates a suite failure as a non-zero exit" \
+        "the real runner exited 0 despite a failing suite"
+    else
+      ok "the committed runner propagates a suite failure as a non-zero exit"
+    fi
+
+    # The DEGRADED path must do the same. A suite that could not run its
+    # assertions still exits 0, and reporting that as a plain PASS would let a
+    # real coverage gap hide behind a green build.
+    printf '#!/usr/bin/env bash\nprintf "RELEASE_GATE_SUITE_DEGRADED: no Android SDK\n0 passed, 0 failed\n"\n' \
+      >"${probe_root}/scripts/tests/probe_suite_test.sh"
+    if bash "${probe_runner}" >/dev/null 2>&1; then
+      bad "the committed runner exits non-zero when a suite reports itself degraded" \
+        "a skipped suite was reported as a clean pass"
+    else
+      ok "the committed runner exits non-zero when a suite reports itself degraded"
+    fi
+
+    # Both assertions above are only meaningful if the harness can also go green.
+    #
+    # The green case deliberately mentions the word in prose, because a suite that
+    # merely *talks about* being degraded has not degraded. Detecting the marker by
+    # grepping the log for the bare word would call this a skip, fail the entire
+    # run, and so train people to ignore a real degraded report. This is a bug that
+    # actually occurred here: an assertion whose name read "... when a suite is
+    # DEGRADED" made a fully passing run report itself as degraded.
+    printf '#!/usr/bin/env bash\nprintf "1 passed, 0 failed\\nok   a suite that merely mentions DEGRADED in prose is not degraded\\n"\nexit 0\n' \
+      >"${probe_root}/scripts/tests/probe_suite_test.sh"
+    if bash "${probe_runner}" >/dev/null 2>&1; then
+      ok "the same runner copy exits 0 for a clean suite (assertions are not vacuous)"
+    else
+      bad "the same runner copy exits 0 for a clean suite (assertions are not vacuous)" \
+        "the probe harness fails on its own"
+    fi
+  else
+    bad "the runner's SUITES list can be narrowed for probing" \
+      "the probe could not rewrite the SUITES list; the assertions above did not run"
+  fi
+  rm -rf "${probe_root}"
 else
-  bad "the runner includes apksigner_gate_test.sh, so the signature gate is covered"
+  bad "run_release_gate_tests.sh exists" "${runner} not found"
 fi
 
 echo " the signing key cannot be committed by accident"
@@ -297,7 +395,9 @@ echo " the emulator-runner script stays a single line in the committed script to
 # The committed script is invoked as `bash <file>`, so multi-line control flow is
 # safe there. The only thing that must not leak back into the workflow is a
 # multi-line inline `script:`.
-if grep -q 'script: |' "${WORKFLOW}"; then
+# A folded block scalar (">") is just as multi-line as a literal ("|") and breaks
+# the emulator-runner action identically, so match both.
+if grep -qE '^[[:space:]]*script:[[:space:]]*[>|]' "${WORKFLOW}"; then
   bad 'no multi-line inline emulator script: block may reappear'
 else
   ok 'no multi-line inline emulator script: block may reappear'

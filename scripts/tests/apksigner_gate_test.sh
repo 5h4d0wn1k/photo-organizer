@@ -35,6 +35,12 @@ pass_count=0
 fail_count=0
 skip_count=0
 
+# The runner detects a degraded suite by looking for this exact marker. It has to
+# be a distinct token rather than the bare word "DEGRADED": the runner greps the
+# whole log, so any assertion whose *name* merely mentions the word (as one of
+# these does) would otherwise be reported as a skipped suite.
+DEGRADED_MARKER='RELEASE_GATE_SUITE_DEGRADED:'
+
 ok() {
   pass_count=$((pass_count + 1))
   printf '  ok   %s\n' "$1"
@@ -51,11 +57,23 @@ fail() {
 skip_all() {
   skip_count=$((skip_count + 1))
   printf '  SKIP %s\n' "$1"
-  printf '\n  !! DEGRADED: this suite could not run: %s\n' "$1"
+  printf '\n  !! %s this suite could not run: %s\n' "${DEGRADED_MARKER}" "$1"
   printf '  !! The signature gate was NOT exercised here. On a GitHub runner the\n'
   printf '  !! Android SDK is preinstalled, so the release job still enforces it;\n'
   printf '  !! do not read this skip as a pass.\n'
   exit 0
+}
+
+# One assertion that cannot be exercised in this environment, while the rest of
+# the suite still runs. The DEGRADED marker is what matters: the suite runner
+# fails on it, so a partial skip cannot be mistaken for full coverage. A skip
+# that only printed SKIP would leave a green build with a hole in it.
+skip_one() {
+  skip_count=$((skip_count + 1))
+  printf '  SKIP %s\n' "$1"
+  printf '       %s\n' "$2"
+  printf '  !! %s %s\n' "${DEGRADED_MARKER}" "$1"
+  printf '  !! That assertion did NOT run; do not read this suite as a pass.\n'
 }
 
 # ---------------------------------------------------------------------------
@@ -241,20 +259,127 @@ else
 fi
 
 # The published checksum must be verifiable by a user who downloaded both files.
+#
+# These are two separate properties. Combining them as `A || B` would let a
+# merely well-formatted checksum pass even when the digest is wrong, because a
+# failed first branch falls through to the format check in the second.
 if [[ -s checksum.txt ]]; then
-  cp signed.apk ./verify-me.apk
-  if (cd "${WORK}" && sha256sum -c --status checksum.txt) 2>/dev/null ||
-    grep -qE '^[0-9a-f]{64}  signed\.apk$' checksum.txt; then
-    ok "the published checksum records the bare filename and verifies"
+  ok "the checksum file is written and non-empty"
+  if (cd "${WORK}" && sha256sum -c --status checksum.txt) 2>/dev/null; then
+    ok "the published checksum actually verifies against the APK"
   else
-    fail "the published checksum records the bare filename and verifies" \
-      "$(tr '\n' ' ' <checksum.txt | cut -c1-160)"
+    fail "the published checksum actually verifies against the APK" \
+      "sha256sum -c rejected it: $(tr '\n' ' ' <checksum.txt | cut -c1-160)"
+  fi
+  if grep -qE '^[0-9a-f]{64}  signed\.apk$' checksum.txt; then
+    ok "the checksum records the bare filename, not a path"
+  else
+    fail "the checksum records the bare filename, not a path" \
+      "got: $(tr '\n' ' ' <checksum.txt | cut -c1-160)"
   fi
 else
-  fail "the published checksum records the bare filename and verifies" "checksum.txt missing or empty"
+  fail "the checksum file is written and non-empty" "checksum.txt missing or empty"
 fi
 
-if grep -qE "$(pwd)" checksum.txt 2>/dev/null; then
+# Prove the assertion above is load-bearing rather than vacuous: corrupt the
+# digest and confirm the verification command rejects it.
+if [[ -s checksum.txt ]]; then
+  sed 's/^[0-9a-f]\{64\}/0000000000000000000000000000000000000000000000000000000000000000/' \
+    checksum.txt >corrupted.sha256
+  if (cd "${WORK}" && sha256sum -c --status corrupted.sha256) 2>/dev/null; then
+    fail "a corrupted checksum is rejected by the verification command" \
+      "sha256sum -c accepted a deliberately wrong digest"
+  else
+    ok "a corrupted checksum is rejected by the verification command"
+  fi
+fi
+
+# The assertions above invoke the gate with a bare filename, so "${APK##*/}" and
+# "${APK}" are the same string and the path-stripping is never exercised. The
+# real caller passes a path (apk/app-release.apk), and stripping it is the entire
+# point: a user who downloads the APK and the .sha256 sidecar into one directory
+# cannot verify a checksum that names an absolute CI build path.
+#
+# So exercise the case the first invocation cannot distinguish.
+mkdir -p dist
+cp signed.apk dist/app-release.apk
+if (cd "${WORK}" && ANDROID_HOME="${sdk_root}" bash "${GATE}" \
+  dist/app-release.apk evidence-path.txt checksum-path.txt) >/dev/null 2>&1; then
+  if grep -qE '^[0-9a-f]{64}  app-release\.apk$' checksum-path.txt; then
+    ok "a checksum for an APK given as a path still records the bare filename"
+  else
+    fail "a checksum for an APK given as a path still records the bare filename" \
+      "got: $(tr '\n' ' ' <checksum-path.txt | cut -c1-160)"
+  fi
+  if (cd "${WORK}/dist" && sha256sum -c --status ../checksum-path.txt) 2>/dev/null; then
+    ok "that checksum verifies next to the downloaded APK, as a user would run it"
+  else
+    fail "that checksum verifies next to the downloaded APK, as a user would run it" \
+      "$(tr '\n' ' ' <checksum-path.txt | cut -c1-160)"
+  fi
+else
+  fail "a checksum for an APK given as a path still records the bare filename" \
+    "the gate rejected dist/app-release.apk"
+fi
+
+# The evidence directory is created by the gate, so a caller may legitimately hand
+# it a path that does not exist yet. The signature here is valid, so the run must
+# succeed; the interesting case is a failure that reports a signature problem
+# when the real fault is a missing directory, which sends the operator to
+# investigate something that is not broken.
+if (cd "${WORK}" && ANDROID_HOME="${sdk_root}" bash "${GATE}" \
+  signed.apk no/such/dir/evidence.txt checksum-missing-dir.txt) >gate-missing-dir.log 2>&1; then
+  if [[ -s no/such/dir/evidence.txt ]]; then
+    ok "a missing evidence directory is created and the run still succeeds"
+  else
+    fail "a missing evidence directory is created and the run still succeeds" \
+      "the gate passed but wrote no evidence"
+  fi
+else
+  fail "a missing evidence directory is created and the run still succeeds" \
+    "the gate failed on a valid APK: $(tr '\n' ' ' <gate-missing-dir.log | cut -c1-200)"
+fi
+
+# An unwritable evidence directory must be reported as such. Otherwise the
+# redirect into it fails, the transcript is empty, and the failure reads as an
+# apksigner problem -- sending the operator to re-check a signature that is fine.
+#
+# `[[ -w ]]` is true for root regardless of the mode bits, so as root this case is
+# not reproducible and the assertions would be meaningless. That is reported as a
+# skip rather than quietly passing.
+if [[ "$(id -u)" == "0" ]]; then
+  skip_one "an unwritable evidence directory is reported as such" \
+    "running as root: the mode bits are ignored, so the writability check cannot fail here"
+  skip_one "an unwritable evidence directory is not misreported as a signature problem" \
+    "running as root: the mode bits are ignored, so the writability check cannot fail here"
+else
+  mkdir -p ro-evidence
+  chmod 0500 ro-evidence
+  if (cd "${WORK}" && ANDROID_HOME="${sdk_root}" bash "${GATE}" \
+    signed.apk ro-evidence/evidence.txt checksum-ro.txt) >gate-ro.log 2>&1; then
+    fail "an unwritable evidence directory is reported as such" \
+      "the gate passed despite not being able to write its evidence"
+  else
+    if grep -Fq "evidence directory" gate-ro.log; then
+      ok "an unwritable evidence directory is reported as such"
+    else
+      fail "an unwritable evidence directory is reported as such" \
+        "it failed, but not as a directory problem: $(tr '\n' ' ' <gate-ro.log | cut -c1-200)"
+    fi
+    if grep -Fq "DOES NOT VERIFY" gate-ro.log; then
+      fail "an unwritable evidence directory is not misreported as a signature problem" \
+        "the log blames the signature: $(tr '\n' ' ' <gate-ro.log | cut -c1-200)"
+    else
+      ok "an unwritable evidence directory is not misreported as a signature problem"
+    fi
+  fi
+  chmod 0700 ro-evidence
+fi
+
+# -F, not -E: the temp directory is caller-controlled, and any ERE metacharacter
+# in it would make this pattern match the wrong thing or nothing at all, silently
+# turning the leak check into a no-op.
+if grep -qF -- "$(pwd)" checksum.txt 2>/dev/null; then
   fail "the published checksum does not leak the CI build path" \
     "checksum.txt embeds an absolute build path: $(tr '\n' ' ' <checksum.txt | cut -c1-160)"
 else

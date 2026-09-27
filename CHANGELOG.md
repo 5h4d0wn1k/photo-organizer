@@ -24,14 +24,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   publishing an unsigned APK. A throwaway per-run key is possible only via the
   explicit `PRIVATE_GALLERY_RELEASE_ALLOW_EPHEMERAL_SIGNING` repository
   variable, and the release notes say so when it is used.
-- `scripts/tests/` — device-free tests for the release gate itself (109
+- `scripts/tests/` — device-free tests for the release gate itself (141
   assertions), run in CI via the "Release gate" job and locally with
   `make release-gate`. `release_workflow_test.sh` asserts the release
   workflow's safety properties structurally, so the guarantee cannot be removed
   by an unrelated edit. A suite that cannot run its assertions (for example, no
   Android SDK for the signature test) is reported as degraded and fails the run
-  rather than passing quietly.
+  rather than passing quietly. The assertions exercise behaviour rather than
+  source text wherever that is possible: a `keytool` shim records the real argv
+  to prove the store password never reaches the command line, the real runner is
+  executed to prove it fails when a suite fails, and the workflow parser is fed
+  a mutated YAML to prove the structural checks actually bite.
 - The published APK now ships a `app-release.apk.sha256` checksum alongside it.
+  It records the bare filename, not the CI build path, so a user who downloads
+  the APK and the sidecar into one directory can verify it with `sha256sum -c`.
 
 ### Security
 
@@ -54,6 +60,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Removed a duplicate definition of `is_enabled` in
   `scripts/production-readiness-check.sh`; the second, narrower-looking copy was
   dead code that silently lost to the first.
+- Values written to `$GITHUB_ENV` are rejected if they contain a newline or a
+  carriage return. `GITHUB_ENV` is a newline-delimited `KEY=VALUE` file, so an
+  embedded line break turns a value into additional environment variables for
+  every later step of the release — the "rejecting newlines is the whole
+  defence" case, since the format offers no escaping. Both the keystore file
+  path, the store password, the key alias and the key password are checked, and
+  the keystore path is checked before any directory is created, so a refused run
+  leaves nothing behind in the working tree.
 
 ### Fixed
 

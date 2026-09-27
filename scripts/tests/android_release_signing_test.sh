@@ -131,12 +131,16 @@ secrets_env() {
 }
 
 with_secrets_run_mode() {
+  # $* here is textual: it is interpolated into the script text that `bash -c`
+  # runs, not passed as arguments to it. Every caller passes exactly one
+  # subcommand word, so there is nothing to split and "$@" would be wrong.
   bash -c "$(secrets_env)
     export RUNNER_TEMP='${WORK_DIR}/runner' GITHUB_WORKSPACE='${WORK_DIR}/workspace' GITHUB_ENV='${GITHUB_ENV_FILE}'
     bash '${SCRIPT}' $*"
 }
 
 with_secrets_run_materialize() {
+  # Textual interpolation into the `bash -c` script text; see the note above.
   bash -c "$(secrets_env)
     export RUNNER_TEMP='${WORK_DIR}/runner' GITHUB_WORKSPACE='${WORK_DIR}/workspace' GITHUB_ENV='${GITHUB_ENV_FILE}'
     bash '${SCRIPT}' $*"
@@ -291,6 +295,138 @@ expect_out "a sibling directory that shares the workspace prefix is allowed" "al
     export RUNNER_TEMP='${WORK_DIR}/workspace-backup' GITHUB_WORKSPACE='${WORK_DIR}/workspace' GITHUB_ENV='${GITHUB_ENV_FILE}'
     bash '${SCRIPT}' materialize >/dev/null 2>&1 && echo allowed || echo refused"
 
+# A refused run must leave no trace in the tree it just declared off-limits.
+#
+# RUNNER_TEMP is checked before the directory is created, so a refusal happens
+# before any mkdir. Without that ordering the check still refuses the keystore,
+# but it has already created a directory inside the repository working tree --
+# which is then uploaded as an artifact and shows up in the diff. This is the
+# only assertion that distinguishes the two orderings, since both refuse.
+refused_dir="${WORK_DIR}/workspace/never-created"
+rm -rf "${refused_dir}"
+env \
+  "ANDROID_KEYSTORE_BASE64=${KEYSTORE_B64}" \
+  "ANDROID_KEYSTORE_PASSWORD=${STORE_PASSWORD}" \
+  "ANDROID_KEY_ALIAS=${ALIAS}" \
+  "ANDROID_KEY_PASSWORD=${KEY_PASSWORD}" \
+  "RUNNER_TEMP=${refused_dir}" \
+  "GITHUB_WORKSPACE=${WORK_DIR}/workspace" \
+  "GITHUB_ENV=${GITHUB_ENV_FILE}" \
+  bash "${SCRIPT}" materialize >"${OUT}" 2>&1
+if [[ -e "${refused_dir}" ]]; then
+  bad "a refused run creates nothing inside the working tree" \
+    "${refused_dir} was created before the refusal"
+else
+  ok "a refused run creates nothing inside the working tree (the check precedes mkdir)"
+fi
+# And the fixture must genuinely be inside the workspace, or the assertion above
+# would be passing because the path was never going to be created anyway.
+if [[ "$(realpath -m "${refused_dir}")" == "${WORK_DIR}/workspace/"* ]]; then
+  ok "the refused-path fixture really is inside the workspace"
+else
+  bad "the refused-path fixture really is inside the workspace" "resolved to $(realpath -m "${refused_dir}")"
+fi
+
+echo " newline injection into GITHUB_ENV"
+# GITHUB_ENV is a newline-delimited KEY=VALUE file and every later step parses it
+# that way, so a value containing a newline is an injection, not merely odd input:
+#
+#   ANDROID_KEY_ALIAS=key
+#   GITHUB_TOKEN_LEAK=pwned
+#
+# is two entries. The second becomes a real environment variable for every step
+# after this one, which is how a hostile or misconfigured secret turns into
+# control over the release. There is no escaping mechanism in the format, so the
+# only safe behaviour is to fail closed.
+#
+# Two separate properties are asserted, and both are needed: the run must fail,
+# AND the injected variable must not appear in GITHUB_ENV. A guard that printed
+# an error but still wrote the file would satisfy "does it fail?" alone.
+#
+# Only the three values that are *inputs* to `materialize` appear here.
+# ANDROID_KEYSTORE_FILE is an output the script computes, so setting it in the
+# environment proves nothing; it is covered structurally just below.
+injection="$(printf 'key\nGITHUB_TOKEN_LEAK=pwned')"
+for guarded in ANDROID_KEYSTORE_PASSWORD ANDROID_KEY_ALIAS ANDROID_KEY_PASSWORD; do
+  : >"${GITHUB_ENV_FILE}"
+  if env \
+    "ANDROID_KEYSTORE_BASE64=${KEYSTORE_B64}" \
+    "ANDROID_KEYSTORE_PASSWORD=${STORE_PASSWORD}" \
+    "ANDROID_KEY_ALIAS=${ALIAS}" \
+    "ANDROID_KEY_PASSWORD=${KEY_PASSWORD}" \
+    "RUNNER_TEMP=${WORK_DIR}/runner" \
+    "GITHUB_WORKSPACE=${WORK_DIR}/workspace" \
+    "GITHUB_ENV=${GITHUB_ENV_FILE}" \
+    "${guarded}=${injection}" \
+    bash "${SCRIPT}" materialize >"${OUT}" 2>&1; then
+    bad "a newline in ${guarded} fails closed" "expected a non-zero exit, got success: $(cat "${OUT}")"
+    continue
+  fi
+  if grep -Fq 'GITHUB_TOKEN_LEAK' "${GITHUB_ENV_FILE}" 2>/dev/null; then
+    bad "a newline in ${guarded} fails closed" \
+      "the injected variable was written to GITHUB_ENV: $(tr '\n' ' ' <"${GITHUB_ENV_FILE}" | cut -c1-160)"
+    continue
+  fi
+  ok "a newline in ${guarded} fails closed, and nothing is injected into GITHUB_ENV"
+done
+
+# The alias and the key password reach the explicit newline check, so assert the
+# diagnostic itself for those. The store password does not: keytool refuses to
+# open a keystore with a non-ASCII store password, so the run is rejected during
+# the keystore check instead. Both are fail-closed, which is the property that
+# matters; the specific guard is a backstop for the store password rather than
+# the primary defence. (keytool: "Encrypt Private Key failed: ... Password is
+# not ASCII".)
+for guarded in ANDROID_KEY_ALIAS ANDROID_KEY_PASSWORD; do
+  : >"${GITHUB_ENV_FILE}"
+  env \
+    "ANDROID_KEYSTORE_BASE64=${KEYSTORE_B64}" \
+    "ANDROID_KEYSTORE_PASSWORD=${STORE_PASSWORD}" \
+    "ANDROID_KEY_ALIAS=${ALIAS}" \
+    "ANDROID_KEY_PASSWORD=${KEY_PASSWORD}" \
+    "RUNNER_TEMP=${WORK_DIR}/runner" \
+    "GITHUB_WORKSPACE=${WORK_DIR}/workspace" \
+    "GITHUB_ENV=${GITHUB_ENV_FILE}" \
+    "${guarded}=${injection}" \
+    bash "${SCRIPT}" materialize >"${OUT}" 2>&1
+  if grep -Fq "must not contain a newline" "${OUT}"; then
+    ok "a newline in ${guarded} is caught by the explicit single-line check"
+  else
+    bad "a newline in ${guarded} is caught by the explicit single-line check" \
+      "got: $(tr '\n' ' ' <"${OUT}" | cut -c1-160)"
+  fi
+done
+
+# The mirror image: a value with no newline must still work, or the assertions
+# above could be passing simply because materialize always fails.
+#
+# GITHUB_ENV must hold exactly four well-formed entries, one per variable. This
+# is the structural check that covers all four *outputs* at once, including the
+# computed keystore path: a value containing a newline necessarily adds a line
+# that does not match NAME=VALUE, and cannot hide from a line count.
+: >"${GITHUB_ENV_FILE}"
+if env \
+  "ANDROID_KEYSTORE_BASE64=${KEYSTORE_B64}" \
+  "ANDROID_KEYSTORE_PASSWORD=${STORE_PASSWORD}" \
+  "ANDROID_KEY_ALIAS=${ALIAS}" \
+  "ANDROID_KEY_PASSWORD=${KEY_PASSWORD}" \
+  "RUNNER_TEMP=${WORK_DIR}/runner" \
+  "GITHUB_WORKSPACE=${WORK_DIR}/workspace" \
+  "GITHUB_ENV=${GITHUB_ENV_FILE}" \
+  bash "${SCRIPT}" materialize >"${OUT}" 2>&1; then
+  ok "a newline-free value is still exported (the guards are not refusing everything)"
+else
+  bad "a newline-free value is still exported (the guards are not refusing everything)" \
+    "$(cat "${OUT}")"
+fi
+if [[ "$(grep -c '' "${GITHUB_ENV_FILE}")" == "4" ]] &&
+  ! grep -qvE '^[A-Z][A-Z0-9_]*=.+$' "${GITHUB_ENV_FILE}"; then
+  ok "GITHUB_ENV holds exactly four well-formed NAME=VALUE entries"
+else
+  bad "GITHUB_ENV holds exactly four well-formed NAME=VALUE entries" \
+    "$(tr '\n' '|' <"${GITHUB_ENV_FILE}" | cut -c1-200)"
+fi
+
 echo " keystore handling"
 # A fixed, guessable filename in the runner temp dir would hand any code running
 # in the Gradle JVM a known path to the signing key. Checked behaviourally: two
@@ -301,14 +437,14 @@ env -u PRIVATE_GALLERY_RELEASE_ALLOW_EPHEMERAL_SIGNING \
   GITHUB_ENV="${GITHUB_ENV_FILE}" bash -c "
     export ANDROID_KEYSTORE_BASE64='${KEYSTORE_B64}' ANDROID_KEYSTORE_PASSWORD='${STORE_PASSWORD}' ANDROID_KEY_ALIAS='${ALIAS}' ANDROID_KEY_PASSWORD='${KEY_PASSWORD}'
     bash '${SCRIPT}' materialize" >/dev/null 2>&1
-first_path="$(grep -E '^ANDROID_KEYSTORE_FILE=' "${GITHUB_ENV_FILE}" | head -n 1 | cut -d= -f2-)"
+first_path="$(grep -E '^ANDROID_KEYSTORE_FILE=' "${GITHUB_ENV_FILE}" 2>/dev/null | head -n 1 | cut -d= -f2- || true)"
 : >"${GITHUB_ENV_FILE}"
 env -u PRIVATE_GALLERY_RELEASE_ALLOW_EPHEMERAL_SIGNING \
   RUNNER_TEMP="${WORK_DIR}/runner" GITHUB_WORKSPACE="${WORK_DIR}/workspace" \
   GITHUB_ENV="${GITHUB_ENV_FILE}" bash -c "
     export ANDROID_KEYSTORE_BASE64='${KEYSTORE_B64}' ANDROID_KEYSTORE_PASSWORD='${STORE_PASSWORD}' ANDROID_KEY_ALIAS='${ALIAS}' ANDROID_KEY_PASSWORD='${KEY_PASSWORD}'
     bash '${SCRIPT}' materialize" >/dev/null 2>&1
-second_path="$(grep -E '^ANDROID_KEYSTORE_FILE=' "${GITHUB_ENV_FILE}" | head -n 1 | cut -d= -f2-)"
+second_path="$(grep -E '^ANDROID_KEYSTORE_FILE=' "${GITHUB_ENV_FILE}" 2>/dev/null | head -n 1 | cut -d= -f2- || true)"
 if [[ -n "${first_path}" && -n "${second_path}" && "${first_path}" != "${second_path}" ]]; then
   ok "the keystore path is randomised per run"
 else
@@ -320,18 +456,58 @@ else
   bad "the randomised keystore still lives under RUNNER_TEMP" "path: ${second_path:-<unset>}"
 fi
 
-# The store password must not appear in keytool's argv, where any local process
-# could read it from /proc/<pid>/cmdline.
-if grep -q '\-storepass "\${ANDROID_KEYSTORE_PASSWORD}"' "${SCRIPT}"; then
-  bad "the store password is passed to keytool via the environment, not argv" \
-    "found -storepass with the password inline"
+# The store password must not appear in keytool's argv, where any other local
+# process could read it from /proc/<pid>/cmdline.
+#
+# Asserted behaviourally with a keytool shim rather than by grepping the source:
+# a source grep cannot tell `-storepass "$P"` from `-storepass"$P"` or
+# `-storepass '$P'`, and it says nothing about what is actually executed. The
+# shim records its own argv, so the assertion is about the real invocation.
+shim_dir="${WORK_DIR}/shim"
+argv_log="${WORK_DIR}/keytool-argv.log"
+mkdir -p "${shim_dir}"
+cat >"${shim_dir}/keytool" <<SHIM
+#!/usr/bin/env bash
+# Test double: record the arguments this process was actually given, then
+# succeed. The values written here are per-run throwaway fixtures generated by
+# this suite, never real repository secrets.
+printf '%s\n' "\$*" >> "${argv_log}"
+exit 0
+SHIM
+chmod +x "${shim_dir}/keytool"
+
+: >"${argv_log}"
+: >"${GITHUB_ENV_FILE}"
+env -u PRIVATE_GALLERY_RELEASE_ALLOW_EPHEMERAL_SIGNING \
+  PATH="${shim_dir}:${PATH}" \
+  RUNNER_TEMP="${WORK_DIR}/runner" GITHUB_WORKSPACE="${WORK_DIR}/workspace" \
+  GITHUB_ENV="${GITHUB_ENV_FILE}" bash -c "
+    export ANDROID_KEYSTORE_BASE64='${KEYSTORE_B64}' ANDROID_KEYSTORE_PASSWORD='${STORE_PASSWORD}' ANDROID_KEY_ALIAS='${ALIAS}' ANDROID_KEY_PASSWORD='${KEY_PASSWORD}'
+    bash '${SCRIPT}' materialize" >/dev/null 2>&1
+
+if [[ -s "${argv_log}" ]]; then
+  ok "the keytool shim recorded the invocation (the argv assertions are not vacuous)"
 else
-  ok "the store password is passed to keytool via the environment, not argv"
+  bad "the keytool shim recorded the invocation (the argv assertions are not vacuous)" \
+    "the shim was never called; nothing below would prove anything"
 fi
-if grep -q 'storepass:env ANDROID_KEYSTORE_PASSWORD' "${SCRIPT}"; then
-  ok "keytool reads the store password from the environment"
+if grep -qF -- "${STORE_PASSWORD}" "${argv_log}" 2>/dev/null; then
+  bad "the store password never appears in keytool's argv" \
+    "found it in: $(head -n 1 "${argv_log}" | cut -c1-160)"
 else
-  bad "keytool reads the store password from the environment" "storepass:env is not used"
+  ok "the store password never appears in keytool's argv"
+fi
+if grep -q -- '-storepass:env' "${argv_log}" 2>/dev/null; then
+  ok "keytool reads the store password from the environment, as intended"
+else
+  bad "keytool reads the store password from the environment, as intended" \
+    "invocation was: $(head -n 1 "${argv_log}" | cut -c1-160)"
+fi
+if grep -qF -- "${KEY_PASSWORD}" "${argv_log}" 2>/dev/null; then
+  bad "the key password never appears in keytool's argv" \
+    "found it in: $(head -n 1 "${argv_log}" | cut -c1-160)"
+else
+  ok "the key password never appears in keytool's argv"
 fi
 
 # umask 077 keeps the keystore we create owner-only. (GITHUB_ENV itself is
