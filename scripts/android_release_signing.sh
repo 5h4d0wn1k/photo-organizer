@@ -55,12 +55,33 @@ set -euo pipefail
 umask 077
 
 EPHEMERAL_KEY_ALIAS="ci-ephemeral-key"
-EPHEMERAL_KEY_PASSWORD="ephemeral-ci-only-not-a-secret"
 EPHEMERAL_KEY_DNAME="CN=Photo Organizer CI Ephemeral, OU=CI, O=Photo Organizer, C=NA"
 EPHEMERAL_KEY_VALIDITY_DAYS=10000
+EPHEMERAL_KEY_PASSWORD_BYTES=32
 # A JKS/PKCS12 keystore is binary; anything smaller means the secret was
 # truncated, base64-corrupted, or the wrong secret entirely.
 MIN_KEYSTORE_BYTES=512
+
+# The throwaway key's password is generated per run instead of being written
+# down here. A committed literal is a value every clone of this repository
+# already has, which makes it a published secret by definition and fails secret
+# scanning on the very commit that adds no real credential.
+#
+# Memoised so the store password, the key password and the value exported to
+# GITHUB_ENV are the same string within a run: they are consumed by different
+# processes, and a keystore that cannot be reopened is worse than no keystore.
+#
+# 32 bytes from the kernel CSPRNG, hex-encoded, gives 128 bits of entropy in a
+# form that cannot inject a second entry into GITHUB_ENV, cannot confuse keytool
+# with a metacharacter, and needs no extra tool beyond coreutils.
+ephemeral_key_password() {
+  if [[ -z "${EPHEMERAL_KEY_PASSWORD:-}" ]]; then
+    EPHEMERAL_KEY_PASSWORD="$(
+      od -An -tx1 -N"${EPHEMERAL_KEY_PASSWORD_BYTES}" /dev/urandom | tr -d ' \n'
+    )"
+  fi
+  printf '%s' "${EPHEMERAL_KEY_PASSWORD}"
+}
 
 is_true() {
   case "$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')" in
@@ -214,14 +235,14 @@ materialize_release_keystore() {
 }
 
 materialize_ephemeral_keystore() {
-  local destination="$1"
+  local destination="$1" password="$2"
   assert_outside_workspace "${destination}"
   rm -f "${destination}"
   keytool -genkeypair \
     -keystore "${destination}" \
     -storetype PKCS12 \
-    -storepass "${EPHEMERAL_KEY_PASSWORD}" \
-    -keypass "${EPHEMERAL_KEY_PASSWORD}" \
+    -storepass "${password}" \
+    -keypass "${password}" \
     -alias "${EPHEMERAL_KEY_ALIAS}" \
     -keyalg RSA \
     -keysize 2048 \
@@ -283,7 +304,7 @@ main() {
     materialize)
       require_tool keytool
       require_tool base64
-      local mode destination
+      local mode destination ephemeral_password
       mode="$(resolve_mode)"
       destination="$(keystore_destination)"
       # The key deliberately outlives this process: `materialize` writes the path to
@@ -295,8 +316,11 @@ main() {
         materialize_release_keystore "${destination}"
         export_to_github_env "${destination}" "${ANDROID_KEYSTORE_PASSWORD}" "${ANDROID_KEY_ALIAS}" "${ANDROID_KEY_PASSWORD}"
       else
-        materialize_ephemeral_keystore "${destination}"
-        export_to_github_env "${destination}" "${EPHEMERAL_KEY_PASSWORD}" "${EPHEMERAL_KEY_ALIAS}" "${EPHEMERAL_KEY_PASSWORD}"
+        # Generated once, here, so the keystore and the exported value are
+        # guaranteed to agree without either side re-deriving it.
+        ephemeral_password="$(ephemeral_key_password)"
+        materialize_ephemeral_keystore "${destination}" "${ephemeral_password}"
+        export_to_github_env "${destination}" "${ephemeral_password}" "${EPHEMERAL_KEY_ALIAS}" "${ephemeral_password}"
       fi
       printf '%s\n' "${mode}"
       ;;

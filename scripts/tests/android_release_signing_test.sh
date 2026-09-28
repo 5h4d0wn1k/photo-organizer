@@ -213,11 +213,62 @@ if [[ -n "${EPHEMERAL_KEYSTORE}" && -f "${EPHEMERAL_KEYSTORE}" ]]; then
 else
   bad "the ephemeral keystore is created" "ANDROID_KEYSTORE_FILE=${EPHEMERAL_KEYSTORE:-<unset>}"
 fi
-if [[ -n "${EPHEMERAL_KEYSTORE}" ]] && keytool -list -keystore "${EPHEMERAL_KEYSTORE}" \
-  -storepass "ephemeral-ci-only-not-a-secret" >/dev/null 2>&1; then
-  ok "the ephemeral keystore is a real, openable keystore"
+# The keystore is opened with the password the run exported, not with a literal
+# copied from the script: the property under test is that the value the script
+# exports is the value it actually signed with, whatever its source.
+EPHEMERAL_PASSWORD="$(grep -E '^ANDROID_KEYSTORE_PASSWORD=' "${GITHUB_ENV_FILE}" 2>/dev/null | head -n 1 | cut -d= -f2- || true)"
+if [[ -n "${EPHEMERAL_KEYSTORE}" && -n "${EPHEMERAL_PASSWORD}" ]] && keytool -list -keystore "${EPHEMERAL_KEYSTORE}" \
+  -storepass "${EPHEMERAL_PASSWORD}" >/dev/null 2>&1; then
+  ok "the ephemeral keystore opens with the password the run exported"
 else
-  bad "the ephemeral keystore is a real, openable keystore" "path: ${EPHEMERAL_KEYSTORE:-<unset>}"
+  bad "the ephemeral keystore opens with the password the run exported" \
+    "path: ${EPHEMERAL_KEYSTORE:-<unset>}"
+fi
+
+echo " ephemeral password generation"
+# The throwaway key's password has to be generated per run rather than written
+# into this repository. A committed constant is a value every clone already
+# knows, which makes it a published secret by definition -- and it makes secret
+# scanning fail on the very commit that adds no real credential.
+#
+# Asserted behaviourally: two runs must export different passwords. Grepping the
+# source for the old literal would not survive renaming it, and would pass
+# against a script that merely mentioned it in a comment.
+run_ephemeral_materialize() {
+  : >"${GITHUB_ENV_FILE}"
+  run_materialize PRIVATE_GALLERY_RELEASE_ALLOW_EPHEMERAL_SIGNING=true
+}
+read_exported() {
+  grep -E "^$1=" "${GITHUB_ENV_FILE}" 2>/dev/null | head -n 1 | cut -d= -f2- || true
+}
+
+run_ephemeral_materialize >/dev/null
+first_password="$(read_exported ANDROID_KEYSTORE_PASSWORD)"
+run_ephemeral_materialize >/dev/null
+second_password="$(read_exported ANDROID_KEYSTORE_PASSWORD)"
+
+if [[ -n "${first_password}" && -n "${second_password}" && "${first_password}" != "${second_password}" ]]; then
+  ok "the ephemeral password is generated per run, not a committed constant"
+else
+  bad "the ephemeral password is generated per run, not a committed constant" \
+    "both runs exported: ${first_password:-<unset>}"
+fi
+# Hex from the kernel CSPRNG: no newline (so it cannot inject a second entry
+# into GITHUB_ENV), no shell or keytool metacharacter, and 128 bits of entropy
+# at the 32 bytes this generates.
+if [[ "${first_password}" =~ ^[0-9a-f]{32,}$ ]]; then
+  ok "the generated password is at least 128 bits of hex (single-line, ASCII-only)"
+else
+  bad "the generated password is at least 128 bits of hex (single-line, ASCII-only)" \
+    "got: ${first_password:-<unset>}"
+fi
+# And the alias stays fixed, so the failure mode of a wrong keystore is a
+# changed password rather than a silently different identity.
+if [[ "$(read_exported ANDROID_KEY_ALIAS)" == "ci-ephemeral-key" ]]; then
+  ok "the ephemeral alias stays stable across runs"
+else
+  bad "the ephemeral alias stays stable across runs" \
+    "got: $(read_exported ANDROID_KEY_ALIAS)"
 fi
 
 echo " corrupt secret handling"
