@@ -105,6 +105,12 @@ jobs:
           tool: cargo-audit
       - name: Rust dependency audit
         run: cargo audit
+      # Workflow hygiene (no pull_request_target, pinned actions, timeouts,
+      # declared permissions) is a security property: the workflow file decides
+      # what code runs with what secrets. scripts/tests/workflow_hygiene_test.sh
+      # asserts it from the parsed YAML, mutation-tested.
+      - name: Workflow hygiene
+        run: bash scripts/tests/workflow_hygiene_test.sh
       - name: Generate SBOM
         uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
         with:

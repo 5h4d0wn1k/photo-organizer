@@ -1,6 +1,6 @@
 SHELL := /bin/bash
 
-.PHONY: help setup fmt lint test check audit flutter-analyze flutter-test release-linux-local release-gate
+.PHONY: help setup fmt lint test check audit flutter-analyze flutter-test release-linux-local release-gate workflow-hygiene
 
 help:
 	@echo "Photo Organizer dev targets:"
@@ -13,6 +13,7 @@ help:
 	@echo "  flutter-test       flutter test (app/)"
 	@echo "  release-gate       tests for the Android artifact/signing release gate"
 	@echo "  release-linux-local build daemon + Flutter Linux bundle (scripts/build_linux_release.sh)"
+	@echo "  workflow-hygiene   structural tests for .github/workflows (triggers, pins, timeouts, permissions)"
 
 setup:
 	@echo "Dependencies: stable Rust toolchain (rust-toolchain.toml), Flutter stable,"
@@ -44,3 +45,6 @@ release-gate:
 
 release-linux-local:
 	./scripts/build_linux_release.sh
+
+workflow-hygiene:
+	bash scripts/tests/workflow_hygiene_test.sh
