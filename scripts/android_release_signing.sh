@@ -119,13 +119,19 @@ Publishing is blocked on purpose. Configure the four release secrets once:
 
   keytool -genkeypair -v -keystore release.jks -storetype PKCS12 \
     -keyalg RSA -keysize 4096 -validity 10000 -alias photo-organizer \
-    -storepass '<store password>' -keypass '<key password>' \
+    -storepass '<store password>' \
     -dname "CN=Photo Organizer, O=Photo Organizer, C=NA"
+
+  A PKCS12 keystore cannot hold two different passwords: keytool prints
+  "Different store and key passwords not supported for PKCS12 KeyStores.
+  Ignoring user-specified -keypass value." and discards -keypass. The key
+  password IS the store password, so set both secrets to the same value. Use
+  -storetype JKS if you need them to differ.
 
   gh secret set ANDROID_KEYSTORE_BASE64   < <(base64 -w0 release.jks)
   gh secret set ANDROID_KEYSTORE_PASSWORD -- '<store password>'
   gh secret set ANDROID_KEY_ALIAS         -- 'photo-organizer'
-  gh secret set ANDROID_KEY_PASSWORD      -- '<key password>'
+  gh secret set ANDROID_KEY_PASSWORD      -- '<the same password>'
 
 Keep release.jks and both passwords somewhere safe and private: the signing key
 is the artifact's identity, and losing it means users can never install an
@@ -211,6 +217,10 @@ materialize_release_keystore() {
     rm -f "${destination}"
     exit 1
   }
+  # Explicit, not relying on mktemp's 0600 or on the process umask: if either ever
+  # changes, the keystore must still be owner-only. This is the mechanism the
+  # signing suite asserts, not a side effect it happens to observe.
+  chmod 600 "${destination}"
   # `wc -c` rather than `stat -c %s`: the `-c` form is GNU coreutils and does not
   # exist on BSD/macOS, where this script is also used to prepare a local release.
   # `wc -c` is POSIX and prints the same byte count on both.
@@ -272,7 +282,14 @@ assert_single_line_value() {
 export_to_github_env() {
   local destination="$1" store_password="$2" alias_name="$3" key_password="$4"
   if [[ -z "${GITHUB_ENV:-}" ]]; then
-    echo "GITHUB_ENV is not set; run this inside GitHub Actions or export the variables yourself." >&2
+    # Outside GitHub Actions there is no environment file to receive the
+    # variables, so the keystore this just wrote would be orphaned: valid, on
+    # disk, at a path nobody was told. In release mode that orphan is the
+    # production signing key. Print the path (never the passwords) so the caller
+    # can export or delete it, instead of succeeding silently with a key nobody
+    # can find to clean up.
+    printf 'GITHUB_ENV is not set; the keystore was written to %s\n' "${destination}" >&2
+    printf 'ANDROID_KEYSTORE_FILE=%s\n' "${destination}"
     return 0
   fi
   assert_single_line_value ANDROID_KEYSTORE_FILE "${destination}"

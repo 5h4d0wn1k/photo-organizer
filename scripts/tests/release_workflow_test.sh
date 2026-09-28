@@ -168,6 +168,18 @@ if smoke_steps:
 # --- signing is not optional, and is not faked ------------------------------
 expect("android_release_signing.sh materialize" in runs_of("android"),
        "the android job must resolve signing through scripts/android_release_signing.sh")
+# Signing resolution must run BEFORE the NDK cross-compile. The signing script's
+# stated purpose is to "fail fast ... instead of letting Gradle report an opaque
+# keystore error after a long NDK cross-compile" -- and a tag cut before the four
+# secrets exist must fail in seconds, not after burning the three-target cargo-ndk
+# release build. Order is load-bearing here, so it is asserted, not assumed.
+android_steps = steps_of("android")
+signing_index = next((i for i, s in enumerate(android_steps)
+                      if "android_release_signing.sh materialize" in str(s.get("run", ""))), None)
+ndk_index = next((i for i, s in enumerate(android_steps)
+                  if "cargo ndk" in str(s.get("run", ""))), None)
+expect(signing_index is not None and ndk_index is not None and signing_index < ndk_index,
+       "signing material must resolve before the NDK cross-compile, so a missing secret fails fast")
 expect("keytool -genkeypair" not in runs_of("android"),
        "the android job must not inline its own throwaway key generation; the policy script owns that decision")
 expect("secrets.ANDROID_KEYSTORE" not in runs_of("android"),
@@ -231,6 +243,14 @@ expect("only partially configured" in gradle,
        "build.gradle.kts must reject a half-configured keystore instead of silently dropping it")
 expect("signingConfigs.getByName(\"debug\")" not in gradle,
        "the release build must never use the debug signing config")
+# An unsigned release build must be an explicit, recorded decision, not the
+# default when the properties file is missing. Without this a developer who
+# builds before populating private-gallery-release.properties gets a green build
+# and an uninstallable APK -- the #97 symptom, reproduced locally.
+expect("allowUnsignedRelease" in gradle,
+       "build.gradle.kts must require an explicit opt-out for unsigned release builds")
+expect("signingConfig = if (hasReleaseSigning)" in gradle,
+       "the release build type must select its signing config from hasReleaseSigning")
 
 for message in failures:
     print(message)
@@ -270,6 +290,35 @@ for suite in android_release_signing_test.sh apksigner_gate_test.sh android_rele
   fi
 done
 
+# The runner is what CI actually executes -- and CI must actually execute the
+# runner. Deleting the entire `release-gate` job from ci.yml used to leave every
+# assertion here green, because this file asserted the runner's contents but
+# nothing bound the runner to CI. Found by mutation.
+ci_gate="$(python3 - "${ROOT_DIR}/.github/workflows/ci.yml" <<'PYTHON'
+import sys
+
+import yaml
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    ci = yaml.safe_load(handle)
+
+found = False
+for job in (ci.get("jobs") or {}).values():
+    for step in job.get("steps", []) or []:
+        if not isinstance(step, dict):
+            continue
+        if "scripts/tests/run_release_gate_tests.sh" in str(step.get("run", "")):
+            found = True
+print("yes" if found else "no")
+PYTHON
+)"
+if [[ "${ci_gate}" == "yes" ]]; then
+  ok "ci.yml runs the release gate test runner"
+else
+  bad "ci.yml runs the release gate test runner" \
+    "no ci.yml step runs scripts/tests/run_release_gate_tests.sh; the gate would not run in CI"
+fi
+
 # The runner is what CI actually executes, so its suite list is parsed rather than
 # grepped. A text grep cannot tell an active entry from a commented-out one, so
 # commenting a suite out used to leave this test green.
@@ -278,7 +327,11 @@ if [[ -f "${runner}" ]]; then
   ok "run_release_gate_tests.sh exists"
   runner_suites="$(sed -n '/^SUITES=(/,/^)/p' "${runner}" |
     sed 's/#.*//' | grep -oE '[A-Za-z0-9_]+_test\.sh' | sort -u)"
-  for suite in android_release_signing_test.sh apksigner_gate_test.sh android_release_artifact_smoke_test.sh; do
+  # The runner's own self-list is the load-bearing entry: every other suite is
+  # asserted by release_workflow_test itself, so removing it from SUITES is the
+  # one removal this file could never notice -- found by mutation, and the enabler
+  # for a green run with the python3 guard removed.
+  for suite in android_release_signing_test.sh apksigner_gate_test.sh android_release_artifact_smoke_test.sh release_workflow_test.sh; do
     if printf '%s\n' "${runner_suites}" | grep -qx "${suite}"; then
       ok "the runner actively lists ${suite} (not just mentions it)"
     else
@@ -433,36 +486,56 @@ if [[ -z "${upload_path}" ]]; then
   bad "the Android artifact is uploaded as a single path" \
     "no android-artifact upload step, or it lists several paths (see the LCA note in the workflow)"
 else
-  # A single path that is a directory makes the artifact root that directory, so
-  # the layout is exactly what the staging step produced. A single *file* would
-  # work too, but a directory is what we stage, and the two are not equivalent if
-  # the staged set ever grows.
-  if [[ -d "${ROOT_DIR}/${upload_path}" ]] || grep -qE "^[[:space:]]*mkdir -p ${upload_path}\$" "${WORKFLOW}"; then
-    ok "the Android artifact is uploaded as a directory, so its root is unambiguous (${upload_path})"
+  # `dist`, exactly. A bare `-d` passes for any directory that happens to exist on
+  # disk -- found by mutation: `path: public/seed-media/demo` (untracked, zero APKs)
+  # went green while the LCA comment in the workflow claims the opposite. The
+  # staging step creates `dist` and nothing else writes it, so the check is the
+  # literal name plus "the staging step creates it", not "it exists".
+  if [[ "${upload_path}" == "dist" ]] && grep -qE "^[[:space:]]*mkdir -p dist\$" "${WORKFLOW}"; then
+    ok "the Android artifact is uploaded as the staged dist/ directory"
   else
-    bad "the Android artifact is uploaded as a directory, so its root is unambiguous" \
-      "'${upload_path}' is neither a tracked directory nor a directory the staging step creates"
+    bad "the Android artifact is uploaded as the staged dist/ directory" \
+      "'${upload_path}' is not the directory the staging step creates; the artifact root would not match what the consumers read"
   fi
 fi
 
 # The staging step must copy every file the consumers reference, so the artifact
-# cannot silently lose its checksum or its signature evidence. Matched on the
-# *destination* of each "source:destination" pair rather than on a whole line, so
-# the assertion does not depend on which entry happens to be last in the list (the
-# last one carries no line-continuation backslash) or on how it is indented.
+# cannot silently lose its checksum or its signature evidence. Parsed from the
+# staging step's own `run:` script, not grepped from the raw file: a comment
+# quoting `"apksigner-verify.txt:apksigner-verify.txt"` satisfies a raw grep and
+# would let a staging entry be replaced with `"":""` while every check stays
+# green -- both found by mutation.
+staged_pairs="$(python3 - "${WORKFLOW}" <<'PYTHON'
+import re
+import sys
+
+import yaml
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    workflow = yaml.safe_load(handle)
+
+steps = workflow["jobs"]["android"].get("steps", []) or []
+code = "\n".join(
+    str(step.get("run", "")) for step in steps if isinstance(step, dict)
+)
+code = "\n".join(
+    line
+    for line in code.splitlines()
+    if line.strip() and not line.lstrip().startswith("#")
+)
+for pair in re.findall(r'"([^"]+:[^"]+)"', code):
+    print(pair)
+PYTHON
+)"
 for required in app-release.apk app-release.apk.sha256 apksigner-verify.txt; do
   # Assign from a command substitution, not a `while read` loop over a process
   # substitution: the loop would run in a subshell and the variable it set would be
-  # lost, silently reporting every name as unstaged.
+  # lost, silently reporting every name as unstaged. The pairs were extracted above
+  # from the staging step's own comment-stripped `run:` script, so a comment or
+  # an unrelated step quoting "x:y" cannot satisfy this.
   staged_destination=no
-  staged_pairs="$(grep -oE '"[^"]+:[^"]+"' "${WORKFLOW}" 2>/dev/null || true)"
   for pair in ${staged_pairs}; do
-    # Strip the surrounding quotes grep kept: the match is a quoted YAML/shell
-    # token, so "${pair##*:}" alone would end in a literal `"` and never equal the
-    # bare filename.
     destination="${pair##*:}"
-    destination="${destination%\"}"
-    destination="${destination#\"}"
     if [[ "${destination}" == "${required}" ]]; then
       staged_destination=yes
       break
@@ -477,11 +550,55 @@ for required in app-release.apk app-release.apk.sha256 apksigner-verify.txt; do
 done
 
 # ...and the consumers must all look for the APK at the artifact root.
-if grep -qF 'apk/app-release.apk' "${WORKFLOW}"; then
-  ok "the smoke gate and the publish step read the APK from the artifact root"
+# Parsed from the YAML, not grepped from the raw file. A comment explaining the
+# staging layout quotes `apk/app-release.apk` (it has to, to explain what it is
+# not), so a raw grep is satisfied by the explanation alone -- found by mutation:
+# repointing the emulator runner's `script:` at a nested path left the check green
+# because the comment at the staging step still named the right path.
+apk_consumers="$(python3 - "${WORKFLOW}" <<'PYTHON'
+import sys
+
+import yaml
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    workflow = yaml.safe_load(handle)
+
+smoke_steps = workflow["jobs"]["android-smoke"].get("steps", []) or []
+scripts = [
+    str(step.get("with", {}).get("script", ""))
+    for step in smoke_steps
+    if isinstance(step, dict)
+    and "android-emulator-runner" in str(step.get("uses", ""))
+]
+publish_steps = workflow["jobs"]["android-publish"].get("steps", []) or []
+runs = [
+    str(step.get("run", ""))
+    for step in publish_steps
+    if isinstance(step, dict)
+]
+attached = " ".join(
+    str(step.get("with", {}).get("files", ""))
+    for step in publish_steps
+    if isinstance(step, dict) and "action-gh-release" in str(step.get("uses", ""))
+)
+print("SMOKE_SCRIPT:" + "\n".join(scripts))
+print("PUBLISH_RUN:" + "\n".join(runs))
+print("ATTACHED:" + attached)
+PYTHON
+)"
+if grep -qF '$GITHUB_WORKSPACE/apk/app-release.apk' <<<"${apk_consumers}"; then
+  ok "the smoke gate reads the APK from the artifact root"
 else
-  bad "the smoke gate and the publish step read the APK from the artifact root" \
-    "nothing references apk/app-release.apk; the consumers and the upload disagree"
+  bad "the smoke gate reads the APK from the artifact root" \
+    "the emulator runner script does not reference apk/app-release.apk"
+fi
+if grep -qF 'APK="apk/app-release.apk"' <<<"${apk_consumers}" \
+  && grep -qF 'apk/app-release.apk' <<<"${apk_consumers}" \
+  && grep -qF 'apk/app-release.apk.sha256' <<<"${apk_consumers}"; then
+  ok "the publish step re-verifies and attaches the APK from the artifact root"
+else
+  bad "the publish step re-verifies and attaches the APK from the artifact root" \
+    "the publish job does not verify and attach apk/app-release.apk"
 fi
 
 echo " the job that publishes re-verifies what it publishes"
@@ -516,7 +633,20 @@ for index, step in enumerate(steps):
         # be checking a file nobody downloads. Found by mutation: dropping the APK
         # from `files:` left every check green.
         attached = str(step.get("with", {}).get("files", ""))
-        results["attaches"] = "apk/app-release.apk\n" in f"{attached}\n"
+        # All three, not just the APK: the checksum is what the user verifies
+        # with, and the signature transcript is the certificate audit trail. A
+        # release missing any of them degrades what "verified" means in practice.
+        # Matched as full lines so `apk/app-release.apk` cannot be satisfied by
+        # `apk/app-release.apk.sha256`.
+        attached_lines = f"{attached}\n".splitlines()
+        results["attaches"] = all(
+            name in attached_lines
+            for name in (
+                "apk/app-release.apk",
+                "apk/app-release.apk.sha256",
+                "apk/apksigner-verify.txt",
+            )
+        )
     if "Re-verify" in name:
         reverify_index = index
         # Comments are stripped before matching. A comment explaining *why* a

@@ -561,8 +561,13 @@ else
   ok "the key password never appears in keytool's argv"
 fi
 
-# umask 077 keeps the keystore we create owner-only. (GITHUB_ENV itself is
-# created by the Actions runner, not by us, so its mode is not ours to assert.)
+# The materialized keystore must be owner-only (0600). Asserted twice, for two
+# different mechanisms. The outcome check is behavioural: whatever creates the
+# file, the file on disk must be 0600. The mechanism check is structural and says
+# so: `mktemp` forces 0600 as a side effect, so removing the script's *explicit*
+# `chmod 600` would leave the outcome green while deleting the deliberate
+# guarantee. (GITHUB_ENV itself is created by the Actions runner, not by us, so
+# its mode is not ours to assert.)
 : >"${GITHUB_ENV_FILE}"
 env -u PRIVATE_GALLERY_RELEASE_ALLOW_EPHEMERAL_SIGNING \
   RUNNER_TEMP="${WORK_DIR}/runner" GITHUB_WORKSPACE="${WORK_DIR}/workspace" \
@@ -580,8 +585,42 @@ if [[ -n "${produced}" && -f "${produced}" ]]; then
   else
     bad "the materialized keystore is owner-only (0600)" "mode was '${perms}'"
   fi
+  # The explicit mechanism, not the mktemp side effect. Removing `chmod 600`
+  # from materialize must fail this even though the outcome above would still
+  # pass -- that is the point: the guarantee must be deliberate, not observed.
+  if grep -qF 'chmod 600 "${destination}"' "${SCRIPT}"; then
+    ok "the keystore mode is set by an explicit chmod, not by accident of mktemp"
+  else
+    bad "the keystore mode is set by an explicit chmod, not by accident of mktemp" \
+      "no explicit chmod in materialize; 0600 would be a mktemp side effect only"
+  fi
 else
   bad "the materialized keystore is owner-only (0600)" "materialize produced no keystore"
+fi
+
+echo " materialize without GITHUB_ENV"
+# Outside GitHub Actions there is no environment file, so the keystore would be
+# orphaned: valid, on disk, at a path nobody was told. In release mode that is
+# the production signing key. materialize must print the path (never the
+# passwords) so the caller can export or delete it, not succeed silently.
+env -u GITHUB_ENV -u PRIVATE_GALLERY_RELEASE_ALLOW_EPHEMERAL_SIGNING \
+  RUNNER_TEMP="${WORK_DIR}/runner" GITHUB_WORKSPACE="${WORK_DIR}/workspace" bash -c "
+    export ANDROID_KEYSTORE_BASE64='${KEYSTORE_B64}' ANDROID_KEYSTORE_PASSWORD='${STORE_PASSWORD}' ANDROID_KEY_ALIAS='${ALIAS}' ANDROID_KEY_PASSWORD='${KEY_PASSWORD}'
+    bash '${SCRIPT}' materialize" >"${WORK_DIR}/no-github-env.log" 2>&1
+orphan_path="$(grep -E '^ANDROID_KEYSTORE_FILE=' "${WORK_DIR}/no-github-env.log" 2>/dev/null | head -n 1 | cut -d= -f2- || true)"
+if [[ -n "${orphan_path}" && -f "${orphan_path}" ]]; then
+  ok "materialize without GITHUB_ENV prints the keystore path instead of orphaning it"
+  rm -f "${orphan_path}"
+else
+  bad "materialize without GITHUB_ENV prints the keystore path instead of orphaning it" \
+    "no usable ANDROID_KEYSTORE_FILE on stdout: $(tr '\n' ' ' <"${WORK_DIR}/no-github-env.log" | cut -c1-200)"
+fi
+if grep -qF -- "${STORE_PASSWORD}" "${WORK_DIR}/no-github-env.log" 2>/dev/null \
+  || grep -qF -- "${KEY_PASSWORD}" "${WORK_DIR}/no-github-env.log" 2>/dev/null; then
+  bad "materialize without GITHUB_ENV still never prints a password" \
+    "a password appears in the output"
+else
+  ok "materialize without GITHUB_ENV still never prints a password"
 fi
 
 echo " usage"

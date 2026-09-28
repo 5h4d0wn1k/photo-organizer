@@ -173,16 +173,69 @@ adb_shell() {
 }
 
 # `dumpsys activity exit-info` only exists on API 30+. On an older system image the
-# service answers with one of these instead of exiting non-zero, so a blank or
-# complaining dump is a *missing feature*, not a failure to ask. Distinguishing the
-# two matters: treating an adb failure as "unavailable" would silently disable the
-# crash check, which is the same false pass the gate exists to prevent.
+# service does not exist, so the check has to be skipped -- but the *decision* must
+# come from a dedicated capability probe, never from text found inside the dump.
+#
+# This used to substring-match the whole dump for `not found` / `Unknown command` /
+# `Can't find service` / `No service`. That is unsound, and dangerously so: an
+# `ApplicationExitInfo` record carries a free-text `description=` field holding the
+# crash or ANR message verbatim, and this app's daemon resolves paths and opens its
+# index, so strings like "...: /data/gallery.db not found" are ordinary. One such
+# adverse record therefore reported "exit-info unavailable on this API level",
+# disabled the crash check and returned clean -- a crash shipping green, which is
+# the exact failure class this gate exists to prevent. It was reachable with a
+# real ANR and a real native SIGSEGV; the regression test names both.
+#
+# So the probe is now: read the API level, and treat the feature as absent only
+# when the platform genuinely predates it. The error-shape strings are still
+# recognised, but only against a reply that is not a plausible dumpsys output --
+# see exit_info_looks_like_dumpsys, which is what stops a crash description from
+# being read as a complaint from the service.
+
+# Does this dump contain at least one ApplicationExitInfo record?
+exit_info_has_records() {
+  local dump="$1"
+  contains "ApplicationExitInfo" "${dump}" || contains "reason=" "${dump}"
+}
+
+# Does this look like a genuine `dumpsys activity exit-info` reply, rather than an
+# error from the service or a read that returned nothing?
+#
+# A freshly installed app that is still running has never been recorded as having
+# exited, so the real, healthy reply on API 30+ is the dumpsys section header with
+# zero `ApplicationExitInfo` blocks under it. Requiring a record here would fail
+# every honest first run, so the header counts as a real reply. What must never
+# count is a dump that merely contains an error string somewhere inside a record.
+exit_info_looks_like_dumpsys() {
+  local dump="$1"
+  exit_info_has_records "${dump}" ||
+    contains "ACTIVITY MANAGER LRU PROCESSES" "${dump}" ||
+    contains "Historical Process Exit" "${dump}"
+}
+
+# Does the service itself complain? Only meaningful for a reply that is not already
+# a plausible dumpsys output.
 exit_info_unsupported() {
   local dump="$1"
+  exit_info_looks_like_dumpsys "${dump}" && return 1
   contains "Unknown command" "${dump}" ||
     contains "Can't find service" "${dump}" ||
-    contains "No service" "${dump}" ||
-    contains "not found" "${dump}"
+    contains "No service" "${dump}"
+}
+
+# Is `dumpsys activity exit-info` available on this device at all?
+#
+# This is a positive, dedicated probe. It must not fall back to a default that
+# enables or disables the check: an unreadable API level means we do not know
+# whether the feature exists, and guessing is how a check silently switches off.
+exit_info_supported() {
+  local level
+  level="$(adb_shell getprop ro.build.version.sdk)" || return 2
+  level="$(trim "${level}")"
+  if [[ ! "${level}" =~ ^[0-9]+$ ]]; then
+    return 2
+  fi
+  ((level >= 30))
 }
 
 trim() {
@@ -421,9 +474,46 @@ assert_no_adverse_exits() {
     # could not run is not a passing crash check.
     fail "could not read ApplicationExitInfo (adb exit ${rc}); refusing to report a crash check that never ran"
   fi
-  if is_blank "${dump}" || exit_info_unsupported "${dump}"; then
-    log "exit-info unavailable on this API level; relying on the crash buffer"
-    return 0
+  if is_blank "${dump}"; then
+    # A blank read on a device that has exit-info is not a clean device. `adb_shell`
+    # drops stderr, so a failure the device reported on stderr while still exiting 0
+    # is indistinguishable here from a device that answered nothing. Neither is
+    # evidence of no crash, and this branch is the only one that used to degrade
+    # with no annotation at all. Refuse instead, unless the platform genuinely
+    # predates the feature -- which is a positive fact we can establish, not infer.
+    local support_rc=0
+    exit_info_supported || support_rc=$?
+    if ((support_rc == 1)); then
+      printf '::warning::API level is below 30, so ApplicationExitInfo does not exist; relying on the crash buffer alone\n' >&2
+      log "exit-info unavailable on this API level; relying on the crash buffer"
+      return 0
+    fi
+    if ((support_rc == 2)); then
+      fail "could not read the device API level, so it cannot be established whether ApplicationExitInfo exists; refusing to report a crash check that never ran"
+    fi
+    fail "ApplicationExitInfo returned nothing on a device whose API level supports it; this is a failed read, not a clean result"
+  fi
+  if exit_info_unsupported "${dump}"; then
+    # Reached only for a dump with no records in it, so the complaint really is
+    # about the service. Still confirmed against the platform rather than trusted.
+    local unsupported_rc=0
+    exit_info_supported || unsupported_rc=$?
+    if ((unsupported_rc == 1)); then
+      printf '::warning::API level is below 30, so ApplicationExitInfo does not exist; relying on the crash buffer alone\n' >&2
+      log "exit-info unavailable on this API level; relying on the crash buffer"
+      return 0
+    fi
+    if ((unsupported_rc == 2)); then
+      fail "could not read the device API level, so it cannot be established whether ApplicationExitInfo exists; refusing to report a crash check that never ran"
+    fi
+    fail "dumpsys activity exit-info reported no records and no service on an API level that supports it; refusing to report a crash check that never ran"
+  fi
+  if ! exit_info_looks_like_dumpsys "${dump}"; then
+    # Non-blank, not a service complaint, and not recognisable as dumpsys output.
+    # There is no reading of this that is safe to call clean, so refuse rather than
+    # counting zero adverse entries in something that was never a dump.
+    printf '%s\n' "${dump}" >&2
+    fail "ApplicationExitInfo returned output that is not a dumpsys exit-info reply; refusing to report a crash check that never ran"
   fi
   after="$(adverse_exit_reason_count "${dump}")"
   if [[ "${baseline}" == "unavailable" ]]; then
@@ -626,7 +716,11 @@ await_settled_app_frame() {
     if capture_screenshot "${SCREENSHOT_PATH}"; then
       if colors="$(png_distinct_colors "${SCREENSHOT_PATH}" "${MIN_DISTINCT_COLORS}" 2>/dev/null)"; then
         if [[ "${colors}" =~ ^[0-9]+$ ]] && ((colors >= MIN_DISTINCT_COLORS)); then
-          current="$(sha256sum <"${SCREENSHOT_PATH}" | cut -d' ' -f1)"
+          # sha256_of, not a bare sha256sum: on a host without GNU coreutils a bare
+          # call yields an empty digest every iteration, so `stable_captures` never
+          # advances and the gate burns its whole budget reporting a misleading
+          # "no settled app frame" verdict about a perfectly good frame.
+          current="$(sha256_of "${SCREENSHOT_PATH}")"
           if [[ -n "${current}" && "${current}" == "${previous}" ]]; then
             stable_captures=$((stable_captures + 1))
           else
@@ -667,25 +761,34 @@ assert_native_abis_present() {
   # from the archive itself, or it is not checked at all.
   #
   # The APK is a zip. `unzip -Z1` lists the archive without extracting it, so this
-  # costs nothing on a device-free runner. When `unzip` is unavailable the check
-  # is skipped with a warning rather than failing: an absent tool is a degraded
-  # verification, and it is reported as one instead of being silently skipped.
+  # costs nothing on a device-free runner.
+  #
+  # Every way this check can fail to run is a hard failure, not a warning. That is
+  # the deliberate difference from a degraded test suite: here the check is the
+  # *only* thing standing between the release and an APK that installs on the CI
+  # emulator and fails on every real phone, and nothing downstream re-asserts it --
+  # an APK with no native libraries at all installs on the x86_64 image with no ABI
+  # mismatch, launches and renders, so a skipped check is a green release. An
+  # absent tool, an unreadable archive, or an APK with no lib/ entries are all
+  # states in which "cannot prove the arm slices are present" is the honest answer,
+  # and the honest answer is not a pass.
   if ! command -v unzip >/dev/null 2>&1; then
-    printf '::warning::unzip is not available; cannot verify the APK contains native libraries for real devices\n'
-    return 0
+    printf '::error::unzip is not available, so the APK native ABIs cannot be verified. The emulator matrix only runs x86_64 images, so this check is the only thing covering the real device ABIs.\n' >&2
+    return 1
   fi
   local entries
-  entries="$(unzip -Z1 "${apk}" 2>/dev/null)" || {
-    printf '::warning::could not list the APK archive; cannot verify native ABIs\n'
-    return 0
-  }
-  # An APK with no lib/ entries at all is a Java-only build and genuinely has no
-  # ABI problem, so this is not itself a failure. The daemon ships native code, so
-  # the gate also says so when it finds none, which turns a silent packaging
-  # regression (a dropped jniLibs) into a visible warning.
+  if ! entries="$(unzip -Z1 "${apk}" 2>&1)"; then
+    printf '::error::could not list the APK archive, so its native ABIs cannot be verified: %s\n' "$(trim "${entries}")" >&2
+    return 1
+  fi
+  # The daemon ships native code, so an APK with no lib/ entries at all means the
+  # cross-compile produced nothing -- a packaging regression that a Java-only build
+  # would pass silently and that the emulator cannot detect. There is no opt-in: if
+  # a future build genuinely has no native code, the REQUIRED_ABIS list is the thing
+  # to change, not this verdict.
   if ! grep -q '^lib/' <<<"${entries}"; then
-    log "::warning::the APK contains no lib/ entries; it is a Java-only build with no native ABI to verify"
-    return 0
+    printf '::error::the APK contains no lib/ entries at all. The daemon ships native code, so this is a packaging regression (a dropped or empty jniLibs), not a Java-only build. An APK with no native libraries installs on the x86_64 emulator with no ABI mismatch, so the emulator cannot catch this.\n' >&2
+    return 1
   fi
   for abi in "${REQUIRED_ABIS[@]}"; do
     if grep -q "^lib/${abi}/" <<<"${entries}"; then

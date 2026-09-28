@@ -48,6 +48,30 @@ if (suppliedSigningValues.any { !it.isNullOrBlank() } && !hasReleaseSigning) {
     )
 }
 
+// Unsigned release builds require an explicit opt-out. Without signing material
+// Gradle would otherwise complete `assembleRelease` successfully and emit an
+// unsigned APK -- no warning, exit 0 -- and sideloading it yields "App not
+// installed", the exact #97 user symptom reproduced locally with a green build.
+// That default is what let the original defect ship: a green build that means
+// "unsigned" is a trap, so building a release without signing must be a decision
+// recorded on the command line (`-PallowUnsignedRelease`), not an accident of a
+// missing properties file.
+val allowUnsignedRelease =
+    providers.gradleProperty("allowUnsignedRelease").orNull == "true" ||
+        providers.environmentVariable("PRIVATE_GALLERY_ALLOW_UNSIGNED_RELEASE").orNull == "true"
+// A task graph that assembles or bundles a release variant. Matched on the task
+// names Gradle was invoked with, so debug builds, `flutter analyze` and IDE
+// syncs -- which configure this file without building a release -- are unaffected.
+val buildsRelease = gradle.startParameter.taskNames.any { it.contains("Release", ignoreCase = true) }
+if (buildsRelease && !hasReleaseSigning && !allowUnsignedRelease) {
+    throw GradleException(
+        "Android release signing is not configured and -PallowUnsignedRelease was not passed. " +
+            "Supply all of storeFile/ANDROID_KEYSTORE_FILE, storePassword/ANDROID_KEYSTORE_PASSWORD, " +
+            "keyAlias/ANDROID_KEY_ALIAS and keyPassword/ANDROID_KEY_PASSWORD, or pass " +
+            "-PallowUnsignedRelease=true to build an unsigned release deliberately."
+    )
+}
+
 // rootProject.file() resolves a relative path against the android/ root project
 // (matching the documented private-gallery-release.properties convention) and
 // returns an absolute path unchanged, which is what CI passes in.

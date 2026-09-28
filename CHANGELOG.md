@@ -11,12 +11,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Screenshots for `docs/screenshots/`.
 - Android release artifact gate: the exact APK that will be published is now
-  installed, cold-launched, and proven to render a first frame on real Android
-  system images (API 30 and API 35) before a release can be cut. A non-empty
-  Android crash buffer (including a native `galleryd` tombstone) or an adverse
-  `ApplicationExitInfo` reason (crash / native crash / ANR / initialization
-  failure) blocks the release. Screenshot, crash buffer, exit-info and logcat
-  are retained as evidence.
+  installed, cold-launched, and proven to render a stable, visually-complex frame
+  on real Android system images (API 30 and API 35) before the APK can be
+  attached to the release. A crash entry in the Android crash buffer (including a
+  native `galleryd` tombstone) or an adverse `ApplicationExitInfo` reason (crash /
+  native crash / ANR / initialization failure) blocks the release. Screenshot,
+  crash buffer, exit-info and logcat are retained as evidence, and a missing
+  evidence directory fails the job instead of passing quietly. Two limits are
+  stated rather than papered over: the images are x86_64, so the arm ABIs are
+  checked structurally from the archive rather than installed on arm hardware; and
+  on API 31+ a stable focused frame cannot be distinguished from the system
+  splash, which is drawn inside the app's own window. This covers the APK only —
+  the Linux, Windows, macOS and iOS artifacts are not install-tested in CI.
 - `scripts/android_release_signing.sh`: a single, tested source of truth for
   Android release signing. All four `ANDROID_KEYSTORE_*` secrets are required;
   a partial configuration always fails rather than being silently ignored; no
@@ -24,8 +30,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   publishing an unsigned APK. A throwaway per-run key is possible only via the
   explicit `PRIVATE_GALLERY_RELEASE_ALLOW_EPHEMERAL_SIGNING` repository
   variable, and the release notes say so when it is used.
-- `scripts/tests/` — device-free tests for the release gate itself (174
-  assertions), run in CI via the "Release gate" job and locally with
+- `scripts/tests/` — device-free tests for the release gate itself (201
+  assertions: 42 release-workflow, 60 signing, 27 signature, 72 smoke), run in CI
+  via the "Release gate" job and locally with
   `make release-gate`. `release_workflow_test.sh` asserts the release
   workflow's safety properties structurally, so the guarantee cannot be removed
   by an unrelated edit. A suite that cannot run its assertions (for example, no
@@ -36,9 +43,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   runner is executed to prove it fails when a suite fails, and every new
   assertion was mutation-tested — each was confirmed to fail when the code it
   protects is broken, and to pass when restored.
-- The published APK now ships a `app-release.apk.sha256` checksum alongside it.
-  It records the bare filename, not the CI build path, so a user who downloads
-  the APK and the sidecar into one directory can verify it with `sha256sum -c`.
+- The published APK now ships a `app-release.apk.sha256` checksum and the
+  `apksigner-verify.txt` signature transcript alongside it. The checksum records
+  the bare filename, not the CI build path, so a user who downloads the APK and
+  the sidecar into one directory can verify it with `sha256sum -c`; the
+  transcript records the signing certificate digest so a release is traceable to
+  a key without exposing the key itself.
 
 ### Security
 
@@ -61,28 +71,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Removed a duplicate definition of `is_enabled` in
   `scripts/production-readiness-check.sh`; the second, narrower-looking copy was
   dead code that silently lost to the first.
-- The Android artifact was staged for upload as a multi-path list. That does not
-  produce a flat artifact: `actions/upload-artifact` documents that "if multiple
-  paths are provided as input, the least common ancestor of all the search paths
-  will be used as the root directory of the artifact", so the APK was archived at
-  its full build path while the smoke gate and the publish step both looked for
-  it at the artifact root. Every release would have failed the smoke gate on a
-  missing file. The three files are now staged into one directory and that
-  directory is uploaded, so the layout is exactly what was staged and no longer
-  depends on the action's path-hierarchy rules.
-- The launch gate accepted the first screenshot that looked visually complex.
-  Window focus was checked once *before* the render loop and never re-checked, so
-  a window that lost focus mid-wait still passed; and a screen caught mid-
-  transition was accepted as "rendered". Focus is now re-asserted inside the
-  loop, and a frame must be visually complex *and* identical across two
-  consecutive captures before it counts as rendered. Both new behaviours are
-  mutation-tested.
-
-  The gate still cannot distinguish the system splash screen (drawn inside the
-  app's own window on API 31+) from the app's own first frame, because both are
-  stable, complex, and focused. That is stated in the gate and the runbook rather
-  than papered over with a colour threshold that would be wrong in the lenient
-  direction — the same false pass the gate exists to prevent.
 - A lost adb connection was reported as a clean crash check. `adb_shell` ended in
   `|| true`, so an emulator that died mid-run produced an empty `dumpsys` and an
   empty crash buffer — and an empty string parses as "zero adverse exits" and "no
@@ -91,6 +79,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   propagated, and a dump that could not be read fails the gate rather than
   reporting nothing wrong. Three states are now distinguished that were
   previously collapsed into one: adverse, clean, and *could not ask*.
+- **The crash check could switch itself off from inside a crash report.** Whether
+  `ApplicationExitInfo` applies was decided by substring-matching the whole dump
+  for `not found` / `Unknown command` / `Can't find service` / `No service`. An
+  `ApplicationExitInfo` record carries a free-text `description=` field holding the
+  crash or ANR message verbatim, and this app's daemon resolves paths and opens its
+  index — so a description such as `SIGSEGV in galleryd opening /data/gallery.db:
+  path not found` is ordinary. One such adverse record therefore read as "exit-info
+  unavailable on this API level", disabled the crash check and returned clean. A
+  native crash and an ANR both shipped green. This is the same false pass the gate
+  exists to prevent, reached through a different door: the gate was reading its own
+  evidence as a platform capability. The decision now comes from a dedicated
+  API-level probe, and a dump carrying any record can never be reinterpreted as
+  "unsupported" no matter what its text says. Four states are now distinguished —
+  adverse, clean, feature-absent, and unreadable — and only a positively
+  established pre-30 API level skips the check, with a warning.
+- **The native-ABI check degraded to a warning in three separate ways**, and it is
+  the only thing covering the real device ABIs, because the emulator matrix runs
+  x86_64 images only. A missing `unzip`, an archive that could not be listed, and
+  an APK with no `lib/` entries at all each passed with a `::warning::` and none of
+  them is re-asserted anywhere downstream. The last one is the worst: an APK
+  carrying no native libraries installs on the x86_64 emulator with no ABI mismatch,
+  launches and renders, so a dropped `jniLibs` step shipped green. All three are now
+  hard failures.
+- **No smoke evidence was ever produced.** `ANDROID_SMOKE_NAME` and
+  `ANDROID_SMOKE_EVIDENCE_DIR` were nested under the emulator runner's `with:`
+  block, which is an *action input*, not a step environment. The pinned
+  `android-emulator-runner` has no `env` input, so GitHub dropped both values with
+  only an "Unexpected input(s)" warning; the gate then fell back to writing evidence
+  into the workspace root, and the upload step — configured
+  `if-no-files-found: warn` — reported a missing directory as a pass. The
+  install/launch verdict was unaffected, so the gate still blocked correctly, but
+  the mandatory "evidenced on the runner harness" half of the drop-gate never
+  happened and the runbook's promise of retained evidence was false on every run.
+  The variables are now step-level `env:`, and the upload fails when the evidence
+  is absent.
 - When the pre-launch `ApplicationExitInfo` baseline could not be read, the
   comparison silently degraded to "no worse than zero". The baseline is now
   recorded as `unavailable` and the gate applies the strictly stronger
@@ -163,7 +186,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it, so the last platform to finish no longer erased the other platforms'
   signing warnings. Exactly one job generates the changelog, so it is no longer
   duplicated once per platform.
-- Build-only release jobs no longer hold `contents: write`.
+- The Android **build** job no longer holds `contents: write`; it only uploads an
+  artifact, and the separate `android-publish` job owns the release. The
+  `linux`, `windows`, `macos` and `ios` jobs still hold it, because those jobs
+  publish their own artifacts.
 - The Android artifact was staged for upload as a multi-path list. That does not
   produce a flat artifact: `actions/upload-artifact` documents that "if multiple
   paths are provided as input, the least common ancestor of all the search paths

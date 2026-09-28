@@ -198,6 +198,79 @@ else
   skip_all "apksigner could not produce the v2-only fixture"
 fi
 
+# v3 only: the mirror image, and the one that proves the *v2* assertion is
+# load-bearing. The v2-only case above is caught by the v3 assertion, so removing
+# the v2 line changes nothing for it -- without this fixture the v2 assertion
+# could be deleted and all 24 checks would still pass.
+if sign_variant v3only.apk false false true; then
+  gate_rc=0
+  ANDROID_HOME="${sdk_root}" bash "${GATE}" v3only.apk evidence-v3.txt >gate-v3.log 2>&1 || gate_rc=$?
+  if ((gate_rc != 0)); then
+    if grep -qF 'missing a v2' gate-v3.log 2>/dev/null; then
+      ok "a v3-only APK is rejected for the v2 signature specifically"
+    else
+      fail "a v3-only APK is rejected for the v2 signature specifically" \
+        "rejected, but not for the missing v2 signature: $(tr '\n' ' ' <gate-v3.log | cut -c1-200)"
+    fi
+  else
+    fail "a v3-only APK is rejected for the v2 signature specifically" \
+      "the gate accepted an artifact with no v2 signature"
+  fi
+else
+  skip_all "apksigner could not produce the v3-only fixture"
+fi
+
+# A lying apksigner: exits 0 but reports no successful verification. The gate
+# must not trust the exit status alone -- the anchored `grep -qx "Verifies"` is
+# the assertion that catches this, and without it this case would pass.
+STUB_BIN="${WORK}/stub-bin"
+mkdir -p "${STUB_BIN}"
+cat >"${STUB_BIN}/apksigner" <<'STUB'
+#!/usr/bin/env bash
+# A tool that "succeeds" while saying nothing verifiable.
+echo "some output that is not a verification transcript"
+exit 0
+STUB
+chmod +x "${STUB_BIN}/apksigner"
+gate_rc=0
+env -u ANDROID_HOME PATH="${STUB_BIN}:${PATH}" bash "${GATE}" signed.apk evidence-stub.txt >gate-stub.log 2>&1 || gate_rc=$?
+if ((gate_rc != 0)); then
+  if grep -qF 'did not report a successful verification' gate-stub.log 2>/dev/null; then
+    ok "an apksigner that exits 0 without reporting success is rejected"
+  else
+    fail "an apksigner that exits 0 without reporting success is rejected" \
+      "rejected, but not by the success assertion: $(tr '\n' ' ' <gate-stub.log | cut -c1-200)"
+  fi
+else
+  fail "an apksigner that exits 0 without reporting success is rejected" \
+    "the gate trusted the exit status alone"
+fi
+
+# A failing apksigner whose output happens to contain the success token. The
+# `verify_rc != 0` branch must fire first: without it the "Verifies" anchor would
+# pass and the gate would accept a tool that reported failure.
+cat >"${STUB_BIN}/apksigner" <<'STUB'
+#!/usr/bin/env bash
+# A tool that fails while its transcript contains the success token.
+echo "Verifies"
+echo "DOES NOT VERIFY"
+exit 1
+STUB
+chmod +x "${STUB_BIN}/apksigner"
+gate_rc=0
+env -u ANDROID_HOME PATH="${STUB_BIN}:${PATH}" bash "${GATE}" signed.apk evidence-rc.txt >gate-rc.log 2>&1 || gate_rc=$?
+if ((gate_rc != 0)); then
+  if grep -qF 'signature verification failed (apksigner exit 1)' gate-rc.log 2>/dev/null; then
+    ok "a non-zero apksigner exit is rejected before the transcript is trusted"
+  else
+    fail "a non-zero apksigner exit is rejected before the transcript is trusted" \
+      "rejected, but not by the exit-status branch: $(tr '\n' ' ' <gate-rc.log | cut -c1-200)"
+  fi
+else
+  fail "a non-zero apksigner exit is rejected before the transcript is trusted" \
+    "the gate accepted a tool that reported failure"
+fi
+
 # A file that is not an APK at all.
 printf 'this is not an apk' >notanapk.apk
 gate_rc=0

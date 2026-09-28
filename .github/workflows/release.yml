@@ -318,18 +318,7 @@ jobs:
           channel: stable
           cache: true
 
-      - name: Hermetic Android NDK cross-compile (cargo-ndk, vendored sqlcipher-openssl; no vcpkg)
-        run: |
-          set -euo pipefail
-          cargo install cargo-ndk --locked
-          rustup target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-android
-          cargo ndk -t arm64-v8a -t armeabi-v7a -t x86_64 \
-            -o app/android/app/src/main/jniLibs \
-            build --manifest-path native_core/Cargo.toml --bin galleryd --release --locked
-          mkdir -p app/android/app/src/main/assets
-          cp -R ml_sidecar app/android/app/src/main/assets/ml_sidecar
-
-      - name: Resolve Android release signing material
+      - name: Resolve Android release signing material (BEFORE the NDK build, so a missing secret fails in seconds)
         id: signing
         # The signing policy lives in exactly one place
         # (scripts/android_release_signing.sh) so the workflow, the local
@@ -363,6 +352,17 @@ jobs:
               ;;
           esac
           echo "mode=${mode}" >> "$GITHUB_OUTPUT"
+
+      - name: Hermetic Android NDK cross-compile (cargo-ndk, vendored sqlcipher-openssl; no vcpkg)
+        run: |
+          set -euo pipefail
+          cargo install cargo-ndk --locked
+          rustup target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-android
+          cargo ndk -t arm64-v8a -t armeabi-v7a -t x86_64 \
+            -o app/android/app/src/main/jniLibs \
+            build --manifest-path native_core/Cargo.toml --bin galleryd --release --locked
+          mkdir -p app/android/app/src/main/assets
+          cp -R ml_sidecar app/android/app/src/main/assets/ml_sidecar
 
       - name: Build Flutter Android APK (signed)
         # Signing material arrives via $GITHUB_ENV from the step above, so no
@@ -508,6 +508,14 @@ jobs:
 
       - name: Install, cold-launch, detect crash, capture evidence
         uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2.38.0
+        env:
+          ANDROID_SMOKE_NAME: android-smoke-api${{ matrix.api-level }}
+          ANDROID_SMOKE_EVIDENCE_DIR: ${{ github.workspace }}/android-smoke-evidence
+        # MUST stay a single line. This action splits its `script` input on
+        # newlines and runs each line as an independent `sh -c`, which breaks
+        # control flow, drops variables between lines, and cannot use
+        # `set -o pipefail` (dash has no pipefail). All logic therefore lives in
+        # a committed, locally tested bash script.
         with:
           api-level: ${{ matrix.api-level }}
           arch: x86_64
@@ -518,14 +526,6 @@ jobs:
           disable-animations: true
           working-directory: ${{ github.workspace }}
           emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
-          env:
-            ANDROID_SMOKE_NAME: android-smoke-api${{ matrix.api-level }}
-            ANDROID_SMOKE_EVIDENCE_DIR: ${{ github.workspace }}/android-smoke-evidence
-          # MUST stay a single line. This action splits its `script` input on
-          # newlines and runs each line as an independent `sh -c`, which breaks
-          # control flow, drops variables between lines, and cannot use
-          # `set -o pipefail` (dash has no pipefail). All logic therefore lives in
-          # a committed, locally tested bash script.
           script: bash "$GITHUB_WORKSPACE/scripts/android_release_artifact_smoke.sh" "$GITHUB_WORKSPACE/apk/app-release.apk"
 
       - name: Upload smoke evidence (screenshot, crash buffer, exit-info, logs)
@@ -534,7 +534,12 @@ jobs:
         with:
           name: android-smoke-evidence-api${{ matrix.api-level }}
           path: android-smoke-evidence/
-          if-no-files-found: warn
+          # `error`, not `warn`. Evidence is a required half of the drop-gate
+          # ("evidenced on the runner harness"), so evidence that is silently
+          # absent is a gate failure. A missing evidence dir can only happen when
+          # the gate step already failed or the wiring above is wrong; in both
+          # cases the job is red either way, so this cannot mask a real result.
+          if-no-files-found: error
 
   # Publish the Android APK only after BOTH the signed build and the install+launch
   # gate are green. This is the actual "no un-installable APK ships" guarantee (#97).
@@ -616,6 +621,7 @@ jobs:
           files: |
             apk/app-release.apk
             apk/app-release.apk.sha256
+            apk/apksigner-verify.txt
           # `generate_release_notes` is intentionally NOT set here: that input is
           # re-applied on every update, so more than one job setting it would
           # duplicate the changelog once per platform job. The `linux` job owns it.
@@ -629,10 +635,20 @@ jobs:
             and v3) before publication. v1/JAR signing is off because minSdk is 24.
             ${{ needs.android.outputs.signing_mode == 'release' && 'This artifact is signed with the project release key, so future versions install over it without an uninstall.' || 'This artifact is signed with an ephemeral per-run CI key, so it installs once but a future version will require uninstalling it first — which discards this device’s paired identity.' }}
 
-            Installability was additionally proven in CI on real Android system images
-            (API 30 and API 35): install, cold launch, first-frame render, and a clean
-            crash buffer / ApplicationExitInfo, with screenshots as evidence. A build
-            that failed any of those checks could not have been published.
+            Installability was additionally checked in CI on real Android system images
+            (API 30 and API 35): install, cold launch, a stable visually-complex frame,
+            and a clean crash buffer / ApplicationExitInfo. A build that failed any of
+            those checks could not have been published.
+
+            What that does not prove, stated plainly so it is not read as a stronger
+            guarantee than it is:
+            * Those images are x86_64. The arm64-v8a and armeabi-v7a slices are checked
+              structurally by reading the archive before the device is touched, not by
+              installing them on arm hardware.
+            * On API 31+ the system splash is drawn inside the app's own window, so a
+              stable focused frame does not by itself prove the app's own UI painted.
+            * This covers the APK only. The Linux, Windows, macOS and iOS artifacts are
+              not install-tested in CI.
 
   ios:
     name: iOS (unsigned .app)

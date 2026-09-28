@@ -159,9 +159,19 @@ keytool -genkeypair -v \
   -keystore release.jks -storetype PKCS12 \
   -keyalg RSA -keysize 4096 -validity 10000 \
   -alias photo-organizer \
-  -storepass '<store password>' -keypass '<key password>' \
+  -storepass '<store password>' \
   -dname "CN=Photo Organizer, O=Photo Organizer, C=NA"
 ```
+
+**Use one password for the store and the key.** This is not a simplification. A
+PKCS12 keystore cannot hold two different passwords — `keytool` prints
+`Different store and key passwords not supported for PKCS12 KeyStores. Ignoring
+user-specified -keypass value.` and carries on, so passing `-keypass` with a
+different value does not warn you afterwards, it just discards it. The key's
+password then *is* the store password, and setting `ANDROID_KEY_PASSWORD` to
+something else makes the Gradle build fail to load the key. If you genuinely need
+two distinct passwords, use `-storetype JKS` and keep `-keypass`; either way, set
+both secrets to the values the keystore actually has.
 
 Then publish it to the repository as four secrets:
 
@@ -169,12 +179,15 @@ Then publish it to the repository as four secrets:
 gh secret set ANDROID_KEYSTORE_BASE64   < <(base64 -w0 release.jks)
 gh secret set ANDROID_KEYSTORE_PASSWORD -- '<store password>'
 gh secret set ANDROID_KEY_ALIAS         -- 'photo-organizer'
-gh secret set ANDROID_KEY_PASSWORD      -- '<key password>'
+gh secret set ANDROID_KEY_PASSWORD      -- '<the key password, which for PKCS12 is the store password>'
 ```
 
 `release.jks` itself stays local and is never committed. The CI job decodes the
 keystore into the runner's temp directory, never into the working tree, and
-validates that it opens with the configured password before Gradle runs.
+validates that the **store** password opens it before Gradle runs. The key alias
+and the key password are not checked by that step — `keytool -list` ignores
+`-keypass` — so a wrong key password surfaces as a Gradle failure, which still
+blocks the release.
 
 Verify locally without publishing anything:
 
@@ -220,19 +233,27 @@ Before a tag can publish an APK, all of the following must pass:
    with no v2 signature.)
 2. The APK carries native libraries for **arm64-v8a** and **armeabi-v7a**. This is
    checked structurally, by reading the archive, *before* the device is touched —
-   see the limitation in point 7 for why it cannot be left to the emulator.
+   see *The APK installs on an arm device* under **What this does not prove** below
+   for why it cannot be left to the emulator. The check runs on every path now: a
+   missing `unzip`, an unlistable archive, and an APK with no `lib/` entries at all
+   are all hard failures, not skips, because nothing downstream re-asserts it.
 3. The exact APK is installed on Android system images at **API 30 and API 35**,
    cold-launched, and a window is proven to have rendered a stable, non-blank
    frame: a capture must be visually complex *and* byte-identical across two
    consecutive captures, which rejects a blank screen and a screen mid-transition.
-4. The Android crash buffer is empty afterwards — which also catches a native
+4. No crash entry appears in the Android crash buffer — which also catches a native
    SIGSEGV in the Rust `galleryd` daemon, since a native crash never appears as a
-   Java `FATAL EXCEPTION`.
+   Java `FATAL EXCEPTION`. A bare `--------- beginning of crash` header with no
+   entries under it is tolerated: some platform versions print one, and treating a
+   header as a crash would fail every release.
 5. Android recorded no adverse `ApplicationExitInfo` (crash, native crash, ANR,
    or initialization failure) relative to a pre-launch baseline. If the baseline
    itself could not be read, the comparison is replaced by the strictly stronger
    requirement of *zero* adverse entries, so an unreadable baseline can only ever
-   make this check harder to pass.
+   make this check harder to pass. Whether the check applies at all is decided by a
+   dedicated API-level probe, never by text found inside the dump: a crash
+   description such as `...: /data/gallery.db not found` is ordinary for this app
+   and must not be able to switch the check off.
 6. Screenshot, crash buffer, exit-info dump, `apksigner` transcript and a
    `sha256` checksum are uploaded as evidence, and the checksum records the bare
    filename so a user can verify it with `sha256sum -c`. The job that publishes
