@@ -221,6 +221,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   wrong in the lenient direction, which is the same false pass the gate exists to
   prevent.
 
+### Fixed
+
+- Encryption activation no longer bricks the daemon when interrupted between
+  the database swap and the state write (#109). Startup now probes the
+  database header: an encrypted database with no (or torn) state rebuilds
+  the state from the stored key -- whose id is derived deterministically
+  from the database path -- after proving the key opens the database, and a
+  key that does not verify (or no key at all) fails loudly instead of
+  opening silently. State writes are atomic (temp + fsync + rename), so torn
+  state files cannot arise from future writes.
+
 ## [0.1.0] - 2026-09-22
 
 Ported from the *photos-and-videos-organizer* / Private Gallery MVP.
