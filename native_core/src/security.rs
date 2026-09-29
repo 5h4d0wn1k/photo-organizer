@@ -1484,6 +1484,7 @@ pub fn database_sha256(path: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::VaultKeyStorage;
     fn test_config(name: &str) -> (AppConfig, crate::test_support::TestTempDir) {
         let root = crate::test_support::TestTempDir::new(&format!("security-{name}"));
         let config = AppConfig {
@@ -2725,6 +2726,34 @@ mod tests {
         assert!(
             temps.is_empty(),
             "atomic writes must not leave temp files: {temps:?}"
+        );
+        cleanup(&root);
+    }
+
+    /// #110: report the selected vault-key backend clearly in security status.
+    #[test]
+    fn file_key_storage_is_reported_in_encryption_status() {
+        let (mut config, root) = test_config("file-key-status");
+        config.vault_key_storage = VaultKeyStorage::File;
+        let status = encryption_status(&config);
+        assert!(
+            status.warning.contains("vault-keys") || status.warning.contains("Vault AES keys"),
+            "file-key storage must be disclosed, got: {}",
+            status.warning
+        );
+        cleanup(&root);
+    }
+
+    #[test]
+    fn os_keychain_storage_has_no_file_key_warning() {
+        let (mut config, root) = test_config("keychain-key-status");
+        config.vault_key_storage = VaultKeyStorage::OsKeychain;
+        let status = encryption_status(&config);
+        assert!(
+            !status.warning.contains("vault-keys")
+                && !status.warning.contains("Vault AES keys"),
+            "OS keychain mode must not report file-key storage, got: {}",
+            status.warning
         );
         cleanup(&root);
     }

@@ -34,6 +34,10 @@
   power loss ([Apple file-system write guidance](https://developer.apple.com/documentation/xcode/reducing-disk-writes)).
   Users should keep independent backups of important libraries.
 - Secure-storage integration for keys on each platform.
+- Vault AES keys live in the OS keychain by default. File-backed key storage
+  (`PRIVATE_GALLERY_VAULT_KEY_STORAGE=file`) is only for headless deployments
+  with no keyring; selecting it logs a startup warning, is reported by
+  `GET /security/encryption/status`, and is documented here -- never silent.
 - Reset and delete flow for the People feature, including face templates and labels.
 - Minimal permissions only, with no background location.
 - Explicit separation between organization features, sync, and diagnostics.
