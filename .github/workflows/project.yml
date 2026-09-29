@@ -1,13 +1,46 @@
 name: Project board
 
+# Scoped PAT first, workflow token as fallback (issue #107).
+#
+# Proven live: GITHUB_TOKEN *reads* user-owned Projects v2 fine but every
+# mutation 403s ("Resource not accessible by integration"), so a board that
+# only ever used the workflow token could add nothing and move nothing. The
+# workflow therefore uses a fine-grained PAT with Projects read/write stored as
+# the PROJECTS_TOKEN secret, and falls back to GITHUB_TOKEN (which degrades to
+# warnings) when it is absent. That is one scoped secret, created once by the
+# owner, instead of a classic PAT -- and the automation never fails a build
+# either way.
+#
+# Board: users/5h4d0wn1k/projects/3 ("Photo Organizer"). The workflow column
+# is the `Stage` single-select (Backlog / In Progress / In Review / Shipped),
+# matching the contributor workflow in AGENTS.md.
+#
+# Behaviour: issues.opened -> add + Backlog; PR opened/ready -> add PR and set
+# every `Closes #N` issue to In Review; PR merged -> those issues to Shipped.
+# Which references count is decided by scripts/project_board_refs.py, not by a
+# regex inline here: an inline `body.match(/#(\d+)/g)` matched *any* `#N`, so a
+# sentence like "related to #57" moved this repository's issue #57 to Shipped
+# when the PR merged. The parser has its own suite, run as a step below, so a
+# regression is visible in this workflow's own log rather than on the board.
+# Every failure degrades to a warning: board automation must never fail a
+# build or block a merge.
+
 on:
   issues:
     types: [opened]
   pull_request:
-    types: [opened, ready_for_review, closed]
+    # synchronize included so a `Closes #N` added to the body mid-review still
+    # moves the issue; the concurrency group cancels superseded runs.
+    types: [opened, synchronize, ready_for_review, closed]
 
 concurrency:
-  group: project-board-${{ github.event_name }}-${{ github.event.action != 'closed' && github.event.pull_request.head.ref || github.event.issue.number || github.sha }}
+  # Keyed on the issue/PR number, never on `head.ref`. Two PRs can share a head
+  # ref (one open, one reopened from the same branch) and a fork chooses its
+  # branch name, so `head.ref` lets an unrelated PR cancel this one's board
+  # update -- and lets an attacker squat a name that permanently starves the
+  # board of runs. `pull_request.number` is unique, monotonic and not
+  # contributor-controlled.
+  group: project-board-${{ github.event_name }}-${{ github.event.pull_request.number || github.event.issue.number || github.sha }}
   cancel-in-progress: true
 
 permissions:
@@ -17,43 +50,90 @@ permissions:
 
 jobs:
   board:
+    name: Sync project board
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          # Shallow is enough: this workflow runs the parser's suites from
+          # disk and reads no history. Board automation should not spend the
+          # runner's time on a full clone to do that.
+          fetch-depth: 1
+
+      - name: Test the closing-reference parser
+        # The parser decides what moves on the board, so its suite runs in the
+        # same job and is a hard failure on purpose. If the parsing rules are
+        # wrong the right outcome is a red run and an unchanged board, not a
+        # board quietly corrupted by a parser nobody checked. This workflow is
+        # not a required check, so this can never block a merge -- it is the
+        # opposite of "board automation must never fail a build", which is
+        # about the *board* failing, not about the code that drives it.
+        #
+        # These suites and the parser itself are files in the repository, so the
+        # checkout above is load-bearing: without it this step fails with
+        # "No such file or directory", which is how it first failed in CI.
+        run: bash scripts/tests/project_board_refs_test.sh
+
+      - name: Parse closing references
+        id: refs
+        if: github.event_name == 'pull_request'
+        env:
+          # The body arrives as an environment variable, never interpolated into
+          # the github-script block below: `script:` is executed as JavaScript,
+          # so splicing an attacker-written PR body straight into it would be
+          # script injection. The result crosses the step boundary as a step
+          # output and re-enters the next step as env.
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          set -euo pipefail
+          # `--github-output` emits `refs=[...]` and `count=N` from the same
+          # code path the suite tests, so what the workflow consumes cannot
+          # drift from what is asserted there. Capture first, append second:
+          # a step's own outputs are not readable during that step, and
+          # writing straight to $GITHUB_OUTPUT would hide a parser error
+          # behind an empty diff in the log.
+          refs_output="$(printf '%s' "${PR_BODY}" \
+            | python3 scripts/project_board_refs.py --github-output)"
+          printf '%s\n' "${refs_output}" >> "${GITHUB_OUTPUT}"
+          printf 'closing references parsed from the body: %s\n' \
+            "$(sed -n 's/^refs=//p' <<<"${refs_output}")"
+
+      - name: Test the board helpers
+        # findItemId's pagination and closingIssueNumbers' validation used to be
+        # inline in the `script:` block below, where no test could reach them.
+        # Node is preinstalled on GitHub-hosted runners; this step fails loudly
+        # if it ever is not, rather than skipping the suite quietly.
+        run: node --test scripts/tests/project_board_graphql_test.js
+
       - name: Sync project board
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
-          PROJECTS_TOKEN: ${{ secrets.PROJECTS_TOKEN }}
+          CLOSING_REFS: ${{ steps.refs.outputs.refs }}
+        # Fine-grained PAT with Projects read/write when the owner configures
+        # it; the workflow token otherwise (mutations then warn, never fail).
         with:
+          github-token: ${{ secrets.PROJECTS_TOKEN || secrets.GITHUB_TOKEN }}
           script: |
-            const { owner, repo } = context.repo;
-            const PROJECT_TITLE = "Photo Organizer — Delivery & Roadmap";
-            // GITHUB_TOKEN lacks `project` scope on user-owned Projects v2, so prefer a
-            // Projects-scoped PAT when the repository secret is configured. Falls back to
-            // the workflow token (org-owned boards) otherwise.
-            const gql = process.env.PROJECTS_TOKEN
-              ? github.graphql.withAuth(process.env.PROJECTS_TOKEN)
-              : github.graphql;
-            const STATUS_NAME = "Status";
+            const { closingIssueNumbers, findItemId } = require("./scripts/project_board_graphql.js");
+            const PROJECT_ID = "PVT_kwHOBVymY84BlB6V";
+            const STAGE_NAME = "Stage";
 
+            // The project ID is hardcoded rather than listed: GITHUB_TOKEN
+            // cannot enumerate a user's Projects v2 (that query 404s), so the
+            // only way to reach a user-owned board is to name it explicitly.
+            // Naming it is necessary, not sufficient: as proven live and
+            // recorded in this file's header, GITHUB_TOKEN reads the board but
+            // every mutation 403s with "Resource not accessible by
+            // integration". So the PAT above is what actually writes, and this
+            // function's only remaining job is to hand back a constant.
             async function findProject() {
-              const { user } = await gql(
-                `query($login: String!) {
-                   user(login: $login) {
-                     projectsV2(first: 20) { nodes { id title number } }
-                   }
-                 }`,
-                { login: owner }
-              );
-              const project = (user.projectsV2.nodes || []).find(
-                (n) => n.title === PROJECT_TITLE
-              );
-              if (!project) throw new Error(`Project "${PROJECT_TITLE}" not found for ${owner}`);
-              return project;
+              return { id: PROJECT_ID };
             }
 
-            async function resolveStatusField(projectId) {
-              const { node } = await gql(
+            async function resolveStageField(projectId) {
+              const { node } = await github.graphql(
                 `query($id: ID!) {
                    node(id: $id) {
                      ... on ProjectV2 {
@@ -71,18 +151,39 @@ jobs:
                  }`,
                 { id: projectId }
               );
-              const field = (node.fields.nodes || []).find((f) => f && f.name === STATUS_NAME);
-              if (!field) throw new Error("Status single-select field not found on project");
-              const optionId = (name) => {
-                const opt = (field.options || []).find((o) => o.name === name);
-                if (!opt) throw new Error(`Status option "${name}" not found`);
-                return opt.id;
-              };
-              return { field, optionId };
+              const field = (node.fields.nodes || []).find((f) => f && f.name === STAGE_NAME);
+              if (!field) throw new Error(`"${STAGE_NAME}" single-select field not found`);
+              return field;
             }
 
-            async function setStatus(projectId, itemId, fieldId, optionId) {
-              await gql(
+            function optionId(field, name) {
+              const opt = (field.options || []).find((o) => o.name === name);
+              if (!opt) throw new Error(`Stage option "${name}" not found`);
+              return opt.id;
+            }
+
+            async function ensureItem(projectId, contentId) {
+              try {
+                const res = await github.graphql(
+                  `mutation($input: AddProjectV2ItemByIdInput!) {
+                     addProjectV2ItemById(input: $input) { item { id } }
+                   }`,
+                  { input: { projectId, contentId } }
+                );
+                return res.addProjectV2ItemById.item.id;
+              } catch (err) {
+                // Already on the board: fall through to the lookup in the module, which
+                // paginates -- see scripts/project_board_graphql.js for why that
+                // matters and what it replaces.
+                if (!String(err).match(/already/i)) throw err;
+                const itemId = await findItemId(github.graphql, projectId, contentId);
+                if (!itemId) throw new Error(`Item ${contentId} not found on project`);
+                return itemId;
+              }
+            }
+
+            async function setStage(projectId, itemId, fieldId, stageOptionId) {
+              await github.graphql(
                 `mutation($input: UpdateProjectV2ItemFieldValueInput!) {
                    updateProjectV2ItemFieldValue(input: $input) { projectV2Item { id } }
                  }`,
@@ -91,79 +192,25 @@ jobs:
                     projectId,
                     itemId,
                     fieldId,
-                    value: { singleSelectOptionId: optionId }
+                    value: { singleSelectOptionId: stageOptionId }
                   }
                 }
               );
             }
 
-            function issueNumbersFromBody(body) {
-              if (!body) return [];
-              const matches = (body.match(/#(\d+)/g) || []).map((m) => m.slice(1));
-              return [...new Set(matches)];
-            }
-
-            async function findItem(projectId, contentId) {
-              const { node } = await gql(
-                `query($id: ID!) {
-                   node(id: $id) {
-                     ... on ProjectV2 {
-                       items(first: 100) {
-                         nodes {
-                           id
-                           content {
-                             ... on Issue { id }
-                             ... on PullRequest { id }
-                             ... on DraftIssue { id }
-                           }
-                         }
-                       }
-                     }
-                   }
-                 }`,
-                { id: projectId }
-              );
-              const item = (node.items.nodes || []).find(
-                (i) => i.content && i.content.id === contentId
-              );
-              if (!item) throw new Error(`Item ${contentId} not found on project`);
-              return item.id;
-            }
-
-            async function ensureItem(projectId, contentId) {
-              try {
-                const res = await gql(
-                  `mutation($input: AddProjectV2ItemByIdInput!) {
-                     addProjectV2ItemById(input: $input) { item { id } }
-                   }`,
-                  { input: { projectId, contentId } }
-                );
-                return res.addProjectV2ItemById.item.id;
-              } catch (err) {
-                if (String(err).match(/already/i)) return await findItem(projectId, contentId);
-                throw err;
-              }
-            }
-
             async function issueNodeId(number) {
-              const { repository } = await gql(
+              const { repository } = await github.graphql(
                 `query($owner: String!, $repo: String!, $number: Int!) {
                    repository(owner: $owner, name: $repo) {
                      issue(number: $number) { id }
                    }
                  }`,
-                { owner, repo, number }
+                { owner: context.repo.owner, repo: context.repo.repo, number: Number(number) }
               );
               if (!repository || !repository.issue) {
-                throw new Error(`Issue #${number} not found in ${owner}/${repo}`);
+                throw new Error(`Issue #${number} not found`);
               }
               return repository.issue.id;
-            }
-
-            // issues.opened -> Backlog; PR opened/ready -> In review; PR merged -> Shipped
-            async function applyStatus(projectId, field, statusName, contentId) {
-              const itemId = await ensureItem(projectId, contentId);
-              await setStatus(projectId, itemId, field.id, field.optionId(statusName));
             }
 
             try {
@@ -171,8 +218,10 @@ jobs:
 
               if (eventName === "issues" && payload.action === "opened") {
                 const project = await findProject();
-                const { field, optionId } = await resolveStatusField(project.id);
-                await applyStatus(project.id, { ...field, optionId }, "Backlog", payload.issue.node_id);
+                const field = await resolveStageField(project.id);
+                const itemId = await ensureItem(project.id, payload.issue.node_id);
+                await setStage(project.id, itemId, field.id, optionId(field, "Backlog"));
+                core.info(`board: issue #${payload.issue.number} -> Backlog`);
                 return;
               }
 
@@ -181,22 +230,37 @@ jobs:
               const pr = payload.pull_request || {};
               const actionable =
                 payload.action === "opened" ||
+                payload.action === "synchronize" ||
                 payload.action === "ready_for_review" ||
                 (payload.action === "closed" && pr.merged);
               if (!actionable) return;
 
-              const statusName = payload.action === "closed" ? "Shipped" : "In review";
+              const stageName = payload.action === "closed" ? "Shipped" : "In Review";
               const project = await findProject();
-              const { field, optionId } = await resolveStatusField(project.id);
+              const field = await resolveStageField(project.id);
 
-              for (const number of issueNumbersFromBody(pr.body)) {
+              // The PR itself always joins the board.
+              const prItem = await ensureItem(project.id, pr.node_id);
+              await setStage(project.id, prItem, field.id, optionId(field, stageName));
+
+              // Which issues this PR closes was decided upstream, by
+            // scripts/project_board_refs.py, and arrives as validated JSON in
+            // CLOSING_REFS. The old code here matched any `#N` in the body, so
+            // a bare cross-reference ("related to #57", a quoted snippet,
+            // other/repo#42) moved this repository's issue #57 to In Review and
+            // then to Shipped on merge. closingIssueNumbers() now lives in the
+            // module, where its validation is tested.
+            for (const number of closingIssueNumbers(process.env)) {
                 try {
-                  const contentId = await issueNodeId(Number(number));
-                  await applyStatus(project.id, { ...field, optionId }, statusName, contentId);
+                  const contentId = await issueNodeId(number);
+                  const itemId = await ensureItem(project.id, contentId);
+                  await setStage(project.id, itemId, field.id, optionId(field, stageName));
+                  core.info(`board: issue #${number} -> ${stageName}`);
                 } catch (err) {
-                  core.warning(`project board: issue #${number}: ${err.message}`);
+                  core.warning(`board: issue #${number}: ${err.message}`);
                 }
               }
             } catch (err) {
+              // Board automation is informational: it must never fail the run.
               core.warning(`project board workflow: ${err.message}`);
             }
