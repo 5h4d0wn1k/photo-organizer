@@ -221,6 +221,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   wrong in the lenient direction, which is the same false pass the gate exists to
   prevent.
 
+### Fixed
+
+- Vault AES key storage is an explicit, documented configuration choice
+  instead of a silent environment-variable downgrade (#110). `AppConfig`
+  carries `vault_key_storage` (`os_keychain` by default); `file` mode is for
+  headless deployments with no keyring, logs a startup warning, and is
+  reported by `GET /security/encryption/status`. Unknown values warn on
+  stderr and fall back to the keychain -- a typo must choose the stronger
+  store.
+
 ## [0.1.0] - 2026-09-22
 
 Ported from the *photos-and-videos-organizer* / Private Gallery MVP.
