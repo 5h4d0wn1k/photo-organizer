@@ -561,6 +561,36 @@ else
   ok "the key password never appears in keytool's argv"
 fi
 
+# The ephemeral path must meet the same bar. It used to pass -storepass and
+# -keypass with the password inline, which this shim would have recorded --
+# but no test ever ran materialize in ephemeral mode through the shim, so the
+# release-path assertions above said nothing about it. The ephemeral password
+# is generated per run, so it is read back from GITHUB_ENV rather than
+# asserted as a literal.
+: >"${argv_log}"
+: >"${GITHUB_ENV_FILE}"
+env PRIVATE_GALLERY_RELEASE_ALLOW_EPHEMERAL_SIGNING=true \
+  PATH="${shim_dir}:${PATH}" \
+  RUNNER_TEMP="${WORK_DIR}/runner" GITHUB_WORKSPACE="${WORK_DIR}/workspace" \
+  GITHUB_ENV="${GITHUB_ENV_FILE}" bash -c "
+    bash '${SCRIPT}' materialize" >/dev/null 2>&1
+ephemeral_password="$(grep -E '^ANDROID_KEYSTORE_PASSWORD=' "${GITHUB_ENV_FILE}" 2>/dev/null | head -n 1 | cut -d= -f2- || true)"
+if [[ -z "${ephemeral_password}" ]]; then
+  bad "ephemeral materialize exports its generated password" \
+    "no ANDROID_KEYSTORE_PASSWORD in GITHUB_ENV; the argv check below would prove nothing"
+elif grep -qF -- "${ephemeral_password}" "${argv_log}" 2>/dev/null; then
+  bad "the ephemeral password never appears in keytool's argv" \
+    "found it in: $(head -n 1 "${argv_log}" | cut -c1-160)"
+else
+  ok "the ephemeral password never appears in keytool's argv"
+fi
+if grep -q -- '-storepass:env' "${argv_log}" 2>/dev/null; then
+  ok "ephemeral keytool reads the password from the environment, as intended"
+else
+  bad "ephemeral keytool reads the password from the environment, as intended" \
+    "invocation was: $(head -n 1 "${argv_log}" | cut -c1-160)"
+fi
+
 # The materialized keystore must be owner-only (0600). Asserted twice, for two
 # different mechanisms. The outcome check is behavioural: whatever creates the
 # file, the file on disk must be 0600. The mechanism check is structural and says

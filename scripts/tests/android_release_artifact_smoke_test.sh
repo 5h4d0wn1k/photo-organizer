@@ -445,6 +445,12 @@ printf 'not a png at all' >"${WORK_DIR}/garbage.png"
 # device ABIs present, only the emulator's ABI (installs on CI, fails on every
 # real phone), and no native code at all (a dropped jniLibs step).
 make_apk() {
+  # Builds the fixture AND verifies it in the same process: testzip() reads
+  # every entry back, and the namelist must contain exactly what the ABI
+  # assertions below assume. A fixture truncated by a full disk (seen once:
+  # the validation 50 lines below failed while the archive was later fine)
+  # must fail here, at creation, with the true cause -- not downstream as a
+  # misleading gate failure.
   python3 - "$1" "${@:2}" <<'PY'
 import sys
 import zipfile
@@ -456,21 +462,42 @@ with zipfile.ZipFile(path, "w") as archive:
     archive.writestr("classes.dex", "fake dex")
     for abi in abis:
         archive.writestr(f"lib/{abi}/libgalleryd.so", f"fake native library for {abi}")
+with zipfile.ZipFile(path) as archive:
+    bad = archive.testzip()
+    if bad is not None:
+        print(f"FATAL: fixture {path} has a corrupt entry: {bad}", file=sys.stderr)
+        sys.exit(1)
+    names = set(archive.namelist())
+    for abi in abis:
+        entry = f"lib/{abi}/libgalleryd.so"
+        if entry not in names:
+            print(f"FATAL: fixture {path} is missing {entry}", file=sys.stderr)
+            sys.exit(1)
 PY
 }
 
-make_apk "${WORK_DIR}/app-release.apk" arm64-v8a armeabi-v7a x86_64
-make_apk "${WORK_DIR}/apk-x86-only.apk" x86_64
-make_apk "${WORK_DIR}/apk-no-native.apk"
+# Fixture creation is infrastructure, not an assertion: if it fails, nothing
+# below can mean anything, so stop with a non-zero exit rather than cascading
+# dozens of misleading failures. (A failing suite is honest; a suite that
+# fails 40 unrelated assertions over one truncated fixture is noise.)
+make_apk "${WORK_DIR}/app-release.apk" arm64-v8a armeabi-v7a x86_64 || exit 1
+make_apk "${WORK_DIR}/apk-x86-only.apk" x86_64 || exit 1
+make_apk "${WORK_DIR}/apk-no-native.apk" || exit 1
 
 
 # The fixture must really contain what the passing test assumes, or every ABI
-# assertion below would be satisfied by an empty archive.
-if unzip -Z1 "${WORK_DIR}/app-release.apk" 2>/dev/null | grep -q '^lib/arm64-v8a/libgalleryd.so$'; then
+# assertion below would be satisfied by an empty archive. make_apk already
+# verified this at creation; this re-checks through the same tool the gate
+# uses (unzip), and reports the tool's own exit code and the file size on
+# failure -- the previous version discarded stderr, which is why the one
+# observed flake of this line arrived with no evidence at all.
+unzip_rc=0
+unzip_out="$(unzip -Z1 "${WORK_DIR}/app-release.apk" 2>"${WORK_DIR}/unzip-err.log" || unzip_rc=$?)"
+if ((unzip_rc == 0)) && grep -q '^lib/arm64-v8a/libgalleryd.so$' <<<"${unzip_out}"; then
   ok "the default APK fixture is a real archive carrying an arm64-v8a library"
 else
   bad "the default APK fixture is a real archive carrying an arm64-v8a library" \
-    "unzip cannot see the entry the ABI check is supposed to find"
+    "unzip exit ${unzip_rc}, size $(wc -c <"${WORK_DIR}/app-release.apk" 2>/dev/null || echo '?') bytes, stderr: $(tr '\n' ' ' <"${WORK_DIR}/unzip-err.log" 2>/dev/null | cut -c1-160)"
 fi
 
 : >"${WORK_DIR}/empty-exit-info.txt"

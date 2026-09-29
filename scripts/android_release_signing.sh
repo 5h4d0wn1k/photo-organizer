@@ -248,11 +248,16 @@ materialize_ephemeral_keystore() {
   local destination="$1" password="$2"
   assert_outside_workspace "${destination}"
   rm -f "${destination}"
-  keytool -genkeypair \
+  # The password reaches keytool through the environment, never argv:
+  # /proc/<pid>/cmdline is readable by other local users, and the release
+  # path already keeps passwords out of argv with -storepass:env for the same
+  # reason. Only the variable NAME appears on the command line. Scoped to this
+  # one invocation via prefix assignment, so it cannot leak into GITHUB_ENV.
+  EPHEMERAL_KEYSTORE_PASSWORD="${password}" keytool -genkeypair \
     -keystore "${destination}" \
     -storetype PKCS12 \
-    -storepass "${password}" \
-    -keypass "${password}" \
+    -storepass:env EPHEMERAL_KEYSTORE_PASSWORD \
+    -keypass:env EPHEMERAL_KEYSTORE_PASSWORD \
     -alias "${EPHEMERAL_KEY_ALIAS}" \
     -keyalg RSA \
     -keysize 2048 \
