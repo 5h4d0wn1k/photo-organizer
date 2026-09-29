@@ -177,6 +177,7 @@ jobs:
               const pr = payload.pull_request || {};
               const actionable =
                 payload.action === "opened" ||
+                payload.action === "synchronize" ||
                 payload.action === "ready_for_review" ||
                 (payload.action === "closed" && pr.merged);
               if (!actionable) return;
