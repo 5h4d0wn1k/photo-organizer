@@ -1,12 +1,15 @@
 name: Project board
 
-# Token-free Projects v2 automation (issue #107).
+# Token-free first, scoped PAT as fallback (issue #107).
 #
-# The old workflow needed a personal access token with `project` scope
-# (PROJECTS_TOKEN) that does not exist, so every board move was manual and the
-# workflow itself was decoration. Projects v2 accepts the workflow token for
-# issue/PR project mutations on the repository's own board, so no PAT is
-# stored, rotated, or leaked here.
+# Proven live: GITHUB_TOKEN *reads* user-owned Projects v2 fine but every
+# mutation 403s ("Resource not accessible by integration"), so a board that
+# only ever used the workflow token could add nothing and move nothing. The
+# workflow therefore prefers a fine-grained PAT with Projects read/write
+# stored as the PROJECTS_TOKEN secret, and falls back to GITHUB_TOKEN (which
+# degrades to warnings) when it is absent. That is one scoped secret, created
+# once by the owner, instead of a classic PAT -- and the automation never
+# fails a build either way.
 #
 # Board: users/5h4d0wn1k/projects/3 ("Photo Organizer"). The workflow column
 # is the `Stage` single-select (Backlog / In Progress / In Review / Shipped),
@@ -42,7 +45,10 @@ jobs:
     steps:
       - name: Sync project board
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        # Fine-grained PAT with Projects read/write when the owner configures
+        # it; the workflow token otherwise (mutations then warn, never fail).
         with:
+          github-token: ${{ secrets.PROJECTS_TOKEN || secrets.GITHUB_TOKEN }}
           script: |
             const PROJECT_ID = "PVT_kwHOBVymY84BlB6V";
             const STAGE_NAME = "Stage";
