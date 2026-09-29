@@ -56,6 +56,37 @@ jobs:
         run: flutter pub outdated
         continue-on-error: true
 
+  # The release gate decides whether an APK that users cannot install can reach
+  # a release (issue #97). Its logic is shell, so it gets real tests here rather
+  # than being trusted because it is "just CI glue".
+  release-gate:
+    name: Release gate (artifact + signing policy)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Shellcheck the release gate scripts
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends shellcheck
+          # --severity=warning blocks on errors and warnings. Info/style findings
+          # are not treated as failures because shellcheck's rule set shifts
+          # between releases, which would make this job fail for reasons that
+          # have nothing to do with the artifact gate.
+          shellcheck --severity=warning \
+            scripts/android_release_signing.sh \
+            scripts/android_release_artifact_smoke.sh \
+            scripts/android_release_verify_signature.sh \
+            scripts/production-readiness-check.sh \
+            scripts/dev-check.sh \
+            scripts/tests/release_workflow_test.sh \
+            scripts/tests/android_release_signing_test.sh \
+            scripts/tests/apksigner_gate_test.sh \
+            scripts/tests/android_release_artifact_smoke_test.sh \
+            scripts/tests/run_release_gate_tests.sh
+      - name: Run the release gate tests
+        run: bash scripts/tests/run_release_gate_tests.sh
+
   security:
     name: Security gates
     runs-on: ubuntu-latest

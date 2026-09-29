@@ -33,13 +33,6 @@ warn() {
   warn_count=$((warn_count + 1))
 }
 
-is_enabled() {
-  case "${1:-}" in
-    1 | true | TRUE | yes | YES) return 0 ;;
-    *) return 1 ;;
-  esac
-}
-
 run_check() {
   local label="$1"
   shift
@@ -57,6 +50,8 @@ have_command() {
   command -v "$1" >/dev/null 2>&1
 }
 
+# NOTE: this used to be defined twice; the earlier, narrower copy was dead code
+# that silently lost to this one. Keep exactly one definition.
 is_enabled() {
   case "${1:-}" in
     1 | true | TRUE | yes | YES | on | ON)
@@ -100,6 +95,7 @@ check_android_release_signing_config() {
   local gradle_file="${ROOT_DIR}/app/android/app/build.gradle.kts"
   local ignore_file="${ROOT_DIR}/app/android/.gitignore"
   local properties_file="${ROOT_DIR}/app/android/private-gallery-release.properties"
+  local release_workflow="${ROOT_DIR}/.github/workflows/release.yml"
   local store_file
 
   if [[ ! -f "${gradle_file}" ]]; then
@@ -114,25 +110,82 @@ check_android_release_signing_config() {
     warn "Android release signing properties file must be git-ignored"
     return 1
   fi
+
+  # The release signing path must exist in BOTH forms: environment variables for
+  # CI (so secrets never touch the working tree) and the ignored properties file
+  # for local release builds. A regression here is how #97 recurs.
+  local env_var
+  for env_var in ANDROID_KEYSTORE_FILE ANDROID_KEYSTORE_PASSWORD ANDROID_KEY_ALIAS ANDROID_KEY_PASSWORD; do
+    if ! grep -q "${env_var}" "${gradle_file}"; then
+      warn "Android release signing must resolve ${env_var} from the environment"
+      return 1
+    fi
+  done
+  if ! grep -q 'only partially configured' "${gradle_file}"; then
+    warn "Android release signing must reject a half-configured keystore instead of silently dropping it"
+    return 1
+  fi
+  if ! grep -q 'enableV1Signing = flutter.minSdkVersion < 24' "${gradle_file}"; then
+    warn "Android v1 signing must stay conditional on minSdk (every minSdk 24 device understands v2)"
+    return 1
+  fi
+
+  # The pipeline must also be able to prove the artifact installs, or an
+  # uninstallable APK can still reach users (the #97 failure mode).
+  if [[ ! -f "${release_workflow}" ]]; then
+    warn "Release workflow not found; Android release artifact evidence is unavailable"
+    return 1
+  fi
+  if ! grep -q 'android_release_artifact_smoke.sh' "${release_workflow}"; then
+    warn "The release workflow must gate the APK on scripts/android_release_artifact_smoke.sh (install + cold launch)"
+    return 1
+  fi
+  if ! grep -q 'android_release_signing.sh materialize' "${release_workflow}"; then
+    warn "The release workflow must resolve signing through scripts/android_release_signing.sh"
+    return 1
+  fi
+  if ! grep -q 'apksigner' "${release_workflow}"; then
+    warn "The release workflow must verify the APK signature with apksigner before publishing"
+    return 1
+  fi
+
   if ! is_enabled "${REQUIRE_RELEASE_SIGNING}"; then
     warn "Android release signing material was not required for this local check; set PRIVATE_GALLERY_READINESS_REQUIRE_RELEASE_SIGNING=1 for release evidence"
     return 0
   fi
-  if [[ ! -f "${properties_file}" ]]; then
-    warn "Android release signing properties are required but app/android/private-gallery-release.properties is missing"
-    return 1
-  fi
-  for key in storeFile storePassword keyAlias keyPassword; do
-    if ! grep -Eq "^${key}=.+" "${properties_file}"; then
-      warn "Android release signing properties are missing ${key}"
-      return 1
+
+  # Release evidence is satisfied by complete signing material from EITHER
+  # source: CI supplies it through the environment, a local release build through
+  # the ignored properties file.
+  local missing_env=""
+  for env_var in ANDROID_KEYSTORE_FILE ANDROID_KEYSTORE_PASSWORD ANDROID_KEY_ALIAS ANDROID_KEY_PASSWORD; do
+    if [[ -z "${!env_var:-}" ]]; then
+      missing_env="${missing_env}${missing_env:+, }${env_var}"
     fi
   done
-  store_file="$(sed -n 's/^storeFile=//p' "${properties_file}" | tail -1)"
-  if [[ ! -f "${ROOT_DIR}/app/android/${store_file}" && ! -f "${store_file}" ]]; then
-    warn "Android release signing keystore file referenced by storeFile was not found"
-    return 1
+  if [[ -z "${missing_env}" ]]; then
+    if [[ ! -f "${ANDROID_KEYSTORE_FILE}" ]]; then
+      warn "ANDROID_KEYSTORE_FILE does not point at a readable keystore"
+      return 1
+    fi
+    return 0
   fi
+  if [[ -f "${properties_file}" ]]; then
+    for key in storeFile storePassword keyAlias keyPassword; do
+      if ! grep -Eq "^${key}=.+" "${properties_file}"; then
+        warn "Android release signing properties are missing ${key}"
+        return 1
+      fi
+    done
+    store_file="$(sed -n 's/^storeFile=//p' "${properties_file}" | tail -1)"
+    if [[ ! -f "${ROOT_DIR}/app/android/${store_file}" && ! -f "${store_file}" ]]; then
+      warn "Android release signing keystore file referenced by storeFile was not found"
+      return 1
+    fi
+    return 0
+  fi
+  warn "Android release signing evidence requires either the four ANDROID_KEYSTORE_* environment variables or app/android/private-gallery-release.properties (missing from the environment: ${missing_env})"
+  return 1
 }
 
 run_cargo_fmt() {
