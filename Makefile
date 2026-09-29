@@ -7,7 +7,7 @@ help:
 	@echo "  fmt                cargo fmt --check"
 	@echo "  lint               cargo clippy -D warnings"
 	@echo "  test               cargo test (Rust workspace)"
-	@echo "  check              scripts/dev-check.sh (Rust + Flutter + release gate when available)"
+	@echo "  check              scripts/dev-check.sh (Rust + Flutter + structural tests + release gate)"
 	@echo "  audit              cargo audit"
 	@echo "  flutter-analyze    flutter analyze (app/)"
 	@echo "  flutter-test       flutter test (app/)"

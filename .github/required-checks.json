@@ -12,6 +12,11 @@
       "why": "Desktop/Android client; analyze/tests catch breakage before release builds."
     },
     {
+      "context": "Android debug build",
+      "source": "ci.yml job 'android-build', added for issue #84",
+      "why": "analyze and unit tests never touch Gradle; a Kotlin/AGP/manifest mistake otherwise reaches a tag. Required because the issue's acceptance is that Android breakage fails loudly."
+    },
+    {
       "context": "Security gates",
       "source": "ci.yml job 'security'",
       "why": "Secret scan, dependency audit, SBOM. Security defects get highest priority by repo principle."
