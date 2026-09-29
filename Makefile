@@ -1,6 +1,6 @@
 SHELL := /bin/bash
 
-.PHONY: help setup fmt lint test check audit flutter-analyze flutter-test release-linux-local release-gate workflow-hygiene
+.PHONY: help setup fmt lint test check audit flutter-analyze flutter-test release-linux-local release-gate workflow-hygiene canary canary-mutations
 
 help:
 	@echo "Photo Organizer dev targets:"
@@ -14,6 +14,8 @@ help:
 	@echo "  release-gate       tests for the Android artifact/signing release gate"
 	@echo "  release-linux-local build daemon + Flutter Linux bundle (scripts/build_linux_release.sh)"
 	@echo "  workflow-hygiene   structural tests for .github/workflows (triggers, pins, timeouts, permissions)"
+	@echo "  canary             tests for the schedule/liveness canary (scripts/canary_liveness.sh)"
+	@echo "  canary-mutations   prove the canary suite's assertions fail when the logic is broken"
 
 setup:
 	@echo "Dependencies: stable Rust toolchain (rust-toolchain.toml), Flutter stable,"
@@ -48,3 +50,12 @@ release-linux-local:
 
 workflow-hygiene:
 	bash scripts/tests/workflow_hygiene_test.sh
+
+canary:
+	bash scripts/tests/canary_liveness_test.sh
+
+# Not part of `make check`: it re-runs the whole suite once per mutation, so it
+# costs minutes. It exists because "the tests pass" means nothing until you have
+# watched a test fail for the right reason.
+canary-mutations:
+	bash scripts/tests/canary_mutation_test.sh

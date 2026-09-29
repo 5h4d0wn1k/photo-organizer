@@ -36,6 +36,10 @@ fi
 # because its runners do have the SDK. A suite that actually FAILS still fails
 # here -- only the "could not run" outcome is downgraded, and it says so loudly.
 echo
+echo "[canary] schedule/liveness canary tests"
+bash "${ROOT_DIR}/scripts/tests/canary_liveness_test.sh"
+
+echo
 echo "[release-gate] artifact + signing policy tests"
 gate_log="$(mktemp)"
 if bash "${ROOT_DIR}/scripts/tests/run_release_gate_tests.sh" >"${gate_log}" 2>&1; then

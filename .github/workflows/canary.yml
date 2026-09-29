@@ -1,0 +1,53 @@
+name: Schedule canary
+
+# A check that cannot report its own absence is not a check. Two things in this
+# repo can die silently:
+#
+#  1. A `schedule:`-triggered workflow (Scorecard, Stale) that stops running --
+#     disabled schedule, renamed file, deleted workflow. There is no run, so
+#     there is no failure, and the security check is simply gone.
+#  2. Drift between .github/required-checks.json (the reviewable contract,
+#     issue #104) and what CI actually enforces.
+#
+# The logic lives in scripts/canary_liveness.sh, not inline here, because an
+# inline `run:` block cannot be tested and this check is entirely about which
+# runs should be expected. It has its own suite:
+# scripts/tests/canary_liveness_test.sh.
+#
+# Runs weekly, plus on demand via workflow_dispatch. Needs only contents: read.
+
+on:
+  schedule:
+    # Monday 05:00 UTC -- after the Sunday-night Scorecard/Stale schedules.
+    - cron: "0 5 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: canary-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  canary:
+    name: Scheduled workflows and contract checks are alive
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Shellcheck the canary and its suites
+        run: shellcheck --severity=warning scripts/canary_liveness.sh scripts/tests/canary_liveness_test.sh scripts/tests/canary_mutation_test.sh
+      - name: Canary suite (device-free; runs the logic against fixtures)
+        run: bash scripts/tests/canary_liveness_test.sh
+      # 22 mutations, each breaking one behaviour and requiring the suite above
+      # to go red for the right reason. An assertion nobody has ever seen fail
+      # is a comment, and this file's entire job is to not be a comment.
+      - name: Mutation pass (proves the canary suite's assertions bite)
+        run: bash scripts/tests/canary_mutation_test.sh
+      - name: Liveness against the live repository
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CANARY_REPO: ${{ github.repository }}
+          CANARY_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: bash scripts/canary_liveness.sh
