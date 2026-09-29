@@ -370,6 +370,22 @@ install_apk() {
 # informational rather than a gate, so an unreadable property does not fail the
 # run -- but a silently empty field in published evidence is exactly the kind of
 # claim a reader cannot check, so each one is annotated when it cannot be read.
+# One policy for paths in evidence. User-downloaded sidecars (the checksum)
+# record bare filenames, because they must verify outside the runner. The
+# run-internal summary records paths relative to the workspace root when they
+# lie inside it, and absolute otherwise: absolute runner paths (e.g.
+# /home/runner/work/...) differ on every machine and make evidence
+# incomparable across runs, while relative paths stay stable. Paths are never
+# secrets, so this is about comparability, not redaction.
+evidence_display_path() {
+  local path="$1" workspace="${GITHUB_WORKSPACE:-}"
+  if [[ -n "${workspace}" && "${path}" == "${workspace}/"* ]]; then
+    printf '%s\n' "${path#"${workspace}/"}"
+  else
+    printf '%s\n' "${path}"
+  fi
+}
+
 record_installed_version() {
   local apk="$1" dump version_name version_code abi api release
   dump="$(adb_shell dumpsys package "${PACKAGE}")" || dump=""
@@ -380,7 +396,7 @@ record_installed_version() {
   release="$(device_property ro.build.version.release || printf 'unknown')"
   {
     printf 'package: %s\n' "${PACKAGE}"
-    printf 'apk: %s\n' "${apk}"
+    printf 'apk: %s\n' "$(evidence_display_path "${apk}")"
     printf 'apk sha256: %s\n' "$(sha256_of "${apk}")"
     printf 'device: API %s (Android %s), abi %s\n' "${api}" "${release}" "${abi}"
     printf 'installed versionName: %s\n' "${version_name:-unknown}"
@@ -867,7 +883,7 @@ main() {
     printf 'result: PASS\n'
     printf 'focused window: %s\n' "$(focused_window)"
     printf 'final pid: %s\n' "$(app_pid)"
-    printf 'screenshot: %s\n' "${SCREENSHOT_PATH}"
+    printf 'screenshot: %s\n' "$(evidence_display_path "${SCREENSHOT_PATH}")"
   } >>"${SUMMARY_PATH}"
 
   log "PASS: the release artifact installed, cold-launched and rendered on Android $(device_property ro.build.version.release) (API $(device_property ro.build.version.sdk))"

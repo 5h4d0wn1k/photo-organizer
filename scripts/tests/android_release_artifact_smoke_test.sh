@@ -1082,6 +1082,28 @@ if grep -q "apk sha256:" "${WORK_DIR}/evidence/case-summary.txt" 2>/dev/null; th
 else
   bad "the summary records the exact artifact digest"
 fi
+# One path policy: inside the workspace the summary records workspace-relative
+# paths, so evidence is comparable across runners instead of embedding
+# machine-specific prefixes. GITHUB_WORKSPACE is the workspace root here, and
+# the APK lives directly under it, so `apk:` must read `app-release.apk`.
+if run_smoke_on "${WORK_DIR}/app-release.apk" "GITHUB_WORKSPACE=${WORK_DIR}" \
+  >"${WORK_DIR}/relpaths.log" 2>&1; then
+  if grep -q '^apk: app-release.apk$' "${WORK_DIR}/evidence/case-summary.txt" 2>/dev/null; then
+    ok "summary paths are workspace-relative when inside the workspace"
+  else
+    bad "summary paths are workspace-relative when inside the workspace" \
+      "got: $(grep -E '^(apk|screenshot): ' "${WORK_DIR}/evidence/case-summary.txt" 2>/dev/null | tr '\n' '|' | cut -c1-160)"
+  fi
+  if grep -qE "^apk: /" "${WORK_DIR}/evidence/case-summary.txt" 2>/dev/null; then
+    bad "no absolute runner path leaks into the summary" \
+      "an absolute path makes evidence incomparable across machines"
+  else
+    ok "no absolute runner path leaks into the summary"
+  fi
+else
+  bad "summary paths are workspace-relative when inside the workspace" \
+    "the gate failed with GITHUB_WORKSPACE set: $(tr '\n' '|' <"${WORK_DIR}/relpaths.log" | cut -c1-200)"
+fi
 
 echo " PNG complexity decoder"
 sed -n '/^png_distinct_colors()/,/^}/p' "${SCRIPT}" >"${WORK_DIR}/decoder.sh"
