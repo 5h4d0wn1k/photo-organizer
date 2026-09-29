@@ -40,6 +40,17 @@ echo "[canary] schedule/liveness canary tests"
 bash "${ROOT_DIR}/scripts/tests/canary_liveness_test.sh"
 
 echo
+echo "[project-board] closing-reference parser, board helpers, and their wiring"
+bash "${ROOT_DIR}/scripts/tests/project_board_refs_test.sh"
+if command -v node >/dev/null 2>&1; then
+  node --test "${ROOT_DIR}/scripts/tests/project_board_graphql_test.js"
+else
+  echo "  !! DEGRADED: node is not installed, so the board helper suite did not run." >&2
+  echo "     Install node to check this locally; CI's project job has it." >&2
+fi
+bash "${ROOT_DIR}/scripts/tests/project_board_workflow_test.sh"
+
+echo
 echo "[release-gate] artifact + signing policy tests"
 gate_log="$(mktemp)"
 if bash "${ROOT_DIR}/scripts/tests/run_release_gate_tests.sh" >"${gate_log}" 2>&1; then

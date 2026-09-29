@@ -54,8 +54,22 @@ workflow-hygiene:
 canary:
 	bash scripts/tests/canary_liveness_test.sh
 
-# Not part of `make check`: it re-runs the whole suite once per mutation, so it
-# costs minutes. It exists because "the tests pass" means nothing until you have
+# Project-board parsing, its helpers, and the wiring between them (issue #107).
+# The two wiring suites exist because the parser and helper logic were once
+# inline in the workflow, where nothing could test them; the mutation harnesses
+# exist because a wiring suite is easy to write assertions into that are
+# satisfied by the comments documenting the very bug they describe.
+project-board:
+	bash scripts/tests/project_board_refs_test.sh
+	node --test scripts/tests/project_board_graphql_test.js
+	bash scripts/tests/project_board_workflow_test.sh
+
+# Not part of `make check`: each re-runs its suite once per mutation, so they
+# cost minutes. They exist because "the tests pass" means nothing until you have
 # watched a test fail for the right reason.
 canary-mutations:
 	bash scripts/tests/canary_mutation_test.sh
+
+project-board-mutations:
+	bash scripts/tests/project_board_refs_mutation_test.sh
+	bash scripts/tests/project_board_workflow_mutation_test.sh
