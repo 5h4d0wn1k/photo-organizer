@@ -39,7 +39,7 @@ jobs:
           mkdir -p "$TMPDIR"
           for run in 1 2; do
             echo "Rust test pass ${run}/2"
-            cargo test --locked
+            cargo test --all-features --locked
             leaked="$(find "$TMPDIR" -mindepth 1 -maxdepth 1 -type d -name 'private-gallery-*' -print)"
             if [[ -n "$leaked" ]]; then
               echo "Rust tests left temporary directories after pass ${run}:" >&2
