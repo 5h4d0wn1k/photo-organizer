@@ -111,6 +111,13 @@ jobs:
       # asserts it from the parsed YAML, mutation-tested.
       - name: Workflow hygiene
         run: bash scripts/tests/workflow_hygiene_test.sh
+      # The canary reads required-checks.json and the workflow files, and
+      # decides whether a dead check is reported. Running it only on its weekly
+      # schedule would mean a PR could break it and merge, so it runs here too
+      # (7s, fixture-only, no network). The 2.5-minute mutation pass stays on the
+      # schedule -- see .github/workflows/canary.yml.
+      - name: Canary suite
+        run: bash scripts/tests/canary_liveness_test.sh
 
       # Required-checks contract: every ci.yml job must be listed in
       # .github/required-checks.json as required or advisory-with-reason, so a
