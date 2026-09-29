@@ -22,3 +22,25 @@ ignore = [
     "RUSTSEC-2026-0194",
     "RUSTSEC-2026-0195",
 ]
+# Judged warnings (visible, NOT ignored -- they must stay loud on every audit).
+# Re-judged 2026-09-29 on the refreshed lockfile (issue #120). A `cargo update`
+# cleared the three yanked warnings (chacha20 0.10.1 -> 0.10.2, spin 0.9.8 /
+# 0.10.0 -> patched releases). What remains is iroh 0.98.2's pinned subtree:
+#
+#   atomic-polyfill 1.0.3 (unmaintained, RUSTSEC-2023-0089): via heapless 0.7
+#     -> postcard -> iroh-metrics. No advisory beyond "unmaintained"; provides
+#     atomic shims consumed unconditionally by heapless. No action except the
+#     iroh 1.x migration. (Our direct crypto uses chacha20poly1305 0.10 ->
+#     chacha20 0.9.1, unaffected.)
+#   paste 1.0.15 (unmaintained, RUSTSEC-2024-0436): proc-macro used at COMPILE
+#     time only by netlink-packet-core (codegen for netlink structs). Cannot
+#     affect runtime memory safety; supply-chain pin suffices.
+#   lru 0.16.4 (unsound, RUSTSEC-2026-0253, patched >= 0.18.2): the advisory
+#     needs a panicking Drop on cache keys plus catch_unwind. iroh-relay's
+#     sole use is LruCache<PublicKey, ()> (key_cache.rs) -- a 32-byte array
+#     wrapper with trivial Drop that cannot panic -- so the defect is not
+#     reachable in this graph. iroh-relay pins lru ^0.16; moving to >= 0.18.2
+#     requires the iroh 1.x migration.
+#
+# Durable fix for all three: iroh 0.98 -> 1.x (protocol compat with enrolled
+# devices must be proven first; tracked separately, not in this refresh).
