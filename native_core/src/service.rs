@@ -6398,10 +6398,57 @@ fn replaceable_bootstrap_vault_index(state: &LibraryState) -> Option<usize> {
     Some(0)
 }
 
+/// Which vault an asset's blobs belong in.
+///
+/// Vault membership is decided here, per asset, and nowhere else. Order is
+/// stability-first:
+/// (a) a live BlobRecord wins -- the asset already has sealed chunks
+///     somewhere, and re-homing sealed data on a routine pass is how #112
+///     disclosed one vault's originals to another vault's devices;
+/// (b) a mobile-upload receipt wins for fresh uploads -- it records the vault
+///     the upload was accepted into, so the bytes land where the API said;
+/// (c) a file-namespace entry wins next -- reservation places uploads there
+///     with their vault;
+/// (d) the first vault is the historical fallback for assets that predate
+///     any association.
+/// A referenced vault that no longer exists resolves to nothing: skipping
+/// the asset is safer than misfiling it into an unrelated vault, and the
+/// orphan-row reconciliation (Step 1b, separate change) owns the repair.
+fn target_vault_for_asset(state: &LibraryState, asset_id: Uuid) -> Option<Vault> {
+    if let Some(blob) = state
+        .blob_records
+        .iter()
+        .find(|blob| blob.asset_id == asset_id && blob.tombstoned_at.is_none())
+        && let Some(vault) = state.vaults.iter().find(|vault| vault.id == blob.vault_id)
+    {
+        return Some(vault.clone());
+    }
+    if let Some(upload) = state
+        .mobile_uploads
+        .iter()
+        .find(|upload| upload.asset_id == Some(asset_id))
+        && let Some(vault) = state
+            .vaults
+            .iter()
+            .find(|vault| vault.id == upload.vault_id)
+    {
+        return Some(vault.clone());
+    }
+    if let Some(entry) = state
+        .file_entries
+        .iter()
+        .find(|entry| entry.asset_id == Some(asset_id))
+        && let Some(vault) = state.vaults.iter().find(|vault| vault.id == entry.vault_id)
+    {
+        return Some(vault.clone());
+    }
+    state.vaults.first().cloned()
+}
+
 fn refresh_blob_records(config: &AppConfig, state: &mut LibraryState) -> bool {
-    let Some(vault) = state.vaults.first().cloned() else {
+    if state.vaults.is_empty() {
         return false;
-    };
+    }
     let Some(local_device) = local_device_id(state) else {
         return false;
     };
@@ -6411,6 +6458,11 @@ fn refresh_blob_records(config: &AppConfig, state: &mut LibraryState) -> bool {
     let library_root = PathBuf::from(effective_library_root(state, config));
 
     for asset in state.assets.clone() {
+        // Per-asset vault, resolved above: an asset whose vault vanished is
+        // skipped rather than misfiled (see target_vault_for_asset).
+        let Some(vault) = target_vault_for_asset(state, asset.id) else {
+            continue;
+        };
         let blob_id = if let Some(blob) = state
             .blob_records
             .iter()
@@ -10347,6 +10399,179 @@ mod tests {
                 .mobile_session_status(&refreshed.bearer_token)
                 .await
                 .is_err()
+        );
+    }
+
+    /// #112 Step 1: an upload accepted into a secondary vault must be sealed
+    /// into that vault -- not re-homed into the first vault by the next
+    /// reconciliation pass, which disclosed one vault's originals to another
+    /// vault's devices (uploader 404, stranger 200).
+    #[tokio::test]
+    async fn mobile_upload_to_second_vault_stays_in_that_vault() {
+        let runtime_root = temp_root("second-vault-upload");
+        let library_root = runtime_root.join("library");
+        let config = AppConfig {
+            runtime_root: runtime_root.clone(),
+            ..AppConfig::default()
+        };
+        let service = GalleryService::new(config.clone()).expect("service");
+        service
+            .update_library_settings(UpdateLibrarySettingsRequest {
+                library_root: library_root.to_string_lossy().to_string(),
+                default_import_mode: ImportMode::Copy,
+                original_storage_policy: None,
+            })
+            .await
+            .expect("settings");
+        // Personal vault first (as auto-creation would), one asset imported so
+        // it is no longer a replaceable bootstrap placeholder, then Kids --
+        // the exact shape from #112. Pair one phone to each.
+        let personal = service
+            .create_vault(CreateVaultRequest {
+                id: None,
+                name: "Personal vault".to_string(),
+                storage_policy: None,
+            })
+            .await
+            .expect("first vault");
+        let seed_path = runtime_root.join("seed.jpg");
+        fs::write(&seed_path, b"personal seed bytes").expect("seed file");
+        service
+            .import_asset(ImportAssetRequest {
+                source_path: seed_path.to_string_lossy().to_string(),
+                original_filename: "seed.jpg".to_string(),
+                media_kind: MediaKind::Photo,
+                mime_type: "image/jpeg".to_string(),
+                bytes: 19,
+                content_hash: None,
+                captured_at: None,
+                place_hint: None,
+                import_mode: Some(ImportMode::Copy),
+            })
+            .await
+            .expect("seed import");
+        let kids = service
+            .create_vault(CreateVaultRequest {
+                id: None,
+                name: "Kids vault".to_string(),
+                storage_policy: None,
+            })
+            .await
+            .expect("second vault");
+        assert_ne!(personal.id, kids.id);
+        {
+            let state = service.state.read().await;
+            assert!(
+                state.vaults.iter().any(|vault| vault.id == personal.id)
+                    && state.vaults.iter().any(|vault| vault.id == kids.id),
+                "both vaults must coexist; the second creation must append, not replace"
+            );
+        }
+
+        async fn pair_scoped(
+            service: &GalleryService,
+            device_name: &str,
+            vault_id: uuid::Uuid,
+        ) -> String {
+            let pairing = service
+                .create_pairing_session(CreatePairingSessionRequest {
+                    device_name: device_name.to_string(),
+                    platform: "android".to_string(),
+                    vault_id: Some(vault_id),
+                })
+                .await
+                .expect("pairing session");
+            service
+                .pair_mobile_device(MobilePairRequest {
+                    pairing_token: pairing.pairing_token.clone(),
+                    device_name: device_name.to_string(),
+                    platform: "android".to_string(),
+                    vault_id: None,
+                    storage_profile: None,
+                })
+                .await
+                .expect("pair mobile")
+                .bearer_token
+        }
+        let kids_token = pair_scoped(&service, "kidphone", kids.id).await;
+        let personal_token = pair_scoped(&service, "myphone", personal.id).await;
+
+        let bytes = b"kidsecret bytes".to_vec();
+        let reserved = service
+            .reserve_mobile_upload(
+                &kids_token,
+                MobileUploadRequest {
+                    original_filename: "kidsecret.jpg".to_string(),
+                    media_kind: MediaKind::Photo,
+                    mime_type: "image/jpeg".to_string(),
+                    bytes: bytes.len() as u64,
+                    content_hash: None,
+                    captured_at: None,
+                    place_hint: None,
+                },
+            )
+            .await
+            .expect("reserve upload");
+        let completed = service
+            .receive_mobile_upload(&kids_token, reserved.id, bytes.clone())
+            .await
+            .expect("receive upload");
+        assert_eq!(completed.status, MobileUploadStatus::Completed);
+        // The API accepted the upload into the Kids vault...
+        assert_eq!(completed.vault_id, kids.id);
+        let asset_id = completed.asset_id.expect("asset id");
+
+        // ...so the sealed record must live there, not in vaults[0].
+        {
+            let state = service.state.read().await;
+            let blob = state
+                .blob_records
+                .iter()
+                .find(|blob| blob.asset_id == asset_id && blob.tombstoned_at.is_none())
+                .expect("one live blob record");
+            assert_eq!(
+                blob.vault_id, kids.id,
+                "upload accepted into the Kids vault must be sealed there"
+            );
+        }
+
+        // The uploader sees its own photo; the other vault's phone does not.
+        let kids_assets = service
+            .mobile_assets(&kids_token)
+            .await
+            .expect("kids assets");
+        assert!(
+            kids_assets.iter().any(|asset| asset.asset_id == asset_id),
+            "uploader must see its own upload"
+        );
+        let personal_assets = service
+            .mobile_assets(&personal_token)
+            .await
+            .expect("personal assets");
+        assert!(
+            !personal_assets
+                .iter()
+                .any(|asset| asset.asset_id == asset_id),
+            "the other vault's phone must not see this upload"
+        );
+        service
+            .mobile_original_bytes(&kids_token, asset_id)
+            .await
+            .expect("uploader downloads its own original");
+        let err = service
+            .mobile_original_bytes(&personal_token, asset_id)
+            .await
+            .expect_err("other vault must not download it");
+        assert!(
+            err.to_string().contains("not found"),
+            "expected a 404-style NotFound, got: {err}"
+        );
+
+        // And the secondary vault exists on disk holding chunks.
+        let kids_dir = library_root.join("vaults").join(kids.id.to_string());
+        assert!(
+            kids_dir.is_dir(),
+            "the Kids vault directory must exist on disk"
         );
     }
 
