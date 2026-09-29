@@ -1,21 +1,20 @@
 name: Schedule canary
 
-# A check that cannot report its own absence is not a check. Two things in
-# this repo can die silently:
+# A check that cannot report its own absence is not a check. Two things in this
+# repo can die silently:
 #
 #  1. A `schedule:`-triggered workflow (Scorecard, Stale) that stops running --
 #     disabled schedule, renamed file, deleted workflow. There is no run, so
 #     there is no failure, and the security check is simply gone.
 #  2. Drift between .github/required-checks.json (the reviewable contract,
-#     issue #104) and what CI actually enforces. GITHUB_TOKEN cannot read
-#     branch protection, so this job cannot verify the "required" flag
-#     itself; what it CAN verify with its own token is that every
-#     contract-required check has a recent successful run on the default
-#     branch -- i.e. the job exists, runs, and passes. The required flag
-#     stays owner-verified (see #102); this canary proves the other half.
+#     issue #104) and what CI actually enforces.
 #
-# Runs weekly, plus on demand via workflow_dispatch. Fails loudly on either
-# condition. Needs only contents: read.
+# The logic lives in scripts/canary_liveness.sh, not inline here, because an
+# inline `run:` block cannot be tested and this check is entirely about which
+# runs should be expected. It has its own suite:
+# scripts/tests/canary_liveness_test.sh.
+#
+# Runs weekly, plus on demand via workflow_dispatch. Needs only contents: read.
 
 on:
   schedule:
@@ -26,6 +25,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: canary-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   canary:
     name: Scheduled workflows and contract checks are alive
@@ -33,83 +36,18 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - name: Check scheduled workflows ran recently
+      - name: Shellcheck the canary and its suites
+        run: shellcheck --severity=warning scripts/canary_liveness.sh scripts/tests/canary_liveness_test.sh scripts/tests/canary_mutation_test.sh
+      - name: Canary suite (device-free; runs the logic against fixtures)
+        run: bash scripts/tests/canary_liveness_test.sh
+      # 22 mutations, each breaking one behaviour and requiring the suite above
+      # to go red for the right reason. An assertion nobody has ever seen fail
+      # is a comment, and this file's entire job is to not be a comment.
+      - name: Mutation pass (proves the canary suite's assertions bite)
+        run: bash scripts/tests/canary_mutation_test.sh
+      - name: Liveness against the live repository
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          # Every workflow with a schedule: trigger must have produced a
-          # completed run in the last 10 days. A missing run means the schedule
-          # died (disabled, renamed, deleted) and nobody was told -- the exact
-          # failure this canary exists to catch.
-          failures=0
-          for workflow in $(python3 -c "
-          import glob, yaml
-          for f in sorted(glob.glob('.github/workflows/*.yml')):
-              d = yaml.safe_load(open(f))
-              # Bare 'on:' parses as boolean True under YAML 1.1; read both.
-              on = d.get(True, d.get('on', {}))
-              if isinstance(on, dict):
-                  triggers = set(on)
-              elif isinstance(on, list):
-                  triggers = set(on)
-              elif isinstance(on, str):
-                  triggers = {on}
-              else:
-                  triggers = set()
-              if 'schedule' in triggers:
-                  print(f.split('/')[-1])
-          "); do
-            # The canary itself is excluded: its own absence is reported by its
-            # own absence, which no check can observe. Its liveness is proven
-            # the same way as the others' -- by a run existing -- and a human
-            # looking at the Actions tab.
-            if [[ "${workflow}" == "canary.yml" ]]; then
-              continue
-            fi
-            latest="$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/${workflow}/runs?per_page=1&event=schedule" \
-              --jq '.workflow_runs[0] | "\(.created_at) \(.conclusion)"' 2>/dev/null || echo 'none')"
-            echo "${workflow}: latest schedule run: ${latest}"
-            if [[ "${latest}" == "none" ]] || [[ "${latest}" == "null "* ]]; then
-              echo "::error::${workflow} has no schedule-triggered runs; its schedule is dead or the file was renamed"
-              failures=$((failures + 1))
-            fi
-          done
-          if ((failures > 0)); then
-            echo "::error::${failures} scheduled workflow(s) show no recent runs"
-            exit 1
-          fi
-          echo "all scheduled workflows have recent runs"
-      - name: Check contract-required checks run and pass on main
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          # For every context in required[] (+ pending[] entries whose source
-          # exists, i.e. already merged): the default branch HEAD must carry a
-          # successful check run with that name. This proves the job exists,
-          # executes, and passes -- the half of the guarantee a token without
-          # admin scope can verify. It does NOT prove the check is marked
-          # required in the ruleset; that half is owner-verified per #102.
-          head_sha="$(git rev-parse HEAD)"
-          failures=0
-          while IFS=$'\t' read -r context; do
-            [[ -n "${context}" ]] || continue
-            conclusion="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${head_sha}/check-runs?per_page=100" \
-              --jq "[.check_runs[] | select(.name == \"${context}\") | .conclusion] | first // \"absent\"" \
-              2>/dev/null || echo "api-error")"
-            echo "${context}: ${conclusion}"
-            if [[ "${conclusion}" != "success" ]]; then
-              echo "::error::contract check '${context}' is '${conclusion}' on main HEAD; the contract and CI disagree"
-              failures=$((failures + 1))
-            fi
-          done < <(python3 -c "
-          import json
-          contract = json.load(open('.github/required-checks.json'))
-          for entry in contract.get('required', []):
-              print(entry['context'])
-          ")
-          if ((failures > 0)); then
-            exit 1
-          fi
-          echo "all contract-required checks are green on main HEAD"
+          CANARY_REPO: ${{ github.repository }}
+          CANARY_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: bash scripts/canary_liveness.sh
