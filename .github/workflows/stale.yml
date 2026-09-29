@@ -8,6 +8,14 @@ permissions:
   issues: write
   pull-requests: write
 
+# Superseded runs are pure waste for these read/annotate jobs: none
+# deploys, publishes, or mutates release state, so a newer run always
+# obsoletes an older one on the same ref. (release.yml deliberately keeps
+# cancel-in-progress: false -- a release must never be cancelled mid-flight.)
+concurrency:
+  group: stale-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   mark:
     name: Mark stale items
