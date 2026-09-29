@@ -42,23 +42,16 @@ jobs:
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:
           script: |
-            const PROJECT_NUMBER = 3;
+            const PROJECT_ID = "PVT_kwHOBVymY84BlB6V";
             const STAGE_NAME = "Stage";
 
+            // The project ID is hardcoded rather than listed: GITHUB_TOKEN
+            // cannot enumerate a user's Projects v2 (that query 404s), but it
+            // can mutate a project it is given explicitly. If this ever 403s,
+            // the fallback is a fine-grained PAT with Projects read/write --
+            // still no classic PAT.
             async function findProject() {
-              const { user } = await github.graphql(
-                `query($login: String!) {
-                   user(login: $login) {
-                     projectsV2(first: 20) { nodes { id title number } }
-                   }
-                 }`,
-                { login: context.repo.owner }
-              );
-              const project = (user.projectsV2.nodes || []).find(
-                (n) => n.number === PROJECT_NUMBER
-              );
-              if (!project) throw new Error(`Project #${PROJECT_NUMBER} not found`);
-              return project;
+              return { id: PROJECT_ID };
             }
 
             async function resolveStageField(projectId) {
