@@ -9,7 +9,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Screenshots for `docs/screenshots/`.
 - Android release artifact gate: the exact APK that will be published is now
   installed, cold-launched, and proven to render a stable, visually-complex frame
   on real Android system images (API 30 and API 35) before the APK can be
@@ -160,6 +159,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The documentation claimed configuration prefixes (`PG_*`) that no longer
+  exist anywhere in the tree, described the application-menu entry as still
+  using the legacy *Private Gallery* name, and listed roughly a third of the
+  local API surface. The API list in `docs/architecture.md` is now generated
+  from `native_core/src/api.rs` by `scripts/generate-api-list.py`, which also
+  verifies it with `--check`, so it cannot rot silently again. The changelog no
+  longer advertises screenshots for an empty `docs/screenshots/` directory.
 - The Android release APK was published completely unsigned, so stock Android
   refused to install it ("App not installed"). `build.gradle.kts` now resolves
   signing material from the CI environment, and CI refuses to publish without

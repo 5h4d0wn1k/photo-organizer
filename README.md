@@ -95,9 +95,10 @@ scripts/private_gallery_linux_launcher.sh  # starts the daemon and launches the 
 ```
 
 The bundled output lands in `app/build/linux/x64/release/bundle/` with `galleryd`
-and the `ml_sidecar/` beside the Flutter binary; the application-menu entry still
-displays the legacy *Private Gallery* name until the branding migration lands
-(see [CHANGELOG](CHANGELOG.md)).
+and the `ml_sidecar/` beside the Flutter binary; the application-menu entry
+shows the migrated *Photo Organizer* name (`assets/linux/photo-organizer.desktop`).
+The in-app window title and a few default labels still read *Private Gallery*;
+those are tracked with the remaining branding work, not with this document.
 
 For Android pairing during development, run the daemon in LAN mode on a trusted
 network:
@@ -172,9 +173,9 @@ acceleration at higher throughput.
 ## Heritage and Affiliation
 
 Photo Organizer was formerly developed as **Private Gallery**, which grew out of
-the *photos-and-videos-organizer* project and still carries its `PG_*`
-configuration prefixes in some scripts. The legacy Python face sorter now lives
-in [`tools/quick-face-sort/`](tools/quick-face-sort/).
+the *photos-and-videos-organizer* project. No `PG_*` configuration prefixes
+remain anywhere in the tree -- every knob is `PRIVATE_GALLERY_*`. The legacy
+Python face sorter now lives in [`tools/quick-face-sort/`](tools/quick-face-sort/).
 
 Photo Organizer is **not affiliated with or endorsed by Google Photos**, or by
 any other photo-hosting provider.

@@ -69,61 +69,246 @@ All derived entities carry:
 
 ## Local API Surface
 
-- `GET /library/status`
-- `GET /library/settings`
-- `POST /library/settings`
-- `GET /watch-folders`
-- `POST /watch-folders`
-- `DELETE /watch-folders/:id`
-- `POST /pairing/sessions`
-- `POST /mobile/pair`
-- `GET /mobile/session`
-- `GET /mobile/uploads/:id`
-- `POST /mobile/uploads`
-- `PUT /mobile/uploads/:id` (legacy one-shot upload)
-- `DELETE /mobile/uploads/:id`
-- `PUT /mobile/uploads/:id/chunks/:offset`
-- `POST /mobile/uploads/:id/complete`
-- `GET /mobile/assets`
-- `GET /mobile/assets/:id/original` with `Range: bytes=start-end` support
-- `POST /imports/assets`
-- `POST /imports/scan`
-- `POST /imports/commit`
-- `GET /imports/sessions/:id`
-- `GET /timeline`
-- `GET /people`
-- `POST /people/:id/merge`
-- `POST /people/:id/split`
-- `GET /places`
-- `GET /events`
-- `POST /events/:id/title`
-- `POST /feedback`
-- `GET /search`
-- `GET /jobs`
-- `GET /vaults`
-- `POST /vaults`
-- `GET /vaults/:id/status`
-- `POST /vaults/:id/storage-policy`
-- `GET /devices`
-- `POST /devices`
-- `POST /devices/enroll`
-- `POST /devices/:id/revoke`
-- `GET /sync/plan`
-- `POST /sync/run`
-- `GET /sync/transfers`
-- `GET /sync/network/status`
-- `POST /sync/network/start`
-- `POST /sync/network/stop`
-- `POST /sync/transfers/:id/retry`
-- `POST /sync/transfers/:id/cancel`
-- `POST /backup/verify`
+_Generated from `native_core/src/api.rs` by `scripts/generate-api-list.py` -- edit the routes, not this list._
+
+### `/albums`
+
+- `GET /albums`
+- `GET /albums/{album_id}`
+- `GET /albums/{album_id}/assets`
+- `POST /albums/{album_id}/assets/remove`
+- `POST /albums/{album_id}/rename`
+
+### `/assets`
+
+- `GET /assets/archived`
+- `GET /assets/favorites`
+- `POST /assets/flags/bulk`
+- `GET /assets/{asset_id}/availability`
+- `POST /assets/{asset_id}/evict-local`
+- `POST /assets/{asset_id}/flags`
+- `GET /assets/{asset_id}/original`
+- `POST /assets/{asset_id}/pin-local`
+- `POST /assets/{asset_id}/tags`
+
+### `/audit`
+
+- `GET /audit/events`
+
+### `/backup`
+
 - `POST /backup/export`
 - `POST /backup/restore/plan`
 - `POST /backup/restore/run`
-- `GET /assets/:id/original` with `Range: bytes=start-end` support
-- `GET /assets/:id/availability`
-- `POST /assets/:id/pin-local`
-- `POST /assets/:id/evict-local`
+- `POST /backup/restore/verify`
+- `POST /backup/verify`
+
+### `/devices`
+
+- `GET /devices`
+- `POST /devices/enroll`
+- `POST /devices/{device_id}/revoke`
+
+### `/diagnostics`
+
+- `GET /diagnostics`
+
+### `/duplicates`
+
+- `GET /duplicates`
+
+### `/entitlements`
+
+- `GET /entitlements/status`
+
+### `/events`
+
+- `GET /events`
+- `POST /events/rebuild`
+- `GET /events/{event_id}/assets`
+- `POST /events/{event_id}/title`
+
+### `/feedback`
+
+- `POST /feedback`
+
+### `/files`
+
+- `POST /files/folders`
+- `GET /files/tree`
+- `PATCH /files/{entry_id}`
+- `POST /files/{entry_id}/move`
+- `GET /files/{entry_id}/original`
+- `POST /files/{entry_id}/restore`
+- `POST /files/{entry_id}/trash`
+
+### `/health`
+
+- `GET /health`
+
+### `/imports`
+
+- `POST /imports/assets`
+- `POST /imports/commit`
+- `POST /imports/scan`
+- `GET /imports/sessions`
+- `GET /imports/sessions/{session_id}`
+
+### `/jobs`
+
+- `GET /jobs`
+- `GET /jobs/{job_id}`
+- `POST /jobs/{job_id}/cancel`
+- `GET /jobs/{job_id}/logs`
+- `POST /jobs/{job_id}/retry`
+
+### `/library`
+
+- `GET /library/settings`
+- `GET /library/status`
+
+### `/local-web`
+
+- `GET /local-web`
+- `GET /local-web/`
+- `GET /local-web/{*asset_path}`
+
+### `/metadata`
+
+- `GET /metadata/assets/{asset_id}`
+- `POST /metadata/assets/{asset_id}/correct-date`
+- `POST /metadata/rebuild`
+
+### `/mobile`
+
+- `GET /mobile/assets`
+- `GET /mobile/assets/{asset_id}/availability`
+- `POST /mobile/assets/{asset_id}/flags`
+- `GET /mobile/assets/{asset_id}/original`
+- `GET /mobile/assets/{asset_id}/preview`
+- `POST /mobile/assets/{asset_id}/tags`
+- `POST /mobile/devices/{device_id}/sessions/revoke`
+- `GET /mobile/files/tree`
+- `GET /mobile/files/{entry_id}/original`
+- `POST /mobile/pair`
+- `GET /mobile/search`
+- `GET /mobile/session`
+- `POST /mobile/session/refresh`
+- `POST /mobile/session/revoke`
+- `GET /mobile/sessions`
+- `POST /mobile/storage-profile`
+- `GET /mobile/storage/blobs/{blob_id}/chunks/{chunk_index}`
+- `POST /mobile/storage/blobs/{blob_id}/report`
+- `GET /mobile/storage/plan`
+- `POST /mobile/uploads`
+- `GET /mobile/uploads/{upload_id}`
+- `PUT /mobile/uploads/{upload_id}/chunks/{offset}`
+- `POST /mobile/uploads/{upload_id}/complete`
+- `GET /mobile/workspace`
+
+### `/models`
+
+- `GET /models`
+- `POST /models/import-local`
+- `POST /models/install`
+- `GET /models/runtime-status`
+- `POST /models/{model_id}/verify`
+
+### `/ocr`
+
+- `GET /ocr/assets/{asset_id}`
+- `POST /ocr/rebuild`
+
+### `/pairing`
+
+- `POST /pairing/sessions`
+
+### `/people`
+
+- `GET /people`
+- `POST /people/index`
+- `POST /people/manual`
+- `POST /people/reset`
+- `GET /people/{person_id}`
+- `GET /people/{person_id}/assets`
+- `POST /people/{person_id}/assets/remove`
+- `POST /people/{person_id}/hide`
+- `POST /people/{person_id}/merge`
+- `POST /people/{person_id}/reject-match`
+- `POST /people/{person_id}/rename`
+- `POST /people/{person_id}/split`
+
+### `/places`
+
+- `GET /places`
+- `POST /places/rebuild`
+- `GET /places/{place_id}/assets`
+- `POST /places/{place_id}/correct`
+
+### `/privacy`
+
+- `GET /privacy/status`
+
+### `/release`
+
+- `GET /release/readiness`
+
+### `/scenes`
+
+- `POST /scenes/rebuild`
+
+### `/search`
+
+- `GET /search`
+- `POST /search/rebuild`
+- `GET /search/status`
+
+### `/security`
+
+- `GET /security/encryption-status`
+- `POST /security/encryption/activate`
+- `GET /security/encryption/status`
+
+### `/semantic`
+
+- `POST /semantic/rebuild`
+
+### `/smart-folders`
+
+- `GET /smart-folders`
+- `DELETE /smart-folders/{folder_id}`
+- `GET /smart-folders/{folder_id}/search`
+
+### `/support`
+
+- `POST /support/bundle`
+
+### `/sync`
+
+- `GET /sync/network/local-endpoint`
+- `POST /sync/network/start`
+- `GET /sync/network/status`
+- `POST /sync/network/stop`
+- `GET /sync/plan`
+- `POST /sync/run`
+- `GET /sync/transfers`
+- `POST /sync/transfers/{transfer_id}/cancel`
+- `POST /sync/transfers/{transfer_id}/retry`
+
+### `/timeline`
+
+- `GET /timeline`
+
+### `/vaults`
+
+- `GET /vaults`
+- `GET /vaults/{vault_id}/status`
+- `POST /vaults/{vault_id}/storage-policy`
+
+### `/watch-folders`
+
+- `GET /watch-folders`
+- `DELETE /watch-folders/{watch_folder_id}`
 
 ## Implementation Defaults
 
