@@ -21,7 +21,7 @@ FAIL_COUNT=0
 # Set just above the current count, so deleting assertions cannot silently
 # shrink the suite: a neutered suite must not exit 0. The mutation harness
 # confirms this floor bites.
-MINIMUM_ASSERTIONS="${MINIMUM_ASSERTIONS:-16}"
+MINIMUM_ASSERTIONS="${MINIMUM_ASSERTIONS:-17}"
 
 ok() {
   PASS_COUNT=$((PASS_COUNT + 1))
@@ -42,6 +42,7 @@ bad() {
 # already fell into once (#117).
 wf() {
   python3 - "${WORKFLOW}" "$1" <<'PY'
+import re
 import sys
 import yaml
 
@@ -85,9 +86,13 @@ CODE = {
     )
 }
 
+CHECKOUT_REF = "actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683"
+
 namespace = {
     "doc": doc,
+    "re": re,
     "REQUIRE": REQUIRE,
+    "CHECKOUT_REF": CHECKOUT_REF,
     "CODE": CODE,
     "triggers": triggers,
     "board": board,
@@ -146,6 +151,18 @@ assert_true "the script does not redefine closingIssueNumbers inline" \
 # the parser suite asserts directly. What the workflow owns is the step id the
 # env mapping reads from, so that is what is asserted here. An earlier version
 # asserted `'refs=' in run`, which a *comment* in the step satisfied.
+# The suites and the parser are files in the repository, so this job cannot run
+# them without a checkout. It failed in CI exactly this way -- "No such file or
+# directory" -- so the dependency is asserted rather than remembered.
+assert_true "the job checks the repository out before running anything from it" \
+  "(bool(steps) and steps[0].get('uses','') == CHECKOUT_REF)"
+
+# And that the ref is a full commit SHA, not a tag. `@v4` satisfies a naive
+# "uses actions/checkout" check, which is how the first version of the
+# assertion above was defeated by its own mutation.
+assert_true "the checkout action is pinned to a commit SHA" \
+  "re.fullmatch(r'actions/checkout@[0-9a-f]{40}', steps[0].get('uses','')) is not None"
+
 assert_true "the parse step is id'd 'refs', matching the env mapping" \
   "step('Parse closing references').get('id','') == 'refs'"
 

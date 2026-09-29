@@ -54,6 +54,14 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          # Shallow is enough: this workflow runs the parser's suites from
+          # disk and reads no history. Board automation should not spend the
+          # runner's time on a full clone to do that.
+          fetch-depth: 1
+
       - name: Test the closing-reference parser
         # The parser decides what moves on the board, so its suite runs in the
         # same job and is a hard failure on purpose. If the parsing rules are
@@ -62,6 +70,10 @@ jobs:
         # not a required check, so this can never block a merge -- it is the
         # opposite of "board automation must never fail a build", which is
         # about the *board* failing, not about the code that drives it.
+        #
+        # These suites and the parser itself are files in the repository, so the
+        # checkout above is load-bearing: without it this step fails with
+        # "No such file or directory", which is how it first failed in CI.
         run: bash scripts/tests/project_board_refs_test.sh
 
       - name: Parse closing references

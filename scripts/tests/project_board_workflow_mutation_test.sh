@@ -75,6 +75,25 @@ PY
 
 printf 'project_board_workflow mutation test\n'
 
+# Two separate mutations, because one assertion covered both properties and
+# could only bite for one of them. Unpinning to a tag satisfies "uses
+# actions/checkout"; dropping the checkout entirely satisfies "pinned to a SHA".
+mutate "unpinning the checkout action to a tag is caught" \
+  'uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2|||uses: actions/checkout@v4' \
+  'FAIL the checkout action is pinned to a commit SHA'
+
+mutate "removing the checkout step is caught" \
+  '      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          # Shallow is enough: this workflow runs the parser'"'"'s suites from
+          # disk and reads no history. Board automation should not spend the
+          # runner'"'"'s time on a full clone to do that.
+          fetch-depth: 1
+
+|||' \
+  'FAIL the job checks the repository out before running anything from it'
+
 mutate "renaming the CLOSING_REFS env key is caught" \
   '          CLOSING_REFS: ${{ steps.refs.outputs.refs }}|||          CLOSING_REFS_WRONG: ${{ steps.refs.outputs.refs }}' \
   'FAIL the github-script step receives refs via the CLOSING_REFS env var'
