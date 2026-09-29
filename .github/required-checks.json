@@ -1,0 +1,58 @@
+{
+  "_comment": "Source of truth for which CI checks must pass before merge (issue #104). Reviewed in diffs; enforced by scripts/tests/required_checks_test.sh in CI. The live ruleset (main-protection) must match the required[] list -- drift between this file and the ruleset is detected by the scheduled canary (issue #108), because GITHUB_TOKEN cannot read branch protection and the merge-time test therefore cannot call the API.",
+  "required": [
+    {
+      "context": "Rust service",
+      "source": "ci.yml job 'rust'",
+      "why": "Rust daemon is the encrypted store; fmt/clippy/tests are the correctness floor."
+    },
+    {
+      "context": "Flutter app",
+      "source": "ci.yml job 'flutter'",
+      "why": "Desktop/Android client; analyze/tests catch breakage before release builds."
+    },
+    {
+      "context": "Security gates",
+      "source": "ci.yml job 'security'",
+      "why": "Secret scan, dependency audit, SBOM. Security defects get highest priority by repo principle."
+    }
+  ],
+  "pending": [
+    {
+      "context": "Release gate (artifact + signing policy)",
+      "source": "ci.yml job 'release-gate', added by PR #100",
+      "why": "Move to required[] when #100 merges: the gate that decides what ships must never be advisory."
+    },
+    {
+      "context": "Dependency review",
+      "source": "dependency-review.yml, already passing",
+      "why": "Move to required[] when #100 merges: dependency changes must not land unreviewed."
+    }
+  ],
+  "advisory": [
+    {
+      "context": "label",
+      "reason": "Cosmetic. A mislabeled PR says nothing about correctness."
+    },
+    {
+      "context": "board",
+      "reason": "Project-board automation; informational, and currently token-limited (issue #81)."
+    },
+    {
+      "context": "Analyze (actions)",
+      "reason": "CodeQL matrix leg; kept advisory so fork PRs (where CodeQL upload is skipped) are never permanently blocked."
+    },
+    {
+      "context": "Analyze (python)",
+      "reason": "Same fork-PR reasoning as Analyze (actions)."
+    },
+    {
+      "context": "Analyze (rust)",
+      "reason": "Same fork-PR reasoning as Analyze (actions)."
+    },
+    {
+      "context": "Validate title",
+      "reason": "Advisory until proven stable: the workflow never successfully ran before #103/#113. Revisit once it has a green history."
+    }
+  ]
+}
