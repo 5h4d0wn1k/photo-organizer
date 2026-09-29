@@ -8,7 +8,19 @@ updates:
       - deps
       - ci
     groups:
-      github-actions:
+      # `update-types` is the load-bearing line, not tidiness. With a bare
+      # `patterns: ["*"]` Dependabot puts every github-actions bump into one PR
+      # regardless of how far it moves, so a four-major-version jump of an
+      # action used in the release-signing path can arrive sitting next to
+      # two-line patch bumps -- where nobody reads it. That is not hypothetical:
+      # it is exactly what PR #128 did to actions/download-artifact
+      # (4.1.8 -> 8.0.1). See #130.
+      #
+      # Grouping only minor+patch keeps routine weeks at one PR, while a major
+      # bump arrives on its own, where the upstream release notes are the whole
+      # story and the change is reviewable as a change.
+      github-actions-minor-patch:
+        update-types: ["minor", "patch"]
         patterns: ["*"]
 
   - package-ecosystem: "cargo"

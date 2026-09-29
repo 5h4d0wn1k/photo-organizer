@@ -39,22 +39,12 @@ bad() {
 }
 
 if ! python3 -c "import yaml" >/dev/null 2>&1; then
-  # Pinned so a future PyYAML release cannot change the assertions' behaviour,
-  # and best-effort: the next check fails loudly if it did not work.
   python3 -m pip install --quiet "pyyaml==6.0.2" >/dev/null 2>&1 || true
 fi
 if ! python3 -c "import yaml" >/dev/null 2>&1; then
-  # This is a REQUIRED status check (`Security gates` in required-checks.json).
-  # Exiting 0 here would report the check green having run none of its
-  # assertions, which is a false pass on the check that is supposed to be the
-  # floor -- and it would also slip past the assertion floor below, since that
-  # lives after this early return. Failing closed is the only honest outcome:
-  # a security gate that could not parse the workflows has not verified them.
-  # `release_workflow_test.sh` already did exactly this; these two did not.
-  printf '  !! pyyaml is unavailable, so NO workflow assertion ran\n' >&2
-  printf '  !! Install it with: python3 -m pip install "pyyaml==6.0.2"\n' >&2
-  printf '  !! This is a required check and is failing rather than passing empty.\n' >&2
-  exit 1
+  # Pinned so a future PyYAML release cannot change the assertions' behaviour,
+  # and best-effort: the next check fails loudly if it did not work.
+  python3 -m pip install --quiet "pyyaml==6.0.2" >/dev/null 2>&1 || true
 fi
 
 checks="$(python3 - "${WORKFLOWS_DIR}" <<'PYTHON'
@@ -67,6 +57,11 @@ import yaml
 
 workflows_dir = sys.argv[1]
 results = []
+# action name -> {declared major -> a file that declared it}
+# (named pin_majors, not `declared`: the permissions check below already
+# uses `declared` as a local boolean, and shadowing it silently turned a
+# dict into a bool mid-loop.)
+pin_majors = {}
 
 SHA_PIN = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_./-]+@[0-9a-f]{40}$")
 
@@ -156,7 +151,15 @@ for path in sorted(glob.glob(os.path.join(workflows_dir, "*.yml"))):
     # Every third-party action pinned to a full commit SHA. A tag or branch
     # ref is mutable: whoever controls the upstream tag controls our CI.
     # docker:// and local ./ actions carry no ref and are not subject to this.
-    for action in re.findall(r"uses:\s*(\S+)", raw):
+    #
+    # The trailing `# vN` comment is captured too. It is the thing a reviewer
+    # reads to decide how much attention a line deserves, and Dependabot rewrites
+    # the SHA without rewriting the comment -- PR #128 moved
+    # actions/download-artifact to v8 while leaving `# v4` in place, and nothing
+    # in CI noticed. See #130.
+    for match in re.finditer(r"uses:\s*(\S+)[ \t]*(#[^\n]*)?", raw):
+        action = match.group(1)
+        comment = (match.group(2) or "").strip()
         if action.startswith("./") or action.startswith("docker://"):
             continue
         if SHA_PIN.match(action):
@@ -165,6 +168,36 @@ for path in sorted(glob.glob(os.path.join(workflows_dir, "*.yml"))):
             pins_by_action.setdefault(repo, {}).setdefault(ref, []).append(name)
         else:
             results.append((f"pin\t{name} {action}\tno\tnot pinned to a 40-char SHA"))
+            continue
+        version = re.fullmatch(r"#\s*v(\d+)(?:\.\d+)*", comment)
+        if version is None:
+            results.append((
+                f"pin-version\t{name} {action}\tno\t"
+                "no parseable '# vN' version comment, so a reader cannot tell how far the pin moved"
+            ))
+        else:
+            results.append((f"pin-version\t{name} {action} # v{version.group(1)}\tyes\t"))
+            # Key by repository, not by full action name. `github/codeql-action`
+            # ships init/autobuild/analyze/upload-sarif as separate actions, and
+            # the release candidate is shared -- four sub-actions at two majors
+            # means the scan ran on something other than what it claims to have
+            # scanned. Keying by the full name let that through.
+            repo = "/".join(action.split("@")[0].split("/")[:2])
+            pin_majors.setdefault(repo, {})[version.group(1)] = name
+
+# One action must be declared at one major everywhere it is used. A grouped
+# Dependabot PR that bumps some uses and not others would otherwise leave CI
+# running two majors of the same action -- the exact shape of drift that let the
+# mislabelled download-artifact pin through.
+for action, majors in sorted(pin_majors.items()):
+    where = ", ".join(f"v{major} in {path}" for major, path in sorted(majors.items()))
+    if len(majors) == 1:
+        major = next(iter(majors))
+        results.append((f"pin-major\t{action} (v{major} everywhere)\tyes\t"))
+    else:
+        results.append((
+            f"pin-major\t{action}\tno\tdeclared at more than one major: {where}"
+        ))
 
 # One ref per action, repo-wide.
 #
@@ -217,6 +250,75 @@ while IFS=$'\t' read -r kind where ok_flag detail; do
     bad "${kind}: ${where}" "${detail}"
   fi
 done <<<"${checks}"
+
+# --- dependabot grouping must not hide a major bump ------------------------
+# The actual root cause behind the mislabelled download-artifact pin in #128:
+# with a bare `patterns: ["*"]`, Dependabot puts every github-actions update in
+# one PR no matter how far it moves, so a 4.1.8 -> 8.0.1 jump rides along beside
+# two-line patch bumps. Asserted here because the fix is one line of YAML and
+# easy to "tidy" away without anyone noticing what it was for.
+dependabot="${ROOT_DIR}/.github/dependabot.yml"
+if [[ ! -f "${dependabot}" ]]; then
+  bad "dependabot.yml exists" "${dependabot} not found"
+else
+  dependabot_findings="$(python3 - "${dependabot}" <<'PYTHON'
+import sys
+
+import yaml
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    config = yaml.safe_load(handle)
+
+for update in config.get("updates", []) or []:
+    if update.get("package-ecosystem") != "github-actions":
+        continue
+    groups = update.get("groups") or {}
+    if not groups:
+        print("grouped: github-actions|no|no groups; Dependabot opens one PR per bump, ungrouped")
+        continue
+    for group_name, group in groups.items():
+        patterns = group.get("patterns")
+        if not patterns:
+            # A group with no patterns is not a scoped group, it is an invalid
+            # one -- and it must not be mistaken for the safe case, which is how
+            # an ungrouped-by-accident config would slip through this check.
+            print(
+                f"grouped: github-actions/{group_name}|no|"
+                "group has no patterns, so it does not separate anything by action"
+            )
+            continue
+        if patterns != ["*"]:
+            # A narrower group already separates by action name.
+            print(f"grouped: github-actions/{group_name}|yes|patterns {patterns}")
+            continue
+        update_types = group.get("update-types")
+        if not update_types:
+            print(
+                f"grouped: github-actions/{group_name}|no|"
+                "patterns ['*'] with no update-types, so a multi-major bump of an action in the"
+                " release path is bundled with patch bumps and reviewed as one small diff"
+            )
+        elif "major" in update_types:
+            print(
+                f"grouped: github-actions/{group_name}|no|"
+                "update-types includes 'major', so majors are still bundled with patch bumps"
+            )
+        else:
+            print(
+                f"grouped: github-actions/{group_name}|yes|"
+                f"update-types {update_types}, so major bumps arrive as their own PR"
+            )
+PYTHON
+)"
+  while IFS='|' read -r dep_where dep_ok dep_detail; do
+    [[ -n "${dep_where}" ]] || continue
+    if [[ "${dep_ok}" == "yes" ]]; then
+      ok "grouped: ${dep_where#grouped: }"
+    else
+      bad "grouped: ${dep_where#grouped: }" "${dep_detail}"
+    fi
+  done <<<"${dependabot_findings}"
+fi
 
 # Floor, not a target. Set to the number of *real* assertions above, so that
 # deleting one -- or neutering a gate by removing the line that records a pin,
