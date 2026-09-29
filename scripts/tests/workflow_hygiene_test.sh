@@ -103,6 +103,27 @@ for path in sorted(glob.glob(os.path.join(workflows_dir, "*.yml"))):
         + ("yes\t" if "pull_request_target" not in trigger_names else "no\tuses pull_request_target")
     ))
 
+    # Concurrency, declared, and pointed the right way. A workflow without a
+    # concurrency group queues every run, so a force-push storm spends the
+    # Actions budget re-running superseded commits (issue #105). The stronger
+    # half is release.yml: `cancel-in-progress: true` there would let a second
+    # tag build kill a release that is mid-flight, which is the one place a
+    # cancelled run silently skips the artifact QA gate. Read from the parsed
+    # mapping, so the explanatory comment beside it cannot satisfy the check.
+    concurrency = workflow.get("concurrency")
+    if not isinstance(concurrency, dict) or not str(concurrency.get("group", "")).strip():
+        results.append((f"concurrency\t{name}\tno\tno concurrency group declared"))
+    else:
+        results.append((f"concurrency\t{name}\tyes\t"))
+        if name == "release.yml" and concurrency.get("cancel-in-progress") is not False:
+            results.append((
+                f"concurrency-cancel\t{name}\tno\t"
+                "release.yml must keep cancel-in-progress: false so a new tag "
+                "cannot cancel a release that is mid-flight"
+            ))
+        elif name == "release.yml":
+            results.append((f"concurrency-cancel\t{name}\tyes\t"))
+
     # Least privilege, declared. A workflow without top-level permissions
     # inherits the repository default, which is a decision nobody made here.
     # `read-all` counts: it is an explicit posture (the OpenSSF Scorecard
