@@ -31,7 +31,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   explicit `PRIVATE_GALLERY_RELEASE_ALLOW_EPHEMERAL_SIGNING` repository
   variable, and the release notes say so when it is used.
 - `scripts/tests/` — device-free tests for the release gate itself (201
-  assertions: 42 release-workflow, 60 signing, 27 signature, 72 smoke), run in CI
+  assertions: 42 release-workflow, 62 signing, 27 signature, 74 smoke), run in CI
   via the "Release gate" job and locally with
   `make release-gate`. `release_workflow_test.sh` asserts the release
   workflow's safety properties structurally, so the guarantee cannot be removed
