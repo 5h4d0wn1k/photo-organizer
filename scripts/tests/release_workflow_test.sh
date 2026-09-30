@@ -143,6 +143,42 @@ for job, spec in jobs.items():
             f"`{job}` step `{step.get('name', ref)}` must pin a full 40-char commit SHA, got: {ref}",
         )
 
+# ...and pinned to the *same* SHA every other workflow uses, which is a
+# different and much stronger property than the shape check above.
+#
+# release.yml is where this went wrong. Two of its checkout pins read
+# `actions/checkout@3d3d42e5...` against `3d3c42e5...` everywhere else: one
+# character apart, both valid 40-hex strings, so the shape check passed and so
+# did every mutation harness in the repository. The `android` job owns one of
+# them, declares no `needs:`, and therefore runs on every `v*` tag -- where it
+# could not resolve its own checkout and failed before executing a step. The
+# entire Android release path, blocking install+launch gate included, was dead
+# on a real tag and nothing here could see it. Since this file is the suite
+# that owns the release path, the release path gets its own copy of the check
+# rather than relying on the repo-wide one in workflow_hygiene_test.sh.
+#
+# Scanned textually and across files on purpose: the claim is about every
+# `uses:` line in the repository agreeing, which is a fact about the files
+# rather than about this workflow's parsed step graph.
+import glob as _glob
+
+_repo_refs: dict[str, dict[str, list[str]]] = {}
+for _path in sorted(_glob.glob(str(ROOT_DIR / ".github/workflows/*.yml"))):
+    _name = Path(_path).name
+    for _ref in re.findall(r"uses:\s*(\S+)", Path(_path).read_text(encoding="utf-8")):
+        if _ref.startswith("./") or _ref.startswith("docker://") or "@" not in _ref:
+            continue
+        _repo, _, _sha = _ref.partition("@")
+        if re.fullmatch(r"[0-9a-f]{40}", _sha):
+            _repo_refs.setdefault(_repo, {}).setdefault(_sha, []).append(_name)
+
+for _repo, _by_sha in sorted(_repo_refs.items()):
+    expect(
+        len(_by_sha) == 1,
+        f"every workflow must pin `{_repo}` to one reviewed SHA, found {len(_by_sha)}: "
+        + "; ".join(f"{s} in {', '.join(sorted(set(v)))}" for s, v in sorted(_by_sha.items())),
+    )
+
 # --- the emulator action's execution model ---------------------------------
 # reactivecircus/android-emulator-runner splits `script` on newlines and runs
 # each line as an independent `sh -c`. Any multi-line script silently destroys
