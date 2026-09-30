@@ -18,10 +18,11 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 WORKFLOW="${ROOT_DIR}/.github/workflows/project.yml"
 PASS_COUNT=0
 FAIL_COUNT=0
-# Set just above the current count, so deleting assertions cannot silently
-# shrink the suite: a neutered suite must not exit 0. The mutation harness
-# confirms this floor bites.
-MINIMUM_ASSERTIONS="${MINIMUM_ASSERTIONS:-17}"
+# Set to the current count, so deleting an assertion cannot silently shrink the
+# suite: a neutered suite must not exit 0. It has to be equal to the count and
+# not one below it -- a floor under the count is no floor at all, and a floor
+# above it can never be met. The mutation harness confirms it bites.
+MINIMUM_ASSERTIONS="${MINIMUM_ASSERTIONS:-18}"
 
 ok() {
   PASS_COUNT=$((PASS_COUNT + 1))
@@ -90,9 +91,20 @@ CODE = {
 # Shape alone (`@[0-9a-f]{40}`, asserted separately below) would accept any
 # 40-hex string, so pinning the literal is what makes this a supply-chain
 # assertion: a different-but-well-formed SHA is a reviewable edit in two places
-# rather than a silent substitution. #133 aligned project.yml with the other 13
-# workflows, so this constant is now the same SHA every workflow uses -- the
-# assertion became stronger, not merely different.
+# rather than a silent substitution.
+#
+# #133 brought project.yml onto this value; it had been left on v4.2.2 while
+# every other checkout pin in the repo had moved to v7, so this constant went
+# from "the pin this one workflow should have" to "the pin". Chasing the
+# straggler then turned up a second defect underneath it: two pins in
+# release.yml read `3d3d42e5...` where all the others read `3d3c42e5...` --
+# one character apart, both immaculately well-formed 40-hex strings, and the
+# `android` job owning one of them could not resolve its own checkout, so the
+# whole Android release path was unrunnable with nothing in the repo able to
+# see it. Both are this value now, and workflow_hygiene_test.sh asserts the
+# single-valued property across every workflow, so neither a stray major nor a
+# mistyped SHA can merge again. This constant is that same single value, so
+# this assertion got strictly stronger rather than merely different.
 CHECKOUT_REF = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
 
 namespace = {

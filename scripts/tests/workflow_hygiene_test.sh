@@ -61,6 +61,11 @@ results = []
 
 SHA_PIN = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_./-]+@[0-9a-f]{40}$")
 
+# Cross-file: exactly one audited ref per action. Populated by the per-file
+# loop below and reported after it, because the property is repo-wide and
+# cannot be judged from inside a single file.
+pins_by_action: dict[str, dict[str, list[str]]] = {}
+
 for path in sorted(glob.glob(os.path.join(workflows_dir, "*.yml"))):
     name = os.path.basename(path)
     with open(path, encoding="utf-8") as handle:
@@ -147,8 +152,49 @@ for path in sorted(glob.glob(os.path.join(workflows_dir, "*.yml"))):
             continue
         if SHA_PIN.match(action):
             results.append((f"pin\t{name} {action}\tyes\t"))
+            repo, _, ref = action.partition("@")
+            pins_by_action.setdefault(repo, {}).setdefault(ref, []).append(name)
         else:
             results.append((f"pin\t{name} {action}\tno\tnot pinned to a 40-char SHA"))
+
+# One ref per action, repo-wide.
+#
+# The per-file `pin` assertion only proves the *shape* of the ref, and that
+# gap was load-bearing rather than theoretical. Two pins in release.yml read
+# `actions/checkout@3d3d42e5...` where the other fourteen read `3d3c42e5...`:
+# one character apart, both perfectly well-formed 40-hex strings. Every shape
+# assertion passed, every mutation harness in the repository reported a clean
+# bite, and the `android` job -- which declares no `needs:` and therefore always
+# runs on a `v*` tag -- failed to resolve its own checkout before executing a
+# single step. The entire Android release path, including the install+launch
+# gate AGENTS.md calls blocking, was unrunnable and nothing in the repo could
+# see it, because checking that a ref *looks* like a SHA is not checking that
+# it is the SHA somebody audited.
+#
+# Parity closes that: a ref that differs from the repo-wide value is a finding
+# even when both values are valid SHAs, because "reviewed once, used
+# everywhere" is the property actually being relied on. Two majors of one
+# action coexisting is the same defect wearing a different mask -- that was
+# #133, project.yml on v4.2.2 while thirteen other pins were on v7 -- and
+# parity rejects it for the same reason. Splitting an action's refs across
+# workflows means one of them was pinned without review.
+for repo in sorted(pins_by_action):
+    refs = pins_by_action[repo]
+    placements = sum(len(files) for files in refs.values())
+    if len(refs) == 1:
+        only = next(iter(refs))
+        results.append((
+            f"parity\t{repo}\tyes\t{placements} pin(s), all on {only}"
+        ))
+    else:
+        detail = "; ".join(
+            f"{ref} in {', '.join(sorted(set(files)))}"
+            for ref, files in sorted(refs.items())
+        )
+        results.append((
+            f"parity\t{repo}\tno\t{len(refs)} distinct refs for one action, so at "
+            f"least one was pinned without review: {detail}"
+        ))
 
 for line in results:
     print(line)
@@ -162,6 +208,26 @@ while IFS=$'\t' read -r kind where ok_flag detail; do
     bad "${kind}: ${where}" "${detail}"
   fi
 done <<<"${checks}"
+
+# Floor, not a target. Set to the number of *real* assertions above, so that
+# deleting one -- or neutering a gate by removing the line that records a pin,
+# which drops the total without removing any visible check -- fails the suite
+# instead of quietly reporting a smaller pass. This suite had no floor at all
+# before, so "it went green" and "someone removed the check" were
+# indistinguishable.
+#
+# The count only ever grows on its own, so the floor cannot go stale in the
+# permissive direction: adding a workflow or a step raises the total and the
+# floor is untouched. Work that legitimately *shrinks* the suite -- deleting
+# semantic-pr.yml once #103 retires it, say -- must lower this number in the
+# same change, in the open, where the reduction is visible in the diff. That is
+# the point: shrinking the gate is allowed, doing it quietly is not.
+MINIMUM_ASSERTIONS="${MINIMUM_ASSERTIONS:-232}"
+if ((PASS_COUNT < MINIMUM_ASSERTIONS)); then
+  bad "assertion floor" "only ${PASS_COUNT} assertions ran, floor is ${MINIMUM_ASSERTIONS}: an assertion was deleted or a gate was neutered"
+else
+  ok "assertion floor: ${PASS_COUNT} >= ${MINIMUM_ASSERTIONS}"
+fi
 
 printf '\n%s passed, %s failed\n' "${PASS_COUNT}" "${FAIL_COUNT}"
 if ((FAIL_COUNT > 0)); then
