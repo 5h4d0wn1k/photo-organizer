@@ -39,12 +39,24 @@ bad() {
 }
 
 if ! python3 -c "import yaml" >/dev/null 2>&1; then
-  python3 -m pip install --quiet "pyyaml==6.0.2" >/dev/null 2>&1 || true
-fi
-if ! python3 -c "import yaml" >/dev/null 2>&1; then
   # Pinned so a future PyYAML release cannot change the assertions' behaviour,
   # and best-effort: the next check fails loudly if it did not work.
   python3 -m pip install --quiet "pyyaml==6.0.2" >/dev/null 2>&1 || true
+fi
+if ! python3 -c "import yaml" >/dev/null 2>&1; then
+  # Runs inside the REQUIRED `Security gates` check, so continuing would report
+  # that check green having asserted nothing, and the job would pass every other
+  # step -- making an unverified contract indistinguishable from a verified one.
+  # Fail closed, and say why here rather than letting the assertion floor below
+  # report "an assertion was deleted or a gate was neutered", which points the
+  # reader at a deleted assertion instead of at the missing dependency that
+  # caused it. (That misdiagnosis is not hypothetical: this guard shipped once
+  # as two copies of the install block with no exit at all, and the floor was
+  # the only thing making it fail closed.)
+  printf '  !! pyyaml is unavailable, so NO workflow-hygiene assertion ran\n' >&2
+  printf '  !! Install it with: python3 -m pip install "pyyaml==6.0.2"\n' >&2
+  printf '  !! This is a required check and is failing rather than passing empty.\n' >&2
+  exit 1
 fi
 
 checks="$(python3 - "${WORKFLOWS_DIR}" <<'PYTHON'
@@ -103,26 +115,90 @@ for path in sorted(glob.glob(os.path.join(workflows_dir, "*.yml"))):
         + ("yes\t" if "pull_request_target" not in trigger_names else "no\tuses pull_request_target")
     ))
 
-    # Concurrency, declared, and pointed the right way. A workflow without a
-    # concurrency group queues every run, so a force-push storm spends the
-    # Actions budget re-running superseded commits (issue #105). The stronger
-    # half is release.yml: `cancel-in-progress: true` there would let a second
-    # tag build kill a release that is mid-flight, which is the one place a
-    # cancelled run silently skips the artifact QA gate. Read from the parsed
-    # mapping, so the explanatory comment beside it cannot satisfy the check.
+    # Concurrency. Four separate ways to get this wrong, and they are not the
+    # same wrong, so they are four assertions rather than one "concurrency: yes".
+    #
+    #   (1) no group at all -- every run queues, so a force-push storm re-runs
+    #       superseded commits (issue #105). #124 adds groups to the five
+    #       workflows that had none.
+    #   (2) a group that is a bare literal -- every ref, branch and event in the
+    #       repository shares one bucket, which turns "cancel superseded runs"
+    #       into "cancel whatever else happened to be running".
+    #   (3) cancellation left off -- the same queueing in a subtler spelling: the
+    #       group is present, so (1) passes, and nothing is ever superseded.
+    #   (4) a workflow reachable by two different triggers, with cancellation on,
+    #       must be able to tell those triggers apart *in the group*.
+    #
+    # (4) is the one that is easy to miss, because `github.ref` looks like it
+    # identifies the run. It does not distinguish trigger classes: `schedule` and
+    # `workflow_dispatch` both run on the default branch, so they share a ref.
+    # With `cancel-in-progress: true` the newer run then cancels the older one
+    # across trigger classes, silently -- and for canary.yml, whose entire
+    # purpose is proving that a scheduled workflow is still running, a manual
+    # "is the schedule alive?" dispatch cancels the weekly run that would have
+    # reported it. #124 shipped exactly that, in scorecard.yml and canary.yml,
+    # because nothing here asserted it.
+    #
+    # Read from the parsed mapping, so the explanatory comment beside a block
+    # cannot satisfy any of these.
     concurrency = workflow.get("concurrency")
-    if not isinstance(concurrency, dict) or not str(concurrency.get("group", "")).strip():
+    group = str(concurrency.get("group", "") or "") if isinstance(concurrency, dict) else ""
+    if not group.strip():
         results.append((f"concurrency\t{name}\tno\tno concurrency group declared"))
     else:
         results.append((f"concurrency\t{name}\tyes\t"))
-        if name == "release.yml" and concurrency.get("cancel-in-progress") is not False:
+
+        if "${{" not in group:
+            results.append((
+                f"concurrency-group\t{name}\tno\t"
+                f"the group is the bare literal {group!r}, so every ref and every "
+                "branch in the repository shares one bucket; a group has to "
+                "interpolate at least the ref to mean anything"
+            ))
+        else:
+            results.append((f"concurrency-group\t{name}\tyes\t"))
+
+        # `cancel-in-progress` is optional and defaults to false, which is the
+        # queueing #105 exists to remove. An expression is accepted only when it
+        # is gated on the trigger, which is how codeql-analysis.yml declines to
+        # cancel a pull_request run. `is True` rather than truthiness, so the
+        # quoted string "false" -- which YAML hands back verbatim -- is not read
+        # as cancellation being enabled.
+        cip = concurrency.get("cancel-in-progress", None)
+        cancels = cip is True or (isinstance(cip, str) and "github.event_name" in cip)
+
+        if name == "release.yml":
+            # The one place a cancelled run is worse than a wasted one: this is
+            # the artifact QA gate, so cancelling a mid-flight release would
+            # skip the install/launch/crash evidence entirely (see AGENTS.md).
+            if cip is not False:
+                results.append((
+                    f"concurrency-cancel\t{name}\tno\t"
+                    "release.yml must keep cancel-in-progress: false so a new tag "
+                    "cannot cancel a release that is mid-flight"
+                ))
+            else:
+                results.append((f"concurrency-cancel\t{name}\tyes\t"))
+        elif not cancels:
             results.append((
                 f"concurrency-cancel\t{name}\tno\t"
-                "release.yml must keep cancel-in-progress: false so a new tag "
-                "cannot cancel a release that is mid-flight"
+                f"cancel-in-progress is {cip!r}, so superseded runs queue instead of "
+                "being cancelled; a read-only workflow declares true, or an "
+                "expression gated on github.event_name if cancellation has to "
+                "vary by trigger"
             ))
-        elif name == "release.yml":
+        else:
             results.append((f"concurrency-cancel\t{name}\tyes\t"))
+
+        if cancels and len(trigger_names) > 1 and "github.event_name" not in group:
+            results.append((
+                f"concurrency-scope\t{name}\tno\t"
+                f"triggers {sorted(trigger_names)} share the group {group!r} and "
+                "cancel-in-progress is on, so a run of one trigger can cancel a "
+                "run of another; the group has to reference github.event_name"
+            ))
+        else:
+            results.append((f"concurrency-scope\t{name}\tyes\t"))
 
     # Least privilege, declared. A workflow without top-level permissions
     # inherits the repository default, which is a decision nobody made here.

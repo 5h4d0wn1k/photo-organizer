@@ -13,7 +13,15 @@ permissions: read-all
 # obsoletes an older one on the same ref. (release.yml deliberately keeps
 # cancel-in-progress: false -- a release must never be cancelled mid-flight.)
 concurrency:
-  group: scorecard-${{ github.ref }}
+  # `github.event_name` is load-bearing, not decoration. This workflow is
+  # reachable by both `schedule` and `push`, and both run on the default branch,
+  # so `github.ref` alone puts them in the same group -- and with
+  # `cancel-in-progress: true` a push to main would cancel an in-flight weekly
+  # scan, or vice versa. A cancelled scan uploads no SARIF and calls
+  # `publish_results: true` for nothing, so the loss is silent: the scorecard
+  # simply does not update that week. Asserted by `concurrency-scope` in
+  # scripts/tests/workflow_hygiene_test.sh.
+  group: scorecard-${{ github.ref }}-${{ github.event_name }}
   cancel-in-progress: true
 
 jobs:
