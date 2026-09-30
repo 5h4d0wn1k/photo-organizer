@@ -1,5 +1,5 @@
 {
-  "_comment": "Source of truth for which CI checks must pass before merge (issue #104). Reviewed in diffs; enforced by scripts/tests/required_checks_test.sh in CI. The live ruleset (main-protection) must match the required[] list -- drift between this file and the ruleset is detected by the scheduled canary (issue #108), because GITHUB_TOKEN cannot read branch protection and the merge-time test therefore cannot call the API. pending[] is now empty: both entries that waited on PR #100 (Release gate, Dependency review) are required, and the live ruleset (5 contexts, strict) matches this file.",
+  "_comment": "Source of truth for which CI checks must pass before merge (issue #104). Reviewed in diffs; enforced by scripts/tests/required_checks_test.sh in CI. The live ruleset (main-protection) must match the required[] list -- drift between this file and the ruleset is detected by the scheduled canary (issue #108), because GITHUB_TOKEN cannot read branch protection and the merge-time test therefore cannot call the API. pending[] is now empty: both entries that waited on PR #100 (Release gate, Dependency review) are required. KNOWN GAP: this file lists 6 required contexts; the live ruleset (main-protection, strict) still lists 5. 'Android debug build' is added here for #84 and is deliberately ahead of the ruleset -- the ruleset is strict, so adding the context while PRs that predate the job are still open would block every one of them forever on a check that never reports. The ruleset PUT must follow the merge of that PR. Until it does, the Android job is required-by-contract but NOT enforced at merge time, and the canary (issue #108) will report the drift. Update this paragraph whenever the ruleset changes; it is a snapshot, not a source of truth.",
   "required": [
     {
       "context": "Rust service",
@@ -10,6 +10,11 @@
       "context": "Flutter app",
       "source": "ci.yml job 'flutter'",
       "why": "Desktop/Android client; analyze/tests catch breakage before release builds."
+    },
+    {
+      "context": "Android debug build",
+      "source": "ci.yml job 'android-build', added for issue #84",
+      "why": "analyze and unit tests never touch Gradle; a Kotlin/AGP/manifest mistake otherwise reaches a tag. Required because the issue's acceptance is that Android breakage fails loudly."
     },
     {
       "context": "Security gates",

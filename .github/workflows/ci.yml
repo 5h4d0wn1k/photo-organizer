@@ -28,10 +28,13 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libdbus-1-dev pkg-config libsecret-1-dev
       - name: Format
         run: cargo fmt --check
+      # clippy and test must see the same feature set, or "green locally" and
+      # "green in CI" test different code. scripts/dev-check.sh uses these exact
+      # flags (issue #84).
       - name: Clippy
         run: cargo clippy --all-targets --all-features --locked -- -D warnings
       - name: Test
-        run: cargo test --locked
+        run: cargo test --all-features --locked
 
   flutter:
     name: Flutter app
@@ -55,6 +58,50 @@ jobs:
       - name: Outdated report
         run: flutter pub outdated
         continue-on-error: true
+
+  # Android breakage used to be invisible until someone cut a tag: analyze and
+  # unit tests never touch Gradle, so a Kotlin/AGP/manifest mistake shipped all
+  # the way to release. A debug assemble is the cheapest build that exercises
+  # the whole Android toolchain, and it needs no signing material.
+  android-build:
+    name: Android debug build
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    defaults:
+      run:
+        working-directory: app
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      # Same actions and the same `cache: true` as the five release.yml jobs
+      # that build with Flutter (linux, windows, macos, android, ios): a build
+      # path that differs between CI and release is a build path that is not
+      # proven. No extra third-party action is introduced -- ubuntu-latest
+      # already ships a JDK and the Android SDK, and flutter-action's cache
+      # covers both pub and Gradle.
+      - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2
+        with:
+          channel: stable
+          cache: true
+      - name: Dependencies
+        run: flutter pub get --enforce-lockfile
+      - name: Assemble debug APK
+        run: flutter build apk --debug
+      # Proof the build produced an installable-shaped artifact rather than a
+      # zero-byte file that Gradle reported success on.
+      - name: Verify the APK exists and is non-trivial
+        run: |
+          set -euo pipefail
+          apk="build/app/outputs/flutter-apk/app-debug.apk"
+          if [[ ! -f "${apk}" ]]; then
+            echo "::error::expected ${apk} to exist after flutter build apk --debug" >&2
+            exit 1
+          fi
+          size="$(stat -c %s "${apk}")"
+          if ((size < 1024 * 1024)); then
+            echo "::error::${apk} is only ${size} bytes; that is not a real APK" >&2
+            exit 1
+          fi
+          echo "debug APK: ${size} bytes"
 
   # The release gate decides whether an APK that users cannot install can reach
   # a release (issue #97). Its logic is shell, so it gets real tests here rather
