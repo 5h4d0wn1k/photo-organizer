@@ -1,13 +1,16 @@
 #!/usr/bin/env bash
 #
 # Mutation pass for the pin-version / pin-major / dependabot-grouping
-# assertions added to scripts/tests/workflow_hygiene_test.sh (issue #130).
+# assertions added to scripts/tests/workflow_hygiene_test.sh (issue #130), and for
+# the four-way concurrency split (#105, #124).
 #
-# Those three assertions exist because Dependabot moved
+# Those assertions exist because Dependabot moved
 # actions/download-artifact from 4.1.8 to 8.0.1 inside a grouped PR while
-# leaving the trailing `# v4` comment in place, and nothing in CI noticed. An
-# assertion that cannot be made to fail is a comment, so each one is broken
-# here and the suite is required to go red.
+# leaving the trailing `# v4` comment in place, and nothing in CI noticed; and
+# because a concurrency group keyed on `github.ref` alone let a push to main
+# cancel the weekly scorecard scan, in two files at once. An assertion that
+# cannot be made to fail is a comment, so each one is broken here and the suite
+# is required to go red.
 #
 # Leaves the working tree untouched.
 set -uo pipefail
@@ -320,6 +323,73 @@ then
   fi
 else
   mismatches+=("ecosystem deleted: could not apply the mutation")
+fi
+restore
+
+echo "== the concurrency policy (issue #105) =="
+
+# 13-14. The defect #124 actually shipped, in both files it shipped in.
+#
+#     `schedule` and `push` (canary: `schedule` and `workflow_dispatch`) both run
+#     on the default branch, so a group keyed on `github.ref` alone cannot tell
+#     them apart -- and with `cancel-in-progress: true` the newer run cancels the
+#     older one across trigger classes. One mutation per file, because fixing
+#     only the one that was reported is how the second one stays.
+mutate "scorecard's group can no longer tell a push from the weekly scan" \
+  "${ROOT_DIR}/.github/workflows/scorecard.yml" \
+  'scorecard-${{ github.ref }}-${{ github.event_name }}|||scorecard-${{ github.ref }}' \
+  "can cancel a run of another"
+
+mutate "canary's group can no longer tell a dispatch from the weekly run" \
+  "${ROOT_DIR}/.github/workflows/canary.yml" \
+  'canary-${{ github.ref }}-${{ github.event_name }}|||canary-${{ github.ref }}' \
+  "can cancel a run of another"
+
+# 15. A group that exists but names nothing. Every ref and every branch in the
+#     repository then shares one bucket, so "cancel superseded runs" becomes
+#     "cancel whatever else was running" -- the opposite of the intent, and a
+#     group is still present, so the pre-split `concurrency` check passed.
+mutate "a concurrency group is a bare literal naming no ref" \
+  "${ROOT_DIR}/.github/workflows/dependency-review.yml" \
+  'dependency-review-${{ github.event.pull_request.number || github.ref }}|||dependency-review' \
+  "bare literal"
+
+# 16. Cancellation silently absent. `cancel-in-progress` is optional and defaults
+#     to false, so this is the #105 queueing behaviour wearing a group -- and the
+#     single "a group exists" check that #124 shipped passed it.
+mutate "a read-only workflow's cancel-in-progress is removed entirely" \
+  "${ROOT_DIR}/.github/workflows/stale.yml" \
+  '  group: stale-${{ github.ref }}\n  cancel-in-progress: true\n|||  group: stale-${{ github.ref }}\n' \
+  "queue instead of being cancelled"
+
+# 17. release.yml flips the other way. Not a queueing problem -- the opposite:
+#     a second tag build would cancel a release that is mid-flight, skipping the
+#     artifact QA gate that AGENTS.md calls blocking.
+mutate "release.yml allows a new tag to cancel an in-flight release" \
+  "${ROOT_DIR}/.github/workflows/release.yml" \
+  '  cancel-in-progress: false|||  cancel-in-progress: true' \
+  "must keep cancel-in-progress: false"
+
+# 18. The group removed altogether: the pre-#124 state of all five files.
+mutate "a workflow's concurrency group is removed altogether" \
+  "${ROOT_DIR}/.github/workflows/dependency-review.yml" \
+  'concurrency:\n  group: dependency-review-${{ github.event.pull_request.number || github.ref }}\n  cancel-in-progress: true\n\n|||\n' \
+  "no concurrency group declared"
+
+# 19. Over-strictness guard for the expression path. `cancel-in-progress` may be
+#     an expression gated on the trigger -- that is how codeql-analysis.yml
+#     declines to cancel a pull_request run, and rejecting it would pressure
+#     someone into deleting a deliberate conditional. This one is expected NOT to
+#     bite; a "bites" here means the assertion has become a literal `true` test.
+MUTATIONS_RUN=$((MUTATIONS_RUN + 1))
+restore
+if apply "${ROOT_DIR}/.github/workflows/canary.yml" \
+  '  cancel-in-progress: true|||  cancel-in-progress: ${{ github.event_name == '"'"'schedule'"'"' }}' \
+  && bash "${SUITE}" >/dev/null 2>&1; then
+  MUTATIONS_BITING=$((MUTATIONS_BITING + 1))
+  printf '  bites  a trigger-gated cancel-in-progress expression is accepted (over-strict guard)\n'
+else
+  mismatches+=("over-strict: a trigger-gated cancel-in-progress expression was rejected; the assertion must accept it")
 fi
 restore
 

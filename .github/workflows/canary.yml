@@ -26,7 +26,15 @@ permissions:
   contents: read
 
 concurrency:
-  group: canary-${{ github.ref }}
+  # `github.event_name` is load-bearing, not decoration. This workflow is
+  # reachable by both `schedule` and `workflow_dispatch`, and both run on the
+  # default branch, so `github.ref` alone puts them in the same group -- and
+  # with `cancel-in-progress: true` an operator dispatching "are the schedules
+  # still alive?" would cancel the weekly run that would have answered it. That
+  # is failure mode 1 in the header above, reproduced by this file's own
+  # concurrency block, and silently: the cancelled run reports nothing.
+  # Asserted by `concurrency-scope` in scripts/tests/workflow_hygiene_test.sh.
+  group: canary-${{ github.ref }}-${{ github.event_name }}
   cancel-in-progress: true
 
 jobs:
