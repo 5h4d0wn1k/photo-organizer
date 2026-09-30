@@ -157,6 +157,19 @@ for path in sorted(glob.glob(os.path.join(workflows_dir, "*.yml"))):
     # the SHA without rewriting the comment -- PR #128 moved
     # actions/download-artifact to v8 while leaving `# v4` in place, and nothing
     # in CI noticed. See #130.
+    #
+    # What this can and cannot see, stated rather than implied. `pin-version`
+    # proves the comment is *parseable*; `pin-major` proves every pin of an
+    # action declares the *same* major. Neither can prove the declared major is
+    # the truth, because that needs the network: resolving a SHA to its tag is
+    # exactly the lookup this suite deliberately does not make. So the split is:
+    #
+    #   comments that disagree with each other -> caught here (`pin-major`)
+    #   a comment that disagrees with reality -> NOT caught; that is #135
+    #
+    # `parity` below covers the case that actually happened in #133 -- a ref
+    # that differs from the repo-wide value. An audited action -> SHA map would
+    # cover a wholesale consistent re-pin, and is filed as #135.
     for match in re.finditer(r"uses:\s*(\S+)[ \t]*(#[^\n]*)?", raw):
         action = match.group(1)
         comment = (match.group(2) or "").strip()
@@ -257,6 +270,22 @@ done <<<"${checks}"
 # one PR no matter how far it moves, so a 4.1.8 -> 8.0.1 jump rides along beside
 # two-line patch bumps. Asserted here because the fix is one line of YAML and
 # easy to "tidy" away without anyone noticing what it was for.
+#
+# The property is "no group bundles a major bump with anything else", so the
+# check is on `update-types` and NOT on the shape of `patterns`. An earlier
+# version of this suite tested `patterns != ["*"]` and only then looked at
+# `update-types` -- which meant the identical hazard re-expressed itself as
+# `["**"]`, `["actions/**"]` or `["*", "actions/checkout"]` and walked straight
+# through. Measured on that version, with majors re-included in every row:
+#
+#   patterns: ["*"]                      -> FAIL  (correct)
+#   patterns: ["**"]                     -> ok    (bypass)
+#   patterns: ["*", "actions/checkout"]  -> ok    (bypass)
+#   patterns: ["actions/**"]             -> ok    (bypass)
+#
+# That is the same shape as the two `3d3d42e5...` pins in #133: an
+# exact-literal test that a shape-equivalent value passes. `patterns` is now
+# reported for information only; `update-types` decides.
 dependabot="${ROOT_DIR}/.github/dependabot.yml"
 if [[ ! -f "${dependabot}" ]]; then
   bad "dependabot.yml exists" "${dependabot} not found"
@@ -269,9 +298,11 @@ import yaml
 with open(sys.argv[1], encoding="utf-8") as handle:
     config = yaml.safe_load(handle)
 
+saw_github_actions = False
 for update in config.get("updates", []) or []:
     if update.get("package-ecosystem") != "github-actions":
         continue
+    saw_github_actions = True
     groups = update.get("groups") or {}
     if not groups:
         print("grouped: github-actions|no|no groups; Dependabot opens one PR per bump, ungrouped")
@@ -287,27 +318,42 @@ for update in config.get("updates", []) or []:
                 "group has no patterns, so it does not separate anything by action"
             )
             continue
-        if patterns != ["*"]:
-            # A narrower group already separates by action name.
-            print(f"grouped: github-actions/{group_name}|yes|patterns {patterns}")
-            continue
         update_types = group.get("update-types")
         if not update_types:
             print(
                 f"grouped: github-actions/{group_name}|no|"
-                "patterns ['*'] with no update-types, so a multi-major bump of an action in the"
-                " release path is bundled with patch bumps and reviewed as one small diff"
+                f"patterns {patterns} with no update-types, so a multi-major bump of an action in"
+                " the release path is bundled with patch bumps and reviewed as one small diff"
             )
         elif "major" in update_types:
             print(
                 f"grouped: github-actions/{group_name}|no|"
-                "update-types includes 'major', so majors are still bundled with patch bumps"
+                f"patterns {patterns} and update-types includes 'major', so majors are still"
+                " bundled with patch bumps"
             )
         else:
             print(
                 f"grouped: github-actions/{group_name}|yes|"
-                f"update-types {update_types}, so major bumps arrive as their own PR"
+                f"patterns {patterns}, update-types {update_types}, so major bumps arrive as"
+                " their own PR"
             )
+
+# Without this, deleting the whole `github-actions` ecosystem from
+# dependabot.yml makes the loop above emit nothing at all, and every `grouped:`
+# check silently disappears rather than failing. A gate that can be switched off
+# by deleting the thing it reads is not a gate.
+if saw_github_actions:
+    print(
+        "grouped: github-actions-ecosystem|yes|"
+        "dependabot.yml configures the github-actions ecosystem, so the group checks above are"
+        " reading real configuration"
+    )
+else:
+    print(
+        "grouped: github-actions-ecosystem|no|"
+        "dependabot.yml declares no github-actions ecosystem, so action bumps are unconfigured"
+        " and every group check above was vacuous"
+    )
 PYTHON
 )"
   while IFS='|' read -r dep_where dep_ok dep_detail; do

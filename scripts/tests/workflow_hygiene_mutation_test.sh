@@ -68,10 +68,26 @@ with open(path, "w", encoding="utf-8") as handle:
 PYTHON
 }
 
+# The single definition of "did the right assertion go red". `mutate()` uses it
+# to judge every mutation, and `needle_selfcheck` uses the *same function* -- not
+# a re-implementation -- so the self-check exercises the code path the results
+# actually depend on. A self-check written against a second copy of the logic
+# would be free to drift into checking something else entirely, which is the
+# failure mode it exists to catch.
+#
+# FAIL lines and their indented detail lines only. `ok` lines are excluded by
+# construction because they share substrings with the FAIL lines: 62 of them
+# begin `ok   pin-version:`. Matching the whole output meant a mutation that went
+# red for an unrelated reason still satisfied its needle from a *passing* line.
+needle_matches() {
+  grep -E '^  FAIL |^        ' <<<"$1" | grep -qF "$2"
+}
+
 # mutate <name> <file> <old|||new> <expected-needle>
 # The needle matters: "the suite went red" is not the same as "the suite went
 # red on the assertion this mutation is about". A wrong-red is reported as a
-# failure, not counted.
+# failure, not counted. See needle_matches for why the needle is scoped to FAIL
+# lines, and needle_selfcheck for the proof that the scoping works.
 mutate() {
   local name="$1" file="$2" expr="$3" needle="$4"
   MUTATIONS_RUN=$((MUTATIONS_RUN + 1))
@@ -86,9 +102,9 @@ mutate() {
   rc=$?
   if [[ ${rc} -eq 0 ]]; then
     mismatches+=("${name}: SUITE STILL PASSED (assertion does not bite)")
-  elif ! grep -qF "${needle}" <<<"${out}"; then
+  elif ! needle_matches "${out}" "${needle}"; then
     mismatches+=("${name}: went red but not on '${needle}'")
-    mismatches+=("        saw: $(grep -E '^( +ok|  FAIL)' <<<"${out}" | grep -iF "$(cut -d: -f1 <<<"${needle}" | head -1)" | head -2 | tr '\n' ' ')")
+    mismatches+=("        saw: $(grep -E '^  FAIL ' <<<"${out}" | head -3 | tr '\n' ' ')")
   else
     MUTATIONS_BITING=$((MUTATIONS_BITING + 1))
     printf '  bites  %s\n' "${name}"
@@ -96,13 +112,63 @@ mutate() {
   restore
 }
 
+# A matcher that accepted every needle would report every mutation as biting
+# while proving nothing, and no amount of green output would reveal it. So the
+# harness checks its own discrimination, on a real mutation, using needle_matches
+# itself:
+#   (a) the label that actually failed is matched
+#   (b) a different REAL label that passed is NOT matched -- while provably
+#       being present in the output, so this is the matcher rejecting it and not
+#       the string simply being absent
+# (b) is the whole check. With the needle scoped to the whole output,
+# `pin-version` is satisfied by 62 passing `ok` lines, (b) fails, and the harness
+# reports itself as broken -- which is what makes the numbers above mean anything.
+needle_selfcheck() {
+  local target="${ROOT_DIR}/.github/workflows/ci.yml"
+  local out
+  restore
+  if ! apply "${target}" \
+    'actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7|||actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v9'; then
+    mismatches+=("needle self-check: could not apply its own mutation")
+    restore
+    return
+  fi
+  out="$(bash "${SUITE}" 2>&1)"
+
+  if ! needle_matches "${out}" 'pin-major'; then
+    mismatches+=("needle self-check: 'pin-major' was not matched although that is the assertion this mutation breaks")
+  fi
+  if ! grep -qF 'pin-version' <<<"${out}"; then
+    mismatches+=("needle self-check: 'pin-version' is absent from the output entirely, so rejecting it below would prove nothing")
+  elif needle_matches "${out}" 'pin-version'; then
+    mismatches+=("needle self-check: 'pin-version' WAS matched, but this mutation moves a major and not a comment -- the matcher is reading the whole output instead of the failures")
+  fi
+
+  restore
+  printf '  checks  needle matcher: matches the real failure, rejects a real but passing label (%s FAIL / %s ok lines in the mutated run)\n' \
+    "$(grep -cE '^  FAIL ' <<<"${out}" || true)" "$(grep -cE '^ +ok ' <<<"${out}" || true)"
+}
+
 echo "== the mislabelled-pin regression (the reason these assertions exist) =="
 
-# 1. The exact defect from #128: SHA moves to a new major, comment stays.
-mutate "download-artifact pin moves but the comment is left stale" \
+# 1. One of two uses of the same action declares a different major.
+#
+#    The name and needle here were both wrong, and the tightened matcher is what
+#    exposed it. This mutation rewrites the FIRST of release.yml's two
+#    `actions/download-artifact` pins (`replace(old, new, 1)`), so it creates a
+#    disagreement between two uses of one action -- which `pin-major` catches. It
+#    does not reproduce #128, and it is not caught by `pin-version`.
+#
+#    #128 proper was a comment left stale against its own SHA, and that is NOT
+#    detectable here: proving the declared major is true means resolving the SHA
+#    to its tag, the network lookup this suite deliberately does not make. The
+#    needle is `pin-major` because that is the assertion that bites; claiming
+#    `pin-version` would have been the exact defect this harness exists to
+#    detect -- a mutation counted as proving something it did not prove.
+mutate "one of two uses of an action declares a different major" \
   "${ROOT_DIR}/.github/workflows/release.yml" \
   'actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4|||actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v8' \
-  "pin-version"
+  "declared at more than one major"
 
 # 2. A pin with no version comment at all -- the reviewer has nothing to read.
 mutate "a pin loses its version comment entirely" \
@@ -190,7 +256,10 @@ then
   # which reports a biting assertion as non-biting. The exit status of interest
   # is the suite's, so it is kept separate from the text search.
   no_groups_out="$(bash "${SUITE}" 2>&1)"
-  if grep -qF "no groups" <<<"${no_groups_out}"; then
+  # Scoped to the failures for the same reason needle_matches does: an `ok` line
+  # and a `FAIL` line here both contain "github-actions", so whole-output
+  # matching would report this as biting even if the group check were gone.
+  if needle_matches "${no_groups_out}" "no groups"; then
     MUTATIONS_BITING=$((MUTATIONS_BITING + 1))
     printf '  bites  dependabot with no groups at all is reported, not silently accepted\n'
   else
@@ -200,6 +269,64 @@ else
   mismatches+=("no groups: could not apply the mutation")
 fi
 restore
+
+# 10. The bypass this suite used to have, kept as a mutation so it cannot come
+#     back. Majors re-included *and* the wildcard re-spelled, so the group still
+#     covers every action. Before the fix, `patterns: ["*"]` was the only literal
+#     that reached the update-types check, so this exact configuration passed: the
+#     same exact-literal-versus-shape-equivalent trap as the two `3d3d42e5...`
+#     pins in #133.
+mutate "majors bundled but the wildcard re-spelled as ['**']" \
+  "${DEPENDABOT}" \
+  '        update-types: ["minor", "patch"]\n        patterns: ["*"]|||        update-types: ["minor", "patch", "major"]\n        patterns: ["**"]' \
+  "includes 'major'"
+
+# 11. A glob that covers every action without being a bare `*`. Same hazard, same
+#     bypass, third spelling -- so no single pattern list satisfies the assertion.
+mutate "majors bundled behind a covering ['actions/**'] glob" \
+  "${DEPENDABOT}" \
+  '        update-types: ["minor", "patch"]\n        patterns: ["*"]|||        update-types: ["minor", "patch", "major"]\n        patterns: ["actions/**"]' \
+  "includes 'major'"
+
+# 12. The whole github-actions ecosystem deleted. Every `grouped:` assertion above
+#     then has nothing to read and the loop emits nothing at all, so the group
+#     checks vanish instead of failing. Deleting the thing a gate reads must not
+#     be a way to switch the gate off.
+MUTATIONS_RUN=$((MUTATIONS_RUN + 1))
+restore
+if python3 - "${DEPENDABOT}" <<'PYTHON3'
+import re
+import sys
+
+path = sys.argv[1]
+with open(path, encoding="utf-8") as handle:
+    text = handle.read()
+pattern = re.compile(
+    r"  - package-ecosystem: \"github-actions\"\n(?:.*\n)*?(?=  - package-ecosystem)",
+)
+if not pattern.search(text):
+    print("MUTATION TARGET NOT FOUND: github-actions ecosystem block", file=sys.stderr)
+    sys.exit(3)
+with open(path, "w", encoding="utf-8") as handle:
+    handle.write(pattern.sub("", text, count=1))
+PYTHON3
+then
+  eco_out="$(bash "${SUITE}" 2>&1)"
+  if needle_matches "${eco_out}" 'declares no github-actions ecosystem'; then
+    MUTATIONS_BITING=$((MUTATIONS_BITING + 1))
+    printf '  bites  deleting the github-actions ecosystem is reported, not silently vacuous\n'
+  else
+    mismatches+=("ecosystem deleted: the suite did not report the absence; its group checks were vacuous")
+  fi
+else
+  mismatches+=("ecosystem deleted: could not apply the mutation")
+fi
+restore
+
+# The needle matcher decides whether the numbers above mean anything, so it is
+# checked rather than believed. Runs on a real mutation of its own, and restores.
+echo "== the needle matcher itself =="
+needle_selfcheck
 
 restore
 final_out="$(bash "${SUITE}" 2>&1)"
