@@ -1,6 +1,6 @@
 SHELL := /bin/bash
 
-.PHONY: help setup fmt lint test check audit flutter-analyze flutter-test release-linux-local release-gate workflow-hygiene canary canary-mutations
+.PHONY: help setup fmt lint test check audit flutter-analyze flutter-test release-linux-local release-gate workflow-hygiene workflow-hygiene-mutations canary canary-mutations
 
 help:
 	@echo "Photo Organizer dev targets:"
@@ -14,6 +14,7 @@ help:
 	@echo "  release-gate       tests for the Android artifact/signing release gate"
 	@echo "  release-linux-local build daemon + Flutter Linux bundle (scripts/build_linux_release.sh)"
 	@echo "  workflow-hygiene   structural tests for .github/workflows (triggers, pins, timeouts, permissions)"
+	@echo "  workflow-hygiene-mutations  prove those structural assertions fail when CI wiring drifts"
 	@echo "  canary             tests for the schedule/liveness canary (scripts/canary_liveness.sh)"
 	@echo "  canary-mutations   prove the canary suite's assertions fail when the logic is broken"
 
@@ -50,6 +51,11 @@ release-linux-local:
 
 workflow-hygiene:
 	bash scripts/tests/workflow_hygiene_test.sh
+
+# Proves the hygiene assertions fail when a pin, a version comment or the
+# dependabot grouping is broken. 3.6s, and it runs in CI too.
+workflow-hygiene-mutations:
+	bash scripts/tests/workflow_hygiene_mutation_test.sh
 
 canary:
 	bash scripts/tests/canary_liveness_test.sh

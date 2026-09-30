@@ -100,7 +100,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - name: Install cargo-audit
-        uses: taiki-e/install-action@7623a79cdfecb99d681017af368ca353d9f49bb5 # v2
+        uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2
         with:
           tool: cargo-audit
       - name: Rust dependency audit
@@ -111,6 +111,11 @@ jobs:
       # asserts it from the parsed YAML, mutation-tested.
       - name: Workflow hygiene
         run: bash scripts/tests/workflow_hygiene_test.sh
+      # 3.6s. Proves the hygiene assertions above actually fail when the
+      # workflow files or dependabot.yml drift. Without it, "the pins are
+      # checked" is a claim about a comment rather than about behaviour.
+      - name: Workflow hygiene mutation pass
+        run: bash scripts/tests/workflow_hygiene_mutation_test.sh
       # The canary reads required-checks.json and the workflow files, and
       # decides whether a dead check is reported. Running it only on its weekly
       # schedule would mean a PR could break it and merge, so it runs here too
