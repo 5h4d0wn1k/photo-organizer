@@ -86,7 +86,14 @@ CODE = {
     )
 }
 
-CHECKOUT_REF = "actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683"
+# The repository-wide checkout pin, asserted exactly rather than by shape.
+# Shape alone (`@[0-9a-f]{40}`, asserted separately below) would accept any
+# 40-hex string, so pinning the literal is what makes this a supply-chain
+# assertion: a different-but-well-formed SHA is a reviewable edit in two places
+# rather than a silent substitution. #133 aligned project.yml with the other 13
+# workflows, so this constant is now the same SHA every workflow uses -- the
+# assertion became stronger, not merely different.
+CHECKOUT_REF = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
 
 namespace = {
     "doc": doc,

@@ -78,13 +78,19 @@ printf 'project_board_workflow mutation test\n'
 # Two separate mutations, because one assertion covered both properties and
 # could only bite for one of them. Unpinning to a tag satisfies "uses
 # actions/checkout"; dropping the checkout entirely satisfies "pinned to a SHA".
+# These literals track the repository-wide checkout pin, so they must be
+# updated together with CHECKOUT_REF in project_board_workflow_test.sh and with
+# the pin in .github/workflows/project.yml. The harness is fail-closed on this:
+# a mutation whose `old` string is no longer present reports
+# "FAIL ... (mutation did not apply)" rather than passing vacuously, which is
+# what caught this drift the first time (#133).
 mutate "unpinning the checkout action to a tag is caught" \
-  'uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2|||uses: actions/checkout@v4' \
+  'uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7|||uses: actions/checkout@v4' \
   'FAIL the checkout action is pinned to a commit SHA'
 
 mutate "removing the checkout step is caught" \
   '      - name: Checkout
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           # Shallow is enough: this workflow runs the parser'"'"'s suites from
           # disk and reads no history. Board automation should not spend the
