@@ -6400,8 +6400,14 @@ fn replaceable_bootstrap_vault_index(state: &LibraryState) -> Option<usize> {
 
 /// Which vault an asset's blobs belong in.
 ///
-/// Vault membership is decided here, per asset, and nowhere else. Order is
-/// stability-first:
+/// Vault membership is decided here, per asset, and nowhere else. The
+/// associations are collected before any of them is acted on, because the
+/// distinction that matters cannot be expressed by trying them one at a time:
+/// an asset with *no* association and an asset whose associations all name a
+/// vault that no longer exists are opposite cases, and only the first one may
+/// be filed by fallback.
+///
+/// Order is stability-first:
 /// (a) a live BlobRecord wins -- the asset already has sealed chunks
 ///     somewhere, and re-homing sealed data on a routine pass is how #112
 ///     disclosed one vault's originals to another vault's devices;
@@ -6411,37 +6417,85 @@ fn replaceable_bootstrap_vault_index(state: &LibraryState) -> Option<usize> {
 ///     with their vault;
 /// (d) the first vault is the historical fallback for assets that predate
 ///     any association.
-/// A referenced vault that no longer exists resolves to nothing: skipping
-/// the asset is safer than misfiling it into an unrelated vault, and the
-/// orphan-row reconciliation (Step 1b, separate change) owns the repair.
+///
+/// A referenced vault that no longer exists resolves to nothing: skipping the
+/// asset is safer than misfiling it into an unrelated vault, and the orphan-row
+/// reconciliation (Step 1b, separate change) owns the repair. That was the
+/// documented promise and the code did not keep it -- the old `&& let` chains
+/// let a dangling vault fall through to the next branch and then to an
+/// unconditional `vaults.first()`, so `None` was unreachable for any library
+/// with at least one vault and the caller's `else { continue }` was dead code.
+/// Falling back is now reachable only from the no-association case.
 fn target_vault_for_asset(state: &LibraryState, asset_id: Uuid) -> Option<Vault> {
-    if let Some(blob) = state
+    let live_vault = |vault_id: Uuid| {
+        state
+            .vaults
+            .iter()
+            .find(|vault| vault.id == vault_id)
+            .cloned()
+    };
+    let blob_vault = state
         .blob_records
         .iter()
         .find(|blob| blob.asset_id == asset_id && blob.tombstoned_at.is_none())
-        && let Some(vault) = state.vaults.iter().find(|vault| vault.id == blob.vault_id)
-    {
-        return Some(vault.clone());
-    }
-    if let Some(upload) = state
+        .map(|blob| blob.vault_id);
+    let upload_vault = state
         .mobile_uploads
         .iter()
         .find(|upload| upload.asset_id == Some(asset_id))
-        && let Some(vault) = state
-            .vaults
-            .iter()
-            .find(|vault| vault.id == upload.vault_id)
-    {
-        return Some(vault.clone());
-    }
-    if let Some(entry) = state
+        .map(|upload| upload.vault_id);
+    let entry_vault = state
         .file_entries
         .iter()
         .find(|entry| entry.asset_id == Some(asset_id))
-        && let Some(vault) = state.vaults.iter().find(|vault| vault.id == entry.vault_id)
+        .map(|entry| entry.vault_id);
+
+    // (a) A live BlobRecord wins. It is rejected in one case only: nothing else
+    //     corroborates it *and* something contradicts it.
+    //
+    //     Blob records are written in exactly one place in this codebase -- the
+    //     fallback at the bottom of this function. So a record naming a live
+    //     vault that no receipt and no namespace entry corroborates can only
+    //     have been minted by that fallback, and an asset carrying a dangling
+    //     reference is exactly the asset the fallback was never meant to touch.
+    //     Trusting such a record re-seals the disclosure on every pass, and
+    //     because it names a *valid* vault, an orphan sweep looking for missing
+    //     vaults never selects it. Step 1b owns the repair; the resolver's job
+    //     is to stop making it worse.
+    //
+    //     Both halves are required. On its own, "uncorroborated" would reject
+    //     every record on an asset that legitimately predates associations --
+    //     exactly the case (d) exists to serve -- and silently stop sealing.
+    if let Some(blob_id) = blob_vault
+        && let Some(vault) = live_vault(blob_id)
     {
-        return Some(vault.clone());
+        let corroborated = upload_vault == Some(blob_id) || entry_vault == Some(blob_id);
+        let contradicted = [upload_vault, entry_vault]
+            .into_iter()
+            .flatten()
+            .any(|other| live_vault(other).is_none());
+        if corroborated || !contradicted {
+            return Some(vault);
+        }
     }
+    // (b) A mobile-upload receipt: the vault the API accepted the bytes into.
+    if let Some(vault) = upload_vault.and_then(live_vault) {
+        return Some(vault);
+    }
+    // (c) A file-namespace entry, which reservation writes with the vault.
+    if let Some(vault) = entry_vault.and_then(live_vault) {
+        return Some(vault);
+    }
+
+    // The asset has associations and every one of them names a vault that is
+    // gone. Nothing here can be right, and `vaults[0]` would be a guess with
+    // security consequences, so the caller skips the asset instead.
+    if blob_vault.is_some() || upload_vault.is_some() || entry_vault.is_some() {
+        return None;
+    }
+
+    // (d) The historical fallback, now reachable only from here -- which is what
+    //     makes it a fallback rather than a catch-all.
     state.vaults.first().cloned()
 }
 
@@ -9658,8 +9712,8 @@ mod tests {
     use crate::{
         config::AppConfig,
         domain::{
-            AssetAvailabilityState, BlobReplica, CorrectDateRequest, CorrectPlaceRequest,
-            CreateAlbumRequest, CreateDeviceRequest, CreateFileFolderRequest,
+            AssetAvailabilityState, BlobRecord, BlobReplica, CorrectDateRequest,
+            CorrectPlaceRequest, CreateAlbumRequest, CreateDeviceRequest, CreateFileFolderRequest,
             CreateManualPersonRequest, CreatePairingSessionRequest, CreateSmartFolderRequest,
             CreateVaultRequest, DeviceRole, DeviceStorageProfile, DeviceTrustLevel,
             EncryptionActivationRequest, EnrollDeviceRequest, EntitlementCacheStatus,
@@ -9667,24 +9721,25 @@ mod tests {
             EntitlementTier, FileOrganizationHints, ImportAssetRequest, ImportMode,
             ImportSourceKind, MediaKind, MetadataSource, MobilePairRequest,
             MobileReplicaChunkReport, MobileReplicaReportRequest,
-            MobileStorageProfileUpdateRequest, MobileUploadRequest, MobileUploadStatus,
-            ModelImportRequest, ModelInstallRequest, MoveFileEntryRequest, NetworkPolicy,
-            PlatformReleaseEvidenceStatus, PlatformReleaseReadinessStatus, PlatformReleaseSurface,
-            RebuildRequest, RenameAlbumRequest, RenameFileEntryRequest, ReplicaHealth,
-            RevokeDeviceRequest, RunSyncRequest, ScanImportSourceRequest, SearchQuery,
-            StoragePolicy, StoragePolicyMode, SupportBundleExportRequest, SyncTransfer,
-            SyncTransferExecutionStatus, SyncTransferStatus, UpdateAlbumAssetsRequest,
-            UpdateAssetFlagsRequest, UpdateAssetTagsRequest, UpdateAssetsFlagsRequest,
-            UpdateEntitlementCacheRequest, UpdateLibrarySettingsRequest, UpdatePersonAssetsRequest,
-            UpdateVaultStoragePolicyRequest, VaultFileKind,
+            MobileStorageProfileUpdateRequest, MobileUpload, MobileUploadRequest,
+            MobileUploadStatus, ModelImportRequest, ModelInstallRequest, MoveFileEntryRequest,
+            NetworkPolicy, PlatformReleaseEvidenceStatus, PlatformReleaseReadinessStatus,
+            PlatformReleaseSurface, RebuildRequest, RenameAlbumRequest, RenameFileEntryRequest,
+            ReplicaHealth, RevokeDeviceRequest, RunSyncRequest, ScanImportSourceRequest,
+            SearchQuery, StoragePolicy, StoragePolicyMode, SupportBundleExportRequest,
+            SyncTransfer, SyncTransferExecutionStatus, SyncTransferStatus,
+            UpdateAlbumAssetsRequest, UpdateAssetFlagsRequest, UpdateAssetTagsRequest,
+            UpdateAssetsFlagsRequest, UpdateEntitlementCacheRequest, UpdateLibrarySettingsRequest,
+            UpdatePersonAssetsRequest, UpdateVaultStoragePolicyRequest, Vault, VaultFileEntry,
+            VaultFileKind,
         },
         imports,
     };
 
     use super::{
-        ByteRangeRequest, GalleryService, constant_time_eq, effective_library_root,
+        ByteRangeRequest, GalleryService, LibraryState, constant_time_eq, effective_library_root,
         hash_pairing_token, local_device_id, mobile_replica_chunk_proof_hex, mobile_upload_dir,
-        sha256_hex_bytes,
+        refresh_blob_records, sha256_hex_bytes, target_vault_for_asset,
     };
 
     fn temp_root(name: &str) -> PathBuf {
@@ -10572,6 +10627,490 @@ mod tests {
         assert!(
             kids_dir.is_dir(),
             "the Kids vault directory must exist on disk"
+        );
+    }
+
+    // ---- which vault an asset belongs in: target_vault_for_asset ----------
+    //
+    // Unit tests on a pure function, deliberately. Reaching each branch through
+    // the service needs a different setup per branch, and the review found
+    // branches (a) and (c) with no coverage at all -- reachable, load-bearing,
+    // and never once executed by the suite. `target_vault_for_asset` is a pure
+    // function of LibraryState, so it is tested as one.
+    //
+    // The states below are built by hand because the interesting ones are states
+    // the service cannot currently produce: nothing in this codebase removes a
+    // vault from `state.vaults` (no retain/remove/clear/truncate/assignment on
+    // it anywhere in service.rs), so no association can dangle today. Vault
+    // deletion is what #112 Step 1b presumes, and these are the states it will
+    // have to be correct about. Recorded as latent, not as an active exploit.
+    fn vault_fixture(name: &str) -> Vault {
+        Vault {
+            id: uuid::Uuid::new_v4(),
+            name: name.to_string(),
+            storage_policy: StoragePolicy {
+                mode: StoragePolicyMode::Custom,
+                min_replicas: 1,
+                preferred_device_ids: Vec::new(),
+                excluded_device_ids: Vec::new(),
+                min_free_space_bytes: 0,
+                allow_metered_network: true,
+                pause_on_low_battery: true,
+            },
+            key_version: 1,
+            deletion_grace_days: 30,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    fn blob_fixture(vault_id: uuid::Uuid, asset_id: uuid::Uuid) -> BlobRecord {
+        BlobRecord {
+            id: uuid::Uuid::new_v4(),
+            vault_id,
+            asset_id,
+            content_hash: "content-hash".to_string(),
+            encrypted_hash: format!("unsealed-v1:{asset_id}"),
+            bytes: 4,
+            chunk_count: 0,
+            encryption_key_version: 1,
+            created_at: Utc::now(),
+            tombstoned_at: None,
+        }
+    }
+
+    fn upload_fixture(vault_id: uuid::Uuid, asset_id: uuid::Uuid) -> MobileUpload {
+        MobileUpload {
+            id: uuid::Uuid::new_v4(),
+            session_id: uuid::Uuid::new_v4(),
+            device_id: uuid::Uuid::new_v4(),
+            vault_id,
+            asset_id: Some(asset_id),
+            original_filename: "x.jpg".to_string(),
+            media_kind: MediaKind::Photo,
+            mime_type: "image/jpeg".to_string(),
+            bytes_total: 4,
+            bytes_received: 4,
+            content_hash: Some("content-hash".to_string()),
+            captured_at: None,
+            place_hint: None,
+            status: MobileUploadStatus::Completed,
+            error_detail: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    fn entry_fixture(vault_id: uuid::Uuid, asset_id: uuid::Uuid) -> VaultFileEntry {
+        VaultFileEntry {
+            id: uuid::Uuid::new_v4(),
+            vault_id,
+            parent_id: None,
+            asset_id: Some(asset_id),
+            name: "x.jpg".to_string(),
+            kind: VaultFileKind::File,
+            media_kind: Some(MediaKind::Photo),
+            mime_type: Some("image/jpeg".to_string()),
+            bytes: 4,
+            content_hash: Some("content-hash".to_string()),
+            origin_device_id: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            trashed_at: None,
+            organization: FileOrganizationHints::default(),
+        }
+    }
+
+    fn resolver_state(
+        vaults: Vec<Vault>,
+        blobs: Vec<BlobRecord>,
+        uploads: Vec<MobileUpload>,
+        entries: Vec<VaultFileEntry>,
+    ) -> LibraryState {
+        LibraryState {
+            vaults,
+            blob_records: blobs,
+            mobile_uploads: uploads,
+            file_entries: entries,
+            ..LibraryState::default()
+        }
+    }
+
+    fn resolved_vault_id(state: &LibraryState, asset_id: uuid::Uuid) -> Option<uuid::Uuid> {
+        target_vault_for_asset(state, asset_id).map(|vault| vault.id)
+    }
+
+    /// Branch (a): a live BlobRecord outranks a competing reservation. Never
+    /// covered before -- `blob.tombstoned_at.is_none() && false` left all 101
+    /// tests green. This is the guard against re-homing sealed data, which is
+    /// what #112 disclosed, so it is the one branch that must not be reachable by
+    /// accident in either direction.
+    #[test]
+    fn live_blob_record_outranks_a_competing_reservation() {
+        let personal = vault_fixture("Personal vault");
+        let kids = vault_fixture("Kids vault");
+        let asset_id = uuid::Uuid::new_v4();
+        let state = resolver_state(
+            vec![personal.clone(), kids.clone()],
+            vec![blob_fixture(personal.id, asset_id)],
+            vec![upload_fixture(kids.id, asset_id)],
+            vec![entry_fixture(kids.id, asset_id)],
+        );
+        assert_eq!(
+            resolved_vault_id(&state, asset_id),
+            Some(personal.id),
+            "sealed chunks already exist in Personal; a reservation naming Kids \
+             must not move them"
+        );
+    }
+
+    /// A tombstoned record is not a live one, so (a) must fall through.
+    #[test]
+    fn tombstoned_blob_record_does_not_outrank_a_reservation() {
+        let personal = vault_fixture("Personal vault");
+        let kids = vault_fixture("Kids vault");
+        let asset_id = uuid::Uuid::new_v4();
+        let mut tombstoned = blob_fixture(personal.id, asset_id);
+        tombstoned.tombstoned_at = Some(Utc::now());
+        let state = resolver_state(
+            vec![personal, kids.clone()],
+            vec![tombstoned],
+            vec![upload_fixture(kids.id, asset_id)],
+            Vec::new(),
+        );
+        assert_eq!(
+            resolved_vault_id(&state, asset_id),
+            Some(kids.id),
+            "a tombstoned record is not sealed chunks that must be preserved"
+        );
+    }
+
+    /// The other side of the rule above, and the one that keeps the fix from
+    /// being a regression: a fallback-minted record with nothing contradicting
+    /// it is exactly the historical case (d) produces, and it must be accepted.
+    /// Requiring corroboration unconditionally would make every pre-existing
+    /// desktop library stop sealing its assets, silently, because the records
+    /// there were minted by the fallback and nothing else ever names them.
+    #[test]
+    fn a_fallback_minted_record_with_nothing_contradicting_it_stays_put() {
+        let personal = vault_fixture("Personal vault");
+        let asset_id = uuid::Uuid::new_v4();
+        let state = resolver_state(
+            vec![personal.clone()],
+            vec![blob_fixture(personal.id, asset_id)],
+            Vec::new(),
+            Vec::new(),
+        );
+        assert_eq!(
+            resolved_vault_id(&state, asset_id),
+            Some(personal.id),
+            "an uncorroborated record is only suspect when the asset also carries \
+             a dangling reference; without one it is the historical placement"
+        );
+    }
+
+    /// Branch (b): the receipt records the vault the API accepted the upload
+    /// into, so the bytes land where the API said.
+    #[test]
+    fn upload_receipt_wins_when_no_blob_record_exists() {
+        let personal = vault_fixture("Personal vault");
+        let kids = vault_fixture("Kids vault");
+        let asset_id = uuid::Uuid::new_v4();
+        let state = resolver_state(
+            vec![personal, kids.clone()],
+            Vec::new(),
+            vec![upload_fixture(kids.id, asset_id)],
+            Vec::new(),
+        );
+        assert_eq!(resolved_vault_id(&state, asset_id), Some(kids.id));
+    }
+
+    /// Branch (c): a file-namespace entry with no receipt behind it. Also
+    /// uncovered before this change.
+    #[test]
+    fn file_namespace_entry_wins_when_no_receipt_or_blob_exists() {
+        let personal = vault_fixture("Personal vault");
+        let kids = vault_fixture("Kids vault");
+        let asset_id = uuid::Uuid::new_v4();
+        let state = resolver_state(
+            vec![personal, kids.clone()],
+            Vec::new(),
+            Vec::new(),
+            vec![entry_fixture(kids.id, asset_id)],
+        );
+        assert_eq!(resolved_vault_id(&state, asset_id), Some(kids.id));
+    }
+
+    /// Branch (d): the historical fallback, for assets that predate any
+    /// association. This is the case the fallback exists for and it must keep
+    /// working -- the distinction from the next test is the whole point.
+    #[test]
+    fn first_vault_is_the_fallback_only_for_an_asset_with_no_association() {
+        let personal = vault_fixture("Personal vault");
+        let kids = vault_fixture("Kids vault");
+        let asset_id = uuid::Uuid::new_v4();
+        let state = resolver_state(
+            vec![personal.clone(), kids],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+        assert_eq!(
+            resolved_vault_id(&state, asset_id),
+            Some(personal.id),
+            "an asset with no association at all predates them; vaults[0] is the \
+             documented historical home"
+        );
+    }
+
+    /// Every association names a vault that is gone. There is no honest answer,
+    /// and `vaults[0]` is a lie: it would seal this asset's originals under an
+    /// unrelated vault's key, which is the disclosure #112 was filed for. The
+    /// function's doc comment promises None here and did not deliver it.
+    #[test]
+    fn resolves_to_nothing_when_every_association_names_a_deleted_vault() {
+        let personal = vault_fixture("Personal vault");
+        let deleted = uuid::Uuid::new_v4();
+        let asset_id = uuid::Uuid::new_v4();
+        let state = resolver_state(
+            vec![personal],
+            vec![blob_fixture(deleted, asset_id)],
+            vec![upload_fixture(deleted, asset_id)],
+            vec![entry_fixture(deleted, asset_id)],
+        );
+        assert_eq!(
+            resolved_vault_id(&state, asset_id),
+            None,
+            "an orphaned asset must resolve to nothing so the caller skips it; \
+             falling back to vaults[0] would re-file it into an unrelated vault"
+        );
+    }
+
+    /// The already-leaked row. `state.blob_records` is written in exactly one
+    /// place -- the fallback inside this function -- so a record sitting in a
+    /// *live* vault that no receipt or namespace entry names can only have been
+    /// minted by that fallback. Treating it as authoritative re-seals the leak
+    /// on every pass, and because it names a valid vault, an orphan sweep that
+    /// looks for missing vaults will never select it.
+    #[test]
+    fn a_fallback_minted_record_on_an_orphaned_asset_is_not_authoritative() {
+        let personal = vault_fixture("Personal vault");
+        let deleted = uuid::Uuid::new_v4();
+        let asset_id = uuid::Uuid::new_v4();
+        let state = resolver_state(
+            vec![personal.clone()],
+            // vaults[0] at the time it was minted: a *live* vault, which is what
+            // makes this hard and what makes it dangerous. An earlier version of
+            // this test used a random id here, so the record named a vault that
+            // did not exist, branch (a) never fired, and the test passed whatever
+            // the rule said -- it was green for the wrong reason and would have
+            // passed against the pre-fix code too, for F1's reason rather than
+            // F2's.
+            vec![blob_fixture(personal.id, asset_id)],
+            vec![upload_fixture(deleted, asset_id)],
+            Vec::new(),
+        );
+        assert_eq!(
+            resolved_vault_id(&state, asset_id),
+            None,
+            "a record nothing else backs, on an asset that carries a dangling \
+             reference, is a leaked row -- keeping it re-seals the leak forever"
+        );
+    }
+
+    /// The guard on the guard, and the only shape in which it can be observed.
+    /// A *corroborated* record has to survive a competing live association that
+    /// names a different vault. The competition is what makes the assertion
+    /// bite: if branch (a) were rejected here the fall-through would answer with
+    /// the receipt's vault, and the two answers would differ. With the receipt
+    /// and the record agreeing, the fall-through lands on the same vault and the
+    /// test passes whether or not branch (a) ran at all.
+    ///
+    /// Note what this does *not* isolate: `corroborated` and `!contradicted` are
+    /// each necessary and neither is separately observable, because rejecting
+    /// branch (a) always falls through to a corroborating association naming the
+    /// same vault. The pair is pinned by the tests above taken together, not by
+    /// this one.
+    #[test]
+    fn a_backed_record_wins_even_against_a_competing_live_receipt() {
+        let personal = vault_fixture("Personal vault");
+        let kids = vault_fixture("Kids vault");
+        let asset_id = uuid::Uuid::new_v4();
+        let state = resolver_state(
+            vec![personal.clone(), kids.clone()],
+            vec![blob_fixture(personal.id, asset_id)],
+            vec![upload_fixture(kids.id, asset_id)],
+            vec![entry_fixture(personal.id, asset_id)],
+        );
+        assert_eq!(
+            resolved_vault_id(&state, asset_id),
+            Some(personal.id),
+            "the namespace entry corroborates the record, so it is real; the \
+             receipt naming another vault does not overrule sealed data"
+        );
+    }
+
+    /// The order between (b) and (c) is a policy, so it is pinned rather than
+    /// assumed -- with *both* naming a live, different vault, because an entry
+    /// pointing at a vault that does not exist cannot discriminate the order at
+    /// all (an earlier version of this test did exactly that and passed under
+    /// either order). A receipt records where the API accepted the bytes; a
+    /// namespace entry records where a human filed them afterwards. The bytes
+    /// win, or a later reorganisation could redirect an upload that was already
+    /// accepted into a different vault.
+    #[test]
+    fn upload_receipt_outranks_a_namespace_entry_naming_a_different_vault() {
+        let personal = vault_fixture("Personal vault");
+        let kids = vault_fixture("Kids vault");
+        let asset_id = uuid::Uuid::new_v4();
+        let state = resolver_state(
+            vec![personal.clone(), kids.clone()],
+            Vec::new(),
+            vec![upload_fixture(kids.id, asset_id)],
+            vec![entry_fixture(personal.id, asset_id)],
+        );
+        assert_eq!(
+            resolved_vault_id(&state, asset_id),
+            Some(kids.id),
+            "the receipt records where the bytes were accepted; the entry records a \
+             later filing decision and does not override it"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_skips_an_asset_whose_vault_is_gone_instead_of_refiling_it() {
+        let runtime_root = temp_root("orphan-vault-refresh");
+        let library_root = runtime_root.join("library");
+        let config = AppConfig {
+            runtime_root: runtime_root.clone(),
+            ..AppConfig::default()
+        };
+        let service = GalleryService::new(config.clone()).expect("service");
+        service
+            .update_library_settings(UpdateLibrarySettingsRequest {
+                library_root: library_root.to_string_lossy().to_string(),
+                default_import_mode: ImportMode::Copy,
+                original_storage_policy: None,
+            })
+            .await
+            .expect("settings");
+        service
+            .create_vault(CreateVaultRequest {
+                id: None,
+                name: "Personal vault".to_string(),
+                storage_policy: None,
+            })
+            .await
+            .expect("personal");
+        let seed_path = runtime_root.join("seed.jpg");
+        fs::write(&seed_path, b"personal seed bytes").expect("seed file");
+        service
+            .import_asset(ImportAssetRequest {
+                source_path: seed_path.to_string_lossy().to_string(),
+                original_filename: "seed.jpg".to_string(),
+                media_kind: MediaKind::Photo,
+                mime_type: "image/jpeg".to_string(),
+                bytes: 19,
+                content_hash: None,
+                captured_at: None,
+                place_hint: None,
+                import_mode: Some(ImportMode::Copy),
+            })
+            .await
+            .expect("seed import");
+        let kids = service
+            .create_vault(CreateVaultRequest {
+                id: None,
+                name: "Kids vault".to_string(),
+                storage_policy: None,
+            })
+            .await
+            .expect("kids");
+
+        let pairing = service
+            .create_pairing_session(CreatePairingSessionRequest {
+                device_name: "kidphone".to_string(),
+                platform: "android".to_string(),
+                vault_id: Some(kids.id),
+            })
+            .await
+            .expect("pairing session");
+        let kids_token = service
+            .pair_mobile_device(MobilePairRequest {
+                pairing_token: pairing.pairing_token.clone(),
+                device_name: "kidphone".to_string(),
+                platform: "android".to_string(),
+                vault_id: None,
+                storage_profile: None,
+            })
+            .await
+            .expect("pair mobile")
+            .bearer_token;
+        let bytes = b"kidsecret bytes".to_vec();
+        let reserved = service
+            .reserve_mobile_upload(
+                &kids_token,
+                MobileUploadRequest {
+                    original_filename: "kidsecret.jpg".to_string(),
+                    media_kind: MediaKind::Photo,
+                    mime_type: "image/jpeg".to_string(),
+                    bytes: bytes.len() as u64,
+                    content_hash: None,
+                    captured_at: None,
+                    place_hint: None,
+                },
+            )
+            .await
+            .expect("reserve upload");
+        let completed = service
+            .receive_mobile_upload(&kids_token, reserved.id, bytes)
+            .await
+            .expect("receive upload");
+        assert_eq!(completed.status, MobileUploadStatus::Completed);
+        let kid_asset = completed.asset_id.expect("asset id");
+
+        let mut state = service.state.write().await;
+        // The post-deletion state, built by hand because there is no vault
+        // deletion to call yet. Exactly what a delete would leave: the asset and
+        // its sealed record still name a vault that is no longer in the library.
+        state.vaults.retain(|vault| vault.id != kids.id);
+        assert_eq!(
+            state.vaults.len(),
+            1,
+            "precondition: only the Personal vault is left"
+        );
+        assert!(
+            state
+                .blob_records
+                .iter()
+                .any(|blob| blob.asset_id == kid_asset && blob.vault_id == kids.id),
+            "precondition: the asset's record still names the removed vault"
+        );
+        assert!(
+            state
+                .mobile_uploads
+                .iter()
+                .any(|upload| upload.asset_id == Some(kid_asset) && upload.vault_id == kids.id),
+            "precondition: its receipt still names the removed vault"
+        );
+
+        let records_before = state.blob_records.len();
+        refresh_blob_records(&config, &mut state);
+
+        assert_eq!(
+            state.blob_records.len(),
+            records_before,
+            "refresh must skip the orphaned asset, not mint a record for whichever \
+             vault happens to be first -- that seals one vault's originals under \
+             another vault's key"
+        );
+        assert!(
+            !state
+                .blob_records
+                .iter()
+                .any(|blob| blob.asset_id == kid_asset
+                    && state.vaults.iter().any(|vault| vault.id == blob.vault_id)),
+            "no record for the orphaned asset may name a vault that still exists"
         );
     }
 
