@@ -39,13 +39,22 @@ bad() {
 }
 
 if ! python3 -c "import yaml" >/dev/null 2>&1; then
+  # Pinned so a future PyYAML release cannot change the assertions' behaviour,
+  # and best-effort: the next check fails loudly if it did not work.
   python3 -m pip install --quiet "pyyaml==6.0.2" >/dev/null 2>&1 || true
 fi
 if ! python3 -c "import yaml" >/dev/null 2>&1; then
-  printf '  SKIP pyyaml is unavailable, so the workflow files cannot be parsed\n'
-  printf '  !! RELEASE_GATE_SUITE_DEGRADED: no pyyaml\n'
-  printf '  !! These assertions did NOT run; do not read this suite as a pass.\n'
-  exit 0
+  # This is a REQUIRED status check (`Security gates` in required-checks.json).
+  # Exiting 0 here would report the check green having run none of its
+  # assertions, which is a false pass on the check that is supposed to be the
+  # floor -- and it would also slip past the assertion floor below, since that
+  # lives after this early return. Failing closed is the only honest outcome:
+  # a security gate that could not parse the workflows has not verified them.
+  # `release_workflow_test.sh` already did exactly this; these two did not.
+  printf '  !! pyyaml is unavailable, so NO workflow assertion ran\n' >&2
+  printf '  !! Install it with: python3 -m pip install "pyyaml==6.0.2"\n' >&2
+  printf '  !! This is a required check and is failing rather than passing empty.\n' >&2
+  exit 1
 fi
 
 checks="$(python3 - "${WORKFLOWS_DIR}" <<'PYTHON'
