@@ -2,13 +2,25 @@
 #
 # The local inner loop. Its contract with CI is simple to state and was not
 # true until #84: every check CI runs must run here, with the same flags, so
-# "green locally" implies "green in CI". Two ways that promise used to break:
+# "green locally" implies "green in CI". Three ways that promise used to break:
 #
 #   * CI ran clippy with --all-features -D warnings and this script ran neither
 #     clippy nor a locked test, so a lint error or a stale lockfile only ever
 #     surfaced after a push.
-#   * CI ran `flutter test` (71 tests) and this script ran `flutter analyze`
-#     alone, so a broken widget test looked green until CI said otherwise.
+#   * CI ran `flutter test` and this script ran `flutter analyze` alone, so a
+#     broken widget test looked green until CI said otherwise. No test count is
+#     written here on purpose: it drifts on every added test and nothing asserts
+#     it, which is the same class of unverified claim this file is fixing.
+#   * CI ran workflow_hygiene_test.sh and required_checks_test.sh in the
+#     `security` job and this script ran neither, so a broken workflow contract
+#     -- a job that executes with the wrong secrets, or a required check that no
+#     longer matches ci.yml -- looked green until CI said otherwise. That is how
+#     the Release gate sat outside the required list for a release cycle (#102).
+#
+# The contract is one-directional on purpose. This script may be stricter than
+# CI (it also runs the api-list check, which CI does not) and that is fine:
+# CI is the merge gate, so "green in CI" not implying "green here" costs
+# nothing, while the reverse costs a broken push.
 #
 # Anything that genuinely needs hardware or an SDK the developer may not have is
 # skipped loudly rather than silently -- see the DEGRADED note at the release
@@ -64,8 +76,7 @@ fi
 # Structural tests for the things a reviewer cannot see in a diff: the workflow
 # files (which decide what code runs with which secrets) and the required-check
 # contract (which decides what gates a merge). Both are device-free and fast, so
-# there is no reason for them to be CI-only -- that was exactly how the Release
-# gate sat unrequired for a release cycle (#102).
+# there is no reason for them to be CI-only -- see the third bullet above.
 echo
 echo "[workflow-hygiene] .github/workflows structure"
 bash "${ROOT_DIR}/scripts/tests/workflow_hygiene_test.sh"

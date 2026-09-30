@@ -72,11 +72,12 @@ jobs:
         working-directory: app
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      # Same action and the same `cache: true` as release.yml's four Android
-      # jobs, deliberately: a build path that differs between CI and release is
-      # a build path that is not proven. No extra third-party action is
-      # introduced -- ubuntu-latest already ships a JDK and the Android SDK, and
-      # flutter-action's cache covers both pub and Gradle.
+      # Same actions and the same `cache: true` as the five release.yml jobs
+      # that build with Flutter (linux, windows, macos, android, ios): a build
+      # path that differs between CI and release is a build path that is not
+      # proven. No extra third-party action is introduced -- ubuntu-latest
+      # already ships a JDK and the Android SDK, and flutter-action's cache
+      # covers both pub and Gradle.
       - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2
         with:
           channel: stable
