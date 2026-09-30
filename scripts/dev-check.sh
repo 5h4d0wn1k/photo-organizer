@@ -1,20 +1,24 @@
 #!/usr/bin/env bash
 #
-# The host-local inner loop. Its contract with the shared Rust and Flutter CI
-# checks is that both use the same commands and feature flags. Platform-hosted
-# acceptance and provider integrations remain CI checks and are reported
-# separately; a local green run is not a substitute for them. Issue #84 fixed
-# two gaps in this shared local path:
+# The host-local inner loop. Shared Rust and Flutter checks use the same commands
+# and feature flags here as in CI. This is not a substitute for platform-hosted
+# acceptance, provider integrations, or the full CI result. Issue #84 fixed
+# three gaps in the shared local path:
 #
 #   * CI ran clippy with --all-features -D warnings and this script ran neither
 #     clippy nor a locked test, so a lint error or a stale lockfile only ever
 #     surfaced after a push.
-#   * CI ran `flutter test` (71 tests) and this script ran `flutter analyze`
-#     alone, so a broken widget test looked green until CI said otherwise.
+#   * CI ran `flutter test` and this script ran `flutter analyze` alone, so a
+#     broken widget test looked green until CI said otherwise. Test counts are
+#     omitted because nothing keeps a hard-coded count current.
+#   * CI ran workflow_hygiene_test.sh and required_checks_test.sh in the
+#     `security` job and this script ran neither, so a broken workflow contract
+#     looked green until CI said otherwise.
 #
-# A missing Rust or Flutter toolchain is an error, not a silent skip. The
-# device-free release-gate runner may report a named DEGRADED result when a
-# host-specific SDK is absent; it never reports that as full release evidence.
+# This script may run extra device-free checks that CI does not, such as the
+# API-list consistency check. A missing Rust or Flutter toolchain is an error,
+# not a silent skip. The release-gate runner may report a named DEGRADED result
+# when a host-specific SDK is absent; that is never full release evidence.
 
 set -euo pipefail
 
