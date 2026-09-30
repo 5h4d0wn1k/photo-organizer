@@ -65,6 +65,29 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      # Pin the interpreter rather than inheriting whatever python3 the runner
+      # image happens to ship. The test dependency is installed from a
+      # hash-pinned requirements file with --only-binary=:all:, so the install
+      # needs a published wheel. CPython 3.14 has no PyYAML 6.0.2 wheel, and on a
+      # fresh 3.14 interpreter pip refuses (correctly) instead of silently
+      # compiling the sdist. setup-python gives a fresh interpreter on every run,
+      # which is what makes --only-binary meaningful here: an interpreter that
+      # already has PyYAML would short-circuit the flags and verify nothing.
+      # Pinning 3.13 -- the newest minor with a wheel for this pin -- makes that
+      # impossible, and makes a future runner image change unable to alter what
+      # these suites run against.
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.13"
+      - name: Install hash-pinned test dependencies
+        run: |
+          set -euo pipefail
+          # --require-hashes verifies the digest of the artifact pip actually
+          # downloads; --only-binary=:all: forbids building from source. A suite
+          # must not install its own dependency at test time (issue #136): that
+          # made a required check's result depend on the network.
+          python -m pip install --disable-pip-version-check --require-hashes --only-binary=:all: \
+            -r scripts/requirements-test.txt
       - name: Shellcheck the release gate scripts
         run: |
           sudo apt-get update
@@ -95,6 +118,16 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
+      # See the identical step in the release-gate job for why the interpreter
+      # is pinned and why the install is hash-verified.
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.13"
+      - name: Install hash-pinned test dependencies
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check --require-hashes --only-binary=:all: \
+            -r scripts/requirements-test.txt
       - name: Secret scan
         uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3
         env:
@@ -130,6 +163,20 @@ jobs:
       # (#102). Device-free; see issue #104.
       - name: Required-checks contract
         run: bash scripts/tests/required_checks_test.sh
+      # The test dependency is declared, hash-pinned and installed once above
+      # (issue #136). These two prove the declaration is load-bearing rather than
+      # decorative:
+      #   - the generator refuses to emit a lockfile it cannot vouch for, and the
+      #     committed file is exactly what it emits;
+      #   - no suite reaches PyPI at test time, proven by interposing a python3
+      #     that records and refuses every pip call. Without that, a suite could
+      #     quietly reinstall its own dependency and a required check's verdict
+      #     would depend on the network again.
+      - name: Hash-pinned test dependencies
+        run: |
+          set -euo pipefail
+          bash scripts/tests/gen_test_requirements_test.sh
+          bash scripts/tests/suites_offline_test.sh
       - name: Generate SBOM
         uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
         with:

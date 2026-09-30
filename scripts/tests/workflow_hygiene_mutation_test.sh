@@ -393,6 +393,86 @@ else
 fi
 restore
 
+# 20-24. The hash-pinned test-dependency wiring (issue #136). The property being
+#     protected is that the suites get a verified PyYAML *before* they run, rather
+#     than installing their own dependency inside a required check.
+#
+#     Mutation 20 is the one that makes the rest meaningful. An earlier version of
+#     the flag assertion read the step's raw `run` text, and the release-gate
+#     install step's own comment contains the string `--require-hashes` -- so
+#     deleting the flag from the command left the comment to satisfy the check and
+#     the suite stayed green. These entries mutate the command only, so if the
+#     comment-stripping in step_text ever regresses, 20 and 21 go red instead of
+#     passing on a comment.
+CI="${ROOT_DIR}/.github/workflows/ci.yml"
+
+mutate "the install drops --require-hashes" \
+  "${CI}" \
+  'python -m pip install --disable-pip-version-check --require-hashes --only-binary=:all:|||python -m pip install --disable-pip-version-check --only-binary=:all:' \
+  "the install verifies what it downloads"
+
+mutate "the install drops --only-binary, so a wheelless interpreter silently compiles" \
+  "${CI}" \
+  'python -m pip install --disable-pip-version-check --require-hashes --only-binary=:all:|||python -m pip install --disable-pip-version-check --require-hashes ' \
+  "the install verifies what it downloads"
+
+mutate "the pinned interpreter is one with no published wheel (3.14)" \
+  "${CI}" \
+  '          python-version: "3.13"|||          python-version: "3.14"' \
+  "pins the interpreter"
+
+mutate "the pinned interpreter is left to float" \
+  "${CI}" \
+  '          python-version: "3.13"|||          python-version: "lts"' \
+  "pins the interpreter"
+
+# The install relocated to after the suites, which is the ordering failure. This
+# one is hand-rolled rather than a `mutate` call because a move is two edits and
+# `mutate` applies a single replacement: deleting the block instead would go red
+# on "provisions the test dependency" (no install at all) and pass a needle
+# scoped to "before use", which would be reporting the wrong reason as a bite.
+#
+# `setup-python` is deliberately left where it is, so the pinning assertions keep
+# passing and the ordering assertion is the only thing that can go red. A
+# mutation that trips several assertions at once is how a real regression gets
+# papered over behind a green suite.
+MUTATIONS_RUN=$((MUTATIONS_RUN + 1))
+restore
+# Built with printf rather than a literal so the trailing backslash of the pip
+# line survives: a move is two edits, and `apply` takes a single replacement, so
+# the block has to be reconstructed rather than deleted.
+NL=$'\n'
+# The security job's install step, verbatim. Deliberately WITHOUT the two
+# explanatory comment lines: those belong to the release-gate job's install step,
+# and a block that carried them would not be found here.
+INSTALL_BLOCK="$(printf '%s\n' \
+  '      - name: Install hash-pinned test dependencies' \
+  '        run: |' \
+  '          set -euo pipefail' \
+  '          python -m pip install --disable-pip-version-check --require-hashes --only-binary=:all: \' \
+  '            -r scripts/requirements-test.txt')"
+if ! apply "${CI}" "${INSTALL_BLOCK}|||" \
+  || ! apply "${CI}" "      - name: Generate SBOM${NL}|||${INSTALL_BLOCK}      - name: Generate SBOM${NL}"; then
+  mismatches+=("ordering: could not move the install step")
+elif out="$(bash "${SUITE}" 2>&1)" && rc=0; then
+  mismatches+=("ordering: SUITE STILL PASSED (the ordering assertion does not bite)")
+elif ! needle_matches "${out}" "provisions the test dependency before use"; then
+  mismatches+=("ordering: went red but not on 'provisions the test dependency before use'")
+  mismatches+=("        saw: $(grep -E '^  FAIL ' <<<"${out}" | head -3 | tr '\n' ' ')")
+elif grep -E '^  FAIL ' <<<"${out}" | grep -qF "pins the interpreter"; then
+  # The move should leave the pinning assertions green. If they went red too, this
+  # mutation is no longer isolating ordering, and "it went red" would no longer be
+  # evidence about the ordering assertion at all. Checked by looking for the FAIL
+  # line directly rather than through needle_matches, which deliberately only
+  # matches failures and so would report a passing assertion as a mismatch.
+  mismatches+=("ordering: the move also broke the pinning assertions, so it is not isolating ordering")
+  mismatches+=("        saw: $(grep -E '^  FAIL ' <<<"${out}" | head -3 | tr '\n' ' ')")
+else
+  MUTATIONS_BITING=$((MUTATIONS_BITING + 1))
+  printf '  bites  the install moves after the suites that need it\n'
+fi
+restore
+
 # The needle matcher decides whether the numbers above mean anything, so it is
 # checked rather than believed. Runs on a real mutation of its own, and restores.
 echo "== the needle matcher itself =="

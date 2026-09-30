@@ -1,6 +1,6 @@
 SHELL := /bin/bash
 
-.PHONY: help setup fmt lint test check audit flutter-analyze flutter-test release-linux-local release-gate workflow-hygiene workflow-hygiene-mutations canary canary-mutations
+.PHONY: help setup deps fmt lint test check audit flutter-analyze flutter-test release-linux-local release-gate workflow-hygiene workflow-hygiene-mutations canary canary-mutations
 
 help:
 	@echo "Photo Organizer dev targets:"
@@ -8,6 +8,7 @@ help:
 	@echo "  lint               cargo clippy -D warnings"
 	@echo "  test               cargo test (Rust workspace)"
 	@echo "  check              scripts/dev-check.sh (Rust + Flutter + release gate when available)"
+	@echo "  deps               install the hash-pinned test dependencies (scripts/requirements-test.txt)"
 	@echo "  audit              cargo audit"
 	@echo "  flutter-analyze    flutter analyze (app/)"
 	@echo "  flutter-test       flutter test (app/)"
@@ -21,6 +22,21 @@ help:
 setup:
 	@echo "Dependencies: stable Rust toolchain (rust-toolchain.toml), Flutter stable,"
 	@echo "and the libsecret/dbus/gtk dev packages listed in .github/workflows/release.yml."
+
+# The suites under scripts/tests/ parse YAML, so they need PyYAML. It is declared
+# and hash-pinned in scripts/requirements-test.txt and installed here (and once
+# per CI job) rather than by the suites themselves -- issue #136.
+#
+# CPython 3.8-3.13, on a FRESH environment. PyYAML 6.0.2 publishes no 3.14 wheel
+# and the install is --only-binary on purpose, so an unsupported interpreter is
+# refused rather than silently compiling the sdist into a different artifact than
+# every hash in the file authorises. "Fresh" is not a nicety: if PyYAML is already
+# installed, pip reports "Requirement already satisfied" and exits 0 without
+# resolving a wheel, so neither flag is exercised. To exercise them, use a new
+# venv.
+deps:
+	python3 -m pip install --disable-pip-version-check --require-hashes --only-binary=:all: \
+		-r scripts/requirements-test.txt
 
 fmt:
 	cargo fmt --all -- --check

@@ -41,13 +41,16 @@ bad() {
   fi
 }
 
+# PyYAML is a declared, hash-pinned test dependency (scripts/requirements-test.txt).
+# This suite does NOT install it -- see workflow_hygiene_test.sh for why, and
+# issue #136. `actions/setup-python` puts the pinned interpreter first on PATH.
 if ! python3 -c "import yaml" >/dev/null 2>&1; then
-  # Pinned so a future PyYAML release cannot change the assertions' behaviour,
-  # and best-effort: the next check fails loudly if it did not work.
-  python3 -m pip install --quiet "pyyaml==6.0.2" >/dev/null 2>&1 || true
-fi
-if ! python3 -c "import yaml" >/dev/null 2>&1; then
-  echo "PyYAML is required to run these tests" >&2
+  echo "PyYAML is required to run these tests." >&2
+  echo "Install the hash-pinned test dependencies with: make deps" >&2
+  echo "That needs CPython 3.8-3.13 on a FRESH environment: PyYAML 6.0.2 publishes" >&2
+  echo "no 3.14 wheel and the install is --only-binary, so it refuses rather than" >&2
+  echo "compiling the sdist. If PyYAML is already installed pip short-circuits and" >&2
+  echo "neither flag is exercised -- use a new venv to check." >&2
   exit 1
 fi
 
