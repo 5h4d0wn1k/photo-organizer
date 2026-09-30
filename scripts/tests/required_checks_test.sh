@@ -37,18 +37,20 @@ bad() {
   fi
 }
 
-if ! python3 -c "import yaml" >/dev/null 2>&1; then
-  # Pinned so a future PyYAML release cannot change the assertions' behaviour,
-  # and best-effort: the next check fails loudly if it did not work.
-  python3 -m pip install --quiet "pyyaml==6.0.2" >/dev/null 2>&1 || true
-fi
+# PyYAML is a declared, hash-pinned test dependency (scripts/requirements-test.txt).
+# This suite does NOT install it -- see workflow_hygiene_test.sh for why, and
+# issue #136. `actions/setup-python` puts the pinned interpreter first on PATH.
 if ! python3 -c "import yaml" >/dev/null 2>&1; then
   # Runs inside the REQUIRED `Security gates` check, so exiting 0 would report
   # that check green having asserted nothing -- and the job would go on to pass
   # every other step, making an unverified contract indistinguishable from a
   # verified one. Fail closed. `release_workflow_test.sh` already did this.
   printf '  !! pyyaml is unavailable, so NO required-checks assertion ran\n' >&2
-  printf '  !! Install it with: python3 -m pip install "pyyaml==6.0.2"\n' >&2
+  printf '  !! Install the hash-pinned test dependencies with: make deps\n' >&2
+  printf '  !! That needs CPython 3.8-3.13 on a FRESH environment: PyYAML 6.0.2\n' >&2
+  printf '  !!  publishes no 3.14 wheel and the install is --only-binary, so it refuses\n' >&2
+  printf '  !!  rather than compiling the sdist. If PyYAML is already installed pip\n' >&2
+  printf '  !!  short-circuits and neither flag is exercised -- use a new venv to check.\n' >&2
   printf '  !! This is a required check and is failing rather than passing empty.\n' >&2
   exit 1
 fi

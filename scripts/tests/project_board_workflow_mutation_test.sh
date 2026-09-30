@@ -124,8 +124,16 @@ mutate "keying concurrency on the head ref again is caught" \
   '  group: project-board-${{ github.event_name }}-${{ github.event.pull_request.number || github.event.issue.number || github.sha }}|||  group: project-board-${{ github.event.pull_request.head.ref }}' \
   'FAIL the concurrency group is keyed on a number, not on a head ref'
 
+# The step's command is a block rather than a scalar, because the three board
+# suites that previously ran only under `make` were added to it. The anchor
+# follows the shape actually in the file, with a real trailing newline: this
+# harness partitions on `|||` and does no unescaping, so a `\n` written into the
+# anchor would be two literal characters and would never match. A stale anchor is
+# reported as "mutation did not apply", which is the harness saying it could not
+# make the mutation -- not the suite having stopped covering anything.
 mutate "removing the parser suite step is caught" \
-  '        run: bash scripts/tests/project_board_refs_test.sh|||        run: true' \
+  '          bash scripts/tests/project_board_refs_test.sh
+' \
   'FAIL the parser suite runs as a step of the board job'
 
 mutate "removing the helper suite step is caught" \

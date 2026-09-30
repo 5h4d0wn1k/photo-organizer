@@ -51,3 +51,8 @@ tmp/
 __pycache__/
 *.py[cod]
 .gradle-home/
+
+# The interpreter venv `make venv` builds for the hash-pinned test suites.
+# Ignored so a developer's local venv cannot be committed by accident.
+.venv-test/
+.venv/

@@ -393,6 +393,149 @@ else
 fi
 restore
 
+# 20-24. The hash-pinned test-dependency wiring (issue #136). The property being
+#     protected is that the suites get a verified PyYAML *before* they run, rather
+#     than installing their own dependency inside a required check.
+#
+#     Mutation 20 is the one that makes the rest meaningful. An earlier version of
+#     the flag assertion read the step's raw `run` text, and the release-gate
+#     install step's own comment contains the string `--require-hashes` -- so
+#     deleting the flag from the command left the comment to satisfy the check and
+#     the suite stayed green. These entries mutate the command only, so if the
+#     comment-stripping in step_text ever regresses, 20 and 21 go red instead of
+#     passing on a comment.
+CI="${ROOT_DIR}/.github/workflows/ci.yml"
+
+mutate "the install drops --require-hashes" \
+  "${CI}" \
+  'python -m pip install --disable-pip-version-check --require-hashes --only-binary=:all:|||python -m pip install --disable-pip-version-check --only-binary=:all:' \
+  "the install verifies what it downloads"
+
+mutate "the install drops --only-binary, so a wheelless interpreter silently compiles" \
+  "${CI}" \
+  'python -m pip install --disable-pip-version-check --require-hashes --only-binary=:all:|||python -m pip install --disable-pip-version-check --require-hashes ' \
+  "the install verifies what it downloads"
+
+mutate "the pinned interpreter is one with no published wheel (3.14)" \
+  "${CI}" \
+  '          python-version: "3.13"|||          python-version: "3.14"' \
+  "pins the interpreter"
+
+mutate "the pinned interpreter is left to float" \
+  "${CI}" \
+  '          python-version: "3.13"|||          python-version: "lts"' \
+  "pins the interpreter"
+
+# The "is wired into CI" assertions. These exist because the first version of them
+# was `if suite in open(ci_path).read()`, and I showed that is comment-satisfiable:
+# commenting out the invocation and leaving the suite named in a shell comment kept
+# all 373 assertions green.
+#
+# The anchors below include the leading `bash ` and are therefore unique. They have
+# to be: the bare suite path also appears in the workflow's ShellCheck argument
+# list, and `apply` replaces the FIRST occurrence, so a bare-path anchor mutated the
+# linter argument list, left the real execution untouched, and the assertion correctly
+# stayed green. A mutation that does not bite because it hit the wrong line is
+# indistinguishable from a missing assertion unless you read which line changed --
+# so `apply` reports it and these anchors are written to be single-occurrence.
+mutate "the generator test suite is commented out of CI" \
+  "${CI}" \
+  '          bash scripts/tests/gen_test_requirements_test.sh|||          # bash scripts/tests/gen_test_requirements_test.sh' \
+  "gen_test_requirements_test.sh is wired into CI"
+
+mutate "the offline-proof suite is commented out of CI" \
+  "${CI}" \
+  '          bash scripts/tests/suites_offline_test.sh|||          # bash scripts/tests/suites_offline_test.sh' \
+  "suites_offline_test.sh is wired into CI"
+
+# And the case a step-name check would also accept: the step's title and a shell
+# comment both name the suite, while the command runs something else entirely. The
+# replacement deliberately mentions the suite NOT AT ALL, because an `echo` naming
+# it would legitimately satisfy a substring check on the command.
+mutate "the step names the offline suite but runs something else" \
+  "${CI}" \
+  '          bash scripts/tests/suites_offline_test.sh|||          bash -c "true"' \
+  "suites_offline_test.sh is wired into CI"
+
+# And the step deleted outright, which is the way someone would "work around a
+# flake". The count is unchanged here (a line was removed, not a step), so this
+# needs its own mutation.
+mutate "the hash-pinned test dependencies step is deleted" \
+  "${CI}" \
+  '      - name: Hash-pinned test dependencies\n        run: |\n          set -euo pipefail\n          bash scripts/tests/gen_test_requirements_test.sh\n          bash scripts/tests/suites_offline_test.sh\n|||' \
+  "wired into CI"
+
+# The install relocated to after the suites, which is the ordering failure. This
+# one is hand-rolled rather than a `mutate` call because a move is two edits and
+# `mutate` applies a single replacement: deleting the block instead would go red
+# on "provisions the test dependency" (no install at all) and pass a needle
+# scoped to "before use", which would be reporting the wrong reason as a bite.
+#
+# `setup-python` is deliberately left where it is, so the pinning assertions keep
+# passing and the ordering assertion is the only thing that can go red. A
+# mutation that trips several assertions at once is how a real regression gets
+# papered over behind a green suite.
+MUTATIONS_RUN=$((MUTATIONS_RUN + 1))
+restore
+# Built with printf rather than a literal so the trailing backslash of the pip
+# line survives: a move is two edits, and `apply` takes a single replacement, so
+# the block has to be reconstructed rather than deleted.
+NL=$'\n'
+# The security job's install step, verbatim. Deliberately WITHOUT the two
+# explanatory comment lines: those belong to the release-gate job's install step,
+# and a block that carried them would not be found here.
+#
+# The trailing ${NL} is load-bearing and was a real bug. Command substitution
+# strips trailing newlines, so the block as first written ended without one, and
+# re-inserting it before `      - name: Generate SBOM` GLUED the two together:
+# the SBOM step's name line was absorbed into the install step's literal `run`
+# scalar and the step was destroyed as collateral. The suite still went red on
+# the ordering assertion, so it reported "bites" while quietly mutating a second
+# unrelated thing -- and the isolation guard below only ever looked for FAIL
+# lines, so it could not see the deletion. Step counting is what catches that
+# class of collateral now.
+INSTALL_BLOCK="$(printf '%s\n' \
+  '      - name: Install hash-pinned test dependencies' \
+  '        run: |' \
+  '          set -euo pipefail' \
+  '          python -m pip install --disable-pip-version-check --require-hashes --only-binary=:all: \' \
+  '            -r scripts/requirements-test.txt')"${NL}
+
+# The step count must survive the move. `grep -c` on the step-name key is enough:
+# it is a structural property of the file, needs no YAML parser, and a destroyed
+# or duplicated step changes it. Asserted on the pristine file first, so a
+# mismatch cannot be blamed on the mutation.
+STEP_COUNT_BEFORE="$(grep -c '^      - name:' "${CI}")"
+if [[ "${STEP_COUNT_BEFORE}" -lt 1 ]]; then
+  mismatches+=("ordering: could not count steps in the pristine ci.yml (${STEP_COUNT_BEFORE})")
+fi
+if ! apply "${CI}" "${INSTALL_BLOCK}|||" \
+  || ! apply "${CI}" "      - name: Generate SBOM${NL}|||${INSTALL_BLOCK}      - name: Generate SBOM${NL}"; then
+  mismatches+=("ordering: could not move the install step")
+elif [[ "$(grep -c '^      - name:' "${CI}")" != "${STEP_COUNT_BEFORE}" ]]; then
+  # Caught before the suite runs, because "the suite went red" is not evidence
+  # that it went red about ordering rather than about a step this mutation broke.
+  mismatches+=("ordering: the move changed the number of steps, so it mutates something else too")
+  mismatches+=("        steps before=${STEP_COUNT_BEFORE} after=$(grep -c '^      - name:' "${CI}")")
+elif out="$(bash "${SUITE}" 2>&1)" && rc=0; then
+  mismatches+=("ordering: SUITE STILL PASSED (the ordering assertion does not bite)")
+elif ! needle_matches "${out}" "provisions the test dependency before use"; then
+  mismatches+=("ordering: went red but not on 'provisions the test dependency before use'")
+  mismatches+=("        saw: $(grep -E '^  FAIL ' <<<"${out}" | head -3 | tr '\n' ' ')")
+elif grep -E '^  FAIL ' <<<"${out}" | grep -qF "pins the interpreter"; then
+  # The move should leave the pinning assertions green. If they went red too, this
+  # mutation is no longer isolating ordering, and "it went red" would no longer be
+  # evidence about the ordering assertion at all. Checked by looking for the FAIL
+  # line directly rather than through needle_matches, which deliberately only
+  # matches failures and so would report a passing assertion as a mismatch.
+  mismatches+=("ordering: the move also broke the pinning assertions, so it is not isolating ordering")
+  mismatches+=("        saw: $(grep -E '^  FAIL ' <<<"${out}" | head -3 | tr '\n' ' ')")
+else
+  MUTATIONS_BITING=$((MUTATIONS_BITING + 1))
+  printf '  bites  the install moves after the suites that need it\n'
+fi
+restore
+
 # The needle matcher decides whether the numbers above mean anything, so it is
 # checked rather than believed. Runs on a real mutation of its own, and restores.
 echo "== the needle matcher itself =="

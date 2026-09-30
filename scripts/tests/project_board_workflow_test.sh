@@ -137,9 +137,14 @@ assert_true() {
   fi
 }
 
+# Non-zero, not zero. This suite became a step of the board job's required check
+# in this change, and a step that exits 0 without running an assertion is a green
+# run that proves nothing -- which is the specific failure this suite exists to
+# catch, one level up. A plain SUITE_DEGRADED marker is enforced nowhere, unlike
+# RELEASE_GATE_SUITE_DEGRADED, which the release-gate driver greps for.
 if ! python3 -c "import yaml,sys; yaml.safe_load(open(sys.argv[1]))" "${WORKFLOW}" 2>/dev/null; then
   printf '  !! SUITE_DEGRADED: %s does not parse as YAML\n' "${WORKFLOW}" >&2
-  exit 0
+  exit 1
 fi
 
 # --- The parser is wired in, and the inline over-match is gone -------------

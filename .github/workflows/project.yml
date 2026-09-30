@@ -74,7 +74,11 @@ jobs:
         # These suites and the parser itself are files in the repository, so the
         # checkout above is load-bearing: without it this step fails with
         # "No such file or directory", which is how it first failed in CI.
-        run: bash scripts/tests/project_board_refs_test.sh
+        run: |
+          bash scripts/tests/project_board_refs_test.sh
+          bash scripts/tests/project_board_workflow_test.sh
+          bash scripts/tests/project_board_refs_mutation_test.sh
+          bash scripts/tests/project_board_workflow_mutation_test.sh
 
       - name: Parse closing references
         id: refs

@@ -42,15 +42,22 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# A suite that cannot run must not exit 0. This suite is a CI step, so exiting 0
+# here turned a green required check into one that had asserted nothing -- and
+# nothing downstream looked for the marker. The release-gate driver greps for
+# RELEASE_GATE_SUITE_DEGRADED; CANARY_SUITE_DEGRADED was invented here and enforced
+# nowhere, which is exactly the gap a marker without an enforcer leaves open. The
+# marker is kept because it names the cause in the log, but the exit status is what
+# actually fails the run.
 if ! python3 -c "import yaml" >/dev/null 2>&1; then
-  printf '  SKIP pyyaml is unavailable, so the workflow fixtures cannot be written\n'
+  printf '  FAIL pyyaml is unavailable, so the workflow fixtures cannot be written\n'
   printf '  !! CANARY_SUITE_DEGRADED: no pyyaml\n'
-  exit 0
+  exit 1
 fi
 if ! command -v shellcheck >/dev/null 2>&1; then
-  printf '  SKIP shellcheck is unavailable; the script under test is not checked\n'
+  printf '  FAIL shellcheck is unavailable; the script under test is not checked\n'
   printf '  !! CANARY_SUITE_DEGRADED: no shellcheck\n'
-  exit 0
+  exit 1
 fi
 
 # ---------------------------------------------------------------------------
