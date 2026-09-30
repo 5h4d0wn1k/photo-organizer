@@ -394,9 +394,11 @@ import sys
 import yaml
 
 # The supported-interpreter range is a property of the lockfile's pin, so it is
-# read from the generator that produced the lockfile rather than restated here.
-# Two copies of that number would drift, and the drift would only show up as a
-# confusing pip failure in CI.
+# read from the lockfile itself rather than restated here or held as a constant in
+# the generator. The generator derives it from the artifact filenames and renders
+# it into the header; the header is what round-trip equality proves, so a
+# hand-edited range cannot survive. Two independent copies of that number would
+# drift, and the drift would only show up as a confusing pip failure in CI.
 import importlib.util
 
 workflows_dir = sys.argv[1]
@@ -409,10 +411,25 @@ _spec = importlib.util.spec_from_file_location(
 )
 _generator = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_generator)
-MIN_WHEEL_CPYTHON = _generator.MIN_CPYTHON_WITH_WHEEL
-MAX_WHEEL_CPYTHON = _generator.MAX_CPYTHON_WITH_WHEEL
 REQUIREMENTS_PACKAGE = _generator.PACKAGE
 REQUIREMENTS_VERSION = _generator.VERSION
+
+# The range the generator derived from the artifact list, as it stands in the
+# committed lockfile's header. If the header cannot be parsed the range is
+# unknown, and every assertion below that depends on it has to fail rather than
+# fall back to a default -- a default here is exactly the "unasserted precondition"
+# failure mode, and it would let the check pass for a lockfile that says nothing.
+_range_body = ""
+_range_path = os.path.join(repo_root, "scripts", "requirements-test.txt")
+if os.path.isfile(_range_path):
+    with open(_range_path, encoding="utf-8") as _handle:
+        _range_body = _handle.read()
+_range_match = _generator.CP_RANGE_IN_HEADER.search(_range_body)
+if not _range_match:
+    MIN_WHEEL_CPYTHON = MAX_WHEEL_CPYTHON = None
+else:
+    MIN_WHEEL_CPYTHON = int(_range_match.group(1))
+    MAX_WHEEL_CPYTHON = int(_range_match.group(2))
 
 results = []
 
@@ -453,6 +470,22 @@ def step_text(step):
         line for line in str(step.get("run", "")).splitlines() if not line.strip().startswith("#")
     )
     return " ".join([command] + [str(step.get(key, "")) for key in ("name", "uses", "with")])
+
+
+def step_command(step):
+    """Only the command a step executes, with shell comments stripped.
+
+    Narrower than step_text on purpose. step_text also folds in `name`, `uses` and
+    `with`, which is right for asking "does this step have anything to do with X"
+    and wrong for asking "does this step RUN X": a step named
+    "Run gen_test_requirements_test.sh" whose `run` is commented out satisfies
+    step_text while executing nothing. Mutation-tested: commenting out the
+    invocation, and naming the suite while running something else, both fail only
+    because this function ignores the name.
+    """
+    return "\n".join(
+        line for line in str(step.get("run", "")).splitlines() if not line.strip().startswith("#")
+    )
 
 
 def is_install_step(step):
@@ -570,11 +603,22 @@ for job_name, job in sorted(jobs.items()):
     except ValueError:
         no(f"{job_name}: pins the interpreter", f"cannot read a minor from {version!r}")
         continue
+    # The range is read from the committed lockfile, so a lockfile whose header
+    # no longer states it must fail here rather than skip the comparison. `None`
+    # compares false against every value, so this cannot be satisfied by accident.
+    if MIN_WHEEL_CPYTHON is None:
+        no(
+            f"{job_name}: pins the interpreter",
+            "the committed lockfile states no CPython range, so the pinned "
+            f"interpreter {version} cannot be checked against it. Regenerate the "
+            "lockfile with scripts/gen_test_requirements.py.",
+        )
+        continue
     if not MIN_WHEEL_CPYTHON <= minor <= MAX_WHEEL_CPYTHON:
         no(
             f"{job_name}: pins the interpreter",
             f"python {version} is outside CPython "
-            f"{MIN_WHEEL_CPYTHON}.{MIN_WHEEL_CPYTHON}-{MAX_WHEEL_CPYTHON}, the range for "
+            f"3.{MIN_WHEEL_CPYTHON}-3.{MAX_WHEEL_CPYTHON}, the range for "
             f"which {REQUIREMENTS_PACKAGE}=={REQUIREMENTS_VERSION} publishes a wheel. "
             "CI's interpreter is always fresh, so --only-binary is exercised and the "
             "install would fail -- but with an error that blames the package rather "
@@ -584,19 +628,48 @@ for job_name, job in sorted(jobs.items()):
     ok(f"{job_name}: pins the interpreter", f"actions/setup-python@{ref[:12]} python {version}")
 
 # The new suites have to actually run somewhere, or they are decoration.
-ci_text = open(ci_path, encoding="utf-8").read()
+#
+# "Actually run" means an INVOCATION, not a mention. Three weaker forms were each
+# demonstrated to pass while the suite ran nowhere:
+#   * `if suite in open(ci_path).read()` is satisfied by a shell comment naming it;
+#   * checking the step's `name` as well is satisfied by a step titled after the
+#     suite whose `run` is commented out;
+#   * checking the step's command for the bare path is satisfied by this workflow's
+#     own ShellCheck argument list, which is a `run:` block naming every script it
+#     lints -- including these two. I introduced that list while fixing a different
+#     review finding, and it silently defanged these two assertions.
+# So the command has to contain the suite as an argument to an interpreter or to
+# `.`, which is what "executes it" means.
+INVOCATION_TEMPLATES = (r"(?:^|[\s;&|(])(?:bash|sh|zsh|dash|env|source|\./)\s+[\w./-]*%s\b",)
 for suite in ("gen_test_requirements_test.sh", "suites_offline_test.sh"):
-    if suite in ci_text:
-        ok(f"{suite} is wired into CI")
+    pattern = re.compile(
+        "|".join(template % re.escape(suite) for template in INVOCATION_TEMPLATES),
+        re.M,
+    )
+    invoking = [
+        f"{job_name} step {i}"
+        for job_name, job in sorted(jobs.items())
+        for i, step in enumerate(job.get("steps") or [])
+        if pattern.search(step_command(step))
+    ]
+    if invoking:
+        ok(f"{suite} is wired into CI", f"executed by {', '.join(invoking)}")
     else:
-        no(f"{suite} is wired into CI", "no step in ci.yml invokes it")
+        no(
+            f"{suite} is wired into CI",
+            "no step in ci.yml executes it; naming it in a comment, a step title, "
+            "or the ShellCheck argument list is not an execution",
+        )
 
 # And the lockfile itself has to be committed, not generated into the runner.
 requirements_path = os.path.join(repo_root, requirements_rel)
 if os.path.isfile(requirements_path):
     with open(requirements_path, encoding="utf-8") as handle:
         body = handle.read()
-    hashes = re.findall(r"--hash=sha256:([0-9a-f]{64})", body)
+    # The lookahead rejects an over-long digest rather than counting its first
+    # 64 characters -- otherwise a 65-character digest would satisfy a floor
+    # that exists to catch truncation.
+    hashes = re.findall(r"--hash=sha256:([0-9a-f]{64})(?![0-9A-Za-z])", body)
     if hashes:
         ok(requirements_rel, f"committed, {len(hashes)} hashes")
     else:

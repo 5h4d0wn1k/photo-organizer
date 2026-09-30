@@ -106,7 +106,15 @@ jobs:
             scripts/tests/android_release_signing_test.sh \
             scripts/tests/apksigner_gate_test.sh \
             scripts/tests/android_release_artifact_smoke_test.sh \
-            scripts/tests/run_release_gate_tests.sh
+            scripts/tests/run_release_gate_tests.sh \
+            scripts/tests/gen_test_requirements_test.sh \
+            scripts/tests/suites_offline_test.sh \
+            scripts/tests/workflow_hygiene_test.sh \
+            scripts/tests/workflow_hygiene_mutation_test.sh \
+            scripts/tests/gen_test_requirements_mutation_test.sh \
+            scripts/tests/tests_wiring_test.sh \
+            scripts/tests/tests_wiring_mutation_test.sh \
+            scripts/tests/required_checks_test.sh
       - name: Run the release gate tests
         run: bash scripts/tests/run_release_gate_tests.sh
 
@@ -147,6 +155,8 @@ jobs:
       # 3.6s. Proves the hygiene assertions above actually fail when the
       # workflow files or dependabot.yml drift. Without it, "the pins are
       # checked" is a claim about a comment rather than about behaviour.
+      - name: Test-suite wiring
+        run: bash scripts/tests/tests_wiring_test.sh
       - name: Workflow hygiene mutation pass
         run: bash scripts/tests/workflow_hygiene_mutation_test.sh
       # The canary reads required-checks.json and the workflow files, and
@@ -177,6 +187,17 @@ jobs:
           set -euo pipefail
           bash scripts/tests/gen_test_requirements_test.sh
           bash scripts/tests/suites_offline_test.sh
+      # A mutation pass that is not itself run is decoration. `bash -c true` in its
+      # place was demonstrated to leave a mutation pass reporting green while its
+      # suite had stopped running at all, and the suite above is what would have
+      # caught that -- if anything had. The two mutation passes run offline, in
+      # seconds, and they are the reason the assertions above can be believed.
+      - name: Mutation passes
+        run: |
+          set -euo pipefail
+          bash scripts/tests/gen_test_requirements_mutation_test.sh
+          bash scripts/tests/tests_wiring_mutation_test.sh
+          bash scripts/tests/workflow_hygiene_mutation_test.sh
       - name: Generate SBOM
         uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
         with:

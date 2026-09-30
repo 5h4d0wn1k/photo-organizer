@@ -28,11 +28,15 @@ Usage
     # print to stdout instead of writing
     python3 scripts/gen_test_requirements.py --stdout
 
-    # offline, from a saved PyPI JSON response (used by the tests)
-    python3 scripts/gen_test_requirements.py --from-json pypi.json --stdout
+    # offline, from the recorded PyPI response this pin was generated from
+    python3 scripts/gen_test_requirements.py --from-json \
+        scripts/tests/fixtures/pyyaml-6.0.2-pypi.json --stdout
 
-`render_requirements` and `validate_artifacts` are pure: no network, no clock, no
-filesystem. That is what the tests exercise.
+`render_requirements`, `validate_artifacts`, `cpython_wheel_range`,
+`extract_artifacts` and `render_file` are pure: no network, no clock, no
+filesystem. The write path -- `main`, its flags, and the file it produces -- is
+exercised too, through `main()` with `--from-json --output` aimed at a temporary
+path, so the CLI is not the one uncovered corner.
 """
 
 from __future__ import annotations
@@ -50,24 +54,69 @@ VERSION = "6.0.2"
 # Where the generated file lives, relative to the repository root.
 OUTPUT_RELATIVE_PATH = "scripts/requirements-test.txt"
 
+# The recorded PyPI response this pin was generated from. Committed so the
+# artifact list -- filenames included -- is available offline, which is what makes
+# the header's wheel-range claim DERIVED rather than transcribed, and what makes the
+# artifact-count floor a comparison against a recorded list rather than a bare
+# literal. Regenerating from it must reproduce the committed lockfile byte for byte.
+FIXTURE_RELATIVE_PATH = "scripts/tests/fixtures/pyyaml-6.0.2-pypi.json"
+
 PYPI_JSON_URL = "https://pypi.org/pypi/{package}/{version}/json"
 
-# The range of CPython minors for which this pin publishes a wheel, measured from
-# the artifact set PyPI returned for 6.0.2: cp38, cp39, cp310, cp311, cp312, cp313.
-# There is no cp314 wheel, which is why CI pins an interpreter from this range and
-# why the install is --only-binary.
+# The range of CPython minors for which this pin publishes a wheel is NOT written
+# down here. It used to be, as MIN_CPYTHON_WITH_WHEEL = 8 / MAX = 13, and that was
+# the weakest part of the design: it is the number that decides whether CI's
+# install can work at all, it cannot be checked offline, and nothing connected it
+# to the artifact list -- so `gen_test_requirements.py --version 6.0.3` would
+# regenerate a lockfile whose header still claimed 6.0.2's wheel coverage.
 #
-# This is a property of the pin, not of the tool, so it must be re-measured when
-# the version is bumped: regenerate the lockfile, then update these two numbers to
-# whatever the new artifact set says. A CI job pinned to a minor above this range
-# does not fail in a way that names the cause -- pip says "Could not find a
-# version that satisfies the requirement pyyaml==6.0.2 (from versions: 6.0.3)",
-# which reads as a bad pin rather than a missing wheel. The test asserts the
-# pinned interpreter stays inside the range so that failure cannot be reached by
-# editing ci.yml. That assertion is worth its keep even though the check is
-# belt-and-braces: it names the cause, while pip's message does not.
-MIN_CPYTHON_WITH_WHEEL = 8
-MAX_CPYTHON_WITH_WHEEL = 13
+# It is now derived by `cpython_wheel_range` from the filenames the artifact list
+# actually carries, and rendered into the header. That closes the staleness: the
+# header cannot claim a range the artifact set does not support, because the header
+# *is* a function of the artifact set. The hygiene test reads the range back out
+# of the committed header rather than from a constant, so a CI interpreter pinned
+# outside the derived range still fails.
+#
+# Why the range matters at all: a CI job pinned to a minor above it does not fail
+# in a way that names the cause -- pip says "Could not find a version that
+# satisfies the requirement pyyaml==6.0.2 (from versions: 6.0.3)", which reads as a
+# bad pin rather than a missing wheel. The hygiene assertion is worth its keep
+# even though it is belt-and-braces: it names the cause, while pip's message does
+# not.
+#
+# What remains unverified, and is the same boundary as the digests: nothing here
+# compares the artifact list against PyPI. `python3 scripts/gen_test_requirements.py`
+# fetches it, and `--from-json` replays a saved response offline. A hand-edited
+# header is caught, because round-trip equality re-derives it.
+_CP_TAG = re.compile(r"-cp3(\d+)(?:[a-z]{1,2})?-(?:cp3\d+|abi3)-")
+
+
+def cpython_wheel_range(artifacts: Sequence[tuple[str, str]]) -> tuple[int, int]:
+    """Derive (min, max) CPython minor for which `artifacts` publishes a wheel.
+
+    Pure, and the single source of the range the header states and the hygiene
+    test enforces. Reads the `-cp3XX-` interpreter tag out of each wheel
+    filename; sdists and wheels for other interpreters (abi3, pp*) are skipped
+    rather than guessed at.
+
+    Raises ValueError when no wheel carries a CPython tag. That is the case where
+    the header could not state a range honestly, and --only-binary would refuse
+    every CPython interpreter, so it must not be rendered as though it would not.
+    """
+    minors: set[int] = set()
+    for filename, _ in artifacts:
+        if not filename.endswith(".whl"):
+            continue
+        match = _CP_TAG.search(filename)
+        if match:
+            minors.add(int(match.group(1)))
+    if not minors:
+        raise ValueError(
+            "no artifact is a CPython wheel, so the file cannot state which "
+            "interpreters it supports; check that the PyPI response is for the "
+            f"right package and version before trusting it ({len(artifacts)} artifacts read)"
+        )
+    return min(minors), max(minors)
 
 # pip normalises names for comparison: runs of -_. collapse to a single - and the
 # result is lowercased. The wheel filenames on PyPI use the project's own
@@ -297,13 +346,20 @@ def render_requirements(
     return "\n".join(lines)[:-2].rstrip() + "\n"
 
 
-def file_header(package: str, version: str) -> str:
+CP_RANGE_IN_HEADER = re.compile(
+    r"^# CPython 3\.(\d+) through 3\.(\d+) for this pin\.$", re.M
+)
+
+
+def file_header(package: str, version: str, cp_min: int, cp_max: int) -> str:
     """The comment block that explains the file to the next person who reads it.
 
-    Deliberately a function of (package, version) only. Anything derived from the
-    artifact list is not recoverable from the rendered file, which would break the
-    round-trip equality that proves the committed file is exactly what this tool
-    emits.
+    A function of (package, version, cp_min, cp_max) and of nothing else, and all
+    four come from the artifact list -- the range is derived, not transcribed. It
+    used to be a function of (package, version) alone and ignored both, which meant
+    a version bump silently kept the old pin's wheel-coverage claim. Deriving it
+    keeps that impossible without needing a comment inside the requirement block,
+    which pip ignores (and the trailing form of which it rejects outright).
     """
     return (
         f"# Hash-pinned test dependencies (issue #136).\n"
@@ -311,18 +367,23 @@ def file_header(package: str, version: str) -> str:
         f"# GENERATED FILE -- do not hand-edit. Regenerate with:\n"
         f"#     python3 scripts/gen_test_requirements.py\n"
         f"#\n"
+        f"# Package: {package}=={version}\n"
+        f"#\n"
         f"# Install with:\n"
         f"#     python3 -m pip install --require-hashes --only-binary=:all: \\\n"
         f"#         -r {OUTPUT_RELATIVE_PATH}\n"
         f"#\n"
         f"# --require-hashes makes pip verify the digest of the artifact it actually\n"
         f"# downloads, which is the property a bare `==` pin does not have.\n"
-        f"# --only-binary=:all: forbids building from source. That is deliberate: as of\n"
-        f"# this pin there is no wheel for CPython 3.14, so on a FRESH 3.14 interpreter\n"
-        f"# pip refuses instead of silently compiling the sdist. A silent compile is a\n"
-        f"# different artifact from every digest listed here, built by whatever\n"
-        f"# toolchain happens to be present, and it is the exact failure mode -- slow,\n"
-        f"# environment-dependent, and invisible -- that this file exists to remove.\n"
+        f"# --only-binary=:all: forbids building from source. That is deliberate:\n"
+        f"# the newest interpreter this pin has a wheel for is 3.{cp_max}, so on a\n"
+        f"# FRESH interpreter above it pip refuses instead of silently compiling the\n"
+        f"# sdist. A silent compile is a different artifact from every digest listed\n"
+        f"# here, built by whatever toolchain happens to be present, and it is the\n"
+        f"# exact failure mode -- slow, environment-dependent, and invisible -- that\n"
+        f"# this file exists to remove.\n"
+        f"#\n"
+        f"# CPython 3.{cp_min} through 3.{cp_max} for this pin.\n"
         f"#\n"
         f"# The qualification 'fresh' is load-bearing and was measured, not assumed. If\n"
         f"# PyYAML is already installed, pip reports 'Requirement already satisfied' and\n"
@@ -348,11 +409,16 @@ def file_header(package: str, version: str) -> str:
         f"# check that a digest is the digest of the real artifact: a digest edited,\n"
         f"# reordered or removed in place still round-trips. The check on that is\n"
         f"# --require-hashes above, which pip runs against the bytes it actually\n"
-        f"# downloads, in CI, on every run.\n"
+        f"# downloads, in CI, on every run. Nor can any offline check prove the list is\n"
+        f"# complete: the floor detects shrinkage, not a PyPI release that adds an\n"
+        f"# artifact. Regenerate from a live response to establish that.\n"
         f"#\n"
-        f"# PyPI does not allow replacing a file that has already been published for\n"
-        f"# a given version, so this list cannot silently go stale; the risk is a\n"
-        f"# hand-edited version bump, which is why the file is generated.\n"
+        f"# PyPI does not normally re-release a file under a name that already exists\n"
+        f"# for a given version, but it is not structurally impossible, and if it did the\n"
+        f"# consequence would be a LOUD one rather than a silent one: --require-hashes\n"
+        f"# rejects the substituted bytes and a required check goes red. The realistic\n"
+        f"# staleness risk is the opposite -- a version bump that does not regenerate this\n"
+        f"# file -- which is why the file is generated rather than maintained by hand.\n"
     )
 
 
@@ -362,7 +428,11 @@ def render_file(
     version: str = VERSION,
 ) -> str:
     validate_artifacts(artifacts, package=package, version=version)
-    return file_header(package, version) + render_requirements(artifacts, package, version)
+    cp_min, cp_max = cpython_wheel_range(artifacts)
+    return (
+        file_header(package, version, cp_min, cp_max)
+        + render_requirements(artifacts, package, version)
+    )
 
 
 def fetch_pypi_json(url: str, timeout: int = 60) -> dict:

@@ -426,6 +426,45 @@ mutate "the pinned interpreter is left to float" \
   '          python-version: "3.13"|||          python-version: "lts"' \
   "pins the interpreter"
 
+# The "is wired into CI" assertions. These exist because the first version of them
+# was `if suite in open(ci_path).read()`, and I showed that is comment-satisfiable:
+# commenting out the invocation and leaving the suite named in a shell comment kept
+# all 373 assertions green.
+#
+# The anchors below include the leading `bash ` and are therefore unique. They have
+# to be: the bare suite path also appears in the workflow's ShellCheck argument
+# list, and `apply` replaces the FIRST occurrence, so a bare-path anchor mutated the
+# linter argument list, left the real execution untouched, and the assertion correctly
+# stayed green. A mutation that does not bite because it hit the wrong line is
+# indistinguishable from a missing assertion unless you read which line changed --
+# so `apply` reports it and these anchors are written to be single-occurrence.
+mutate "the generator test suite is commented out of CI" \
+  "${CI}" \
+  '          bash scripts/tests/gen_test_requirements_test.sh|||          # bash scripts/tests/gen_test_requirements_test.sh' \
+  "gen_test_requirements_test.sh is wired into CI"
+
+mutate "the offline-proof suite is commented out of CI" \
+  "${CI}" \
+  '          bash scripts/tests/suites_offline_test.sh|||          # bash scripts/tests/suites_offline_test.sh' \
+  "suites_offline_test.sh is wired into CI"
+
+# And the case a step-name check would also accept: the step's title and a shell
+# comment both name the suite, while the command runs something else entirely. The
+# replacement deliberately mentions the suite NOT AT ALL, because an `echo` naming
+# it would legitimately satisfy a substring check on the command.
+mutate "the step names the offline suite but runs something else" \
+  "${CI}" \
+  '          bash scripts/tests/suites_offline_test.sh|||          bash -c "true"' \
+  "suites_offline_test.sh is wired into CI"
+
+# And the step deleted outright, which is the way someone would "work around a
+# flake". The count is unchanged here (a line was removed, not a step), so this
+# needs its own mutation.
+mutate "the hash-pinned test dependencies step is deleted" \
+  "${CI}" \
+  '      - name: Hash-pinned test dependencies\n        run: |\n          set -euo pipefail\n          bash scripts/tests/gen_test_requirements_test.sh\n          bash scripts/tests/suites_offline_test.sh\n|||' \
+  "wired into CI"
+
 # The install relocated to after the suites, which is the ordering failure. This
 # one is hand-rolled rather than a `mutate` call because a move is two edits and
 # `mutate` applies a single replacement: deleting the block instead would go red
@@ -445,15 +484,39 @@ NL=$'\n'
 # The security job's install step, verbatim. Deliberately WITHOUT the two
 # explanatory comment lines: those belong to the release-gate job's install step,
 # and a block that carried them would not be found here.
+#
+# The trailing ${NL} is load-bearing and was a real bug. Command substitution
+# strips trailing newlines, so the block as first written ended without one, and
+# re-inserting it before `      - name: Generate SBOM` GLUED the two together:
+# the SBOM step's name line was absorbed into the install step's literal `run`
+# scalar and the step was destroyed as collateral. The suite still went red on
+# the ordering assertion, so it reported "bites" while quietly mutating a second
+# unrelated thing -- and the isolation guard below only ever looked for FAIL
+# lines, so it could not see the deletion. Step counting is what catches that
+# class of collateral now.
 INSTALL_BLOCK="$(printf '%s\n' \
   '      - name: Install hash-pinned test dependencies' \
   '        run: |' \
   '          set -euo pipefail' \
   '          python -m pip install --disable-pip-version-check --require-hashes --only-binary=:all: \' \
-  '            -r scripts/requirements-test.txt')"
+  '            -r scripts/requirements-test.txt')"${NL}
+
+# The step count must survive the move. `grep -c` on the step-name key is enough:
+# it is a structural property of the file, needs no YAML parser, and a destroyed
+# or duplicated step changes it. Asserted on the pristine file first, so a
+# mismatch cannot be blamed on the mutation.
+STEP_COUNT_BEFORE="$(grep -c '^      - name:' "${CI}")"
+if [[ "${STEP_COUNT_BEFORE}" -lt 1 ]]; then
+  mismatches+=("ordering: could not count steps in the pristine ci.yml (${STEP_COUNT_BEFORE})")
+fi
 if ! apply "${CI}" "${INSTALL_BLOCK}|||" \
   || ! apply "${CI}" "      - name: Generate SBOM${NL}|||${INSTALL_BLOCK}      - name: Generate SBOM${NL}"; then
   mismatches+=("ordering: could not move the install step")
+elif [[ "$(grep -c '^      - name:' "${CI}")" != "${STEP_COUNT_BEFORE}" ]]; then
+  # Caught before the suite runs, because "the suite went red" is not evidence
+  # that it went red about ordering rather than about a step this mutation broke.
+  mismatches+=("ordering: the move changed the number of steps, so it mutates something else too")
+  mismatches+=("        steps before=${STEP_COUNT_BEFORE} after=$(grep -c '^      - name:' "${CI}")")
 elif out="$(bash "${SUITE}" 2>&1)" && rc=0; then
   mismatches+=("ordering: SUITE STILL PASSED (the ordering assertion does not bite)")
 elif ! needle_matches "${out}" "provisions the test dependency before use"; then

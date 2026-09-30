@@ -3,18 +3,23 @@
 # GENERATED FILE -- do not hand-edit. Regenerate with:
 #     python3 scripts/gen_test_requirements.py
 #
+# Package: pyyaml==6.0.2
+#
 # Install with:
 #     python3 -m pip install --require-hashes --only-binary=:all: \
 #         -r scripts/requirements-test.txt
 #
 # --require-hashes makes pip verify the digest of the artifact it actually
 # downloads, which is the property a bare `==` pin does not have.
-# --only-binary=:all: forbids building from source. That is deliberate: as of
-# this pin there is no wheel for CPython 3.14, so on a FRESH 3.14 interpreter
-# pip refuses instead of silently compiling the sdist. A silent compile is a
-# different artifact from every digest listed here, built by whatever
-# toolchain happens to be present, and it is the exact failure mode -- slow,
-# environment-dependent, and invisible -- that this file exists to remove.
+# --only-binary=:all: forbids building from source. That is deliberate:
+# the newest interpreter this pin has a wheel for is 3.13, so on a
+# FRESH interpreter above it pip refuses instead of silently compiling the
+# sdist. A silent compile is a different artifact from every digest listed
+# here, built by whatever toolchain happens to be present, and it is the
+# exact failure mode -- slow, environment-dependent, and invisible -- that
+# this file exists to remove.
+#
+# CPython 3.8 through 3.13 for this pin.
 #
 # The qualification 'fresh' is load-bearing and was measured, not assumed. If
 # PyYAML is already installed, pip reports 'Requirement already satisfied' and
@@ -40,11 +45,16 @@
 # check that a digest is the digest of the real artifact: a digest edited,
 # reordered or removed in place still round-trips. The check on that is
 # --require-hashes above, which pip runs against the bytes it actually
-# downloads, in CI, on every run.
+# downloads, in CI, on every run. Nor can any offline check prove the list is
+# complete: the floor detects shrinkage, not a PyPI release that adds an
+# artifact. Regenerate from a live response to establish that.
 #
-# PyPI does not allow replacing a file that has already been published for
-# a given version, so this list cannot silently go stale; the risk is a
-# hand-edited version bump, which is why the file is generated.
+# PyPI does not normally re-release a file under a name that already exists
+# for a given version, but it is not structurally impossible, and if it did the
+# consequence would be a LOUD one rather than a silent one: --require-hashes
+# rejects the substituted bytes and a required check goes red. The realistic
+# staleness risk is the opposite -- a version bump that does not regenerate this
+# file -- which is why the file is generated rather than maintained by hand.
 pyyaml==6.0.2 \
     --hash=sha256:0a9a2848a5b7feac301353437eb7d5957887edbf81d56e903999a75a3d743086 \
     --hash=sha256:29717114e51c84ddfba879543fb232a6ed60086602313ca38cce623c1d62cfbf \

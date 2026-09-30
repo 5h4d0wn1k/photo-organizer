@@ -58,9 +58,13 @@ sys.exit(0 if actual == expected else 1)
   fi
 }
 
+# Non-zero, not zero. This suite became a step of the board job's required check
+# in this change, and a step that exits 0 without running an assertion is a green
+# run that proves nothing. The marker names the cause; the exit status is what
+# fails the run, because no runner greps for CANARY_SUITE_DEGRADED.
 if ! python3 -c "import ast,sys; ast.parse(open(sys.argv[1]).read())" "${PARSER}" 2>/dev/null; then
   printf '  !! CANARY_SUITE_DEGRADED: %s does not parse as Python\n' "${PARSER}"
-  exit 0
+  exit 1
 fi
 
 # --- The regression: a bare cross-reference must not close anything ---------
