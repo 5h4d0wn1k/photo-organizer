@@ -220,9 +220,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   runbook instead of being papered over with a colour threshold that would be
   wrong in the lenient direction, which is the same false pass the gate exists to
   prevent.
-
-### Fixed
-
 - Encryption activation no longer bricks the daemon when interrupted between
   the database swap and the state write (#109). Startup now probes the
   database header: an encrypted database with no (or torn) state rebuilds
@@ -231,6 +228,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   key that does not verify (or no key at all) fails loudly instead of
   opening silently. State writes are atomic (temp + fsync + rename), so torn
   state files cannot arise from future writes.
+- The header probe that recovery depends on no longer reads the whole database
+  file. It was `fs::read`, so a 16-byte question allocated a buffer the size of
+  the entire library -- and it sits on the path taken by every state write, and
+  therefore by every mutating request, on every install that has not activated
+  encryption. Measured at +272 MB peak RSS on a 268 MB database; the probe now
+  reads a fixed 16 bytes and a regression test asserts bounded peak RSS against
+  a 512 MB file. The probe is also evaluated once per open instead of twice on
+  the recovery path, where it was hidden inside a match guard.
+- A file shorter than 16 bytes is no longer reported as an encrypted database.
+  It is neither a valid SQLite header nor a valid SQLCipher page, and the old
+  whole-file comparison classified it as encrypted and sent the operator to the
+  OS keyring to look for a key that was never involved. It now fails as the
+  corruption it is.
+- Recovery after an interrupted activation now *verifies* each candidate key
+  before accepting it and keeps looking if it does not open the database, rather
+  than stopping at the first key it could find. A stale entry in one store no
+  longer aborts the attempt before the store that holds the working key is
+  tried. A key that is present but wrong is now reported distinctly from a key
+  that is absent, and nothing is persisted in either case.
+- The key-verification probe can no longer manufacture its own evidence: it
+  opened the database with `SQLITE_OPEN_CREATE`, so a correct key against a
+  path that did not exist created an empty database that answers the probe
+  under any key. It is now read-write without create.
+- Atomic state writes no longer leave a temp file behind when the write or the
+  rename fails. The temp file is named like the state file and lives in the same
+  security directory, so a failure previously deposited a stray copy of the
+  state next to the state. The file handle is also closed before the rename, so
+  the rename is valid on Windows.
+- Atomic state writes no longer widen permissions. A new state file is created
+  0600 instead of inheriting the process umask, and an existing mode is
+  preserved, so an operator who tightened the state file does not silently get a
+  looser one on the next write.
+- The directory fsync after an atomic rename is compiled out on non-Unix
+  platforms instead of being attempted unconditionally. There is no directory
+  handle to sync on Windows, so the call could fail *after* the database swap
+  had already replaced the live database -- turning the recovery path into the
+  brick #109 exists to prevent.
 
 ## [0.1.0] - 2026-09-22
 
