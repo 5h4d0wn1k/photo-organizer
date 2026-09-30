@@ -10,22 +10,37 @@
 #     `DnssecDnsHandle` path is never compiled or reachable. iroh 0.98.2 pins
 #     `hickory-resolver =0.26.0-beta.4` exactly; no patched release is allowed.
 #
-#   RUSTSEC-2026-0194 / RUSTSEC-2026-0195 (quick-xml via netdev → iroh netwatch):
-#     quick-xml is pulled only by netdev for LOCAL network device enumeration
-#     (no untrusted XML input). netwatch pins netdev ^0.42 which pins
-#     quick-xml ^0.39; quick-xml >=0.41 is not resolvable via iroh 0.98.
+# Dropped 2026-09-30 (issue #120): RUSTSEC-2026-0194 / RUSTSEC-2026-0195
+# (quick-xml). The lockfile refresh moved quick-xml 0.39.4 -> 0.42.0 and both
+# advisories are `patched = [">= 0.41.0"]`, so they now match nothing. A
+# suppression that matches nothing is a suppression that would sit there hiding a
+# real advisory if the crate ever regressed, so it goes.
+#
+# The rationale it was justified by was also wrong, in a way worth recording
+# because the corrected version is the useful fact: quick-xml reaches us through
+# `netdev -> plist`, NOT `netdev -> quick-xml`, and that plist edge is
+# macOS/iOS-only (`netdev-0.42.0/Cargo.toml:105`,
+# `[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies.plist]`).
+# quick-xml is therefore absent from the Linux and Android graphs entirely --
+# the platforms this project actually targets. Verified, not assumed:
+#
+#   cargo tree -i quick-xml --locked --all-features
+#     warning: nothing to print
+#   cargo tree -i quick-xml --locked --all-features --target all
+#     quick-xml v0.42.0 <- plist v1.10.1 <- netdev v0.42.0 <- netwatch v0.16.0
+#                                                    <- iroh v0.98.2
+#
+# (plist itself moved 1.9.0 -> 1.10.1 in the same refresh.)
 
 [advisories]
 ignore = [
     "RUSTSEC-2026-0120",
     "RUSTSEC-2026-0119",
-    "RUSTSEC-2026-0194",
-    "RUSTSEC-2026-0195",
 ]
 # Judged warnings (visible, NOT ignored -- they must stay loud on every audit).
-# Re-judged 2026-09-29 on the refreshed lockfile (issue #120). A `cargo update`
-# cleared the three yanked warnings (chacha20 0.10.1 -> 0.10.2, spin 0.9.8 /
-# 0.10.0 -> patched releases). What remains is iroh 0.98.2's pinned subtree:
+# Re-judged 2026-09-29 on the refreshed lockfile (issue #120); the two dead
+# quick-xml suppressions were dropped 2026-09-30, so "re-judged" is now true of
+# every entry in this file. What remains is iroh 0.98.2's pinned subtree:
 #
 #   atomic-polyfill 1.0.3 (unmaintained, RUSTSEC-2023-0089): via heapless 0.7
 #     -> postcard -> iroh-metrics. No advisory beyond "unmaintained"; provides
@@ -41,6 +56,15 @@ ignore = [
 #     wrapper with trivial Drop that cannot panic -- so the defect is not
 #     reachable in this graph. iroh-relay pins lru ^0.16; moving to >= 0.18.2
 #     requires the iroh 1.x migration.
+#
+# The three version bumps are verified from the lockfile (chacha20 0.10.1 ->
+# 0.10.2, spin 0.9.8 / 0.10.0 -> patched releases). Whether `cargo update` also
+# silenced three *yanked* warnings on stdout is NOT independently verified --
+# that needs network resolution output, not a lockfile diff. The spin advisory
+# (RUSTSEC-2019-0031) carries `patched = []` and
+# `unaffected = [">= 0"]  # workaround for `yanked = true` not removing the
+# advisory`, so it never fired as a vulnerability warning on either side of this
+# refresh and the two facts are independent.
 #
 # Durable fix for all three: iroh 0.98 -> 1.x (protocol compat with enrolled
 # devices must be proven first; tracked separately, not in this refresh).
