@@ -13,12 +13,83 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # Fail in seconds, and before any job holds `contents: write`.
+  #
+  # Every job that builds a platform `needs:` this one -- five of them, and the
+  # platform timeouts are 120 minutes for linux/windows/android and 150 for
+  # macos/ios -- so a tag with no signing material fails here instead of after
+  # two and a half hours of builds. That is only true because those `needs:`
+  # exist: an earlier draft of this file left the platform jobs independent,
+  # which made the "seconds, not hours" claim false while still reading true.
+  #
+  # The signing policy already lives in exactly one place
+  # (scripts/android_release_signing.sh), and the `android` job runs it. What that
+  # did not do was run it *early*: a tag with no signing material used to burn a
+  # checkout, a Rust toolchain and the entire Flutter SDK before failing, and the
+  # other four platform jobs, which had no `needs:` either, could not be held back
+  # by that failure.
+  #
+  # v0.1.7 is the observed instance of the shape that lets through. In run
+  # 35839417899 the Android, Windows and macOS jobs were green and Linux and iOS
+  # failed; the release still went live, non-draft, became "Latest", and carried
+  # exactly those three assets -- no AppImage, no .deb, no .app. Checked against
+  # the release's own asset list (all three of v0.1.5/6/7 carried
+  # app-release.apk, the macOS .dmg and the Windows .zip), not inferred. The
+  # defect is the shape -- a tag consumed by a partial release -- not which
+  # platform happens to fail.
+  #
+  # This job is the same script with the same inputs and no toolchain, so it
+  # cannot drift from the policy it mirrors. It prints the resolved mode and
+  # nothing else; no secret value reaches a command line or the log.
+  release-signing-preflight:
+    name: Android release signing preflight
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      signing_mode: ${{ steps.signing.outputs.mode }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Assert Android release signing material is complete
+        id: signing
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          PRIVATE_GALLERY_RELEASE_ALLOW_EPHEMERAL_SIGNING: ${{ vars.PRIVATE_GALLERY_RELEASE_ALLOW_EPHEMERAL_SIGNING }}
+        run: |
+          set -euo pipefail
+          # `mode` exits non-zero, with the full setup instructions on stderr and
+          # nothing on stdout, when no signing material is configured and the
+          # ephemeral opt-in is off -- and when the four secrets are only
+          # partially set, which is never silently ignored.
+          mode="$(bash scripts/android_release_signing.sh mode | tail -n 1)"
+          case "${mode}" in
+            release)
+              ;;
+            ephemeral)
+              echo "::warning::Signing with an ephemeral per-run CI key. This release installs once, but any future version requires an uninstall first, which discards the device's paired identity."
+              ;;
+            *)
+              echo "::error::android_release_signing.sh returned an unexpected mode: '${mode}'" >&2
+              exit 1
+              ;;
+          esac
+          echo "mode=${mode}" >> "$GITHUB_OUTPUT"
+
   linux:
     name: Linux (AppImage + .deb)
+    # Fail fast: a missing keystore must not cost five long platform builds.
+    needs:
+      - release-signing-preflight
     runs-on: ubuntu-latest
     timeout-minutes: 120
     permissions:
-      contents: write
+      contents: read
       id-token: write
       attestations: write
     steps:
@@ -132,14 +203,12 @@ jobs:
           ln -s /opt/photo-organizer/AppRun "${PKG}/usr/bin/photo-organizer"
           dpkg-deb --build "${PKG}" "photo-organizer_${VERSION}_amd64.deb"
 
-      - name: Upload Linux artifacts
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
-        with:
-          name: linux-artifacts
-          path: |
-            photo-organizer-linux-x86_64-*.AppImage
-            photo-organizer_*_amd64.deb
-
+      # The SBOM is generated BEFORE the upload. On origin/main the two were in
+      # this order and the artifact was published, so the release shipped it.
+      # Moving the SBOM below the upload while consolidating publication silently
+      # dropped it, because nothing re-listed it: `docs/RELEASE_CHECKLIST.md` still
+      # requires an SBOM from CI and no test mentioned it, so the regression was
+      # invisible to both review and CI.
       - name: Generate SBOM
         uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
         with:
@@ -147,6 +216,14 @@ jobs:
           format: spdx-json
           output-file: sbom.spdx.json
 
+      - name: Upload Linux artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: linux-artifacts
+          path: |
+            photo-organizer-linux-x86_64-*.AppImage
+            photo-organizer_*_amd64.deb
+            sbom.spdx.json
       - name: Attest build provenance
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
@@ -154,32 +231,15 @@ jobs:
             photo-organizer-linux-x86_64-*.AppImage
             photo-organizer_*_amd64.deb
 
-      - name: Release Linux
-        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
-        with:
-          files: |
-            photo-organizer-linux-x86_64-*.AppImage
-            photo-organizer_*_amd64.deb
-            sbom.spdx.json
-          # Every platform job publishes into the same release, and a later job
-          # replaces the body unless it appends. Without `append_body: true`,
-          # whichever job finishes last silently deletes every other platform's
-          # signing warning — a security-disclosure regression, not cosmetics.
-          append_body: true
-          # This job owns the generated changelog. `generate_release_notes` is
-          # re-applied on every update, so exactly one job may set it or the
-          # changelog is duplicated once per platform.
-          generate_release_notes: true
-          body: |
-            Linux build (AppImage + .deb). Unsigned: no GPG signature and no Debian
-            package signing were performed.
-
   windows:
     name: Windows (ZIP)
+    # Fail fast: a missing keystore must not cost five long platform builds.
+    needs:
+      - release-signing-preflight
     runs-on: windows-latest
     timeout-minutes: 120
     permissions:
-      contents: write
+      contents: read
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -225,20 +285,15 @@ jobs:
           name: windows-artifact
           path: photo-organizer-windows-x64-*.zip
 
-      - name: Release Windows
-        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
-        with:
-          files: photo-organizer-windows-x64-*.zip
-          append_body: true
-          body: |
-            Windows build (unsigned). No code signing performed.
-
   macos:
     name: macOS (DMG)
+    # Fail fast: a missing keystore must not cost five long platform builds.
+    needs:
+      - release-signing-preflight
     runs-on: macos-latest
     timeout-minutes: 150
     permissions:
-      contents: write
+      contents: read
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -287,22 +342,16 @@ jobs:
           name: macos-artifact
           path: photo-organizer-macos-*.dmg
 
-      - name: Release macOS
-        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
-        with:
-          files: photo-organizer-macos-*.dmg
-          append_body: true
-          body: |
-            macOS build (unsigned). No notarization performed.
   android:
     name: Android (APK)
+    # Fail fast: a missing keystore must not cost five long platform builds.
+    needs:
+      - release-signing-preflight
     runs-on: ubuntu-latest
     timeout-minutes: 120
     permissions:
-      # This job only builds and uploads; `android-publish` owns the release.
+      # This job only builds and uploads; `release` owns the publication.
       contents: read
-    outputs:
-      signing_mode: ${{ steps.signing.outputs.mode }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -351,7 +400,6 @@ jobs:
               exit 1
               ;;
           esac
-          echo "mode=${mode}" >> "$GITHUB_OUTPUT"
 
       - name: Hermetic Android NDK cross-compile (cargo-ndk, vendored sqlcipher-openssl; no vcpkg)
         run: |
@@ -465,9 +513,19 @@ jobs:
             echo "the signing key was already absent"
           fi
 
-      # NOTE: publication is intentionally NOT done here. This job only builds and
-      # uploads the APK; the `android-publish` job (needs: [android, android-smoke])
-      # releases it, and only after the install+launch gate has passed.
+        # NOTE: publication is intentionally NOT done here. This job only builds and
+        # uploads the APK. `android-verify` re-derives its checksum and signature,
+        # and the single `release` job publishes it -- only after the install+launch
+        # gate has passed. There is no `android-publish` job any more: it never
+        # published, and never could have published atomically.
+        #
+        # It never ran because it had `needs: [android, android-smoke]` and no steps
+        # of its own beyond checkout/download/verify/publish -- the signing steps
+        # lived here, in `android`. `android` itself had no `needs:`, and its
+        # `actions/checkout` pin was unresolvable (`3d3d42e5...`, `d` for `c`, HTTP
+        # 422), so every `v*` tag died in `android` and took this job with it. That
+        # was #133, fixed in #134. Runs for v0.1.5/6/7 list only the five platform
+        # jobs and predate the split entirely.
 
   # Installability + launchability gate for the Android artifact. Runs the EXACT
   # APK that will be published, on a real Android system image, before any release
@@ -541,19 +599,27 @@ jobs:
           # cases the job is red either way, so this cannot mask a real result.
           if-no-files-found: error
 
-  # Publish the Android APK only after BOTH the signed build and the install+launch
-  # gate are green. This is the actual "no un-installable APK ships" guarantee (#97).
-  android-publish:
-    name: Android (publish APK)
+  # Re-verify the Android APK only after BOTH the signed build and the
+  # install+launch gate are green. This is the actual "no un-installable APK
+  # ships" guarantee (#97).
+  #
+  # This job does NOT publish. It used to, which meant it was the only platform
+  # whose bytes were re-checked immediately before upload -- a property worth
+  # keeping. With the single `release` job it keeps that property for the same
+  # reason it had it: `release` needs this job, so it cannot attach the APK
+  # until this re-verification is green. The check is not weakened by moving the
+  # upload; it is still a hard `needs:` edge, and it is still a third independent
+  # check on a different runner with a different checkout.
+  android-verify:
+    name: Android (verify APK)
     runs-on: ubuntu-latest
     timeout-minutes: 15
     needs: [android, android-smoke]
     permissions:
-      # Build inputs only. The token needs `contents: write` for the release step,
-      # but the verification steps below run first and must not need it; a job
-      # cannot drop permissions mid-run, so the narrowness that matters is that no
-      # verification step can publish anything.
-      contents: write
+      # Verification only. This job has no business creating or updating a
+      # release, and dropping `contents: write` here means a future step added
+      # to this job cannot publish even by accident.
+      contents: read
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -568,11 +634,14 @@ jobs:
       #
       # The build job already runs the signature gate and the smoke job already
       # installed the APK, so this is a *third* independent check. That redundancy
-      # is the point: the publish job is the last thing that runs before the bytes
-      # become a download, and it is a different job on a different runner with a
-      # different checkout of the gate script. If the artifact store were ever
-      # wrong, truncated, or replaced, this is the step that notices, and it
-      # notices before the release exists.
+      # is the point: `release` `needs:` this job, so nothing is published unless
+      # this passed, and it is a different job on a different runner with a
+      # different checkout of the gate script.
+      #
+      # It is NOT the last check before the bytes become a download -- `release`
+      # still downloads five artifact sets and stages them afterwards. What it does
+      # guarantee is that the artifact verified here is the one `release` stages:
+      # both fetch the same immutable `android-artifact` from this same run.
       #
       # The checksum is verified first because it is the cheap, total check on the
       # bytes: it fails if the file was modified, truncated, or is not the file the
@@ -580,16 +649,16 @@ jobs:
       # bytes. Nothing here is a substitute for the build-job checks; it is the
       # narrowest possible proof that what is about to be published is what was
       # verified.
-      - name: Re-verify the artifact being published
+      - name: Re-verify the artifact about to be published
         run: |
           set -euo pipefail
           APK="apk/app-release.apk"
           if [[ ! -s "${APK}" ]]; then
-            echo "::error::refusing to publish: ${APK} is missing or empty" >&2
+            echo "::error::refusing to release: ${APK} is missing or empty" >&2
             exit 1
           fi
           if [[ ! -s "apk/app-release.apk.sha256" ]]; then
-            echo "::error::refusing to publish: the checksum file is missing or empty" >&2
+            echo "::error::refusing to release: the checksum file is missing or empty" >&2
             exit 1
           fi
           # `sha256sum -c` needs the file to be named exactly as the digest line
@@ -615,47 +684,15 @@ jobs:
           rm -rf "${scratch}"
           echo "re-verified the artifact about to be published"
 
-      - name: Release Android
-        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
-        with:
-          files: |
-            apk/app-release.apk
-            apk/app-release.apk.sha256
-            apk/apksigner-verify.txt
-          # `generate_release_notes` is intentionally NOT set here: that input is
-          # re-applied on every update, so more than one job setting it would
-          # duplicate the changelog once per platform job. The `linux` job owns it.
-          append_body: true
-          body: |
-            Android build. Install via sideload (enable "install unknown apps" for your
-            file manager), then launch normally. Verify the download with the attached
-            app-release.apk.sha256.
-
-            Signature: verified signed by CI with `apksigner` (APK Signature Scheme v2
-            and v3) before publication. v1/JAR signing is off because minSdk is 24.
-            ${{ needs.android.outputs.signing_mode == 'release' && 'This artifact is signed with the project release key, so future versions install over it without an uninstall.' || 'This artifact is signed with an ephemeral per-run CI key, so it installs once but a future version will require uninstalling it first — which discards this device’s paired identity.' }}
-
-            Installability was additionally checked in CI on real Android system images
-            (API 30 and API 35): install, cold launch, a stable visually-complex frame,
-            and a clean crash buffer / ApplicationExitInfo. A build that failed any of
-            those checks could not have been published.
-
-            What that does not prove, stated plainly so it is not read as a stronger
-            guarantee than it is:
-            * Those images are x86_64. The arm64-v8a and armeabi-v7a slices are checked
-              structurally by reading the archive before the device is touched, not by
-              installing them on arm hardware.
-            * On API 31+ the system splash is drawn inside the app's own window, so a
-              stable focused frame does not by itself prove the app's own UI painted.
-            * This covers the APK only. The Linux, Windows, macOS and iOS artifacts are
-              not install-tested in CI.
-
   ios:
     name: iOS (unsigned .app)
+    # Fail fast: a missing keystore must not cost five long platform builds.
+    needs:
+      - release-signing-preflight
     runs-on: macos-latest
     timeout-minutes: 150
     permissions:
-      contents: write
+      contents: read
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -696,11 +733,203 @@ jobs:
           name: ios-artifact
           path: photo-organizer-ios-*.zip
 
-      - name: Release iOS
+  # The one and only job that creates or updates the release.
+  #
+  # Previously each platform job published itself, with no `needs:` between them
+  # and `contents: write` on five of them (linux, windows, macos, ios, and
+  # android-publish). The release action creates the release when it does not
+  # exist, so a tag where any subset of those jobs failed still produced a live,
+  # public, non-draft release carrying whatever the successful jobs had uploaded,
+  # and it became "Latest". The tag was consumed. Nothing asserted against that
+  # shape.
+  #
+  # v0.1.7 is the observed instance: run 35839417899 had Android, Windows and
+  # macOS green, Linux and iOS red, and published exactly those three assets.
+  #
+  # Now nothing can publish until every platform job and the signing preflight is
+  # green, so a release is either complete or it does not exist.
+  release:
+    name: Publish release
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+      # Deliberately NO `if: always()`. That condition is what #82 proposed, and
+      # it is the opposite of what atomic publication needs: `always()` runs the
+      # job *even when its dependencies failed*, which is precisely how a
+      # four-platform release escapes while Android is red. With no `if`, GitHub
+      # runs this job only when every entry in `needs` succeeded, and skips it
+      # otherwise -- which is the guarantee.
+      #
+      # Every entry is listed explicitly rather than reusing a group, so that
+      # adding an ARTIFACT-PRODUCING platform without adding it here fails the suite.
+      # Narrower than it looks: a job that uploads no artifact has nothing to stage,
+      # so adding one without listing it here is not caught -- correct, because there
+      # is no artifact to omit, but do not read this as "every new job must be listed".
+    needs:
+      - release-signing-preflight
+      - linux
+      - windows
+      - macos
+      - ios
+      - android-verify
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      # One download step per artifact, each into its own directory.
+      #
+      # Downloading by name rather than by `pattern:` is deliberate. A pattern
+      # that matched nothing would still succeed, so a renamed or mis-uploaded
+      # artifact would silently contribute zero files to the release. Naming
+      # them one by one makes each absence a hard failure at the step, before
+      # any staging happens.
+      - name: Download Android artifact
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4
+        with:
+          name: android-artifact
+          path: incoming/android
+
+      - name: Download Linux artifacts
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4
+        with:
+          name: linux-artifacts
+          path: incoming/linux
+
+      - name: Download Windows artifact
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4
+        with:
+          name: windows-artifact
+          path: incoming/windows
+
+      - name: Download macOS artifact
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4
+        with:
+          name: macos-artifact
+          path: incoming/macos
+
+      - name: Download iOS artifact
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4
+        with:
+          name: ios-artifact
+          path: incoming/ios
+
+      # Flatten into one directory and prove the set is complete before a single
+      # byte is uploaded.
+      #
+      # Two failure modes are handled explicitly, and both were reachable in the
+      # old workflow:
+      #
+      #   * a platform contributing zero files -- previously that platform just
+      #     published an empty set and the release looked fine;
+      #   * two artifacts sharing a basename -- `action-gh-release` uploads by
+      #     basename, so one would silently overwrite the other and the release
+      #     would carry the wrong bytes under a plausible name.
+      #
+      # Staging by hand rather than trusting the action's own glob behaviour also
+      # means `dist/*` is a literal, reviewable file list in the logs, and the
+      # suite can assert on it.
+      - name: Stage every platform artifact, refusing an incomplete set
+        run: |
+          set -euo pipefail
+          platforms=(android linux windows macos ios)
+          missing=()
+          for platform in "${platforms[@]}"; do
+            dir="incoming/${platform}"
+            if [[ ! -d "${dir}" ]]; then
+              missing+=("${platform}: no directory")
+              continue
+            fi
+            count="$(find "${dir}" -type f -size +0c | wc -l)"
+            if [[ "${count}" -eq 0 ]]; then
+              missing+=("${platform}: no non-empty file")
+            fi
+          done
+          if [[ "${#missing[@]}" -ne 0 ]]; then
+            echo "::error::refusing to publish a partial release:" >&2
+            printf '  %s\n' "${missing[@]}" >&2
+            exit 1
+          fi
+
+          rm -rf dist
+          mkdir -p dist
+          for platform in "${platforms[@]}"; do
+            while IFS= read -r file; do
+              base="$(basename "${file}")"
+              if [[ -e "dist/${base}" ]]; then
+                echo "::error::refusing to publish: ${base} is produced by more than one platform and would overwrite the other" >&2
+                exit 1
+              fi
+              cp "${file}" "dist/${base}"
+            done < <(find "incoming/${platform}" -type f -size +0c)
+          done
+
+          echo "staged $(find dist -type f | wc -l) files from ${#platforms[@]} platforms:"
+          ls -l dist
+
+      - name: Publish the release
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
         with:
-          files: photo-organizer-ios-*.zip
-          append_body: true
+          files: dist/*
+          # The action's own default is `fail_on_unmatched_files: false`, which means
+          # it CREATES a release with zero assets when the glob matches nothing. That
+          # is exactly the v0.1.7 outcome this change exists to prevent: a live,
+          # public release that a user can see is missing every platform. Set to true,
+          # so if staging produced nothing the step fails instead.
+          #
+          # This is deliberately independent of the staging step's own exit code. A
+          # reviewer showed that adding `continue-on-error: true` to the staging step
+          # re-opens the same hole while every other check stays green: the refusal
+          # exits 1, GitHub marks the step failed-but-continued, the job succeeds,
+          # `dist` was never created (the `rm -rf dist` is *after* the refusal), and
+          # the glob matches nothing. The suite now asserts no step in `release` sets
+          # `continue-on-error`, and this key is the second, independent line.
+          fail_on_unmatched_files: true
+          # One publish call, so `append_body` is not needed and the
+          # "last job wins the body" race that made per-platform signing warnings
+          # disappear is structurally impossible rather than guarded against.
+          # Dropping it is a deliberate behaviour change on one path: re-running
+          # this workflow for a tag that already has a release now REPLACES the
+          # body instead of appending a second copy of the signing block. For a
+          # single writer, replace-on-rerun is the correct semantics; append would
+          # duplicate the notes on every retry.
+          generate_release_notes: true
           body: |
-            iOS build (unsigned .app; no codesign). Install via sideload tools or
-            sign with your own Apple identity. No notarization, no App Store claim.
+            ## Signing status per platform
+
+            * **Android** — signed. Verified with `apksigner` (APK Signature Scheme
+              v2 and v3; v1/JAR is off because minSdk is 24) in CI, twice: once in
+              the build job and again in `android-verify`, which `release` needs.
+              ${{ needs.release-signing-preflight.outputs.signing_mode == 'release' && 'This artifact is signed with the project release key, so future versions install over it without an uninstall.' || 'This artifact is signed with an ephemeral per-run CI key, so it installs once but a future version will require uninstalling it first — which discards this device’s paired identity.' }}
+              **Install:** sideload it -- enable "install unknown apps" for your file manager,
+              then open the APK and confirm. There is no store listing.
+              Verify the download with the attached `app-release.apk.sha256`.
+            * **Linux** — unsigned. No GPG signature and no Debian package signing.
+            * **Windows** — unsigned. No Authenticode signing.
+            * **macOS** — unsigned. No notarization.
+            * **iOS** — unsigned `.app`, no codesign. Install via sideload tools or
+              sign with your own Apple identity. No notarization, no App Store claim.
+
+            ## Installability evidence
+
+            The Android APK was installed and cold-launched in CI on real Android
+            system images (API 30 and API 35): install, cold launch, a stable
+            visually-complex frame, and a clean crash buffer / ApplicationExitInfo.
+            A build failing any of those checks could not have been published,
+            because this job needs the gate that runs them.
+
+            What that does **not** prove, stated plainly so it is not read as a
+            stronger guarantee than it is:
+
+            * Those images are x86_64. The arm64-v8a and armeabi-v7a slices are
+              checked structurally by reading the archive before the device is
+              touched, not by installing them on arm hardware.
+            * On API 31+ the system splash is drawn inside the app's own window, so a
+              stable focused frame does not by itself prove the app's own UI painted.
+            * A signed release can only be proven installable over the *previous*
+              signed release by sideloading it onto a device that already has it.
+              CI has no such device; that check is manual and is listed in
+              docs/RELEASE_CHECKLIST.md.
+            * The Linux, Windows, macOS and iOS artifacts are not install-tested in
+              CI. They are built, packaged and published, and that is all this
+              workflow proves about them.

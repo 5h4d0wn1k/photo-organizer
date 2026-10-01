@@ -220,7 +220,7 @@ if len(suites) != expected_count:
 # worse than none because it reads as one. This is the comparison that can fail.
 # Deleting or adding a suite is then a diff in this line rather than a silent loss
 # of coverage, and the failure names what changed.
-KNOWN_SUITE_COUNT = 18
+KNOWN_SUITE_COUNT = 19
 if len(suites) != KNOWN_SUITE_COUNT:
     print(
         f"SUITE COUNT TRIPWIRE: found {len(suites)}, recorded {KNOWN_SUITE_COUNT}. "

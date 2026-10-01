@@ -114,6 +114,7 @@ jobs:
             scripts/tests/gen_test_requirements_mutation_test.sh \
             scripts/tests/tests_wiring_test.sh \
             scripts/tests/tests_wiring_mutation_test.sh \
+            scripts/tests/release_atomic_publish_mutation_test.sh \
             scripts/tests/required_checks_test.sh
       - name: Run the release gate tests
         run: bash scripts/tests/run_release_gate_tests.sh
@@ -196,6 +197,7 @@ jobs:
         run: |
           set -euo pipefail
           bash scripts/tests/gen_test_requirements_mutation_test.sh
+          bash scripts/tests/release_atomic_publish_mutation_test.sh
           bash scripts/tests/tests_wiring_mutation_test.sh
           bash scripts/tests/workflow_hygiene_mutation_test.sh
       - name: Generate SBOM
