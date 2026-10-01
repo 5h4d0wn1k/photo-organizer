@@ -444,6 +444,24 @@ printf 'not a png at all' >"${WORK_DIR}/garbage.png"
 # three variants are the packaging regressions the check exists for: both real
 # device ABIs present, only the emulator's ABI (installs on CI, fails on every
 # real phone), and no native code at all (a dropped jniLibs step).
+#
+# The library is libflutter.so, which is what Flutter actually packages per ABI.
+# The fixture used to be libgalleryd.so, mirroring a comment that claimed "the
+# daemon ships native code" -- false, since native_core declares no crate-type and
+# cargo-ndk therefore drops galleryd (see #140). A fixture that encodes a false
+# premise makes the section untestable against reality.
+#
+# It is deliberately not libiroh.so. `iroh` and `iroh-relay` really do declare
+# `crate-type = ["lib", "cdylib"]` and cargo really does emit those `.so`s, so
+# this fixture is not asserting a fiction -- and asserting one would still be
+# wrong, for three separate reasons: the name is governed by an upstream crate's
+# `crate-type`, so the gate would fail for something outside this repo's
+# packaging; cargo-ndk copies the emitted filename verbatim, so the packaged
+# entry is `libiroh-<metadata-hash>.so` and no stable name to assert exists; and
+# #140 will change what the right Rust witness is at all. libflutter.so is the
+# ABI slice the gate actually exists to prove. The measurements behind all of
+# this, and their limits, are recorded above REQUIRED_NATIVE_LIB in
+# scripts/android_release_artifact_smoke.sh.
 make_apk() {
   # Builds the fixture AND verifies it in the same process: testzip() reads
   # every entry back, and the namelist must contain exactly what the ABI
@@ -461,7 +479,7 @@ with zipfile.ZipFile(path, "w") as archive:
     archive.writestr("AndroidManifest.xml", "<manifest package='com.privategallery.app'/>")
     archive.writestr("classes.dex", "fake dex")
     for abi in abis:
-        archive.writestr(f"lib/{abi}/libgalleryd.so", f"fake native library for {abi}")
+        archive.writestr(f"lib/{abi}/libflutter.so", f"fake native library for {abi}")
 with zipfile.ZipFile(path) as archive:
     bad = archive.testzip()
     if bad is not None:
@@ -469,9 +487,70 @@ with zipfile.ZipFile(path) as archive:
         sys.exit(1)
     names = set(archive.namelist())
     for abi in abis:
-        entry = f"lib/{abi}/libgalleryd.so"
+        entry = f"lib/{abi}/libflutter.so"
         if entry not in names:
             print(f"FATAL: fixture {path} is missing {entry}", file=sys.stderr)
+            sys.exit(1)
+PY
+}
+
+# An APK whose lib/<abi>/ directories exist and each hold a file, but not the
+# native library. This is the case the gate used to accept: the check matched on
+# the "^lib/<abi>/" directory prefix, so one stray file satisfied it for every ABI
+# at once.
+make_abi_dirs_only_apk() {
+  python3 - "$1" "${@:2}" <<'PY'
+import sys
+import zipfile
+
+path = sys.argv[1]
+abis = sys.argv[2:]
+with zipfile.ZipFile(path, "w") as archive:
+    archive.writestr("AndroidManifest.xml", "<manifest package='com.privategallery.app'/>")
+    archive.writestr("classes.dex", "fake dex")
+    for abi in abis:
+        archive.writestr(f"lib/{abi}/placeholder.txt", "not a native library")
+with zipfile.ZipFile(path) as archive:
+    bad = archive.testzip()
+    if bad is not None:
+        print(f"FATAL: fixture {path} has a corrupt entry: {bad}", file=sys.stderr)
+        sys.exit(1)
+    names = set(archive.namelist())
+    for abi in abis:
+        if f"lib/{abi}/placeholder.txt" not in names:
+            print(f"FATAL: fixture {path} is missing lib/{abi}/placeholder.txt", file=sys.stderr)
+            sys.exit(1)
+PY
+}
+
+# An APK whose lib/<abi>/ entry is a *near miss* for the required library name --
+# `libflutterXso`, one character different. This is not hypothetical: the check
+# used `grep -q "^lib/<abi>/libflutter.so$"`, and `.` is a regex metacharacter, so
+# `libflutterXso` satisfied it. The archive would be reported as carrying the
+# Flutter engine while carrying something else. Its own fixture, so the assertion
+# that rejects it cannot be satisfied by the missing-library or missing-directory
+# guards.
+make_abi_nearmiss_apk() {
+  python3 - "$1" "${@:2}" <<'PY'
+import sys
+import zipfile
+
+path = sys.argv[1]
+abis = sys.argv[2:]
+with zipfile.ZipFile(path, "w") as archive:
+    archive.writestr("AndroidManifest.xml", "<manifest package='com.privategallery.app'/>")
+    archive.writestr("classes.dex", "fake dex")
+    for abi in abis:
+        archive.writestr(f"lib/{abi}/libflutterXso", "not the engine")
+with zipfile.ZipFile(path) as archive:
+    bad = archive.testzip()
+    if bad is not None:
+        print(f"FATAL: fixture {path} has a corrupt entry: {bad}", file=sys.stderr)
+        sys.exit(1)
+    names = set(archive.namelist())
+    for abi in abis:
+        if f"lib/{abi}/libflutterXso" not in names:
+            print(f"FATAL: fixture {path} is missing lib/{abi}/libflutterXso", file=sys.stderr)
             sys.exit(1)
 PY
 }
@@ -483,7 +562,25 @@ PY
 make_apk "${WORK_DIR}/app-release.apk" arm64-v8a armeabi-v7a x86_64 || exit 1
 make_apk "${WORK_DIR}/apk-x86-only.apk" x86_64 || exit 1
 make_apk "${WORK_DIR}/apk-no-native.apk" || exit 1
+make_abi_dirs_only_apk "${WORK_DIR}/apk-abi-dirs-only.apk" arm64-v8a armeabi-v7a x86_64 || exit 1
+make_abi_nearmiss_apk "${WORK_DIR}/apk-abi-nearmiss.apk" arm64-v8a armeabi-v7a x86_64 || exit 1
 
+
+# How unzip's exit status is captured matters, and getting it wrong is silent.
+#
+#     out="$(unzip -Z1 "$f" || rc=$?)"   # rc stays 0 in this shell
+#     out="$(unzip -Z1 "$f")" || rc=$?    # rc is the command's real status
+#
+# The first form looks like it records the status, but `$( ... )` is a subshell:
+# the `rc=$?` runs and dies inside it, so the parent keeps whatever it had. With
+# `rc=0` pre-initialised that is always 0, the guard below is always satisfied,
+# and a *missing or broken unzip* is reported as a wrong-fixture failure -- the
+# exact ambiguity this is here to remove. So the assignment stands alone and the
+# `||` follows it. Each check keeps its own status variable because the `||`
+# only reports the last command substitution's status.
+#
+# All three checks stay fail-closed: a non-zero status fails the assertion here
+# and never falls through to a gate assertion below.
 
 # The fixture must really contain what the passing test assumes, or every ABI
 # assertion below would be satisfied by an empty archive. make_apk already
@@ -492,12 +589,38 @@ make_apk "${WORK_DIR}/apk-no-native.apk" || exit 1
 # failure -- the previous version discarded stderr, which is why the one
 # observed flake of this line arrived with no evidence at all.
 unzip_rc=0
-unzip_out="$(unzip -Z1 "${WORK_DIR}/app-release.apk" 2>"${WORK_DIR}/unzip-err.log" || unzip_rc=$?)"
-if ((unzip_rc == 0)) && grep -q '^lib/arm64-v8a/libgalleryd.so$' <<<"${unzip_out}"; then
+unzip_out="$(unzip -Z1 "${WORK_DIR}/app-release.apk" 2>"${WORK_DIR}/unzip-err.log")" || unzip_rc=$?
+if ((unzip_rc == 0)) && grep -qFx 'lib/arm64-v8a/libflutter.so' <<<"${unzip_out}"; then
   ok "the default APK fixture is a real archive carrying an arm64-v8a library"
 else
   bad "the default APK fixture is a real archive carrying an arm64-v8a library" \
     "unzip exit ${unzip_rc}, size $(wc -c <"${WORK_DIR}/app-release.apk" 2>/dev/null || echo '?') bytes, stderr: $(tr '\n' ' ' <"${WORK_DIR}/unzip-err.log" 2>/dev/null | cut -c1-160)"
+fi
+
+# The negative fixture must be negative in the specific way asserted below --
+# lib/<abi>/ directories present, native library absent. A fixture that merely
+# lacked lib/ would exercise the other guard and make the directory-prefix
+# assertion pass for the wrong reason. Same unzip_rc treatment as above, so a
+# tool failure is distinguishable from a wrong fixture.
+dirs_rc=0
+dirs_out="$(unzip -Z1 "${WORK_DIR}/apk-abi-dirs-only.apk" 2>"${WORK_DIR}/unzip-dirs-err.log")" || dirs_rc=$?
+if ((dirs_rc == 0)) && grep -q '^lib/arm64-v8a/placeholder.txt$' <<<"${dirs_out}"; then
+  ok "the ABI-dirs-only fixture has lib/<abi>/ entries but no native library"
+else
+  bad "the ABI-dirs-only fixture has lib/<abi>/ entries but no native library" \
+    "unzip exit ${dirs_rc}, size $(wc -c <"${WORK_DIR}/apk-abi-dirs-only.apk" 2>/dev/null || echo '?') bytes, stderr: $(tr '\n' ' ' <"${WORK_DIR}/unzip-dirs-err.log" 2>/dev/null | cut -c1-160). Fixture shape is wrong either way, so the directory-prefix assertion below is vacuous."
+fi
+
+# The near-miss fixture must hold the almost-right name, or the assertion below
+# could pass because the archive was empty rather than because the gate saw
+# `libflutterXso`. Same unzip_rc treatment as above, for the same reason.
+nearmiss_rc=0
+nearmiss_out="$(unzip -Z1 "${WORK_DIR}/apk-abi-nearmiss.apk" 2>"${WORK_DIR}/unzip-nearmiss-err.log")" || nearmiss_rc=$?
+if ((nearmiss_rc == 0)) && grep -qFx 'lib/arm64-v8a/libflutterXso' <<<"${nearmiss_out}"; then
+  ok "the ABI near-miss fixture carries libflutterXso, not the engine"
+else
+  bad "the ABI near-miss fixture carries libflutterXso, not the engine" \
+    "unzip exit ${nearmiss_rc}, size $(wc -c <"${WORK_DIR}/apk-abi-nearmiss.apk" 2>/dev/null || echo '?') bytes, stderr: $(tr '\n' ' ' <"${WORK_DIR}/unzip-nearmiss-err.log" 2>/dev/null | cut -c1-160). Fixture shape is wrong either way, so the near-miss assertion below is vacuous."
 fi
 
 : >"${WORK_DIR}/empty-exit-info.txt"
@@ -671,16 +794,32 @@ if run_smoke_on "${WORK_DIR}/apk-x86-only.apk" >"${WORK_DIR}/abi.log" 2>&1; then
   bad "an APK with only the emulator's ABI is rejected" \
     "the gate passed an APK that cannot install on any real device"
 else
-  if grep -q "missing native libraries for arm64-v8a" "${WORK_DIR}/abi.log"; then
+  if grep -q "missing libflutter.so for arm64-v8a" "${WORK_DIR}/abi.log"; then
     ok "an APK with only the emulator's ABI is rejected"
   else
     bad "an APK with only the emulator's ABI is rejected" \
       "it failed, but not for the ABI reason: $(tr '\n' '|' <"${WORK_DIR}/abi.log")"
   fi
 fi
+# The engine entry must match exactly. `grep` without -F treats the `.` in
+# `libflutter.so` as "any character", so `libflutterXso` satisfied the old check --
+# an archive reported as carrying the engine while carrying a different file. The
+# near-miss fixture is the only input that distinguishes the two forms; the
+# missing-library and missing-directory fixtures are rejected either way.
+if run_smoke_on "${WORK_DIR}/apk-abi-nearmiss.apk" >"${WORK_DIR}/abi-nearmiss.log" 2>&1; then
+  bad "an APK whose library is a near-miss name for the engine fails the gate" \
+    "passed: libflutterXso was accepted as if it were libflutter.so"
+else
+  if grep -q "missing libflutter.so for arm64-v8a" "${WORK_DIR}/abi-nearmiss.log"; then
+    ok "an APK whose library is a near-miss name for the engine fails the gate"
+  else
+    bad "an APK whose library is a near-miss name for the engine fails the gate" \
+      "it failed, but not for the ABI reason: $(tr '\n' '|' <"${WORK_DIR}/abi-nearmiss.log")"
+  fi
+fi
 # The failure has to name the ABI that is missing, or whoever reads the log cannot
 # tell which cross-compile target to add back.
-if grep -q "missing native libraries for armeabi-v7a" \
+if grep -q "missing libflutter.so for armeabi-v7a" \
   <(ANDROID_SMOKE_REQUIRED_ABIS="armeabi-v7a" run_smoke_on "${WORK_DIR}/apk-x86-only.apk" 2>&1); then
   ok "the ABI failure names the missing ABI, not just 'install failed'"
 else
@@ -696,10 +835,11 @@ else
   bad "an APK carrying both real device ABIs passes the ABI check" "the good fixture was rejected"
 fi
 # An APK with no lib/ entries at all is a packaging regression, not a Java-only
-# build: the daemon ships native code. It used to pass with a warning, which was
-# wrong for a reason specific to this gate -- an APK carrying no native libraries
-# installs on the x86_64 emulator with no ABI mismatch, launches and renders, so
-# nothing downstream compensates and a warning is not a control.
+# build: Flutter Android builds carry per-ABI native libraries. It used to pass
+# with a warning, which was wrong for a reason specific to this gate -- an APK
+# carrying no native libraries installs on the x86_64 emulator with no ABI
+# mismatch, launches and renders, so nothing downstream compensates and a warning
+# is not a control.
 if run_smoke_on "${WORK_DIR}/apk-no-native.apk" >"${WORK_DIR}/no-native.log" 2>&1; then
   bad "an APK with no native code at all fails the gate" \
     "passed: with no lib/ entries there is no ABI mismatch on the x86_64 emulator, so nothing else would catch a dropped jniLibs step"
@@ -709,6 +849,24 @@ else
   else
     bad "an APK with no native code at all fails the gate" \
       "failed for the wrong reason: $(tr '\n' '|' <"${WORK_DIR}/no-native.log" | cut -c1-200)"
+  fi
+fi
+# The lib/<abi>/ directories existing is not evidence that the ABI slice shipped.
+# The check used to be a prefix match on "^lib/<abi>/", so an APK carrying one
+# stray file per ABI directory satisfied every required ABI at once -- and on a
+# real arm device that APK fails to install with INSTALL_FAILED_NO_MATCHING_ABIS,
+# which is the exact bug this gate exists to stop. Asserted separately from the
+# no-lib/ guard above, on a fixture that has lib/ entries precisely so the other
+# guard cannot be what rejects it.
+if run_smoke_on "${WORK_DIR}/apk-abi-dirs-only.apk" >"${WORK_DIR}/abi-dirs.log" 2>&1; then
+  bad "an APK whose lib/<abi>/ directories exist but hold no native library fails the gate" \
+    "passed: the directory prefix is not the native library, so a real arm install would fail"
+else
+  if grep -qF "no lib/arm64-v8a/libflutter.so" "${WORK_DIR}/abi-dirs.log"; then
+    ok "an APK whose lib/<abi>/ directories exist but hold no native library fails the gate"
+  else
+    bad "an APK whose lib/<abi>/ directories exist but hold no native library fails the gate" \
+      "failed for the wrong reason: $(tr '\n' '|' <"${WORK_DIR}/abi-dirs.log" | cut -c1-200)"
   fi
 fi
 # ...and the two ways the check itself cannot run must also fail, rather than
@@ -742,8 +900,8 @@ fi
 # A reader diagnosing "does this build support my phone?" should be able to answer
 # from the log without unzipping the artifact themselves.
 if run_smoke_on "${WORK_DIR}/app-release.apk" >"${WORK_DIR}/abi-pass.log" 2>&1 &&
-  grep -q "native ABI present: arm64-v8a" "${WORK_DIR}/abi-pass.log" &&
-  grep -q "native ABI present: armeabi-v7a" "${WORK_DIR}/abi-pass.log"; then
+  grep -qF "native library present: lib/arm64-v8a/libflutter.so" "${WORK_DIR}/abi-pass.log" &&
+  grep -qF "native library present: lib/armeabi-v7a/libflutter.so" "${WORK_DIR}/abi-pass.log"; then
   ok "the ABI check reports each ABI it found"
 else
   bad "the ABI check reports each ABI it found" \

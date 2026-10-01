@@ -115,6 +115,91 @@ if ((${#REQUIRED_ABIS[@]} == 0)); then
   exit 2
 fi
 
+# The per-ABI library whose presence proves the ABI slice was really packaged.
+#
+# This used to be a claim about the Rust daemon: "the daemon ships native code,
+# so an APK with no lib/ entries means the cross-compile produced nothing". That
+# rationale is false. What is actually true of the `cargo ndk` step, measured
+# rather than assumed:
+#
+#   * `native_core/Cargo.toml` declares no `crate-type`, so `galleryd` builds as
+#     a bin and `native_core` as an rlib. Neither is a cdylib, and `cargo ndk`
+#     copies only artifacts whose `crate_types` contain `cdylib` (cargo-ndk's
+#     `artifact_is_cdylib`), so it drops both and no daemon is packaged. Nothing
+#     in app/lib or app/android calls `loadLibrary`, `DynamicLibrary` or
+#     `System.loadLibrary`, so nothing looks for one either. That is #140.
+#   * The step is NOT a no-op. `iroh` and `iroh-relay` both declare
+#     `crate-type = ["lib", "cdylib"]`, so cargo emits `libiroh.so` and
+#     `libiroh_relay.so` for each target ABI and cargo-ndk copies them into
+#     jniLibs. They are also what keeps the step from failing: cargo-ndk exits
+#     non-zero with "No usable artifacts produced by cargo" when a target has no
+#     cdylib at all, so if iroh ever dropped its cdylib the release build would
+#     break loudly instead of quietly packaging nothing.
+#
+# `libflutter.so` is the witness on purpose, not because the Rust `.so`s are
+# absent:
+#   * it proves the property this gate exists for -- the APK carries a native ABI
+#     slice for every required ABI, which is what INSTALL_FAILED_NO_MATCHING_ABIS
+#     turns on;
+#   * a dependency's `.so` (e.g. `libiroh.so`) would be governed by an upstream
+#     crate's `crate-type`, so the release gate would fail for a reason outside
+#     this repo's packaging;
+#   * once #140 decides between a thin paired client and an on-device cdylib
+#     daemon, the correct Rust witness changes, and that is a product decision
+#     this gate must not pre-empt.
+#
+# `libflutter.so` is the engine, and every Flutter Android build packages it once
+# per target ABI in debug and release alike, so it is a truthful witness for "this
+# APK carries an arm slice". Nothing here may assert a library the APK does not
+# contain.
+#
+# Evidence, and its limits. Measured on this host:
+#
+#   * `cargo metadata --manifest-path native_core/Cargo.toml` lists this package's
+#     targets as `native_core` at `crate_types: ["lib"]` and `galleryd` at
+#     `["bin"]` -- neither declares `crate-type`. (`crate_types` is per *target*,
+#     under `.targets[]`; a dependency package has no top-level `crate_types` key,
+#     so reading one is how a count of the graph goes wrong. Counting `[[lib]]`
+#     sections in the registry manifests gives exactly four: `iroh`,
+#     `iroh-relay`, `wasm-streams` and `ws_stream_wasm`. `rusqlite` also spells
+#     `crate-type = ["cdylib"]`, but on an `[[example]]` rather than its lib
+#     target, so cargo does not build it. The two wasm crates sit behind
+#     `cfg(target_arch = "wasm32")` /
+#     `cfg(all(target_family = "wasm", target_os = "unknown"))`, so cargo never
+#     builds them for an Android target -- which leaves `iroh` and `iroh-relay`
+#     as the two that are built.)
+#   * A throwaway crate outside this repo, depending on `iroh = "=0.98.2"` with
+#     its own `[[bin]]` and `src/lib.rs`, built with
+#     `cargo build --message-format=json`: `galleryd_probe` came back at
+#     `["bin"]` and `cdylib_probe` at `["lib"]`, neither with any `.so`.
+#     `iroh` and `iroh_relay` came back at `["lib","cdylib"]` each, and cargo's
+#     `filenames` for them listed an `.rlib` *and* a `.so` that exists on disk
+#     as a real ELF shared object. 28 `.so` files were written in total: those
+#     two, plus 26 `proc-macro` crates, which are a different `crate_type` and
+#     host-only, so cargo-ndk's filter skips them.
+#   * cargo-ndk 4.1.2 collects every `compiler-artifact` message (no package
+#     filter), keeps the ones whose `target.crate_types` contains `CDyLib`
+#     (`artifact_is_cdylib`), and copies the `.so` to
+#     `<output>/<arch>/<file_name()>` verbatim. So the Rust `.so`s land in
+#     `app/android/app/src/main/jniLibs/<arch>/` -- and their names keep cargo's
+#     metadata hash (`libiroh-<hash>.so`), which is itself a reason no gate can
+#     assert one by a stable name.
+#
+# What was NOT verified: this host has no NDK, no Flutter toolchain and no
+# signing material, so the cross-compiled Android artifacts were never produced
+# and no real signed APK was ever unzipped. `libiroh.so` being packaged is
+# therefore established from cargo's own artifact emission plus cargo-ndk's copy
+# code, NOT from inspecting an archive. The fixture tests below prove the *check*
+# discriminates; they say nothing about what a real APK ships. cargo-ndk is
+# installed unpinned (`cargo install cargo-ndk --locked`), so the copy logic
+# quoted above was read from 4.1.2, the version cached locally, and could differ
+# on a future release build.
+#
+# Asserted by name rather than as "the lib/<abi>/ directory exists": a directory
+# holding one stray file is not a shipped native library, and a prefix match on
+# the directory accepts one.
+REQUIRED_NATIVE_LIB="libflutter.so"
+
 # Runtime permissions the app can ask for. Granting them up front keeps a system
 # permission dialog from stealing window focus during the launch assertion. The
 # app does not request anything on cold start, so this is belt-and-braces; each
@@ -797,21 +882,28 @@ assert_native_abis_present() {
     printf '::error::could not list the APK archive, so its native ABIs cannot be verified: %s\n' "$(trim "${entries}")" >&2
     return 1
   fi
-  # The daemon ships native code, so an APK with no lib/ entries at all means the
-  # cross-compile produced nothing -- a packaging regression that a Java-only build
-  # would pass silently and that the emulator cannot detect. There is no opt-in: if
-  # a future build genuinely has no native code, the REQUIRED_ABIS list is the thing
-  # to change, not this verdict.
+  # Flutter packages native libraries per ABI, so an APK with no lib/ entries at
+  # all means the native packaging produced nothing -- a regression that a
+  # Java-only build would pass silently and that the emulator cannot detect.
+  # There is no opt-in: if a future build genuinely has no native code, the
+  # REQUIRED_ABIS list is the thing to change, not this verdict.
   if ! grep -q '^lib/' <<<"${entries}"; then
-    printf '::error::the APK contains no lib/ entries at all. The daemon ships native code, so this is a packaging regression (a dropped or empty jniLibs), not a Java-only build. An APK with no native libraries installs on the x86_64 emulator with no ABI mismatch, so the emulator cannot catch this.\n' >&2
+    printf '::error::the APK contains no lib/ entries at all. Flutter Android builds package native libraries per ABI (e.g. libflutter.so); no lib/ entries mean the APK is missing the engine slices, a packaging regression the x86_64 emulator cannot detect because it would only expose a mismatch for the wrong ABI set.\n' >&2
     return 1
   fi
   for abi in "${REQUIRED_ABIS[@]}"; do
-    if grep -q "^lib/${abi}/" <<<"${entries}"; then
-      log "native ABI present: ${abi}"
+    # -F and -x, not a regex. `${REQUIRED_NATIVE_LIB}` contains a literal dot, and
+    # a plain `grep -q "^lib/<abi>/libflutter.so$"` treats that dot as "any
+    # character" -- so `lib/<abi>/libflutterXso` satisfied it. That is an
+    # assertion satisfied for the wrong reason: the archive would be reported as
+    # carrying the Flutter engine while carrying a different file. -x requires the
+    # whole line and -F makes the pattern literal, so only the exact entry passes.
+    local lib_entry="lib/${abi}/${REQUIRED_NATIVE_LIB}"
+    if grep -qFx "${lib_entry}" <<<"${entries}"; then
+      log "native library present: lib/${abi}/${REQUIRED_NATIVE_LIB}"
     else
-      printf '::error::the APK contains no lib/%s/ entries. The emulator matrix only runs x86_64 images, so this cannot be caught by installing it: on a real arm device the install would fail with INSTALL_FAILED_NO_MATCHING_ABIS. The native libraries are cross-compiled by the cargo-ndk step in the android job.\n' "${abi}" >&2
-      fail "the APK is missing native libraries for ${abi}"
+      printf '::error::the APK contains no lib/%s/%s. The emulator matrix only runs x86_64 images, so this cannot be caught by installing it: on a real arm device the install would fail with INSTALL_FAILED_NO_MATCHING_ABIS if the required ABI slice is missing. This checks the Flutter engine artifact shipped with the app, not a custom daemon.\n' "${abi}" "${REQUIRED_NATIVE_LIB}" >&2
+      fail "the APK is missing ${REQUIRED_NATIVE_LIB} for ${abi}"
     fi
   done
 }
