@@ -115,10 +115,34 @@ jobs:
             scripts/tests/tests_wiring_test.sh \
             scripts/tests/tests_wiring_mutation_test.sh \
             scripts/tests/release_atomic_publish_mutation_test.sh \
+          shellcheck --severity=warning \
+            scripts/android_release_signing.sh \
+            scripts/android_release_artifact_smoke.sh \
+            scripts/android_release_verify_signature.sh \
+            scripts/production-readiness-check.sh \
+            scripts/dev-check.sh \
+            scripts/tests/release_workflow_test.sh \
+            scripts/tests/android_release_signing_test.sh \
+            scripts/tests/apksigner_gate_test.sh \
+            scripts/tests/android_release_artifact_smoke_test.sh \
+            scripts/tests/run_release_gate_tests.sh \
+            scripts/tests/gen_test_requirements_test.sh \
+            scripts/tests/suites_offline_test.sh \
+            scripts/tests/workflow_hygiene_test.sh \
+            scripts/tests/workflow_hygiene_mutation_test.sh \
+            scripts/tests/gen_test_requirements_mutation_test.sh \
+            scripts/tests/tests_wiring_test.sh \
+            scripts/tests/tests_wiring_mutation_test.sh \
+            scripts/tests/release_atomic_publish_mutation_test.sh \
             scripts/tests/project_board_workflow_test.sh \
             scripts/tests/project_board_workflow_mutation_test.sh \
-            scripts/tests/required_checks_test.sh
-      - name: Run the release gate tests
+            scripts/tests/required_checks_test.sh \
+            scripts/linux_release_artifact_smoke.sh \
+            scripts/tests/linux_release_artifact_smoke_test.sh      - name: Run the release gate tests
+        # Now covers the Android signing/install-launch-render gates AND the
+        # Linux AppImage+.deb gate. Each suite here runs on synthetic fixtures:
+        # this job proves the checks discriminate, it does not install a release
+        # artifact. That happens in release.yml, where the gates block the tag.
         run: bash scripts/tests/run_release_gate_tests.sh
 
   security:
