@@ -8,7 +8,18 @@
 - Run Rust checks: `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`, and `cargo test`.
 - Run Flutter checks from `app/`: `flutter analyze` and `flutter test`.
 - Run secret scanning and dependency audit in CI.
-- Generate or refresh an SBOM artifact from CI.
+- Generate or refresh an SBOM artifact from CI. It is produced by the `linux` job and
+  published as a release asset.
+- **Confirm the published asset list matches the intended platform set, and that the tag
+  resolves to the commit you intend to release.** CI cannot do this: nothing in the
+  workflow compares the tag to a commit, and v0.1.5, v0.1.6 and v0.1.7 were three
+  tags on one commit with a byte-identical APK.
+- **Sideload the new APK over the previous release on a real device.** This is the only
+  check that proves an upgrade path exists. It cannot be automated here: it needs a
+  device that already has the previous signed build, and losing the release key forces
+  an uninstall, which discards `flutter_secure_storage` (the mobile bearer token and
+  paired identity). If the key is an ephemeral per-run key, the upgrade WILL require
+  an uninstall -- see the signing paragraph in the release notes.
 
 ## Platform And Store Completion
 

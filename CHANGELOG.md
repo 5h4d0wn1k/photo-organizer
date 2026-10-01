@@ -29,10 +29,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   publishing an unsigned APK. A throwaway per-run key is possible only via the
   explicit `PRIVATE_GALLERY_RELEASE_ALLOW_EPHEMERAL_SIGNING` repository
   variable, and the release notes say so when it is used.
-- `scripts/tests/` — device-free tests for the release gate itself (201
-  assertions: 42 release-workflow, 62 signing, 27 signature, 74 smoke), run in CI
-  via the "Release gate" job and locally with
-  `make release-gate`. `release_workflow_test.sh` asserts the release
+- `scripts/tests/` — device-free tests for the release gate itself, run in CI
+  via the "Release gate" job and locally with `make release-gate`:
+  `release_workflow_test.sh` (52 shell checks wrapping 166 assertions on the
+  parsed release workflow), `android_release_signing_test.sh` (62),
+  `apksigner_gate_test.sh` (27), `android_release_artifact_smoke_test.sh` (74),
+  and `release_atomic_publish_mutation_test.sh` (42 mutations, each breaking one
+  publication guarantee and required to go red). `release_workflow_test.sh`
+  asserts the release
   workflow's safety properties structurally, so the guarantee cannot be removed
   by an unrelated edit. A suite that cannot run its assertions (for example, no
   Android SDK for the signature test) is reported as degraded and fails the run
@@ -48,6 +52,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the sidecar into one directory can verify it with `sha256sum -c`; the
   transcript records the signing certificate digest so a release is traceable to
   a key without exposing the key itself.
+
+### Changed
+
+- **Release publication is single-writer.** Previously every platform job
+  published to the GitHub release itself, with no `needs:` between them, so a tag
+  whose platform jobs were only partly green still produced a live, public,
+  non-draft release carrying whatever the successful jobs had uploaded — and it
+  became "Latest", consuming the tag. v0.1.7 is the observed instance: the
+  Android, Windows and macOS jobs were green while Linux and iOS failed, and the
+  release shipped exactly those three assets (no AppImage, no `.deb`, no `.app`,
+  despite the APK being present). There was no guard anywhere — the `release-gate`
+  check is required for merges only, the branch ruleset does not govern tags, and
+  the workflow triggers on `push: tags: v*`, so a tag push bypassed every gate by
+  construction. Now exactly one job (`release`) holds `contents: write` and
+  publishes, and exactly one *step* performs the publish: a second publish call
+  inside that same job would recreate the identical partial release, because the
+  action drafts the release, uploads, then flips `draft: false`, so a step placed
+  before staging leaves a live release with whatever it named while the staging
+  refusals run too late. Every platform job uploads its build output as a
+  workflow artifact instead. The publisher requires every platform job, stages the artifact set
+  itself, and refuses to publish on a missing platform directory, a zero-byte
+  payload, or two artifacts sharing a basename. The `android-publish` job, which
+  held `contents: write` and was gated on `needs: [android, android-smoke]` while
+  carrying none of the signing steps, becomes `android-verify` with
+  `contents: read`, and a toolchain-free `release-signing-preflight` job fails a
+  tag with no signing material in seconds, before any job holds
+  `contents: write`. It had in fact never run: `android` had no `needs:` and its
+  `actions/checkout` pin was unresolvable, so every `v*` tag died in `android`
+  first (#133, fixed in #134).
+- The release notes now state the signing mode of the published APK. An
+  ephemeral-key build tells the reader that a future version needs an uninstall,
+  which discards the device's paired identity, instead of promising a clean
+  upgrade over it.
 
 ### Security
 
@@ -124,10 +161,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `if: always()` step in the build job, which also runs on a failed or cancelled
   build. It is a no-op when no key was materialized, so a failed build is not
   replaced by a confusing second failure.
-- The job that publishes the APK now re-verifies it. That job is the last thing to
-  run before the bytes become a download, on its own runner, with its own checkout
-  of the gate script, so it re-derives the checksum (`sha256sum -c`) and
-  re-asserts the v2+v3 signature on exactly the file it attaches. Its evidence is
+- The APK is re-verified before it is published, by a job other than the one that
+  built it. The re-verification runs on its own runner with its own checkout of
+  the gate script, so it re-derives the checksum (`sha256sum -c`) and re-asserts
+  the v2+v3 signature on exactly the artifact the release stages — both jobs fetch
+  the same immutable `android-artifact` from the same run. Its evidence is
   written to a scratch directory: the gate is verifying, not regenerating, and
   must not be able to make a bad artifact look attested by replacing the file a
   reader is told to trust.
@@ -193,9 +231,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   signing warnings. Exactly one job generates the changelog, so it is no longer
   duplicated once per platform.
 - The Android **build** job no longer holds `contents: write`; it only uploads an
-  artifact, and the separate `android-publish` job owns the release. The
-  `linux`, `windows`, `macos` and `ios` jobs still hold it, because those jobs
-  publish their own artifacts.
+  artifact. Publication is owned by a single dedicated job rather than by each
+  platform job — see the single-writer entry under **Changed**.
 - The Android artifact was staged for upload as a multi-path list. That does not
   produce a flat artifact: `actions/upload-artifact` documents that "if multiple
   paths are provided as input, the least common ancestor of all the search paths

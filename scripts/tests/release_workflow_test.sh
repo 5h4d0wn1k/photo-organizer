@@ -92,7 +92,20 @@ def needs_of(job):
     return list(raw)
 
 def is_publish_step(step):
-    return "action-gh-release" in str(step.get("uses", ""))
+    # A second writer does not have to use the action. `gh release create` -- or a
+    # call to the releases API -- in any job's `run:` block creates or updates a
+    # release too, and a scan that only matches `action-gh-release` in `uses:`
+    # cannot see it. Without this, "exactly one job may publish" is a claim about
+    # one spelling of publishing rather than about publishing: an independent
+    # review added a job that ran `gh release create` in a `run:` block and the
+    # suite stayed green.
+    if "action-gh-release" in str(step.get("uses", "")):
+        return True
+    run = str(step.get("run", ""))
+    return bool(
+        re.search(r"\bgh\s+release\s+(create|edit|upload)\b", run)
+        or (re.search(r"\bgh\s+api\b", run) and "releases" in run)
+    )
 
 publishers = {
     job for job, spec in jobs.items() if any(is_publish_step(s) for s in spec.get("steps", []) or [])
@@ -100,15 +113,20 @@ publishers = {
 
 failures = []
 
+checks = 0
+
+
 def expect(condition, message):
+    global checks
+    checks += 1
     if not condition:
         failures.append(message)
 
 # --- the core #97 guarantee -------------------------------------------------
-expect("android" not in publishers, "the `android` build job must not publish; `android-publish` owns publication")
+expect("android" not in publishers, "the `android` build job must not publish; the `release` job owns publication")
 expect(
-    sorted(needs_of("android-publish")) == ["android", "android-smoke"],
-    "`android-publish` must need both `android` and `android-smoke`",
+    sorted(needs_of("android-verify")) == ["android", "android-smoke"],
+    "`android-verify` must need both `android` and `android-smoke`",
 )
 expect(
     sorted(needs_of("android-smoke")) == ["android"],
@@ -123,6 +141,356 @@ expect(
     "the smoke matrix must cover API 30 (legacy) and API 35 (modern, near targetSdk 36)",
 )
 
+# --- atomic publication ------------------------------------------------------
+# Before this, five jobs held `contents: write`, none had a `needs:`, and each
+# published itself. The release action creates the release when it does not
+# exist, so a tag where any subset of those jobs failed still produced a live,
+# public, non-draft release carrying whatever the successful jobs had uploaded,
+# and it became "Latest". The tag was consumed. Nothing asserted against that
+# shape, which is why `release_workflow_test.sh` had to be read to find it.
+#
+# v0.1.7 is the observed instance: run 35839417899 had Android, Windows and
+# macOS green, Linux and iOS red, and published exactly those three assets --
+# three assets, not four, and the APK was one of them.
+#
+# The invariant is therefore not "the Android publish job needs the smoke gate".
+# It is: exactly one job may publish, and everything that produces release
+# material must gate it.
+expect(
+    publishers == {"release"},
+    f"exactly one job may publish, and it must be `release` (found {sorted(publishers)})",
+)
+expect(
+    "release" in jobs,
+    "release.yml must define a single `release` job that owns publication",
+)
+
+# --- one publish *step*, not one publish job ----------------------------------
+# `publishers` is a set of job NAMES, so every property below it was satisfied by
+# `any(...)`/join over whichever steps a job happened to have. A second publish
+# step inside `release` was therefore invisible: the job name is still `release`,
+# the real step still sets `fail_on_unmatched_files`, and the joins still contain
+# `dist/*`. The suite stayed green while a second publish call sat *before*
+# staging -- and the pinned action creates the release as a draft, uploads, then
+# flips `draft: false`, so it leaves a live, Latest release carrying only what it
+# named, with every staging refusal afterwards arriving too late. That is the
+# v0.1.7 incident, reproduced inside the job that exists to prevent it.
+#
+# So count publish steps workflow-wide, pin the single one's position, and derive
+# every publish property from that one step rather than from a join over many.
+publish_steps_everywhere = [
+    (job, step)
+    for job, spec in jobs.items()
+    for step in (spec.get("steps") or [])
+    if is_publish_step(step)
+]
+expect(
+    len(publish_steps_everywhere) == 1,
+    f"exactly one publish step may exist anywhere in the workflow (found "
+    f"{len(publish_steps_everywhere)}: {[(job, str(step.get('name') or step.get('uses') or '(run block)')) for job, step in publish_steps_everywhere]})",
+)
+release_publish_steps = [step for step in steps_of("release") if is_publish_step(step)]
+expect(
+    len(release_publish_steps) == 1,
+    f"exactly one publish step may exist in `release` (found {len(release_publish_steps)})",
+)
+expect(
+    release_publish_steps == steps_of("release")[-1:],
+    "the publish step must be the last step of `release`, so nothing runs after the release "
+    "goes live; a publish step placed earlier publishes whatever it named regardless of staging",
+)
+# The single publish step, for the property assertions below. When the count is
+# wrong these are deliberately vacuous rather than raising: the count assertion is
+# already red and named, and a traceback would replace a readable failure with a
+# crash and hide the other findings.
+publish_step = release_publish_steps[0] if len(release_publish_steps) == 1 else {}
+publish_with = publish_step.get("with") or {}
+for upstream in (
+    "release-signing-preflight",
+    "linux",
+    "windows",
+    "macos",
+    "ios",
+    "android-verify",
+):
+    expect(
+        upstream in needs_of("release"),
+        f"`release` must need `{upstream}`, or a failure there still publishes a partial release",
+    )
+expect(
+    len(needs_of("release")) == len(set(needs_of("release"))),
+    "`release` lists a dependency twice",
+)
+# `if:` on a job runs it even when its dependencies failed, which is exactly the
+# mechanism by which a four-platform release escapes while Android is red.
+# #82 proposed `always()`; it is the opposite of atomic publication.
+#
+# The first version of this check compared the raw string to the literal
+# `always()`. That was not a check at all: an independent review added
+# `if: ${{ always() }}` -- the form GitHub's own documentation uses, semantically
+# identical -- and the suite stayed green.
+#
+# The second version normalised `${{ }}` and whitespace and searched for
+# `always()` anywhere in the expression. Still too narrow. Per GitHub's
+# `jobs.<job_id>.needs` documentation, ANY job-level conditional drops the
+# implicit `success()`, including `if: ${{ !cancelled() }}`, which reads like the
+# opposite of `always()` and is the form someone reaches for when told "the
+# publish job must run even when...".
+#
+# So the correct assertion is the one the workflow comment actually claims: the
+# publisher has no conditional, and therefore runs only when every entry in
+# `needs` succeeded. Absence of `if` is the whole guarantee; any value at all
+# weakens it, so any value at all fails. A step-level `if` is checked separately
+# below, because a step-level scan cannot see a job-level key.
+expect(
+    not jobs["release"].get("if"),
+    "`release` must carry no job-level `if:` at all -- any conditional drops the implicit "
+    "`success()` on `needs`, so `if: ${{ !cancelled() }}` or `if: ${{ success() || failure() }}` "
+    "publishes a partial release just as `always()` does. The guarantee is the ABSENCE of a "
+    "conditional, so only absence passes",
+)
+# And the same for its steps, which is a different key on a different object: a
+# job-level scan cannot see a step-level `if`. This matters independently of the
+# job-level rule, because the staging step *refuses* by exiting non-zero -- a
+# publish step carrying `if: always()` would run anyway and create a release whose
+# `dist/*` glob matches nothing. Nothing in `release` needs a conditional; the two
+# legitimate `if: always()` steps in this file are cleanup and evidence upload, in
+# the `android` and `android-smoke` jobs.
+release_step_conditions = [
+    (step.get("name") or "<unnamed>")
+    for step in steps_of("release")
+    if isinstance(step, dict) and step.get("if")
+]
+expect(
+    not release_step_conditions,
+    "no step in `release` may carry an `if:` -- a step-level `if: always()` on the publish "
+    "step runs it even when the staging step refused, creating exactly the empty release "
+    "this change exists to prevent. Offending step(s): " + ", ".join(release_step_conditions),
+)
+expect(
+    not any("release" in needs_of(job) for job in jobs),
+    "no job may need `release` itself -- `release` is the terminal publisher, and a job "
+    "that depends on it would deadlock on the artifact it waits for",
+)
+
+# Artifact-level completeness. Asserting the `needs:` list alone is not enough: a
+# new platform can be added to `needs` and still never be downloaded, which
+# publishes a release that silently omits it. So every artifact any job uploads
+# is checked against every artifact `release` downloads.
+def upload_names(job):
+    found = []
+    for step in steps_of(job):
+        if not isinstance(step, dict) or "upload-artifact" not in str(step.get("uses", "")):
+            continue
+        name = str((step.get("with") or {}).get("name") or "")
+        if name:
+            found.append(name)
+    return found
+
+def download_names(job):
+    found = []
+    for step in steps_of(job):
+        if not isinstance(step, dict) or "download-artifact" not in str(step.get("uses", "")):
+            continue
+        name = str((step.get("with") or {}).get("name") or "")
+        if name:
+            found.append(name)
+    return found
+
+def download_platforms(job):
+    # The platform directory each download-artifact step writes into. This is the
+    # set of platforms `release` actually has on disk, derived from the workflow
+    # rather than restated, so it cannot drift from what is fetched.
+    found = set()
+    for step in steps_of(job):
+        if not isinstance(step, dict) or "download-artifact" not in str(step.get("uses", "")):
+            continue
+        path = str((step.get("with") or {}).get("path") or "")
+        found.add(path.rstrip("/").rsplit("/", 1)[-1] if path else "")
+    return found
+
+def staged_platforms(job):
+    # The `platforms=(...)` array in the staging step -- the list that decides what
+    # is copied into `dist` and therefore what the release actually attaches.
+    found = None
+    for step in steps_of(job):
+        if not isinstance(step, dict):
+            continue
+        match = re.search(r"^\s*platforms=\(([^)]*)\)", str(step.get("run", "")), re.M)
+        if match:
+            found = set(match.group(1).split())
+    return found or set()
+
+# The published asset set is decided by `platforms=(...)`, and nothing else. An
+# independent review built a composite `freebsd` job that was wired up correctly in
+# every way this file checks -- job created, added to `needs`, artifact uploaded,
+# artifact downloaded into `incoming/freebsd` -- and the suite stayed at 52 passed,
+# because the download landed in a directory the staging loop never visits. The
+# artifact was then attached to nothing. That is precisely the "silently omits a
+# platform" outcome the workflow comment claims to prevent, and the earlier
+# assertion could not see it: it required the literal
+# `find "incoming/${platform}" -type f -size +0c` inside the run block, which is
+# still true no matter which platforms the array holds.
+#
+# So the array is now compared against the download destinations. They must be the
+# same set. A rename of a download path fails here too, instead of failing closed
+# at publish time as a confusing refusal.
+expect(
+    staged_platforms("release") == download_platforms("release")
+    and len(download_platforms("release")) >= 1,
+    "the staging `platforms=(...)` array must be exactly the set of directories the "
+    "download-artifact steps write into -- an artifact fetched into `incoming/<p>` that the "
+    "staging loop never visits is downloaded, verified, and then attached to nothing. "
+    "Add a platform to the array and the suite fails here, not silently at release time",
+)
+
+# `continue-on-error: true` turns a step's refusal into a green job. The staging
+# step's whole purpose is to exit non-zero on an incomplete platform set; with this
+# key the job succeeds anyway, `dist` is never created, and the publish step's glob
+# matches nothing. The review demonstrated the suite stayed green while this was
+# added. The comment at release.yml:802-804 claims the release "is either complete
+# or it does not exist", and a swallowed refusal is the one thing that breaks that.
+continue_on_error = [
+    (step.get("name") or "<unnamed>")
+    for step in steps_of("release")
+    if isinstance(step, dict) and "continue-on-error" in step
+]
+expect(
+    not continue_on_error,
+    "no step in `release` may set `continue-on-error` -- it swallows the staging step's "
+    "refusal and turns the whole job green with nothing staged. Offending step(s): "
+    + ", ".join(continue_on_error),
+)
+
+# The action's default is `fail_on_unmatched_files: false`, which CREATES a release
+# with zero assets when the glob matches nothing -- the v0.1.7 shape, live and
+# public. Asserted separately from `continue-on-error` so that even if a future
+# edit swallows the staging refusal, the publish step itself still refuses to make
+# an empty release.
+expect(
+    "action-gh-release" in str(publish_step.get("uses", ""))
+    and publish_with.get("fail_on_unmatched_files") is True,
+    "the publish step must set `fail_on_unmatched_files: true` -- the action's default is "
+    "`false`, which creates a live release with zero attached assets when `dist/*` matches "
+    "nothing, which is exactly the v0.1.7 partial-release outcome",
+)
+
+def reachable_from(start):
+    # Transitive, not direct. `android` is what produces the APK, but `release`
+    # does not name it: `android-verify` sits between them, and a failing `android`
+    # blocks `android-verify` which blocks `release`. Asserting a *direct* edge
+    # from `release` to every producer would be wrong twice over -- it would fail a
+    # correct workflow, and the "fix" would be a redundant direct dependency that
+    # hides whether the real chain is intact.
+    seen = set()
+    stack = [start]
+    while stack:
+        current = stack.pop()
+        if current not in jobs:
+            continue
+        for dep in needs_of(current):
+            if dep not in seen:
+                seen.add(dep)
+                stack.append(dep)
+    return seen
+
+release_reaches = reachable_from("release")
+produced = {}
+for job in jobs:
+    for name in upload_names(job):
+        produced.setdefault(name, set()).add(job)
+release_downloads = set(download_names("release"))
+
+# `*-evidence-*` artifacts are CI evidence, not release assets, so they are
+# deliberately not downloaded. Everything else is release material.
+for name, producers in sorted(produced.items()):
+    if "evidence" in name:
+        continue
+    for producer in sorted(producers):
+        expect(
+            producer in release_reaches,
+            f"`{producer}` uploads `{name}` but `release` does not depend on it (directly "
+            f"or transitively), so its failure would not block the release",
+        )
+    expect(
+        name in release_downloads,
+        f"`release` must download `{name}` (uploaded by {sorted(producers)}), or the "
+        f"release silently omits it",
+    )
+expect(
+    release_downloads <= set(produced),
+    f"`release` downloads artifacts no job uploads: {sorted(release_downloads - set(produced))}",
+)
+expect(
+    len(release_downloads) == len([n for n in produced if "evidence" not in n]),
+    "`release` must download every release-material artifact exactly once",
+)
+
+# The staging step is what makes "complete or nothing" true at the byte level:
+# without it, a glob that matched nothing would still publish a release.
+staging_runs = "\n".join(
+    str(step.get("run", ""))
+    for step in steps_of("release")
+    if isinstance(step, dict) and "refusing to publish a partial release" in str(step.get("run", ""))
+)
+staging_code = "\n".join(
+    line for line in staging_runs.splitlines()
+    if line.strip() and not line.lstrip().startswith("#")
+)
+expect(bool(staging_code), "`release` must have a staging step that refuses a partial release")
+if staging_code:
+    expect("-type f -size +0c" in staging_code,
+           "the staging step must count non-empty files, or an empty artifact counts as produced")
+    expect("exit 1" in staging_code,
+           "the staging step must exit non-zero when a platform contributed nothing")
+    expect("overwrite the other" in staging_code,
+           "the staging step must refuse two artifacts sharing a basename, or one silently "
+           "overwrites the other in the release")
+    expect(
+    "cp " in staging_code,
+    "the staging step must copy each artifact into the published directory",
+)
+
+# --- the signing preflight cannot be bypassed -------------------------------
+# Its only job is to be fast and to be the same policy everything else uses. A
+# preflight that re-implements the rule, or that tolerates an unexpected mode, is
+# worse than none: it looks like a gate and is not one.
+preflight_steps = steps_of("release-signing-preflight")
+preflight_raw = "\n".join(
+    str(step.get("run", "")) for step in preflight_steps if isinstance(step, dict)
+)
+# Comments are stripped: the preflight's own comments quote the command and the
+# error text it is checking for, so a substring search over the raw block would be
+# satisfied by the explanation alone.
+preflight_code = "\n".join(
+    line
+    for line in preflight_raw.splitlines()
+    if line.strip() and not line.lstrip().startswith("#")
+)
+expect(bool(preflight_steps),
+       "release.yml must define a `release-signing-preflight` job")
+if preflight_steps:
+    expect("android_release_signing.sh mode" in preflight_code,
+           "the preflight must resolve signing through the shared policy script, so it cannot "
+           "drift from the workflow, the local readiness check and the tests")
+    expect("keytool" not in preflight_code,
+           "the preflight must not invoke keytool; it resolves a mode, it does not materialise a key")
+    expect("*)" in preflight_code,
+           "the preflight must have a default branch, so an unexpected mode is not accepted silently")
+    expect(re.search(r"\*\)\s*(?:echo[^\n]*\n)*\s*exit 1", preflight_code) is not None,
+           "the preflight must exit non-zero on an unexpected signing mode")
+    expect(len(preflight_steps) == 2,
+           f"the preflight must be checkout plus the policy call and nothing else, or a missing "
+           f"secret is no longer a fast fail (found {len(preflight_steps)} steps)")
+    expect((jobs["release-signing-preflight"].get("permissions") or {}).get("contents") == "read",
+           "the preflight must not hold contents: write")
+    expect(jobs["release-signing-preflight"].get("timeout-minutes", 999) <= 10,
+           "the preflight must have a short timeout, or it is not a fast fail")
+expect(
+    not needs_of("release-signing-preflight"),
+    "the preflight must need no other job, or a missing secret stops being a fast fail",
+)
+
 # --- least privilege --------------------------------------------------------
 expect(
     jobs["android"]["permissions"] == {"contents": "read"},
@@ -133,6 +501,149 @@ for job in publishers:
         jobs[job].get("permissions", {}).get("contents") == "write",
         f"the publishing job `{job}` needs contents: write",
     )
+# The inverse, which is the property that makes the previous one mean something:
+# every job that CANNOT publish must also not hold the token that publishes. Four
+# build jobs holding `contents: write` is not itself a bug -- it is a fact about
+# who can create a release, and it is the reason the partial publish was possible.
+for job in sorted(set(jobs) - publishers):
+    expect(
+        (jobs[job].get("permissions") or {}).get("contents") != "write",
+        f"`{job}` does not publish, so it must not hold contents: write",
+    )
+expect(
+    workflow.get("permissions", {}).get("contents") == "read",
+    "the workflow's top-level default must stay contents: read, so a new job does not "
+    "inherit write",
+)
+
+# `linux` holds `id-token: write` and `attestations: write`. Those mint an SBOM-backed
+# provenance attestation; neither can create a release, a tag, or an asset, which is
+# why the invariant above is scoped to `contents` and not to "any write". That
+# carve-out is asserted rather than left to a reader's judgement: deleting either key
+# looks like harmless least-privilege cleanup, and it silently stops every future
+# Linux artifact from carrying provenance. The loop above already proves `linux`
+# holds `contents: read`.
+_linux_perms = jobs["linux"].get("permissions") or {}
+expect(
+    any("attest-build-provenance" in str(step.get("uses", ""))
+        for step in jobs["linux"].get("steps", []) or []),
+    "the `linux` job is expected to attest its build provenance",
+)
+expect(
+    _linux_perms.get("id-token") == "write"
+    and _linux_perms.get("attestations") == "write",
+    "the `linux` attestation step needs id-token: write and attestations: write",
+)
+
+# --- the signing disclosure must be driven by the preflight, not hardcoded ----
+# This is the one place the release tells users something they will act on: whether
+# a future version installs over this one, or requires an uninstall that discards
+# their paired identity. An independent review replaced the whole `${{ ... }}`
+# expression with the optimistic literal and this suite still reported 51 passed --
+# so an ephemeral-key release could have published a body promising clean upgrades.
+# Nothing below was asserted, and no mutation covered it.
+_publish_body = ""
+for _step in jobs["release"].get("steps", []) or []:
+    if "softprops/action-gh-release" in str(_step.get("uses", "")):
+        _publish_body = str((_step.get("with") or {}).get("body", ""))
+expect(
+    "needs.release-signing-preflight.outputs.signing_mode" in _publish_body,
+    "the release body must branch on the preflight's signing_mode, or it is a hardcoded "
+    "claim that a future version installs over this one",
+)
+# Both branches must survive. Keeping only the optimistic one is the same defect as
+# hardcoding it, just spelled as an `if`.
+expect(
+    "project release key" in _publish_body,
+    "the release body must describe the real-release-key outcome, so an ephemeral-key "
+    "build does not leave the reader with no guidance",
+)
+expect(
+    "ephemeral per-run CI key" in _publish_body,
+    "the release body must describe the ephemeral-key outcome, which is the case that "
+    "tells users an uninstall is coming and their paired identity will be discarded",
+)
+# The preflight has to publish that value, or the expression above resolves empty and
+# GitHub substitutes "" -- silently deleting the entire sentence rather than failing.
+expect(
+    jobs["release-signing-preflight"].get("outputs", {}).get("signing_mode")
+    == "${{ steps.signing.outputs.mode }}",
+    "the preflight must expose signing_mode from the step that computes it, or the "
+    "release body's expression resolves to an empty string",
+)
+# And the mode must actually come from the shared policy script, not a literal, so
+# the body and the gate that refuses unsigned releases cannot disagree.
+_preflight_run = "".join(
+    str(step.get("run", ""))
+    for step in jobs["release-signing-preflight"].get("steps", []) or []
+)
+expect(
+    "android_release_signing.sh mode" in _preflight_run,
+    "the preflight must read the mode from scripts/android_release_signing.sh, the "
+    "single source of truth the android job's gate also uses",
+)
+
+# --- the fast-fail preflight is only fast if the builds wait for it -----------
+# The preflight comment claims "fail in seconds, and before any job holds
+# `contents: write`" and "every job that builds a platform `needs:` this one, so a
+# tag with no signing material fails here instead of after two and a half hours of
+# builds". An independent review found the second sentence was false: linux/windows/
+# macos/ios had no `needs:` at all, so they ran to completion regardless. The
+# `needs:` was added to make the claim true -- and it is asserted here so a later
+# edit cannot make the comment false again without going red. The job count and the
+# timeouts are asserted below too, because "two and a half hours" is a claim about
+# specific values.
+for _builder in ("linux", "windows", "macos", "ios", "android"):
+    expect(
+        "release-signing-preflight" in needs_of(_builder),
+        f"the `{_builder}` job must need the signing preflight, or the preflight does "
+        f"not actually fail fast -- the long platform builds run to completion "
+        f"whatever the preflight says",
+    )
+
+# --- release assets: the SBOM must actually ship -----------------------------
+# Consolidating publication dropped this. `docs/RELEASE_CHECKLIST.md` still requires "an
+# SBOM artifact from CI", the `linux` job still generates one, and nothing uploaded it --
+# so the release silently lost an asset it had published on origin/main. No assertion
+# mentioned the SBOM, which is why an independent review had to find it.
+_linux_upload = ""
+for _step in jobs["linux"].get("steps", []) or []:
+    if "upload-artifact" in str(_step.get("uses", "")):
+        _linux_upload = str((_step.get("with") or {}).get("path", ""))
+expect(
+    "sbom.spdx.json" in _linux_upload,
+    "the Linux artifact upload must include sbom.spdx.json, or the release no longer "
+    "ships the SBOM that docs/RELEASE_CHECKLIST.md requires",
+)
+_linux_generates_sbom = any(
+    "sbom-action" in str(step.get("uses", ""))
+    for step in jobs["linux"].get("steps", []) or []
+    if isinstance(step, dict)
+)
+expect(
+    _linux_generates_sbom,
+    "the `linux` job must still generate the SBOM it uploads; deleting the step leaves "
+    "the checklist requiring an artifact that nothing produces",
+)
+# Order matters and is easy to lose: `upload-artifact` snapshots the workspace when it
+# runs, so a SBOM generated *after* the upload is a file nothing will ever publish. That
+# is exactly the state this PR was found in.
+_linux_step_names = [
+    str(step.get("name", "")) for step in jobs["linux"].get("steps", []) or []
+    if isinstance(step, dict)
+]
+_sbom_at = next(
+    (n for n, name in enumerate(_linux_step_names) if name == "Generate SBOM"), None
+)
+_upload_at = next(
+    (n for n, name in enumerate(_linux_step_names) if name == "Upload Linux artifacts"),
+    None,
+)
+expect(
+    _sbom_at is not None and _upload_at is not None and _sbom_at < _upload_at,
+    "the SBOM must be generated BEFORE the upload, or `upload-artifact` snapshots the "
+    "workspace before the file exists and the SBOM is silently discarded",
+)
 
 # --- supply chain: every action pinned to a full commit SHA -----------------
 for job, spec in jobs.items():
@@ -209,9 +720,10 @@ expect("android_release_signing.sh materialize" in runs_of("android"),
        "the android job must resolve signing through scripts/android_release_signing.sh")
 # Signing resolution must run BEFORE the NDK cross-compile. The signing script's
 # stated purpose is to "fail fast ... instead of letting Gradle report an opaque
-# keystore error after a long NDK cross-compile" -- and a tag cut before the four
-# secrets exist must fail in seconds, not after burning the three-target cargo-ndk
-# release build. Order is load-bearing here, so it is asserted, not assumed.
+# keystore error after a long NDK cross-compile" -- and a tag cut before the
+# signing secrets exist must fail in seconds, not after burning the three-target
+# cargo-ndk release build. Order is load-bearing here, so it is asserted, not
+# assumed.
 android_steps = steps_of("android")
 signing_index = next((i for i, s in enumerate(android_steps)
                       if "android_release_signing.sh materialize" in str(s.get("run", ""))), None)
@@ -248,27 +760,45 @@ if verify_steps:
     expect(not re.search(r"apksigner\s+verify", verify_run),
            "the workflow must not re-inline apksigner logic; the tested gate script owns it")
 
-# --- release body integrity across platforms --------------------------------
-# Every platform publishes into the same release. Without append_body, the last
-# job to finish silently deletes every other platform's signing warning.
-for job in publishers:
-    for step in steps_of(job):
-        if not is_publish_step(step):
-            continue
-        params = step.get("with", {}) or {}
-        expect(
-            params.get("append_body") is True,
-            f"`{job}` publish step must set append_body: true or it will clobber other platforms' notes",
-        )
+# --- release body integrity --------------------------------------------------
+# With one publish call there is no "last job to finish wins the body" race left
+# to guard against: the body is written exactly once. What still has to hold is
+# that every platform's signing warning survives into it, because that text is
+# the only place a reader learns a platform is unsigned. Losing it is a security
+# disclosure regression, not cosmetics.
+release_body = str(publish_with.get("body", ""))
+for platform in ("Android", "Linux", "Windows", "macOS", "iOS"):
+    # The signing status has to be on the same line as the platform name.
+    # Checking that the name merely appears somewhere was measurably weaker:
+    # rewriting "* **macOS** - unsigned. No notarization." to
+    # "* **macOS** - see notes." left that assertion green, which is precisely the
+    # regression the assertion exists to catch -- a reader can no longer tell
+    # whether the platform is signed.
+    lines = [line for line in release_body.splitlines() if platform in line]
+    expect(
+        any(re.search(r"unsigned|signed|codesign|notariz|authenticode|gpg", line, re.IGNORECASE)
+            for line in lines),
+        f"the release body must state {platform}'s signing status on the same line as its "
+        f"name; it is the only place a reader learns the platform is unsigned",
+    )
 notes_owners = [
-    job
-    for job in publishers
-    for step in steps_of(job)
-    if is_publish_step(step) and (step.get("with", {}) or {}).get("generate_release_notes")
+    job for job, step in publish_steps_everywhere
+    if (step.get("with") or {}).get("generate_release_notes")
 ]
 expect(
     len(notes_owners) == 1,
-    f"exactly one job may set generate_release_notes (found {len(notes_owners)}: {notes_owners})",
+    f"exactly one publish step may set generate_release_notes (found {len(notes_owners)}: {notes_owners})",
+)
+# The publish step must attach the staged directory, and the staging step must be
+# the only thing deciding what is in it. Compared for equality, not containment:
+# `dist/*` joined with `incoming/android/*` contains `dist/*` while attaching a
+# second, unvetted glob.
+release_files = str(publish_with.get("files", ""))
+expect(
+    release_files == "dist/*",
+    f"the publish step must attach exactly the staged directory and nothing else, so the file "
+    f"list is decided by the staging step's assertions rather than by a glob "
+    f"(got: {release_files!r})",
 )
 
 # --- the Gradle signing config ---------------------------------------------
@@ -293,6 +823,11 @@ expect("signingConfig = if (hasReleaseSigning)" in gradle,
 
 for message in failures:
     print(message)
+# The shell wraps this entire block in one `check`, so its own tally cannot see
+# these assertions. Print the count on the way out, or a failure reads as an
+# unexplained red with no way to tell how much of the file had run.
+if failures:
+    print(f'{len(failures)} of {checks} embedded assertions failed')
 sys.exit(1 if failures else 0)
 PY
   then
@@ -379,14 +914,9 @@ if [[ -f "${runner}" ]]; then
     fi
   done
 
-  # And the runner must actually fail when a suite fails. Neutering its failure
-  # handling used to go unnoticed, because nothing exercised it.
-  probe_root="$(mktemp -d)"
-  mkdir -p "${probe_root}/tests"
-  printf '#!/usr/bin/env bash\necho "boom"\nexit 1\n' >"${probe_root}/tests/deliberately_failing_test.sh"
-  chmod +x "${probe_root}/tests/deliberately_failing_test.sh"
-  # The runner must actually fail when a suite fails, or CI reports a red suite
-  # as a green build.
+  # And the runner must actually fail when a suite fails, or CI reports a red
+  # suite as a green build. Neutering its failure handling used to go unnoticed,
+  # because nothing exercised it.
   #
   # This runs the REAL runner rather than a reimplementation of it. A hand-rolled
   # mini-runner would only prove that the pattern works in general, which says
@@ -609,10 +1139,15 @@ scripts = [
     if isinstance(step, dict)
     and "android-emulator-runner" in str(step.get("uses", ""))
 ]
-publish_steps = workflow["jobs"]["android-publish"].get("steps", []) or []
+# The verification job holds the re-verification; the publish job holds the file
+# list. They are different jobs now, and the `release` -> `android-verify` edge is
+# what keeps "verified" and "attached" referring to the same bytes. Both are read
+# here so the chain is checked end to end rather than one half at a time.
+verify_steps = workflow["jobs"]["android-verify"].get("steps", []) or []
+publish_steps = workflow["jobs"]["release"].get("steps", []) or []
 runs = [
     str(step.get("run", ""))
-    for step in publish_steps
+    for step in verify_steps
     if isinstance(step, dict)
 ]
 attached = " ".join(
@@ -634,20 +1169,40 @@ fi
 if grep -qF 'APK="apk/app-release.apk"' <<<"${apk_consumers}" \
   && grep -qF 'apk/app-release.apk' <<<"${apk_consumers}" \
   && grep -qF 'apk/app-release.apk.sha256' <<<"${apk_consumers}"; then
-  ok "the publish step re-verifies and attaches the APK from the artifact root"
+  ok "the verify job re-verifies the APK from the artifact root"
 else
-  bad "the publish step re-verifies and attaches the APK from the artifact root" \
-    "the publish job does not verify and attach apk/app-release.apk"
+  bad "the verify job re-verifies the APK from the artifact root" \
+    "the verify job does not verify apk/app-release.apk"
 fi
 
 echo " the job that publishes re-verifies what it publishes"
 # The build job runs the signature gate and the smoke job installs the APK, so
 # publication is already downstream of two checks. This asserts the third,
-# independent one: the publish job -- the last thing that runs before the bytes
-# become a download, on its own runner, with its own checkout of the gate script --
-# re-derives the checksum and the signature from the artifact it is about to
-# attach. Without it, a mismatch between what was verified and what is published
-# would be invisible until a user hit "App not installed" again.
+# independent one: a job on its own runner, with its own checkout of the gate
+# script, re-derives the checksum and the signature from the exact artifact that
+# is about to become a download. Without it, a mismatch between what was verified
+# and what is published would be invisible until a user hit "App not installed"
+# again.
+#
+# The invariant changed shape when publication moved to one job. It used to be
+# "the re-verify step comes before the publish step", which is an in-step
+# ordering inside a single job. It is now a cross-job chain, and all three links
+# have to hold or the guarantee is gone:
+#
+#   1. `android-verify` re-derives the checksum and signature (the same code as
+#      before, unchanged);
+#   2. `release` needs `android-verify`, so it cannot attach those bytes until the
+#      re-derivation is green;
+#   3. what `release` attaches is what `android-verify` verified -- which is no
+#      longer a literal path list, because the artifacts are staged into `dist/`.
+#      It is now the staging step that decides, so that is what is asserted.
+#
+# Link 3 is the one that needed care. The old check listed
+# `apk/app-release.apk` and friends as full lines in `files:` and was found by
+# mutation: dropping the APK from the list left every check green. Staging
+# replaced that list, so the equivalent assertion is that the staging step copies
+# every file from every platform directory without filtering, and that the publish
+# step attaches exactly the staged directory.
 publish_checks="$(python3 - "${WORKFLOW}" <<'PYTHON'
 import sys
 
@@ -655,39 +1210,22 @@ import yaml
 
 with open(sys.argv[1], encoding="utf-8") as handle:
     workflow = yaml.safe_load(handle)
-steps = workflow["jobs"]["android-publish"].get("steps", []) or []
+jobs = workflow["jobs"]
+steps = jobs["android-verify"].get("steps", []) or []
 
-reverify_index = None
-release_index = None
+
+def as_list(raw):
+    return [raw] if isinstance(raw, str) else list(raw or [])
+
+
 results = {}
-for index, step in enumerate(steps):
+for step in steps:
     if not isinstance(step, dict):
         continue
     name = str(step.get("name", ""))
     run = str(step.get("run", ""))
-    if "action-gh-release" in str(step.get("uses", "")):
-        release_index = index
-        # The whole point of re-verifying is that the *published* bytes are the
-        # verified ones. If the release attached a different path, the gate would
-        # be checking a file nobody downloads. Found by mutation: dropping the APK
-        # from `files:` left every check green.
-        attached = str(step.get("with", {}).get("files", ""))
-        # All three, not just the APK: the checksum is what the user verifies
-        # with, and the signature transcript is the certificate audit trail. A
-        # release missing any of them degrades what "verified" means in practice.
-        # Matched as full lines so `apk/app-release.apk` cannot be satisfied by
-        # `apk/app-release.apk.sha256`.
-        attached_lines = f"{attached}\n".splitlines()
-        results["attaches"] = all(
-            name in attached_lines
-            for name in (
-                "apk/app-release.apk",
-                "apk/app-release.apk.sha256",
-                "apk/apksigner-verify.txt",
-            )
-        )
     if "Re-verify" in name:
-        reverify_index = index
+        results["present"] = True
         # Comments are stripped before matching. A comment explaining *why* a
         # command runs usually quotes the command, so a naive substring search
         # over the raw block is satisfied by the explanation alone -- the same
@@ -701,45 +1239,118 @@ for index, step in enumerate(steps):
         )
         results["checksum"] = "sha256sum -c" in code
         results["signature"] = "android_release_verify_signature.sh" in code
-        results["empty-input"] = "::error::refusing to publish" in code
+        results["empty-input"] = "::error::refusing to release" in code
+    # All three files, not just the APK: the checksum is what the user verifies
+    # with, and the signature transcript is the certificate audit trail. A
+    # release missing any of them degrades what "verified" means in practice.
+    if "android_release_verify_signature.sh" in run:
+        # Comments are stripped first, for the reason spelled out above: the only
+        # occurrence of `apksigner-verify.txt` in this block was a comment quoting it,
+        # so a naive search passed on the explanation and failed on the code. Verified
+        # by deleting just that comment line -- the assertion went red.
+        #
+        # Note what this does and does not claim. The job does NOT read
+        # `apksigner-verify.txt`; it writes its own transcript into a scratch dir from
+        # a fresh `mktemp -d` and greps that for a certificate digest. So the assertion
+        # is that the APK and its checksum are both consumed, and that a digest is
+        # demanded from the re-derivation -- not that a shipped file is re-read.
+        results["all-three-present"] = all(
+            quoted in code
+            for quoted in (
+                'APK="apk/app-release.apk"',
+                "apk/app-release.apk.sha256",
+            )
+        )
+        results["fresh-transcript"] = (
+            "mktemp -d" in code and "certificate SHA-256 digest" in code
+        )
 
-results["present"] = reverify_index is not None
-# The guarantee, stated once: the re-verification has to come before the step that
-# makes the bytes downloadable. `False` when either step is missing, because an
-# absent step cannot be ordered correctly.
-results["ordered"] = (
-    reverify_index is not None
-    and release_index is not None
-    and reverify_index < release_index
+results.setdefault("present", False)
+for key in ("checksum", "signature", "empty-input", "all-three-present", "fresh-transcript"):
+    results.setdefault(key, False)
+
+# Link 2: the ordering, now expressed as the dependency edge.
+results["gated"] = "android-verify" in as_list(jobs["release"].get("needs"))
+
+# Link 3: what is published is what was verified.
+release_steps = jobs["release"].get("steps", []) or []
+publish_files = " ".join(
+    str(step.get("with", {}).get("files", ""))
+    for step in release_steps
+    if isinstance(step, dict) and "action-gh-release" in str(step.get("uses", ""))
+)
+results["attaches"] = "dist/*" in publish_files
+results["stages-everything"] = any(
+    "refusing to publish a partial release" in str(step.get("run", ""))
+    and "find \"incoming/${platform}\" -type f -size +0c" in str(step.get("run", ""))
+    for step in release_steps
+    if isinstance(step, dict)
+)
+results["downloads-android"] = any(
+    str((step.get("with") or {}).get("name", "")) == "android-artifact"
+    for step in release_steps
+    if isinstance(step, dict) and "download-artifact" in str(step.get("uses", ""))
 )
 for key, value in results.items():
     print(f"{key}\t{'yes' if value else 'no'}")
 PYTHON
 )"
-for required in present checksum signature empty-input ordered attaches; do
+for required in present checksum signature empty-input all-three-present fresh-transcript gated attaches stages-everything downloads-android; do
   value="$(printf '%s\n' "${publish_checks}" | grep "^${required}	" | cut -f2 | head -n 1)"
   case "${required}" in
-    ordered)
+    gated)
       if [[ "${value}" == "yes" ]]; then
-        ok "the publish job re-verifies before it publishes"
+        ok "the release cannot attach the APK before the verify job re-verifies it"
       else
-        bad "the publish job re-verifies before it publishes" \
-          "the release step runs before any re-verification, so nothing checks the bytes that get attached"
+        bad "the release cannot attach the APK before the verify job re-verifies it" \
+          "\`release\` does not need \`android-verify\`, so the re-verified bytes are not what gate the publication"
+      fi
+      ;;
+    stages-everything)
+      if [[ "${value}" == "yes" ]]; then
+        ok "the staging step copies every file from every platform directory"
+      else
+        bad "the staging step copies every file from every platform directory" \
+          "the staging step does not enumerate all files per platform, so an artifact can be verified and never published"
+      fi
+      ;;
+    downloads-android)
+      if [[ "${value}" == "yes" ]]; then
+        ok "the release downloads the android artifact the verify job checked"
+      else
+        bad "the release downloads the android artifact the verify job checked" \
+          "\`release\` does not download \`android-artifact\`"
       fi
       ;;
     attaches)
       if [[ "${value}" == "yes" ]]; then
-        ok "the release attaches the same APK the publish job re-verified"
+        ok "the release attaches the same APK the verify job re-verified"
       else
-        bad "the release attaches the same APK the publish job re-verified" \
-          "apk/app-release.apk is verified but not in the release file list, so the check covers a file nobody downloads"
+        bad "the release attaches the same APK the verify job re-verified" \
+          "the publish step does not attach the staged directory, so the verified bytes are not necessarily the published bytes"
+      fi
+      ;;
+    all-three-present)
+      if [[ "${value}" == "yes" ]]; then
+        ok "the verify job consumes both the APK and its checksum, from live code"
+      else
+        bad "the verify job consumes both the APK and its checksum, from live code" \
+          "the APK or its checksum is not checked before publication (and the previous check could be satisfied by a comment quoting the filename)"
+      fi
+      ;;
+    fresh-transcript)
+      if [[ "${value}" == "yes" ]]; then
+        ok "the verify job demands a certificate digest from its own fresh transcript"
+      else
+        bad "the verify job demands a certificate digest from its own fresh transcript" \
+          "the re-verification does not write a transcript to a scratch dir, or does not require a certificate digest from it -- so the signature check could pass having proved nothing"
       fi
       ;;
     present)
       if [[ "${value}" == "yes" ]]; then
         ok "the publish job has a re-verification step"
       else
-        bad "the publish job has a re-verification step" "no step named 'Re-verify' in android-publish"
+        bad "the publish job has a re-verification step" "no step named 'Re-verify' in android-verify"
       fi
       ;;
     *)
@@ -830,6 +1441,131 @@ else
       "the step exited 0 with the keystore still on disk"
   else
     ok "the key removal step does not report success while leaving the key"
+  fi
+fi
+
+echo " the staging step is run, not grepped"
+# String presence is not evidence that a guard is live. The staging step's two
+# refusals are printed by branches; replacing the collision guard with `if false`
+# leaves every one of those strings in place, so a suite that greps for them
+# reports a guarantee that does not exist. The step body is extracted and executed
+# instead, against synthetic artifact trees.
+#
+# This is the same discipline the key-cleanup check above uses, and for the same
+# reason: a `set -e`-free step with a wrong path would otherwise exit 0 while
+# doing nothing.
+staging_probe="$(python3 - "${WORKFLOW}" <<'PYTHON'
+import sys
+
+import yaml
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    workflow = yaml.safe_load(handle)
+for step in workflow["jobs"]["release"].get("steps", []) or []:
+    if not isinstance(step, dict):
+        continue
+    if "refusing to publish a partial release" in str(step.get("run", "")):
+        sys.stdout.write("---SCRIPT---\n")
+        sys.stdout.write(str(step.get("run", "")))
+        sys.stdout.write("\n")
+        break
+else:
+    print("MISSING")
+PYTHON
+)"
+if [[ "$(tail -n 1 <<<"${staging_probe}")" == "MISSING" ]]; then
+  bad "the release stages every platform artifact before publishing" \
+    "the release job has no staging step that refuses a partial release"
+else
+  ok "the release stages every platform artifact before publishing"
+  staging_script="${WORK_DIR}/staging.sh"
+  printf '%s\n' "${staging_probe}" | sed -n '/^---SCRIPT---$/,$p' | tail -n +2 >"${staging_script}"
+
+  # Seed a complete tree. Every probe below mutates one copy of it.
+  seed_complete() {
+    local root="$1"
+    rm -rf "${root}"
+    local platform
+    for platform in android linux windows macos ios; do
+      mkdir -p "${root}/incoming/${platform}"
+      printf 'payload-%s\n' "${platform}" >"${root}/incoming/${platform}/${platform}.bin"
+    done
+  }
+
+  seed_complete "${WORK_DIR}/stage-complete"
+  if ( cd "${WORK_DIR}/stage-complete" && bash "${staging_script}" ) \
+      >"${WORK_DIR}/stage-complete.log" 2>&1 &&
+    [[ "$(find "${WORK_DIR}/stage-complete/dist" -type f 2>/dev/null | wc -l)" -eq 5 ]]; then
+    ok "a complete artifact set is staged"
+  else
+    bad "a complete artifact set is staged" \
+      "$(tr '\n' '|' <"${WORK_DIR}/stage-complete.log" 2>/dev/null)"
+  fi
+
+  # A platform directory that is absent entirely: the case an artifact rename or a
+  # failed upload produces.
+  seed_complete "${WORK_DIR}/stage-missing"
+  rm -rf "${WORK_DIR}/stage-missing/incoming/macos"
+  if ( cd "${WORK_DIR}/stage-missing" && bash "${staging_script}" ) \
+      >"${WORK_DIR}/stage-missing.log" 2>&1; then
+    bad "a missing platform directory refuses the release" \
+      "the step exited 0 with incoming/macos absent"
+  elif ! grep -qF 'refusing to publish a partial release' "${WORK_DIR}/stage-missing.log"; then
+    bad "a missing platform directory refuses the release" \
+      "the step failed but not with the partial-release refusal: $(tr '\n' '|' <"${WORK_DIR}/stage-missing.log")"
+  else
+    ok "a missing platform directory refuses the release"
+  fi
+
+  # A platform whose every file is zero bytes. This is the assertion the
+  # `-size +0c` exists for, and a plain `-type f` would sail past it.
+  seed_complete "${WORK_DIR}/stage-zero"
+  rm -f "${WORK_DIR}/stage-zero/incoming/windows/windows.bin"
+  : >"${WORK_DIR}/stage-zero/incoming/windows/truncated.zip"
+  if ( cd "${WORK_DIR}/stage-zero" && bash "${staging_script}" ) \
+      >"${WORK_DIR}/stage-zero.log" 2>&1; then
+    bad "a platform whose only file is empty refuses the release" \
+      "the step exited 0 with windows contributing nothing but a zero-byte file"
+  else
+    ok "a platform whose only file is empty refuses the release"
+  fi
+
+  # Two platforms producing the same basename. The release action uploads by
+  # basename, so without this guard one platform's artifact silently replaces the
+  # other's and the release carries the wrong bytes under a plausible name.
+  #
+  # The clash has to be *two files with one name in two directories*. Copying one
+  # file to a second directory just produces a single file, which stages fine --
+  # and that is the mistake the first version of this probe made, so it is called
+  # out here rather than left to be rediscovered.
+  seed_complete "${WORK_DIR}/stage-clash"
+  printf 'android-payload\n' >"${WORK_DIR}/stage-clash/incoming/android/shared.bin"
+  printf 'ios-payload\n' >"${WORK_DIR}/stage-clash/incoming/ios/shared.bin"
+  if ( cd "${WORK_DIR}/stage-clash" && bash "${staging_script}" ) \
+      >"${WORK_DIR}/stage-clash.log" 2>&1; then
+    bad "two artifacts sharing a basename refuse the release" \
+      "the step exited 0 and would have published one platform's file as another's"
+  elif ! grep -qF 'overwrite the other' "${WORK_DIR}/stage-clash.log"; then
+    bad "two artifacts sharing a basename refuse the release" \
+      "the step failed but not with the collision refusal: $(tr '\n' '|' <"${WORK_DIR}/stage-clash.log")"
+  else
+    ok "two artifacts sharing a basename refuse the release"
+  fi
+
+  # Deliberate behaviour, pinned: a zero-byte file travelling *beside* a real one is
+  # dropped from the release rather than published. Shipping a 0-byte artifact is
+  # worse than shipping none, and the release is already refused outright when a
+  # platform contributes nothing at all, so nothing is silently lost.
+  seed_complete "${WORK_DIR}/stage-mixed"
+  : >"${WORK_DIR}/stage-mixed/incoming/macos/empty.dmg"
+  if ( cd "${WORK_DIR}/stage-mixed" && bash "${staging_script}" ) \
+      >"${WORK_DIR}/stage-mixed.log" 2>&1 &&
+    [[ ! -e "${WORK_DIR}/stage-mixed/dist/empty.dmg" ]] &&
+    [[ -e "${WORK_DIR}/stage-mixed/dist/macos.bin" ]]; then
+    ok "a zero-byte file is dropped from the release, not published"
+  else
+    bad "a zero-byte file is dropped from the release, not published" \
+      "$(tr '\n' '|' <"${WORK_DIR}/stage-mixed.log" 2>/dev/null)"
   fi
 fi
 

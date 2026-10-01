@@ -256,10 +256,14 @@ Before a tag can publish an APK, all of the following must pass:
    and must not be able to switch the check off.
 6. Screenshot, crash buffer, exit-info dump, `apksigner` transcript and a
    `sha256` checksum are uploaded as evidence, and the checksum records the bare
-   filename so a user can verify it with `sha256sum -c`. The job that publishes
-   the APK re-derives the checksum and re-asserts the v2+v3 signature on exactly
-   the file it attaches, and the materialized signing key is removed from the
-   runner afterwards — including when the build fails.
+   filename so a user can verify it with `sha256sum -c`. `android-verify` re-derives
+   the checksum and re-asserts the v2+v3 signature, and the single `release` job
+   `needs:` it, so nothing is published unless that passed. Both fetch the same
+   immutable `android-artifact` from the same run, which is what makes the
+   verified bytes the published bytes. `release` then stages every platform
+   artifact into `dist/` and attaches that directory, so it does not itself
+   re-derive anything. The materialized signing key is removed from the runner
+   afterwards — including when the build fails.
 
 Any failure blocks the release. Both gates are committed scripts rather than
 inline workflow logic, and both are covered on every CI run by
