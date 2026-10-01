@@ -42,7 +42,7 @@ restore() {
 # and `|`, both of which sed handles badly and neither of which is safe to
 # quote through three layers of shell.
 mutate() {
-  local name="$1" mutation="$2" needle="$3" output=""
+  local name="$1" mutation="$2" needle="$3" output="" rc=0
   restore
   if ! python3 - "${WORKFLOW}" "${mutation}" <<'PY'
 import sys
@@ -64,8 +64,20 @@ PY
     return
   fi
   output="$(bash "${SUITE}" 2>&1)"
+  rc=$?
   restore
-  if [[ ${output} == *"${needle}"* ]]; then
+  # The exit code is checked as well as the needle, and checked first. A needle
+  # match is the sharper evidence, but it is only meaningful on a suite that
+  # actually failed: an unparseable workflow makes this suite exit 1 printing
+  # only `!! SUITE_DEGRADED` and no FAIL line at all, which without this check is
+  # indistinguishable from an assertion that stopped biting. The sibling harness
+  # has checked all three of rc, needle and preflight since it was written.
+  if ((rc == 0)); then
+    MISS_COUNT=$((MISS_COUNT + 1))
+    printf '  FAIL %s: SUITE STILL PASSED (the assertion does not bite)\n' \
+      "${name}" >&2
+    printf '%s\n' "${output}" | tail -6 | sed 's/^/        /' >&2
+  elif [[ ${output} == *"${needle}"* ]]; then
     BITE_COUNT=$((BITE_COUNT + 1))
     printf '  ok   %s\n' "${name}"
   else
@@ -86,31 +98,24 @@ PY
 # signature of "the assertion does not bite". It is a false refusal: it names a
 # defect that does not exist and points the reader at the wrong file.
 #
-# Measured on this harness before the fix, rewriting each action's commit and its
-# `# vN` comment the way Dependabot does:
+# Measured on THIS harness at its parent commit, rewriting every pin in the repo
+# the way Dependabot does -- commit and `# vN` comment together, which is the only
+# way a bump ever lands -- against a tree whose bump script asserts that 0 pins
+# survived unchanged:
 #
-#   download-artifact v4 -> v5 alone                   45 run, 44 bit, 1 could not apply
-#   download-artifact v4 -> v5, attest-build-provenance
-#     v4.2.2 -> v5 and sbom-action v0.24.2 -> v0.25.0,
-#     all three at once                                45 run, 42 bit, 3 could not apply
-#   checkout v7 -> v8 and action-gh-release v3 -> v4   45 run, 45 bit
+#   nothing bumped             14 run, 14 bit
+#   every pin in the repo bumped   12 bit, 2 did not
 #
-# The three that died are the three whose literals sat in a needle. The last pair
-# changed nothing because their literals sit in *replacements* -- the deliberately
-# broken state a mutation writes, which never has to exist in the file, so a
-# version bump cannot break it. That is why a harness can sit green for months
-# with a stale pin in it and still look healthy: the replacements are the only
-# SHAs a bump could have broken, and by luck they were the ones written out of.
+# The two that died are the two mutations that select the checkout pin, "unpinning
+# the checkout action to a tag is caught" and "removing the checkout step is
+# caught". Both assertions are healthy; both were measuring "is this SHA still
+# current". The count of 2 matters on its own: 12 of 14 mutations never named a
+# pin, so a bump costs this harness a third of its coverage and reports it as
+# coverage that does not exist.
 #
-# This file held eight commit-SHA literals across five distinct commits: three in
-# needles (download-artifact, attest-build-provenance, sbom-action) and five in
-# replacements (checkout twice, action-gh-release three times). All eight are now
-# derived, and the guard below keeps them that way.
-#
-# The mutations that died were titled "the macOS artifact is never downloaded",
-# "the SBOM step is deleted entirely" and "the Linux attestation step is
-# silently replaced by a checkout". All three assertions are healthy; all three
-# were measuring "is this SHA still current".
+# This file held two commit-SHA literals, both the same action and the same
+# commit, `actions/checkout`: one in a needle and one in a replacement. Both are
+# now derived, and the guard at the end of this file keeps them that way.
 #
 # So the pin is read from the file. Five shapes are needed, and each is refused
 # rather than guessed when its selector is missing or ambiguous -- a helper that
@@ -150,15 +155,29 @@ PY
 # replacement that happens to parse would be tested against the wrong step.
 #
 # `action-line` is the one mode with no step to take an indent from, so it is also
-# the one that can be handed a wrong depth. Measured on release.yml by inserting
-# a `uses:` line into a real steps list at each depth: 0, 2, 4 and 6 are all parse
-# errors, so `preflight` rejects them, but 10 and 12 both parse -- a `uses:` line
-# deeper than the step's own keys becomes a duplicate key inside the neighbouring
-# step, PyYAML keeps the last one, and the mutation silently retargets that step
-# instead of inventing a new one. `preflight` cannot see that. `from-file` exists
-# for exactly this reason: it takes the depth from the file and refuses when the
-# file has no single depth, which is the only situation in which there is no
-# honest answer to hand back.
+# the one that can be handed a wrong depth. Measured on release.yml by inserting a
+# `uses:` line at each depth above each of its 63 step-start lines, then asking
+# PyYAML two separate questions -- does the file still parse, and did any step
+# gain a `uses:` key it did not have:
+#
+#   depth  0, 2, 4, 6       0 of 63 parse, 0 retargets
+#                          (rejected by `preflight`)
+#   depth  8               54 of 63 parse, and 23 of those put the key *inside the
+#                          neighbouring step* as a duplicate key. PyYAML keeps the
+#                          last one, so the mutation silently retargets a step it
+#                          never named, and `preflight` cannot see it.
+#   depth 10               34 of 63 parse, 0 retargets
+#   depth 12, 14, 16       14 of 63 parse, 0 retargets
+#                          (the line lands in a neighbouring step's `run:` heredoc
+#                          or `with:`, never as a step key)
+#
+# So the depth that needs deriving is 8, and it is the *shallowest* depth that
+# parses, not the deepest. An earlier version of this comment named 10 and 12,
+# which are among the depths that parse most often and never once retarget -- it
+# reported the measurement without running it. `from-file` exists for exactly this
+# reason: it takes the depth from the file and refuses when the file has no single
+# depth, which is the only situation in which there is no honest answer to hand
+# back.
 wf_derive() {
   python3 - "$@" <<'PYTHON'
 import re
@@ -193,22 +212,79 @@ def step_start(step_name):
     return hits[0]
 
 
+def step_indent(start):
+    return len(re.match(r"^[ ]*", lines[start]).group(0))
+
+
 def step_span(start):
     """Indices of the step's own lines: its name through the line before the
     next step. Blank separators are kept, because removing a step from the file
-    without its trailing blank line is a different edit from removing the step."""
+    without its trailing blank line is a different edit from removing the step --
+    and the blank really is there, because `derive` puts back the newline a `$( )`
+    would have stripped.
+
+    `- name:` alone does not bound a step list. The last step of a job is
+    followed by the *next job's* header, so a scan that stopped only at
+    `- name:` handed the caller the next job's `runs-on:`, `steps:` and first
+    step as though they belonged to this one. Measured on the two-job fixture
+    below, `step-block` for the first job's only step returned 132 bytes
+    reaching into job two. So the scan also stops at the first line indented
+    less than the step's own `- name:`. Blank and comment lines are skipped
+    rather than treated as boundaries, so a blank separator inside the step
+    still does not end it."""
+    base = step_indent(start)
     for i in range(start + 1, len(lines)):
         if re.match(r"^[ ]*- name: ", lines[i]):
+            return range(start, i)
+        body = lines[i].strip()
+        if body and not body.startswith("#") and \
+                len(lines[i]) - len(lines[i].lstrip(" ")) < base:
             return range(start, i)
     return range(start, len(lines))
 
 
 def uses_index(start):
+    """The index of the step's own `uses:` key, or None.
+
+    Bounded three ways, each forced by a real fixture rather than imagined:
+
+      * to the step's key indentation. This used to accept any indent at all, so
+        a line inside a `run: |` heredoc was read as the step's action. In the
+        fixture below PyYAML reports that step's keys as `name` and `run` -- it
+        has no `uses:` whatsoever -- and the unbounded scan still returned the
+        heredoc line with exit 0, so `step-uses`, `step-action` and `step-swap`
+        all reported success for a step with nothing to derive.
+      * to lines outside a block scalar. A `run: |` or `path: |` header means
+        everything indented deeper than the key is the scalar's content, so
+        those lines are skipped until a sibling key comes back.
+      * to the step's own span, so a later step's `uses:` is never returned.
+
+    Returning None is the honest answer here and the callers already refuse on
+    it (exit 7): a step with no `uses:` is a real thing to find, and returning
+    the nearest line that looks like one is how a harness ends up asserting
+    against the wrong step."""
+    base = step_indent(start)
+    keys = " " * (base + 2)
+    in_block = False
     for i in range(start + 1, len(lines)):
         if re.match(r"^[ ]*- name: ", lines[i]):
             break
-        if re.match(r"^[ ]*uses: ", lines[i]):
+        body = lines[i].strip()
+        if not body or body.startswith("#"):
+            continue
+        indent = len(lines[i]) - len(lines[i].lstrip(" "))
+        if indent < base:
+            break
+        if in_block:
+            if indent > base + 2:
+                continue
+            in_block = False
+        if not lines[i].startswith(keys):
+            continue
+        if lines[i].startswith(keys + "uses: "):
             return i
+        if re.match(re.escape(keys) + r"(run|script|path): [|>]", lines[i]):
+            in_block = True
     return None
 
 
@@ -325,19 +401,32 @@ PYTHON
 #
 # Every derivation goes through this rather than a bare `$(wf_derive ...)`. A
 # command substitution is a subshell, so wf_derive's `exit 1` on a refusal would
-# leave the variable empty and let the harness carry on, and `apply` would then
-# report an empty anchor under a heading that reads as "these assertions do not
-# bite" -- accusing healthy assertions because the harness's own selector was
-# wrong. Measured, by renaming the step three needles select:
+# leave the variable empty and let the harness carry on, and `mutate` would then
+# report an empty target under a heading that reads as "this mutation did not
+# apply" -- accusing healthy assertions because the harness's own selector was
+# wrong. Reproduced by putting the derivations back inline and renaming the one
+# step they select, which is this workflow's Checkout step:
 #
-#   NON-BITING / WRONG-RED / INVALID MUTATIONS (2):
-#     - the Linux attestation step is silently replaced by a checkout, so a step
-#       named [Attest build provenance] attests nothing: could not apply the
-#       mutation (ANCHOR IS NOT UNIQUE (44082 occurrences): '')
+#     - unpinning the checkout action to a tag is caught: mutation did not apply
+#       (target occurs N times, expected 1)
+#     - a first step named Checkout that checks out nothing is caught: mutation
+#       did not apply (target occurs N times, expected 1)
+#     - removing the checkout step is caught: mutation did not apply
+#       (target occurs N times, expected 1)
+#
+# Three of this file's fourteen mutations, all of them the ones that select the
+# checkout pin. N is project.yml's byte count plus one, for the same reason as in
+# the sibling harness: an empty needle's occurrences are counted against the
+# whole file.
+#
+# An earlier version of this comment quoted the sibling harness's transcript --
+# a Linux attestation step, an SBOM step, a macOS download, none of which exist
+# in project.yml -- and named three needles in prose above a block holding one
+# entry. A reader debugging this harness was sent after steps this workflow does
+# not have, which is the same false accusation one file over, committed again.
 #
 # Going through a file rather than `$( )` keeps the derivation in this shell, so
-# the exit is real, and it avoids `$( )` stripping the trailing newline a derived
-# block ends with. One scratch file is reused rather than made per call: wf_derive
+# the exit is real. One scratch file is reused rather than made per call: wf_derive
 # runs a handful of times per pass and this is not a hot path, but a fresh
 # tempfile per call would be a cleanup obligation on each one.
 # It writes the text to ${DERIVE_SCRATCH}.out and leaves it in ${DERIVED}, and is
@@ -359,10 +448,40 @@ derive() {
     printf 'mutation below was tested. This is not a missing assertion.\n' >&2
     exit 1
   fi
-  DERIVED="$(cat "${DERIVE_SCRATCH}.out")"
+  # A sentinel, because `$( )` strips every trailing newline and `step-block`
+  # returns exactly that: the last line of a step plus the blank line that
+  # separates it from the next one. Without the sentinel the newline is gone by
+  # the time the value reaches `apply`, so removing a step with `new=` left three
+  # blank lines behind where the step used to be -- and `step_span`'s "blank
+  # separators are kept" was true of the scratch file and false of the anchor.
+  # With a sentinel appended, the captured text ends in the sentinel rather than
+  # in a newline, so there is nothing for `$( )` to strip and DERIVED holds
+  # wf_derive's bytes exactly.
+  DERIVED="$(cat "${DERIVE_SCRATCH}.out"; printf '\001')"
+  DERIVED="${DERIVED%$'\001'}"
 }
 
 printf 'project_board_workflow mutation test\n'
+
+# The suite must be green before anything is mutated, or "this mutation bit" and
+# "the suite was already broken" are the same report. Measured on this harness's
+# parent commit: with project.yml's Checkout step moved to the end of its job,
+# the suite printed 16 passed / 2 failed and exited 1, and the harness still
+# reported 13 bit, 1 did not and exited 0 -- a full-looking result produced by a
+# harness measuring a suite that was already red. A red baseline is refused here
+# for the same reason a bad derivation is: it is not a missing assertion, and
+# reporting it as one is how a reader loses an afternoon.
+baseline_out="$(bash "${SUITE}" 2>&1)"
+baseline_rc=$?
+if [[ ${baseline_rc} -ne 0 ]]; then
+  printf 'HARNESS REFUSAL: %s is already red (exit %d) before any mutation ran,\n' \
+    "${SUITE##*/}" "${baseline_rc}" >&2
+  printf 'so a mutation reported as biting here would prove nothing:\n' >&2
+  grep -E '^[[:space:]]*(FAIL|!!) ' <<<"${baseline_out}" | head -10 | sed 's/^/  /' >&2
+  exit 1
+fi
+printf '  ok   baseline green: %s\n' \
+  "$(grep -E '^[[:space:]]*[0-9]+ passed' <<<"${baseline_out}" || echo 'suite exited 0')"
 
 # Two separate mutations, because one assertion covered both properties and
 # could only bite for one of them. Unpinning to a tag satisfies "uses
@@ -380,12 +499,26 @@ printf 'project_board_workflow mutation test\n'
 # earlier version of this rewrote the ref without the leading spaces, which
 # dedented `uses:` out of the step and made the workflow unparseable, so the
 # suite failed on the parse rather than on the assertion under test.
+#
+# NL, and why the replacements below have to carry it themselves. `checkout_uses`
+# used to arrive with its trailing newline already stripped, by `$( )`, and both
+# replacements were written to lean on that: `${checkout_uses%%@*}` cuts at the
+# first `@` and takes the newline with it, and the old code got its newline back
+# for free because the needle never contained one. `derive` now hands back
+# wf_derive's bytes exactly, so the needle ends in a real newline and the
+# replacement has to end in one too -- without it the replacement swallows the
+# line break and welds the next key onto the end of this one, the workflow stops
+# parsing, and the suite reports SUITE_DEGRADED with no FAIL line. Measured: with
+# the sentinel in place and these two unchanged, the harness reported
+# "13 bit, 2 did not", blaming the two assertions when the harness had broken its
+# own edit.
+NL=$'\n'
 derive "the first step's uses: line" step-uses "${WORKFLOW}" 'Checkout'
 checkout_uses="${DERIVED}"
 derive "the whole first step" step-block "${WORKFLOW}" 'Checkout'
 checkout_step="${DERIVED}"
 mutate "unpinning the checkout action to a tag is caught" \
-  "${checkout_uses}|||${checkout_uses%%@*}@v4" \
+  "${checkout_uses}|||${checkout_uses%%@*}@v4${NL}" \
   'FAIL the checkout action is pinned to a commit SHA'
 
 # The half that is about identity rather than form, which is what the constant's
@@ -396,7 +529,7 @@ mutate "unpinning the checkout action to a tag is caught" \
 # step keeps its name, which is the point -- the assertion is not satisfied by
 # the label.
 mutate "a first step named Checkout that checks out nothing is caught" \
-  "${checkout_uses}|||${checkout_uses%%uses:*}run: echo 'this checks out nothing'" \
+  "${checkout_uses}|||${checkout_uses%%uses:*}run: echo 'this checks out nothing'${NL}" \
   'FAIL the job checks the repository out before running anything from it'
 
 mutate "removing the checkout step is caught" \
@@ -474,7 +607,15 @@ mutate "restoring the inline over-match is caught" \
 # file is trying to break, and a reviewer copying it back out of a comment is
 # exactly how the coupling returns.
 self="${BASH_SOURCE[0]}"
-literal_pins="$(grep -oE '[0-9a-f]{40}' "${self}" | sort -u || true)"
+# Case-insensitively, on purpose. Measured: a run of 40 UPPERCASE hex digits
+# passed the lowercase form of this guard while `grep -i` caught it. Hex has no
+# case, so restricting the scan to lowercase made the guard weaker than the thing
+# it guards against -- and a guard that can be defeated by a keyboard is not a
+# guard. The evasion that is left, and is not closed here, is a SHA split across
+# a line boundary: the obvious fix is to join the lines before scanning, which
+# manufactures false positives out of ordinary text that happens to straddle a
+# line, and a guard that cries wolf gets deleted.
+literal_pins="$(grep -ioE '[0-9a-f]{40}' "${self}" | tr 'A-F' 'a-f' | sort -u || true)"
 if [[ -n "${literal_pins}" ]]; then
   printf 'GUARD FAILED: this harness spells out a commit SHA again, so a Dependabot\n' >&2
   printf 'bump would refuse these mutations and report a missing assertion:\n' >&2

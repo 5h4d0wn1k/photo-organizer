@@ -214,15 +214,29 @@ mutate() {
 # replacement that happens to parse would be tested against the wrong step.
 #
 # `action-line` is the one mode with no step to take an indent from, so it is also
-# the one that can be handed a wrong depth. Measured on release.yml by inserting
-# a `uses:` line into a real steps list at each depth: 0, 2, 4 and 6 are all parse
-# errors, so `preflight` rejects them, but 10 and 12 both parse -- a `uses:` line
-# deeper than the step's own keys becomes a duplicate key inside the neighbouring
-# step, PyYAML keeps the last one, and the mutation silently retargets that step
-# instead of inventing a new one. `preflight` cannot see that. `from-file` exists
-# for exactly this reason: it takes the depth from the file and refuses when the
-# file has no single depth, which is the only situation in which there is no
-# honest answer to hand back.
+# the one that can be handed a wrong depth. Measured on release.yml by inserting a
+# `uses:` line at each depth above each of its 63 step-start lines, then asking
+# PyYAML two separate questions -- does the file still parse, and did any step
+# gain a `uses:` key it did not have:
+#
+#   depth  0, 2, 4, 6       0 of 63 parse, 0 retargets
+#                          (rejected by `preflight`)
+#   depth  8               54 of 63 parse, and 23 of those put the key *inside the
+#                          neighbouring step* as a duplicate key. PyYAML keeps the
+#                          last one, so the mutation silently retargets a step it
+#                          never named, and `preflight` cannot see it.
+#   depth 10               34 of 63 parse, 0 retargets
+#   depth 12, 14, 16       14 of 63 parse, 0 retargets
+#                          (the line lands in a neighbouring step's `run:` heredoc
+#                          or `with:`, never as a step key)
+#
+# So the depth that needs deriving is 8, and it is the *shallowest* depth that
+# parses, not the deepest. An earlier version of this comment named 10 and 12,
+# which are among the depths that parse most often and never once retarget -- it
+# reported the measurement without running it. `from-file` exists for exactly this
+# reason: it takes the depth from the file and refuses when the file has no single
+# depth, which is the only situation in which there is no honest answer to hand
+# back.
 wf_derive() {
   python3 - "$@" <<'PYTHON'
 import re
@@ -257,22 +271,79 @@ def step_start(step_name):
     return hits[0]
 
 
+def step_indent(start):
+    return len(re.match(r"^[ ]*", lines[start]).group(0))
+
+
 def step_span(start):
     """Indices of the step's own lines: its name through the line before the
     next step. Blank separators are kept, because removing a step from the file
-    without its trailing blank line is a different edit from removing the step."""
+    without its trailing blank line is a different edit from removing the step --
+    and the blank really is there, because `derive` puts back the newline a `$( )`
+    would have stripped.
+
+    `- name:` alone does not bound a step list. The last step of a job is
+    followed by the *next job's* header, so a scan that stopped only at
+    `- name:` handed the caller the next job's `runs-on:`, `steps:` and first
+    step as though they belonged to this one. Measured on the two-job fixture
+    below, `step-block` for the first job's only step returned 132 bytes
+    reaching into job two. So the scan also stops at the first line indented
+    less than the step's own `- name:`. Blank and comment lines are skipped
+    rather than treated as boundaries, so a blank separator inside the step
+    still does not end it."""
+    base = step_indent(start)
     for i in range(start + 1, len(lines)):
         if re.match(r"^[ ]*- name: ", lines[i]):
+            return range(start, i)
+        body = lines[i].strip()
+        if body and not body.startswith("#") and \
+                len(lines[i]) - len(lines[i].lstrip(" ")) < base:
             return range(start, i)
     return range(start, len(lines))
 
 
 def uses_index(start):
+    """The index of the step's own `uses:` key, or None.
+
+    Bounded three ways, each forced by a real fixture rather than imagined:
+
+      * to the step's key indentation. This used to accept any indent at all, so
+        a line inside a `run: |` heredoc was read as the step's action. In the
+        fixture below PyYAML reports that step's keys as `name` and `run` -- it
+        has no `uses:` whatsoever -- and the unbounded scan still returned the
+        heredoc line with exit 0, so `step-uses`, `step-action` and `step-swap`
+        all reported success for a step with nothing to derive.
+      * to lines outside a block scalar. A `run: |` or `path: |` header means
+        everything indented deeper than the key is the scalar's content, so
+        those lines are skipped until a sibling key comes back.
+      * to the step's own span, so a later step's `uses:` is never returned.
+
+    Returning None is the honest answer here and the callers already refuse on
+    it (exit 7): a step with no `uses:` is a real thing to find, and returning
+    the nearest line that looks like one is how a harness ends up asserting
+    against the wrong step."""
+    base = step_indent(start)
+    keys = " " * (base + 2)
+    in_block = False
     for i in range(start + 1, len(lines)):
         if re.match(r"^[ ]*- name: ", lines[i]):
             break
-        if re.match(r"^[ ]*uses: ", lines[i]):
+        body = lines[i].strip()
+        if not body or body.startswith("#"):
+            continue
+        indent = len(lines[i]) - len(lines[i].lstrip(" "))
+        if indent < base:
+            break
+        if in_block:
+            if indent > base + 2:
+                continue
+            in_block = False
+        if not lines[i].startswith(keys):
+            continue
+        if lines[i].startswith(keys + "uses: "):
             return i
+        if re.match(re.escape(keys) + r"(run|script|path): [|>]", lines[i]):
+            in_block = True
     return None
 
 
@@ -392,26 +463,36 @@ PYTHON
 # leave the variable empty and let the harness carry on, and `apply` would then
 # report an empty anchor under a heading that reads as "these assertions do not
 # bite" -- accusing healthy assertions because the harness's own selector was
-# wrong. Measured, by renaming the step three needles select:
+# wrong. Reproduced by putting the derivations back inline and renaming the one
+# step they select, so all three derived values came back empty:
 #
-#   NON-BITING / WRONG-RED / INVALID MUTATIONS (2):
 #     - the Linux attestation step is silently replaced by a checkout, so a step
 #       named [Attest build provenance] attests nothing: could not apply the
-#       mutation (ANCHOR IS NOT UNIQUE (44082 occurrences): '')
+#       mutation (ANCHOR IS NOT UNIQUE (N occurrences): '')
+#     - the SBOM step is deleted entirely: could not apply the mutation
+#       (ANCHOR IS NOT UNIQUE (N occurrences): '')
+#     - the macOS artifact is never downloaded: could not apply the mutation
+#       (ANCHOR IS NOT UNIQUE (N occurrences): '')
+#
+# Three mutations, three empty needles. N is release.yml's byte count plus one,
+# because `''.count('')` over a file of B bytes is B+1 -- tens of thousands of
+# "occurrences" of a needle that does not exist. The number is left as N rather
+# than a literal: it moves every time release.yml gains a line, and a quoted
+# measurement that is already stale on the day it is written is the failure this
+# comment is in the file to describe.
+#
+# This was reproduced rather than recalled. The inline form never reached a
+# commit -- it existed only in the working tree between authoring and this fix --
+# so the reproduction puts it back by rewriting the two call shapes, and the
+# block above is that run's output, not a transcript remembered from the bug.
+# An earlier version of this comment quoted a block headed "(2)" containing one
+# entry, and a byte count 12 off the file. Both were unreproducible, which is
+# worse than quoting nothing.
 #
 # Going through a file rather than `$( )` keeps the derivation in this shell, so
-# the exit is real, and it avoids `$( )` stripping the trailing newline a derived
-# block ends with. One scratch file is reused rather than made per call: wf_derive
+# the exit is real. One scratch file is reused rather than made per call: wf_derive
 # runs a handful of times per pass and this is not a hot path, but a fresh
 # tempfile per call would be a cleanup obligation on each one.
-# It writes the text to ${DERIVE_SCRATCH}.out and leaves it in ${DERIVED}, and is
-# called on its own line -- NOT inside $( ). That is the whole point. A command
-# substitution runs in a subshell, so an `exit 1` here would abort only the
-# subshell: the harness would carry on with an empty needle, and `apply` would
-# report an empty anchor under a heading that reads as "these assertions do not
-# bite", accusing healthy assertions because the harness's own selector was wrong.
-# Measured, by renaming the step three needles select. Calling it bare makes the
-# exit the harness's exit, and the refusal the last thing on the terminal.
 derive() {
   local what="$1" rc=0
   shift
@@ -423,12 +504,42 @@ derive() {
     printf 'mutation below was tested. This is not a missing assertion.\n' >&2
     exit 1
   fi
-  DERIVED="$(cat "${DERIVE_SCRATCH}.out")"
+  # A sentinel, because `$( )` strips every trailing newline and `step-block`
+  # returns exactly that: the last line of a step plus the blank line that
+  # separates it from the next one. Without the sentinel the newline is gone by
+  # the time the value reaches `apply`, so removing a step with `new=` left three
+  # blank lines behind where the step used to be -- and `step_span`'s "blank
+  # separators are kept" was true of the scratch file and false of the anchor.
+  # With a sentinel appended, the captured text ends in the sentinel rather than
+  # in a newline, so there is nothing for `$( )` to strip and DERIVED holds
+  # wf_derive's bytes exactly.
+  DERIVED="$(cat "${DERIVE_SCRATCH}.out"; printf '\001')"
+  DERIVED="${DERIVED%$'\001'}"
 }
 
 MUTATIONS_RUN=0
 MUTATIONS_BITING=0
 mismatches=()
+
+# The suite must be green before anything is mutated, or "this mutation bit" and
+# "the suite was already broken" are the same report. Measured on this harness's
+# parent commit: with project.yml's Checkout step moved to the end of its job,
+# the suite printed 16 passed / 2 failed and exited 1, and the harness still
+# reported 13 bit, 1 did not and exited 0 -- a full-looking result produced by a
+# harness measuring a suite that was already red. A red baseline is refused here
+# for the same reason a bad derivation is: it is not a missing assertion, and
+# reporting it as one is how a reader loses an afternoon.
+baseline_out="$(PYTHONDONTWRITEBYTECODE=1 bash "${SUITE}" 2>&1)"
+baseline_rc=$?
+if [[ ${baseline_rc} -ne 0 ]]; then
+  printf 'HARNESS REFUSAL: %s is already red (exit %d) before any mutation ran,\n' \
+    "${SUITE##*/}" "${baseline_rc}" >&2
+  printf 'so a mutation reported as biting here would prove nothing:\n' >&2
+  grep -E '^[[:space:]]*(FAIL|!!) ' <<<"${baseline_out}" | head -10 | sed 's/^/  /' >&2
+  exit 1
+fi
+printf '  ok   baseline green: %s\n' \
+  "$(grep -E '^[[:space:]]*[0-9]+ passed' <<<"${baseline_out}" || echo 'suite exited 0')"
 
 # Everything this harness needs out of release.yml, read once from the
 # pristine file. `mutate` restores release.yml before every attempt, so the
@@ -969,7 +1080,15 @@ mutate "the preflight stops using the shared signing policy script" \
 # file is trying to break, and a reviewer copying it back out of a comment is
 # exactly how the coupling returns.
 self="${BASH_SOURCE[0]}"
-literal_pins="$(grep -oE '[0-9a-f]{40}' "${self}" | sort -u || true)"
+# Case-insensitively, on purpose. Measured: a run of 40 UPPERCASE hex digits
+# passed the lowercase form of this guard while `grep -i` caught it. Hex has no
+# case, so restricting the scan to lowercase made the guard weaker than the thing
+# it guards against -- and a guard that can be defeated by a keyboard is not a
+# guard. The evasion that is left, and is not closed here, is a SHA split across
+# a line boundary: the obvious fix is to join the lines before scanning, which
+# manufactures false positives out of ordinary text that happens to straddle a
+# line, and a guard that cries wolf gets deleted.
+literal_pins="$(grep -ioE '[0-9a-f]{40}' "${self}" | tr 'A-F' 'a-f' | sort -u || true)"
 if [[ -n "${literal_pins}" ]]; then
   # Reported on its own rather than appended to `mismatches`: that array is
   # headed NON-BITING / WRONG-RED / INVALID MUTATIONS, and a literal pin is none
