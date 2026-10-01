@@ -20,18 +20,29 @@ SUITE="${ROOT_DIR}/scripts/tests/workflow_hygiene_test.sh"
 WORK="$(mktemp -d)"
 trap 'restore; rm -rf "${WORK}"' EXIT
 
-PINNED_FILES=(
-  "${ROOT_DIR}/.github/workflows/ci.yml"
-  "${ROOT_DIR}/.github/workflows/release.yml"
-  "${ROOT_DIR}/.github/workflows/scorecard.yml"
-  "${ROOT_DIR}/.github/workflows/codeql-analysis.yml"
-  "${ROOT_DIR}/.github/workflows/canary.yml"
-  "${ROOT_DIR}/.github/workflows/dependency-review.yml"
-  "${ROOT_DIR}/.github/workflows/stale.yml"
-  "${ROOT_DIR}/.github/workflows/labeler.yml"
-  "${ROOT_DIR}/.github/workflows/project.yml"
-)
 DEPENDABOT="${ROOT_DIR}/.github/dependabot.yml"
+
+# Derived from the same glob `workflow_hygiene_test.sh`'s `pin-major` assertion
+# reads, NOT hand-listed. A hand-written list is a second, silently diverging
+# copy of "which workflows are pinned", and when it diverges the precondition
+# below answers "would this mutation disagree with nothing?" from a different
+# set than the assertion it is meant to mirror -- so it refuses falsely, with a
+# message indistinguishable from a genuine missing needle. That was not
+# hypothetical: `.github/workflows/semantic-pr.yml` was in the assertion's glob
+# and absent from the hand-written list, so moving CodeQL's only other pin into
+# it made the precondition report a false refusal.
+#
+# This also means `restore` covers every workflow, so a future mutation
+# targeting a newly added workflow cannot leak its edit into the working tree.
+PINNED_FILES=()
+for f in "${ROOT_DIR}"/.github/workflows/*.yml; do
+  [[ -f "$f" ]] && PINNED_FILES+=("$f")
+done
+
+if ((${#PINNED_FILES[@]} == 0)); then
+  echo "ERROR: no workflow files found under ${ROOT_DIR}/.github/workflows/" >&2
+  exit 2
+fi
 
 for f in "${PINNED_FILES[@]}"; do
   if [[ -f "$f" ]]; then
@@ -120,8 +131,20 @@ others = [p for p in sys.argv[4:] if p != edit_file]
 # `actions/download-artifact` has no sub-action segment while
 # `github/codeql-action/upload-sarif` has two, so the sub-action part is
 # optional: repo, slash, then an optional `/segment`.
+#
+# Anchored to a `uses:` line, because that is all the `pin-major` assertion
+# ever reads (`re.finditer(r"uses:\s*(\S+)", raw)`). Matching anywhere in the
+# file let a prose mention hijack the needle: quoting the pin verbatim in a
+# comment above the first real `uses:` line made `apply`'s `text.replace(old,
+# new, 1)` rewrite the COMMENT, leaving every real pin untouched -- and the
+# suite then passed, so the harness reported "SUITE STILL PASSED (assertion
+# does not bite)" for a mutation whose assertion bites perfectly well. Quoting
+# a pin in a comment is an established habit in this repo; `.github/dependabot.yml`
+# does it today. `anchor_only_one` below is the second line of defence.
 action_re = re.compile(
-    rf"{re.escape(repo)}(?:/[A-Za-z0-9_.-]+)*@[0-9a-f]{{40}} # v(\d+)"
+    rf"^(?:\s*(?:-\s*)?)?uses:\s+{re.escape(repo)}"
+    rf"(?:/[A-Za-z0-9_.-]+)*@[0-9a-f]{{40}} # v(\d+)",
+    re.MULTILINE,
 )
 with open(edit_file, encoding="utf-8") as handle:
     text = handle.read()
@@ -146,12 +169,13 @@ if new_major == major:
 
 # The mutation is only meaningful if some OTHER pin of the same action -- in
 # this file or any other -- still declares the major we are about to change.
-# `actions/download-artifact` is used seven times in release.yml and nowhere
-# else, while `github/codeql-action` is used once in scorecard.yml and three
-# times in codeql-analysis.yml, so "the other disagreeing pin" is not always in
-# another file. If no such pin exists, flipping this one changes nothing
+# "the other disagreeing pin" is not always in another file -- an action used
+# several times in one workflow is the common case here -- so this file's own
+# later occurrences count too. If no such pin exists, flipping this one
 # `pin-major` can see, and the harness would report a bite while testing
-# nothing -- the exact defect this harness exists to prevent.
+# nothing -- the exact defect this harness exists to prevent. The search spans
+# the edited file (later occurrences) and every other workflow, so it holds
+# however many times an action is used or how it is spread across files.
 others_majors = {int(m.group(1)) for m in found[1:]}
 for path in others:
     if not os.path.isfile(path):
@@ -169,8 +193,92 @@ if int(major) not in others_majors:
     sys.exit(3)
 
 old = first.group(0)
-new = old.rsplit("# v", 1)[0] + f"# v{new_major}"
+new = old.rsplit("# v", 1)[0].rstrip() + f" # v{new_major}"
 print(f"{old}|||{new}")
+PYTHON
+}
+
+# Usage: pin_expr <file> <two-segment-repo> <edit-kind> [value]
+#
+# The SHA half of a pin is data, not a constant: it changes on every Dependabot
+# bump, which is exactly how this harness came to have a hardcoded SHA that
+# silently stopped applying. So derive it. `pin_major_expr` (above) needs a pin
+# where some other pin disagrees at the target major; these mutations do not --
+# they need a pin that exists and whose declared major can be read -- so they
+# share the lookup and differ only in the edit.
+#
+# edit-kind:
+#   bump-to <major>   rewrite the declared major
+#   strip-comment     drop the "# vN" comment entirely
+#   set-comment <s>   replace the comment with an arbitrary string
+#   minor <v>         rewrite the declared major to a minor-version comment
+#
+# The returned literal is anchored to a `uses:` line and asserted to occur
+# EXACTLY ONCE in the file. `apply` rewrites the first textual occurrence, so a
+# needle that appears twice is a coin flip over which one it hit -- see the
+# `uses:`-anchoring note in pin_major_expr.
+pin_expr() {
+  python3 - "$1" "$2" "$3" "${4:-}" <<'PYTHON'
+import re
+import sys
+
+edit_file, repo, kind = sys.argv[1], sys.argv[2], sys.argv[3]
+value = sys.argv[4] if len(sys.argv) > 4 else ""
+
+# group 1 is everything up to and including the "@" -- `uses: <repo>@`,
+# indentation included -- so a replacement can be rebuilt without dropping the
+# prefix. group 2 is the SHA, group 3 the declared comment.
+action_re = re.compile(
+    rf"^((?:\s*(?:-\s*)?)?uses:\s+{re.escape(repo)}"
+    rf"(?:/[A-Za-z0-9_.-]+)*@)([0-9a-f]{{40}})( # v(\d+(?:\.\d+)*))?",
+    re.MULTILINE,
+)
+with open(edit_file, encoding="utf-8") as handle:
+    text = handle.read()
+
+found = list(action_re.finditer(text))
+if not found:
+    print(
+        f"NEEDLE PRECONDITION FAILED: no `uses:` pin of {repo} in {edit_file}",
+        file=sys.stderr,
+    )
+    sys.exit(3)
+
+first = found[0]
+prefix, sha, comment = first.group(1), first.group(2), first.group(3)
+if kind == "strip-comment":
+    if not comment:
+        print(
+            f"NEEDLE PRECONDITION FAILED: the first {repo} pin in "
+            f"{edit_file} has no '# vN' comment to strip",
+            file=sys.stderr,
+        )
+        sys.exit(3)
+    new = f"{prefix}{sha}"
+elif kind == "set-comment":
+    new = f"{prefix}{sha} {value}"
+elif kind in ("bump-to", "minor"):
+    new = f"{prefix}{sha} # v{value}"
+else:
+    print(f"NEEDLE PRECONDITION FAILED: unknown edit-kind {kind!r}", file=sys.stderr)
+    sys.exit(3)
+
+# `apply` uses `text.replace(old, new, 1)`, so an old that occurs more than once
+# makes the outcome depend on which occurrence comes first in the file -- and
+# here the first occurrence is the *real* pin, so the mutation would rewrite the
+# real pin and the second one would silently keep disagreeing (or not). Refuse
+# rather than guess. Quoting a pin in a comment is an established habit in this
+# repo, so this is not a hypothetical.
+if text.count(first.group(0)) != 1:
+    print(
+        f"NEEDLE PRECONDITION FAILED: the {repo} pin in {edit_file} occurs "
+        f"{text.count(first.group(0))} times as text, so rewriting the first "
+        f"occurrence is ambiguous. This pin must be unique in the file.",
+        file=sys.stderr,
+    )
+    sys.exit(3)
+
+print(f"{first.group(0)}|||{new}")
 PYTHON
 }
 
@@ -183,6 +291,19 @@ mutate() {
   local name="$1" file="$2" expr="$3" needle="$4"
   MUTATIONS_RUN=$((MUTATIONS_RUN + 1))
   restore
+  # An empty expression means a helper refused, and a helper refusing is a
+  # DIFFERENT diagnosis from "the needle no longer matches the file". Letting the
+  # empty string reach `apply` produced
+  #     ValueError: not enough values to unpack (expected 2, got 1)
+  # and then reported "could not apply the mutation" -- blaming `apply` for a
+  # precondition decision the helper had already explained on stderr, and
+  # discarding that explanation. Distinguish the two so the report names the
+  # real cause.
+  if [[ -z "$expr" ]]; then
+    mismatches+=("${name}: a needle helper refused (see the NEEDLE PRECONDITION FAILED line above)")
+    restore
+    return
+  fi
   if ! apply "$file" "$expr"; then
     mismatches+=("${name}: could not apply the mutation")
     restore
@@ -218,8 +339,13 @@ needle_selfcheck() {
   local target="${ROOT_DIR}/.github/workflows/ci.yml"
   local out
   restore
-  if ! apply "${target}" \
-    'actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7|||actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v9'; then
+  local selfcheck_expr
+  if ! selfcheck_expr="$(pin_expr "${target}" actions/upload-artifact bump-to 9)"; then
+    mismatches+=("needle self-check: pin_expr refused its own mutation: ${selfcheck_expr}")
+    restore
+    return
+  fi
+  if ! apply "${target}" "${selfcheck_expr}"; then
     mismatches+=("needle self-check: could not apply its own mutation")
     restore
     return
@@ -267,13 +393,13 @@ mutate "one of two uses of an action declares a different major" \
 # 2. A pin with no version comment at all -- the reviewer has nothing to read.
 mutate "a pin loses its version comment entirely" \
   "${ROOT_DIR}/.github/workflows/ci.yml" \
-  'actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7|||actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a' \
+  "$(pin_expr "${ROOT_DIR}/.github/workflows/ci.yml" actions/upload-artifact strip-comment)" \
   "no parseable '# vN' version comment"
 
 # 3. A garbage comment that looks like a version but is not one.
 mutate "a pin's version comment is unparseable" \
   "${ROOT_DIR}/.github/workflows/ci.yml" \
-  'gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3|||gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # latest' \
+  "$(pin_expr "${ROOT_DIR}/.github/workflows/ci.yml" gitleaks/gitleaks-action set-comment '# latest')" \
   "no parseable '# vN' version comment"
 
 # 4. A minor-version comment is still a parseable major claim, and must pass.
@@ -281,9 +407,12 @@ mutate "a pin's version comment is unparseable" \
 #    regex that would reject `# v2.1.3` and force someone to delete the comment.)
 MUTATIONS_RUN=$((MUTATIONS_RUN + 1))
 restore
-if apply "${ROOT_DIR}/.github/workflows/ci.yml" \
-  'actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2|||actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.1.3' \
-  && bash "${SUITE}" >/dev/null 2>&1; then
+minor_expr="$(pin_expr "${ROOT_DIR}/.github/workflows/ci.yml" actions-rust-lang/setup-rust-toolchain minor 2.1.3)"
+if [[ -z "$minor_expr" ]]; then
+  mismatches+=("over-strict regex: pin_expr could not derive a setup-rust-toolchain pin to downgrade to a minor version")
+elif ! apply "${ROOT_DIR}/.github/workflows/ci.yml" "${minor_expr}"; then
+  mismatches+=("over-strict regex: could not apply the derived minor-version mutation")
+elif bash "${SUITE}" >/dev/null 2>&1; then
   MUTATIONS_BITING=$((MUTATIONS_BITING + 1))
   printf '  bites  a full version comment (# v2.1.3) is accepted (over-strict regex guard)\n'
 else
