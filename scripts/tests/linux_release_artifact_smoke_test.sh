@@ -51,6 +51,7 @@ LAST_STATUS=0
 PASS_COUNT=0
 FAIL_COUNT=0
 MUTATION_COUNT=0
+MUTATION_APPLIED_COUNT=0
 MUTATION_APPLIED=0
 SCENARIO_COUNT=0
 FAILED_NAMES=()
@@ -423,7 +424,26 @@ FAKE_EOF
 # differ, like the real one. A self-comparison must report 0, two different
 # images must report a positive count, and the settle captures report
 # FAKE_COMPARE_SETTLE_DIFF (0 by default: a settled screen).
+#
+# FAKE_COMPARE_FORMAT=im7 makes it answer in ImageMagick 7's shape instead of
+# ImageMagick 6's. The two shapes are not cosmetic: IM7 appends the normalised
+# ratio in parentheses to EVERY count (`0 (0)`) and switches to C scientific
+# notation at 1e6 (`1.024e+06 (1)`), both captured from a real 7.1.2. The gate
+# originally accepted only `^[0-9]+$`, which read every IM7 answer as a broken
+# metric; this knob is what lets the suite see that regression.
 set -uo pipefail
+emit() {
+  local n="$1"
+  if [[ "${FAKE_COMPARE_FORMAT:-}" == "im7" ]]; then
+    if [[ "${n}" =~ ^[0-9]+$ ]] && ((n >= 1000000)); then
+      printf '%s (1)\n' "$(awk -v x="${n}" 'BEGIN { printf "%g", x }')"
+    else
+      printf '%s (%s)\n' "${n}" "$(awk -v x="${n}" -v d=1024000 'BEGIN { printf "%g", x / d }')"
+    fi
+  else
+    printf '%s\n' "${n}"
+  fi
+}
 files=()
 for a in "$@"; do
   case "${a}" in
@@ -447,14 +467,14 @@ if [[ -n "${FAKE_COMPARE_SETTLE_GARBAGE:-}" ]] \
   exit 1
 fi
 if [[ "${a}" == "${b}" ]]; then
-  echo 0 >&2
+  emit 0 >&2
   exit 0
 fi
 if [[ "${a}" == *-settle-* || "${b}" == *-settle-* ]]; then
-  echo "${FAKE_COMPARE_SETTLE_DIFF:-0}" >&2
+  emit "${FAKE_COMPARE_SETTLE_DIFF:-0}" >&2
   exit 1
 fi
-echo 32 >&2
+emit 32 >&2
 exit 1
 FAKE_EOF
   chmod +x "${FARM}/compare"
@@ -940,6 +960,7 @@ run_gate() {
     FAKE_XWININFO_ROOT_MODE="${TEST_ROOT_MODE:-good}" \
     FAKE_CONVERT_COLOURS="${TEST_COLOURS:-500}" \
     FAKE_COMPARE_SETTLE_DIFF="${TEST_SETTLE_DIFF:-0}" \
+    FAKE_COMPARE_FORMAT="${TEST_COMPARE_FORMAT:-}" \
     FAKE_COMPARE_GARBAGE="${TEST_COMPARE_GARBAGE:-}" \
     FAKE_COMPARE_SETTLE_GARBAGE="${TEST_COMPARE_SETTLE_GARBAGE:-}" \
     FAKE_DEB_TEMPLATE="${TEST_DEB_TEMPLATE:-}" \
@@ -1017,20 +1038,30 @@ assert_green() {
 }
 
 assert_red() {
-  local desc="$1" tag="$2"
+  local desc="$1" tag="$2" needle="${3:-}"
   if [[ "${LAST_STATUS}" -eq 0 ]]; then
     fail "${desc} (expected a failure, got exit 0)"
-    return 0
+    return 1
   fi
   if [[ "${LAST_STATUS}" -eq 124 || "${LAST_STATUS}" -eq 137 ]]; then
     fail "${desc} (the gate run TIMED OUT after ${TEST_GATE_TIMEOUT:-180}s; a hang is not a detection)"
-    return 0
+    return 1
   fi
   if printf '%s\n' "${LAST_OUT}" | grep -q "FAIL assertion=${tag}:"; then
+    # An optional needle pins the DETAIL, not just the tag. It is how a large
+    # scientific-notation AE is told apart from a metric that failed to answer:
+    # both are render_unsettled, only one says `last diff 1024000px`. Without it,
+    # a parser that rejected IM7's answer shape and a gate that detected a
+    # genuinely unsettled screen are indistinguishable at the tag level.
+    if [[ -n "${needle}" ]] && ! printf '%s\n' "${LAST_OUT}" | grep -qF -- "${needle}"; then
+      fail "${desc} (hit ${tag} but the message lacked '${needle}'; reported: $(printf '%s\n' "${LAST_OUT}" | sed -n "s/.*FAIL assertion=${tag}: //p" | tr '\n' ' ' | cut -c1-220))"
+      return 1
+    fi
     pass "${desc}"
-  else
-    fail "${desc} (exit ${LAST_STATUS} but no 'FAIL assertion=${tag}:' line; assertions reported: $(printf '%s\n' "${LAST_OUT}" | sed -n 's/.*FAIL assertion=\([a-z_]*\):.*/\1/p' | tr '\n' ' '))"
+    return 0
   fi
+  fail "${desc} (exit ${LAST_STATUS} but no 'FAIL assertion=${tag}:' line; assertions reported: $(printf '%s\n' "${LAST_OUT}" | sed -n 's/.*FAIL assertion=\([a-z_]*\):.*/\1/p' | tr '\n' ' '))"
+  return 1
 }
 
 # The evidence directory a run wrote to. Derived from the tag rather than by
@@ -1112,7 +1143,14 @@ apply_mutation() {
     fi
   done
   if [[ "${MUTATION_APPLIED}" -eq 1 ]]; then
-    MUTATION_COUNT=$((MUTATION_COUNT + 1))
+    # Applications, NOT proofs. `mutation_test` is what counts a PROVEN mutation,
+    # after the assertion has actually gone red. Incrementing MUTATION_COUNT here
+    # as well -- which is what the first version did -- reported an applied edit
+    # that changed a log line and proved nothing as coverage, and double-counted
+    # every on_broken/flips helper, so the headline over-reported by exactly the
+    # helper count. The application is kept separately so section 4 can still
+    # assert that a non-applying mutation is not an application at all.
+    MUTATION_APPLIED_COUNT=$((MUTATION_APPLIED_COUNT + 1))
   fi
 }
 
@@ -1131,16 +1169,21 @@ mutation_test() {
     return 0
   }
   run_gate "mut-${name}" "${MUTANT_PATH}"
-  assert_red "mutation ${name}: inverted assertion turns a good artifact red as ${tag}" "${tag}"
+  # Counted only when the assertion ACTUALLY went red for the claimed tag. An
+  # applied mutation that leaves the good artifact green proves nothing, so it
+  # must not move the headline number; `assert_red`'s return value is that proof.
+  if assert_red "mutation ${name}: inverted assertion turns a good artifact red as ${tag}" "${tag}"; then
+    MUTATION_COUNT=$((MUTATION_COUNT + 1))
+  fi
 }
 
 # A scenario test: the UNMUTATED gate must go red on a broken input, naming the
 # assertion that is supposed to catch it.
 scenario_test() {
-  local name="$1" tag="$2"
+  local name="$1" tag="$2" needle="${3:-}"
   SCENARIO_COUNT=$((SCENARIO_COUNT + 1))
   run_gate "sc-${name}" "${GATE}"
-  assert_red "scenario ${name}: broken input is caught as ${tag}" "${tag}"
+  assert_red "scenario ${name}: broken input is caught as ${tag}" "${tag}" "${needle}"
 }
 
 # A mutation that only BITES on broken input.
@@ -1179,6 +1222,41 @@ mutation_on_broken() {
     fail "mutation ${name}: the broken input is STILL reported as ${tag} after the check was disabled, so that check is not what detected it"
   else
     pass "mutation ${name}: disabling the ${tag} check removes ${tag} from the broken-input run (mutant exit ${LAST_STATUS})"
+    MUTATION_COUNT=$((MUTATION_COUNT + 1))
+  fi
+}
+
+# A mutation that has to move a MESSAGE, not just a tag.
+#
+# When two distinct faults share one assertion tag, a tag-level mutation cannot
+# tell them apart. IM7's scientific-notation AE is exactly that case: a gate that
+# rejects the answer shape and a gate that sees a genuinely unsettled screen both
+# end in `render_unsettled`. This helper pins the detail instead -- the pristine
+# run must print the needle, the mutant run must not -- so disabling the parse
+# that turns `1.024e+06` into `1024000` is visible as the disappearance of
+# `last diff 1024000px`, not as a tag that was red either way.
+mutation_flips_message() {
+  local name="$1" tag="$2" needle="$3"
+  shift 3
+  run_gate "sc-mut-${name}-pristine" "${GATE}"
+  if ! printf '%s\n' "${LAST_OUT}" | grep -qF -- "${needle}"; then
+    fail "mutation ${name}: the pristine run did not report '${needle}', so there is nothing for the mutation to move"
+    return 0
+  fi
+  apply_mutation "${name}" "$@"
+  if [[ "${MUTATION_APPLIED}" -ne 1 ]]; then
+    fail "mutation ${name}: the mutation did not apply, so nothing was proven"
+    return 0
+  fi
+  bash -n "${MUTANT_PATH}" 2>/dev/null || {
+    fail "mutation ${name}: the mutated gate is not valid bash"
+    return 0
+  }
+  run_gate "mut-${name}" "${MUTANT_PATH}"
+  if printf '%s\n' "${LAST_OUT}" | grep -qF -- "${needle}"; then
+    fail "mutation ${name}: '${needle}' is STILL reported after the check was disabled, so that check is not what produced it"
+  else
+    pass "mutation ${name}: disabling the ${tag} parse removes '${needle}' (mutant reported tag: $(printf '%s\n' "${LAST_OUT}" | sed -n 's/.*FAIL assertion=\([a-z_]*\):.*/\1/p' | tr '\n' ' '))"
     MUTATION_COUNT=$((MUTATION_COUNT + 1))
   fi
 }
@@ -1227,6 +1305,7 @@ reset_env() {
     TEST_ID_MODE TEST_ID_X TEST_ID_Y TEST_ROOT_W TEST_ROOT_H TEST_ROOT_MODE \
     TEST_COLOURS \
     TEST_SETTLE_DIFF TEST_COMPARE_GARBAGE TEST_COMPARE_SETTLE_GARBAGE \
+    TEST_COMPARE_FORMAT \
     TEST_DEB_TEMPLATE TEST_DEB_CONTROL \
     TEST_DEB_X_FAIL TEST_DEB_F_MISSING TEST_APPIMAGE_TEMPLATE \
     TEST_APPIMAGE_EXTRACT_FAIL TEST_APP_BEHAVIOUR TEST_IMPORT_SINK \
@@ -1301,6 +1380,22 @@ check "both legs leave named root and window screenshots as evidence${missing:+ 
 # it is tested by running twice into the same place and requiring the same result.
 run_gate happy2 "${GATE}"
 assert_green "the gate is re-runnable: a second cold launch also passes"
+
+# ImageMagick 7's answer shape (see FAKE_COMPARE_FORMAT in the fake `compare`).
+# Deliberately a POSITIVE case: IM7 annotates every count with the normalised
+# ratio -- `0 (0)` for a stable frame, `1.024e+06 (1)` for a fully-changed
+# 1280x800 root -- so the gate's original `^[0-9]+$` parse made it reject its own
+# happy path on IM7, which is the very ImageMagick its `magick` fallback branch
+# and its `%k`/`magick compare` code paths exist to support. The fake answers in
+# the IM6 shape by default, so no other scenario in this suite can see that.
+reset_env
+TEST_COMPARE_FORMAT=im7
+make_good_artifacts "${WORK}/good-im7" ok
+run_gate im7-metric "${GATE}"
+assert_green "the gate reads ImageMagick 7's 'N (ratio)' AE answers (a stable frame is not 'a broken metric')"
+assert_evidence_contains "the IM7 run records the PARSED settle diff, not the raw '0 (0)' string" \
+  "appimage_settle_diff_px=0" im7-metric
+reset_env
 
 # ---------------------------------------------------------------------------
 # 2. Scenarios: a broken input must be caught by the assertion that claims it
@@ -1426,6 +1521,18 @@ reset_env
 make_good_artifacts "${WORK}/s16" ok
 TEST_COMPARE_SETTLE_GARBAGE=1
 scenario_test "diff-metric-returns-garbage-at-render-time" render_unsettled
+
+# The same render-time guard, but here the metric DOES answer -- in IM7's
+# scientific notation, because the whole 1280x800 root changed (`1.024e+06 (1)`).
+# A tag-only assertion cannot see this case: with the parse broken the gate still
+# reports render_unsettled, but it says "did not return a pixel count" instead of
+# naming the diff. The needle pins the parsed value, so the assertion fails if the
+# parse stops turning `1.024e+06` into `1024000`.
+reset_env
+make_good_artifacts "${WORK}/s16c" ok
+TEST_COMPARE_FORMAT=im7
+TEST_SETTLE_DIFF=1024000
+scenario_test "im7-scientific-notation-unsettled-diff" render_unsettled "last diff 1024000px"
 
 # And the global case, asserted as what it really is: the self-check catching it.
 reset_env
@@ -1898,6 +2005,28 @@ reset_env
 mut "metric-selfcheck-settle" metric_selfcheck_settle \
   's/if \[\[ ! "${cross_ae}" =~ \^\[0-9\]+\$ \]\] || ((cross_ae <= 0)); then/if [[ ! "${cross_ae}" =~ ^[0-9]+$ ]] || ((cross_ae >= 0)); then/'
 
+# The IM7 answer shape. The pristine run is green -- that is the positive
+# `im7-metric` case in section 1 -- so what these prove is that the parse is what
+# makes it green, and that both halves of it are reached. First the `(ratio)`
+# strip: a GOOD artifact answered in IM7's shape, with the strip disabled,
+# collapses to `metric_selfcheck_settle` because `0 (0)` no longer parses as 0.
+reset_env
+TEST_COMPARE_FORMAT=im7
+mut "im7-paren-strip" metric_selfcheck_settle \
+  's|count="\${raw%%(\*}"|count="\${raw}"|'
+
+# Then the scientific-notation branch, which the paren strip alone cannot reach:
+# it only fires at 1e6 and above, i.e. when the whole 1280x800 root changes. The
+# pristine broken input names the parsed count in its message; disabling the
+# branch makes that name disappear, which is the only way to tell "rejected the
+# IM7 shape" apart from "detected an unsettled screen" when both share the tag.
+reset_env
+make_good_artifacts "${WORK}/mut-im7-scientific-parse" ok
+TEST_COMPARE_FORMAT=im7
+TEST_SETTLE_DIFF=1024000
+mutation_flips_message "im7-scientific-parse" render_unsettled "last diff 1024000px" \
+  's|if \[\[ "\${count}" =~ \^\[0-9\]+(\\\.\[0-9\]+)?\[eE\]\[+-\]?\[0-9\]+\$ \]\]; then|if false; then|'
+
 reset_env
 mut "required-tool" required_tool \
   's/if ! command -v "$1" >\/dev\/null 2>&1; then/if command -v "$1" >\/dev\/null 2>\&1; then/'
@@ -1991,6 +2120,7 @@ mut "deb-control-version" deb_control_invalid \
 # ---------------------------------------------------------------------------
 # 4. The suite's own honesty
 # ---------------------------------------------------------------------------
+MUT_APPLIED_BEFORE_NON_APPLY="${MUTATION_APPLIED_COUNT}"
 MUT_COUNT_BEFORE_NON_APPLY="${MUTATION_COUNT}"
 # A mutation runner that cannot fail is a coverage report that means nothing. Prove
 # the harness itself detects a mutation that does not apply.
@@ -2001,12 +2131,34 @@ if [[ "${MUTATION_APPLIED}" -eq 0 ]]; then
 else
   fail "the mutation runner accepted a mutation that did not apply"
 fi
-# The count must not have been incremented by that deliberate no-op, or the
-# headline "mutations applied" number over-reports coverage.
-if [[ "${MUTATION_COUNT}" -eq "${MUT_COUNT_BEFORE_NON_APPLY}" ]]; then
-  pass "a mutation that did not apply is not counted as coverage"
+# Neither counter may move for a mutation that never landed, or the headline
+# over-reports: its number is "proven".
+if [[ "${MUTATION_APPLIED_COUNT}" -eq "${MUT_APPLIED_BEFORE_NON_APPLY}" \
+  && "${MUTATION_COUNT}" -eq "${MUT_COUNT_BEFORE_NON_APPLY}" ]]; then
+  pass "a mutation that did not apply is counted as neither an application nor a proof"
 else
-  fail "a mutation that did not apply was counted as coverage (${MUT_COUNT_BEFORE_NON_APPLY} -> ${MUTATION_COUNT})"
+  fail "a mutation that did not apply moved a counter (applied ${MUT_APPLIED_BEFORE_NON_APPLY}->${MUTATION_APPLIED_COUNT}, proven ${MUT_COUNT_BEFORE_NON_APPLY}->${MUTATION_COUNT})"
+fi
+
+# The headline claims "proven load-bearing", so mere application must not advance
+# it. This is checked STRUCTURALLY against this suite's own source rather than by
+# pushing an applied-but-unproven mutation through `mutation_test`: that run
+# SHOULD print `not ok`, and a deliberate `not ok` would make a green suite look
+# failed and bury the real signal. Two properties, both load-bearing: an
+# application does not touch the proven counter, and the proven counter is only
+# advanced inside a mutation's red assertion.
+apply_body="$(sed -n '/^apply_mutation()/,/^}/p' "${BASH_SOURCE[0]}")"
+if printf '%s\n' "${apply_body}" | grep -q 'MUTATION_COUNT='; then
+  fail "apply_mutation advances the PROVEN counter, so an application that proves nothing counts as coverage"
+else
+  pass "applying a mutation does not advance the proven-load-bearing counter"
+fi
+mut_body="$(sed -n '/^mutation_test()/,/^}/p' "${BASH_SOURCE[0]}")"
+if printf '%s\n' "${mut_body}" | grep -q 'if assert_red .*; then' \
+  && printf '%s\n' "${mut_body}" | grep -q 'MUTATION_COUNT=$((MUTATION_COUNT + 1))'; then
+  pass "a mutation advances the proven counter only after its assertion went red"
+else
+  fail "mutation_test does not gate the proven counter on a red assertion"
 fi
 
 # And that a mutation lands ON the assertion it claims to target, rather than
@@ -2066,7 +2218,7 @@ check "the evidence directory is non-empty even when the gate fails early" \
 # ---------------------------------------------------------------------------
 printf '1..%d\n' "$((PASS_COUNT + FAIL_COUNT))"
 printf '# scenarios: %d\n' "${SCENARIO_COUNT}"
-printf '# mutations applied and proven load-bearing: %d\n' "${MUTATION_COUNT}"
+printf '# mutations proven load-bearing: %d (applied: %d)\n' "${MUTATION_COUNT}" "${MUTATION_APPLIED_COUNT}"
 printf '# assertions: %d passed, %d failed\n' "${PASS_COUNT}" "${FAIL_COUNT}"
 if [[ "${FAIL_COUNT}" -ne 0 ]]; then
   printf '# failing tests:\n'

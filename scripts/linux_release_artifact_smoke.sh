@@ -421,6 +421,34 @@ record "xwininfo" "$(xwininfo -version 2>&1 | tr '\n' ' ' | cut -c1-100)"
 # Metric self-check
 # ---------------------------------------------------------------------------
 #
+# `compare -metric AE` has two on-disk answer shapes and the gate must read both.
+# IM6 prints a bare integer (`1024`). IM7 prints the count followed by the
+# normalised ratio in parentheses -- `1024 (0.001)` -- and switches to C
+# scientific notation once the count reaches 1e6: a full 1280x800 root that
+# changes completely prints `1.024e+06 (1)`. BOTH shapes were reproduced against
+# ImageMagick 7.1.2 while writing this, and both occur on a plain 1280x800 Xvfb
+# screen, so a parser that only accepted `^[0-9]+$` did not miss an edge case --
+# it read EVERY IM7 answer, including a perfectly stable one (`0 (0)`), as "the
+# metric is broken". The parse therefore lives in one place and is used by the
+# self-check and the settle probe alike.
+normalise_ae() {
+  local raw="$1" count
+  raw="$(printf '%s' "${raw}" | tr -d '[:space:]')"
+  # Drop IM7's trailing `(normalised)` half, if present.
+  count="${raw%%(*}"
+  if [[ "${count}" =~ ^[0-9]+$ ]]; then
+    printf '%s' "${count}"
+    return 0
+  fi
+  # `1.024e+06` -> `1024000`. AE counts are whole pixels, so there is nothing to
+  # round; LC_ALL=C keeps the decimal point a point.
+  if [[ "${count}" =~ ^[0-9]+(\.[0-9]+)?[eE][+-]?[0-9]+$ ]]; then
+    LC_ALL=C awk -v x="${count}" 'BEGIN { printf "%.0f", x }'
+    return 0
+  fi
+  return 1
+}
+
 # A threshold is only evidence if the tool behind it still works: a stubbed
 # `convert`/`compare` exits 0 and prints nothing, which would turn the two
 # strongest assertions into no-ops. Prove %k counts colours and AE counts
@@ -452,9 +480,11 @@ metric_selfcheck() {
 
   # `compare` prints the metric on stderr and exits 1 when the images differ, so
   # the status is discarded on purpose and only the printed number is trusted --
-  # but only after a self-compare has proved the number is a real count.
+  # but only after a self-compare has proved the number is a real count, and only
+  # after `normalise_ae` has reduced IM7's `0 (0)` / `1.024e+06 (1)` shapes to a
+  # plain integer.
   self_ae="$("${COMPARE_CMD[@]}" -metric AE "${solid}" "${solid}" null: 2>&1 || true)"
-  self_ae="$(printf '%s' "${self_ae}" | tr -d '[:space:]')"
+  self_ae="$(normalise_ae "${self_ae}")" || self_ae=""
   if [[ ! "${self_ae}" =~ ^[0-9]+$ ]]; then
     fail metric_selfcheck_settle \
       "ImageMagick AE self-check returned a non-numeric result ('${self_ae}'); the stability assertion would be meaningless"
@@ -462,7 +492,7 @@ metric_selfcheck() {
   # AE against a genuinely different image, so a tool that always prints 0 is
   # caught rather than trusted.
   cross_ae="$("${COMPARE_CMD[@]}" -metric AE "${solid}" "${two}" null: 2>&1 || true)"
-  cross_ae="$(printf '%s' "${cross_ae}" | tr -d '[:space:]')"
+  cross_ae="$(normalise_ae "${cross_ae}")" || cross_ae=""
   if [[ ! "${cross_ae}" =~ ^[0-9]+$ ]] || ((cross_ae <= 0)); then
     fail metric_selfcheck_settle \
       "ImageMagick AE self-check did not detect differing pixels between two different images (got '${cross_ae}'); the stability assertion would be meaningless"
@@ -706,17 +736,15 @@ count_colours() {
 }
 
 pixel_diff() {
-  local a="$1" b="$2" n
+  local a="$1" b="$2" raw
   # `compare` exits 1 when the images differ, which is the normal expected case
   # here, so only the printed number is used.
-  n="$("${COMPARE_CMD[@]}" -metric AE "${a}" "${b}" null: 2>&1 || true)"
-  n="$(printf '%s' "${n}" | tr -d '[:space:]')"
+  raw="$("${COMPARE_CMD[@]}" -metric AE "${a}" "${b}" null: 2>&1 || true)"
   # Same rule as the colour count: a non-numeric AE means the diff is unknown, and
-  # an unknown diff must never be read as "0 differing pixels".
-  if [[ ! "${n}" =~ ^[0-9]+$ ]]; then
-    return 1
-  fi
-  printf '%s' "${n}"
+  # an unknown diff must never be read as "0 differing pixels". `normalise_ae`
+  # understands both the IM6 and the IM7 answer shapes; its failure status is what
+  # the caller turns into render_unsettled.
+  normalise_ae "${raw}"
 }
 
 # Waits until the window rectangle is visually complex, then proves it stops
