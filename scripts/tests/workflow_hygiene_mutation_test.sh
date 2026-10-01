@@ -86,6 +86,94 @@ needle_matches() {
   grep -E '^  FAIL |^        ' <<<"$1" | grep -qF "$2"
 }
 
+# Build an `old|||new` expression that makes ONE use of `action` disagree with
+# every other use of the same action's major.
+#
+# The needle used to be a literal `action@<sha> # v4`, which meant a routine
+# dependabot bump made the mutation unable to apply -- the harness reported "could
+# not apply", and the required `Security gates` check went red on a PR whose only
+# change was the bump the repo wants. Verified on #137's head: the suite was green
+# (373/0) and the harness reported exactly that one non-applying mutation. The
+# harness was being honest about a mutation it could not perform; the fix belongs
+# here rather than in the bump. Reading the pin out of the files keeps the
+# mutation testing the property ("two uses of one action disagree on their
+# major") instead of testing whether a SHA is still current.
+#
+# `pin-major` keys by the two-segment repo (`github/codeql-action`), not the
+# full action name, precisely so that `init`, `autobuild`, `analyze` and
+# `upload-sarif` count as uses of one action. So this helper takes that repo key
+# too: it rewrites the first pin of ANY sub-action in `file`, and the mutation
+# only bites if at least one OTHER sub-action elsewhere still declares the old
+# major. The precondition check enforces exactly that, so a mutation cannot
+# "bite" against nothing.
+#
+# Usage: pin_major_expr <file-to-edit> <two-segment-repo> <new-major>
+pin_major_expr() {
+  python3 - "$1" "$2" "$3" "${PINNED_FILES[@]}" <<'PYTHON'
+import os
+import re
+import sys
+
+edit_file, repo, new_major = sys.argv[1], sys.argv[2], sys.argv[3]
+others = [p for p in sys.argv[4:] if p != edit_file]
+
+# `actions/download-artifact` has no sub-action segment while
+# `github/codeql-action/upload-sarif` has two, so the sub-action part is
+# optional: repo, slash, then an optional `/segment`.
+action_re = re.compile(
+    rf"{re.escape(repo)}(?:/[A-Za-z0-9_.-]+)*@[0-9a-f]{{40}} # v(\d+)"
+)
+with open(edit_file, encoding="utf-8") as handle:
+    text = handle.read()
+
+found = list(action_re.finditer(text))
+if not found:
+    print(
+        f"NEEDLE PRECONDITION FAILED: no pin of {repo} in {edit_file}",
+        file=sys.stderr,
+    )
+    sys.exit(3)
+
+first = found[0]
+major = first.group(1)
+if new_major == major:
+    print(
+        f"NEEDLE PRECONDITION FAILED: {new_major} is already the declared major "
+        f"for {repo} in {edit_file}",
+        file=sys.stderr,
+    )
+    sys.exit(3)
+
+# The mutation is only meaningful if some OTHER pin of the same action -- in
+# this file or any other -- still declares the major we are about to change.
+# `actions/download-artifact` is used seven times in release.yml and nowhere
+# else, while `github/codeql-action` is used once in scorecard.yml and three
+# times in codeql-analysis.yml, so "the other disagreeing pin" is not always in
+# another file. If no such pin exists, flipping this one changes nothing
+# `pin-major` can see, and the harness would report a bite while testing
+# nothing -- the exact defect this harness exists to prevent.
+others_majors = {int(m.group(1)) for m in found[1:]}
+for path in others:
+    if not os.path.isfile(path):
+        continue
+    with open(path, encoding="utf-8") as handle:
+        others_majors.update(int(m.group(1)) for m in action_re.finditer(handle.read()))
+if int(major) not in others_majors:
+    print(
+        f"NEEDLE PRECONDITION FAILED: rewriting {os.path.basename(edit_file)}'s "
+        f"first {repo} pin to v{new_major} would not disagree with anything; no "
+        f"other pin declares v{major} (found {sorted(others_majors)}). The "
+        f"mutation would be reported as a bite while testing nothing.",
+        file=sys.stderr,
+    )
+    sys.exit(3)
+
+old = first.group(0)
+new = old.rsplit("# v", 1)[0] + f"# v{new_major}"
+print(f"{old}|||{new}")
+PYTHON
+}
+
 # mutate <name> <file> <old|||new> <expected-needle>
 # The needle matters: "the suite went red" is not the same as "the suite went
 # red on the assertion this mutation is about". A wrong-red is reported as a
@@ -157,9 +245,12 @@ echo "== the mislabelled-pin regression (the reason these assertions exist) =="
 # 1. One of two uses of the same action declares a different major.
 #
 #    The name and needle here were both wrong, and the tightened matcher is what
-#    exposed it. This mutation rewrites the FIRST of release.yml's two
-#    `actions/download-artifact` pins (`replace(old, new, 1)`), so it creates a
-#    disagreement between two uses of one action -- which `pin-major` catches. It
+#    exposed it. This mutation rewrites the FIRST of release.yml's
+#    `actions/download-artifact` pins (`replace(old, new, 1)`), leaving the other
+#    uses untouched, so it creates a disagreement between two uses of one action
+#    -- which `pin-major` catches. The count of uses is deliberately not stated
+#    here: #139 added five more, and a comment that names a number goes stale on
+#    the next edit, while the mutation keeps working whatever the number is. It
 #    does not reproduce #128, and it is not caught by `pin-version`.
 #
 #    #128 proper was a comment left stale against its own SHA, and that is NOT
@@ -170,7 +261,7 @@ echo "== the mislabelled-pin regression (the reason these assertions exist) =="
 #    detect -- a mutation counted as proving something it did not prove.
 mutate "one of two uses of an action declares a different major" \
   "${ROOT_DIR}/.github/workflows/release.yml" \
-  'actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4|||actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v8' \
+  "$(pin_major_expr "${ROOT_DIR}/.github/workflows/release.yml" actions/download-artifact 8)" \
   "declared at more than one major"
 
 # 2. A pin with no version comment at all -- the reviewer has nothing to read.
@@ -203,7 +294,7 @@ restore
 # 5. The cross-file major check: same action, two declared majors.
 mutate "one action declared at two different majors" \
   "${ROOT_DIR}/.github/workflows/scorecard.yml" \
-  'github/codeql-action/upload-sarif@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4|||github/codeql-action/upload-sarif@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v5' \
+  "$(pin_major_expr "${ROOT_DIR}/.github/workflows/scorecard.yml" github/codeql-action 5)" \
   "declared at more than one major"
 
 echo "== the dependabot bundling root cause =="
