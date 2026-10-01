@@ -190,6 +190,24 @@ FAKE_EOF
 #!/usr/bin/env bash
 # fake xwininfo. Serves recorded real output, switchable by env so a scenario can
 # present the failure mode it needs to exercise.
+#
+# The good tree below is in xwininfo's own `xwininfo -root -tree` shape: a
+# header block, an indented `N children:` line, and one line per window reading
+#
+#   <indent>0x<id> "<name>": (<class>)  <W>x<H><X><Y>  <ax><ay>
+#
+# where each coordinate is printed with C's `%+d` -- a sign is ALWAYS present, and
+# a negative coordinate therefore prints as `-100`, not as `+-100`. That detail
+# is load-bearing: an earlier version of this fixture wrote `+-100+-100`, which
+# the gate's parser rejects outright (it accepts `[-+][0-9]+`, one sign then
+# digits), so the line was silently SKIPPED and the tree held one window fewer
+# than it appeared to.
+#
+# It is NOT byte-for-byte output captured from a real runner: no xwininfo binary
+# exists on the machine this suite was written on. The shape above is
+# reconstructed from the format xwininfo documents, and what is verified here is
+# that the gate parses it. A reviewer with a real `xwininfo` should diff this
+# against one `xwininfo -root -tree` from a live Flutter/GTK window.
 set -uo pipefail
 root_w="${FAKE_XWININFO_ROOT_W:-1280}"
 root_h="${FAKE_XWININFO_ROOT_H:-800}"
@@ -201,6 +219,51 @@ id_y="${FAKE_XWININFO_ID_Y:-0}"
 id_w="${FAKE_XWININFO_ID_W:-1280}"
 id_h="${FAKE_XWININFO_ID_H:-720}"
 map_state="IsViewable"
+# The good tree, as a function, because `xwininfo -id` has to answer about the
+# window it was ASKED about. It used to answer the same canned 1280x720+0+0 for
+# every id, which quietly neutralised part of the suite: in the
+# `window-area-floor` mutation probe_window correctly selected the 10x10 helper
+# window, `xwininfo -id` then reported that window as 1280x720 at the origin,
+# and the gate rendered and passed. A fixture that contradicts the thing it
+# stands in for is worse than no fixture at all.
+good_tree() {
+  cat <<'TREE'
+xwininfo: Window id: 0x3a7 (the root window) (has no name)
+
+  Root window id: 0x3a7 (the root window) (has no name)
+  Parent window id: 0x0 (none)
+     5 children:
+     0x20001e "com.privategallery.desktop": ()  10x10-100-100  -100-100
+     0x200012 (has no name): ()  1x1-1-1  -1-1
+     0x200005 "Private Gallery": ("com.privategallery.desktop" "Com.privategallery.desktop")  1280x720+0+0  +0+0
+        1 child:
+        0x200006 (has no name): ()  1x1-1-1  -1-1
+     0x20000b (has no name): ()  1x1-100-100  -100-100
+     0x200001 "com.privategallery.desktop": ("com.privategallery.desktop" "Com.privategallery.desktop")  10x10+10+10  +10+10
+
+TREE
+}
+# Geometry of one id, read from the same tree line the probe read, so the two
+# invocations can never disagree. Prints nothing for an id that is not in the
+# tree, which the gate then reports as unreadable geometry.
+geometry_for_id() {
+  local want="$1" line w h x y
+  line="$(good_tree | grep -E "^[[:space:]]+${want}[[:space:]]" || true)"
+  [[ -n "${line}" ]] || return 1
+  if [[ "${line}" =~ ([0-9]+)x([0-9]+)([-+][0-9]+)([-+][0-9]+)[[:space:]] ]]; then
+    w="${BASH_REMATCH[1]}"
+    h="${BASH_REMATCH[2]}"
+    # `${v#+\+}` is the wrong way to drop a sign. Inside a `${v#pattern}` the
+    # `\+` is an escaped `+`, so `+\+` is a TWO-character pattern (`++`) and
+    # matches nothing. The coordinate came back as `+0`, the gate then built a
+    # crop geometry of `1280x720++0++0`, and every string downstream of it was
+    # garbage. `${v#+}` is the one-character pattern that actually strips the
+    # sign; a leading `-` is left alone, because that is the coordinate.
+    x="${BASH_REMATCH[3]#+}"
+    y="${BASH_REMATCH[4]#+}"
+    printf '%s %s %s %s' "${w}" "${h}" "${x}" "${y}"
+  fi
+}
 # Deliberately NOT handled here: `broken` must not exit before the argument
 # dispatch below. It used to, which made `xwininfo -version` and `xwininfo -root`
 # fail as well, so the "the per-window query fails" scenario reported
@@ -209,7 +272,6 @@ map_state="IsViewable"
 # allowed to be broken.
 case "${id_mode}" in
   unmapped) map_state="IsUnmapped" ;;
-  no-geometry) id_w="" ; id_h="" ;;
 esac
 case "${1:-}" in
   -version)
@@ -220,6 +282,14 @@ case "${1:-}" in
     if [[ "${id_mode}" == "broken" ]]; then
       echo "xwininfo: unable to find window '${2:-}'" >&2
       exit 1
+    fi
+    # Answer about the window that was asked for, not about a canned one.
+    if [[ "${id_mode}" != "forced" ]]; then
+      if ! geom="$(geometry_for_id "${2:-0x0}")" || [[ -z "${geom}" ]]; then
+        echo "xwininfo: unable to find window '${2:-}'" >&2
+        exit 1
+      fi
+      read -r id_w id_h id_x id_y <<<"${geom}"
     fi
     printf 'xwininfo: Window id: %s "Private Gallery"\n\n' "${2:-0x0}"
     if [[ "${id_mode}" != "no-geometry" ]]; then
@@ -257,23 +327,7 @@ case "${1:-}" in
           exit 0
           ;;
         good|*)
-          # Verbatim output recorded from xwininfo 1.1.7 against this app's real
-          # GTK window, helper windows and all.
-          cat <<'TREE'
-xwininfo: Window id: 0x3a7 (the root window) (has no name)
-
-  Root window id: 0x3a7 (the root window) (has no name)
-  Parent window id: 0x0 (none)
-     5 children:
-     0x20001e "com.privategallery.desktop": ()  10x10+-100+-100  +-100+-100
-     0x200012 (has no name): ()  1x1+-1+-1  +-1+-1
-     0x200005 "Private Gallery": ("com.privategallery.desktop" "Com.privategallery.desktop")  1280x720+0+0  +0+0
-        1 child:
-        0x200006 (has no name): ()  1x1+-1+-1  +-1+-1
-     0x20000b (has no name): ()  1x1+-100+-100  +-100+-100
-     0x200001 "com.privategallery.desktop": ("com.privategallery.desktop" "Com.privategallery.desktop")  10x10+10+10  +10+10
-
-TREE
+          good_tree
           exit 0
           ;;
       esac
@@ -421,6 +475,15 @@ case "${mode}" in
       echo "dpkg-deb: error: control archive has bad magic" >&2
       exit 2
     fi
+    # Same rule as the AppImage fake, for the same reason: a real dpkg-deb
+    # refuses a .deb whose ar/tar tail has been cut, and a fake that did not
+    # would make the zero-byte negative test prove nothing about the gate.
+    archive="${2:?}"
+    want="$(awk '$1 == "deb" { print $2 }' "${FAKE_FULL_SIZES:-/nonexistent}" 2>/dev/null || true)"
+    if [[ -n "${want}" && -r "${archive}" ]] && (( $(wc -c <"${archive}") < want )); then
+      echo "dpkg-deb: error: control archive has bad magic" >&2
+      exit 2
+    fi
     template="${FAKE_DEB_TEMPLATE:?FAKE_DEB_TEMPLATE is not set}"
     mkdir -p "${root}"
     cp -R "${template}/." "${root}/"
@@ -506,6 +569,7 @@ FAKE_EOF
 # payload binary really is an ELF and a text placeholder would not be a valid
 # fixture for that assertion.
 EL_FIXTURE=""
+WRONG_ARCH_FIXTURE=""
 make_elf_fixture() {
   EL_FIXTURE="${WORK}/elf-fixture"
   # `command -v true` prints the BUILTIN's name ("true"), not a path, so `cp`
@@ -527,6 +591,32 @@ make_elf_fixture() {
     printf 'FATAL: the ELF fixture is not an ELF object (leading bytes %s)\n' "${magic:-none}" >&2
     exit 2
   fi
+  # A valid ELF for the WRONG architecture, for the assertion that the bytes are
+  # the ones this runner can launch. It is derived from the real fixture by
+  # patching only e_machine (header bytes 18-19 -- bytes 16-17 are e_type and
+  # come first, which is the mistake the first version of the gate's own check
+  # made) to 0xb7 = 183 = EM_AARCH64, so it is a genuine ELF64 LSB object that
+  # simply is not x86-64. Handing the gate a text placeholder instead would
+  # prove nothing: the magic assertion would catch it first and the architecture
+  # assertion would never be reached.
+  WRONG_ARCH_FIXTURE="${WORK}/elf-fixture-aarch64"
+  cp -f "${EL_FIXTURE}" "${WRONG_ARCH_FIXTURE}"
+  chmod +x "${WRONG_ARCH_FIXTURE}"
+  printf '\xb7\x00' | dd of="${WRONG_ARCH_FIXTURE}" bs=1 seek=18 conv=notrunc 2>/dev/null
+  local got
+  got="$(od -An -tx1 -N20 "${WRONG_ARCH_FIXTURE}" | tr -d ' \n')"
+  # The good fixture is asserted too, or a silently-wrong EL_FIXTURE would make
+  # both architecture scenarios green for the wrong reason.
+  local base
+  base="$(od -An -tx1 -N20 "${EL_FIXTURE}" | tr -d ' \n')"
+  if [[ "${base:0:8}" != "7f454c46" || "${base:8:2}" != "02" || "${base:10:2}" != "01" || "${base:36:4}" != "3e00" ]]; then
+    printf 'FATAL: the ELF fixture is not a little-endian 64-bit x86-64 ELF (header is %s)\n' "${base:-none}" >&2
+    exit 2
+  fi
+  if [[ "${got:0:8}" != "7f454c46" || "${got:8:2}" != "02" || "${got:10:2}" != "01" || "${got:36:4}" != "b700" ]]; then
+    printf 'FATAL: could not build the wrong-arch ELF fixture (header is %s)\n' "${got:-none}" >&2
+    exit 2
+  fi
 }
 
 # make_appimage_template <dir> [opt=value ...]
@@ -534,11 +624,13 @@ make_elf_fixture() {
 #   omit           a payload path to leave out
 #   not_exec       a payload path to leave non-executable
 #   not_elf        replace private_gallery_app with a non-ELF file
+#   wrong_arch     replace private_gallery_app with a valid ELF64 LSB object
+#                  whose e_machine is EM_AARCH64
 make_appimage_template() {
   local dir="$1"
   shift
   local desktop_exec="photo-organizer"
-  local omit="" not_exec="" not_elf=""
+  local omit="" not_exec="" not_elf="" wrong_arch=""
   local kv k v
   for kv in "$@"; do
     k="${kv%%=*}"
@@ -548,6 +640,7 @@ make_appimage_template() {
       omit) omit="${v}" ;;
       not_exec) not_exec="${v}" ;;
       not_elf) not_elf="1" ;;
+      wrong_arch) wrong_arch="1" ;;
       *) printf 'unknown fixture option: %s\n' "${k}" >&2; exit 2 ;;
     esac
   done
@@ -563,6 +656,9 @@ make_appimage_template() {
       # the text file non-executable made this scenario report
       # appimage_not_executable, which is a different assertion.
       printf 'not an elf\n' >"${dir}/private_gallery_app"
+      chmod +x "${dir}/private_gallery_app"
+    elif [[ -n "${wrong_arch}" ]]; then
+      cp -f "${WRONG_ARCH_FIXTURE}" "${dir}/private_gallery_app"
       chmod +x "${dir}/private_gallery_app"
     else
       cp -f "${EL_FIXTURE}" "${dir}/private_gallery_app"
@@ -597,7 +693,8 @@ make_appimage_template() {
 make_deb_template() {
   local dir="$1"
   shift
-  local omit="" not_exec="" not_elf="" link_target="/opt/photo-organizer/AppRun"
+  local omit="" not_exec="" not_elf="" wrong_arch=""
+  local link_target="/opt/photo-organizer/AppRun"
   local deb_exec="/opt/photo-organizer/AppRun" icon="photo-organizer"
   local kv k v
   for kv in "$@"; do
@@ -610,6 +707,7 @@ make_deb_template() {
       link_target) link_target="${v}" ;;
       deb_exec) deb_exec="${v}" ;;
       icon) icon="${v}" ;;
+      wrong_arch) wrong_arch="1" ;;
       *) printf 'unknown fixture option: %s\n' "${k}" >&2; exit 2 ;;
     esac
   done
@@ -626,6 +724,8 @@ make_deb_template() {
   if [[ -z "${omit}" || "${omit}" != "opt/photo-organizer/private_gallery_app" ]]; then
     if [[ -n "${not_elf}" ]]; then
       printf 'not an elf\n' >"${dir}/opt/photo-organizer/private_gallery_app"
+    elif [[ -n "${wrong_arch}" ]]; then
+      cp -f "${WRONG_ARCH_FIXTURE}" "${dir}/opt/photo-organizer/private_gallery_app"
     else
       cp -f "${EL_FIXTURE}" "${dir}/opt/photo-organizer/private_gallery_app"
     fi
@@ -714,11 +814,36 @@ write_fake_app() {
 #!/usr/bin/env bash
 # fake application runtime for the linux artifact gate test suite.
 set -uo pipefail
+# The behaviour arrives in a FILE next to this script, not in the environment.
+# The gate launches the app under `env -i` with an explicit allow-list, which is
+# right for a release gate -- it must not hand the artifact the CI environment
+# -- but it means a test double can never be steered by an exported variable.
+# Every scenario that set FAKE_APP_BEHAVIOUR was therefore running the `ok` app:
+# five "the app dies / the app crashes" scenarios saw a green run and the suite
+# recorded them as reds. Reading a sibling file is how a fixture the gate cannot
+# see still gets to decide what the app does.
 behaviour="${FAKE_APP_BEHAVIOUR:-ok}"
+_here="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)" || _here="."
+if [[ -r "${_here}/fake-behaviour" ]]; then
+  behaviour="$(tr -d '[:space:]' <"${_here}/fake-behaviour")"
+fi
 if [[ "${1:-}" == "--appimage-extract" ]]; then
   template="${FAKE_APPIMAGE_TEMPLATE:?FAKE_APPIMAGE_TEMPLATE is not set}"
   if [[ -n "${FAKE_APPIMAGE_EXTRACT_FAIL:-}" ]]; then
     echo "Cannot mount AppImage, please check your FUSE setup." >&2
+    exit 1
+  fi
+  # Truncation is fatal to a real AppImage: the squashfs image is the tail of
+  # the file, so cutting it makes the mount fail. A fake that happily unpacks a
+  # cut file would make "the archive is whole" untestable, and the negative test
+  # that cuts the tail would be measuring the harness instead of the gate. The
+  # archive path is not an argument -- the gate invokes this with
+  # `--appimage-extract` and no path -- so it is this script's own path.
+  _self="${BASH_SOURCE[0]}"
+  _want="$(awk '$1 == "appimage" { print $2 }' "${FAKE_FULL_SIZES:-/nonexistent}" 2>/dev/null || true)"
+  if [[ -n "${_want}" && -n "${_self}" && -r "${_self}" ]] \
+    && (( $(wc -c <"${_self}") < _want )); then
+    echo "Cannot mount AppImage: the squashfs image is truncated." >&2
     exit 1
   fi
   mkdir -p squashfs-root
@@ -800,7 +925,7 @@ run_gate() {
     TMPDIR="${WORK}" \
     LINUX_SMOKE_NAME="${tag}" \
     LINUX_SMOKE_EVIDENCE_DIR="${evdir}" \
-    LINUX_SMOKE_SETTLE_SECONDS=0 \
+    LINUX_SMOKE_SETTLE_SECONDS="${TEST_SETTLE_SECONDS:-0}" \
     LINUX_SMOKE_TEARDOWN_GRACE_SECONDS=0 \
     LINUX_SMOKE_POLL_SECONDS="${TEST_POLL:-0}" \
     LINUX_SMOKE_LAUNCH_TIMEOUT="${TEST_LAUNCH_TIMEOUT:-8}" \
@@ -823,6 +948,7 @@ run_gate() {
     FAKE_DEB_F_MISSING="${TEST_DEB_F_MISSING:-}" \
     FAKE_APPIMAGE_TEMPLATE="${TEST_APPIMAGE_TEMPLATE:-}" \
     FAKE_APPIMAGE_EXTRACT_FAIL="${TEST_APPIMAGE_EXTRACT_FAIL:-}" \
+    FAKE_FULL_SIZES="${artdir}/fake-full-sizes" \
     FAKE_APP_BEHAVIOUR="${TEST_APP_BEHAVIOUR:-ok}" \
     FAKE_IMPORT_SINK_FILE="${TEST_IMPORT_SINK:-}" \
     "${gate}" "${artdir}" 2>&1)"
@@ -832,7 +958,15 @@ run_gate() {
 }
 
 # Builds a complete, valid pair of artifacts. `behaviour` is the fake app's
-# behaviour; the AppImage and the .deb both get one, because both legs launch.
+# behaviour and it is written INTO THE FIXTURE, in the two places the two legs
+# actually execute the app from:
+#
+#   * next to the .AppImage inside the artifact directory, because the gate runs
+#     the AppImage in place, and
+#   * next to the .deb's `AppRun`, because the gate extracts the payload and
+#     runs `AppRun` from the extracted tree.
+#
+# It cannot travel in the environment: the gate launches the app under `env -i`.
 make_good_artifacts() {
   local dir="$1"
   local behaviour="${2:-ok}"
@@ -842,10 +976,23 @@ make_good_artifacts() {
   mkdir -p "${dir}/out"
   ARTIFACT_SRC="${dir}/out"
   write_fake_app "${dir}/out/photo-organizer-linux-x86_64-v0.1.7.AppImage"
+  printf '%s' "${behaviour}" >"${dir}/out/fake-behaviour"
+  printf '%s' "${behaviour}" >"${dir}/deb-payload/opt/photo-organizer/fake-behaviour"
   # A real AppImage is tens of megabytes; the size floor is asserted, so the
   # double has to be over it.
   dd if=/dev/zero bs=1024 count=1200 >>"${dir}/out/photo-organizer-linux-x86_64-v0.1.7.AppImage" 2>/dev/null
   printf 'fake deb payload\n' >"${dir}/out/photo-organizer_0.1.7_amd64.deb"
+  # Both archives' pristine sizes, recorded here while they are whole. The two
+  # extractor fakes compare the file they were handed against these, so a
+  # truncated artifact fails the way a truncated artifact fails in production.
+  # Without the file, the fakes unpack anything -- including an empty file -- and
+  # the two truncation scenarios below would assert that the harness is lenient
+  # rather than that the gate is not.
+  {
+    printf 'appimage %s\n' \
+      "$(wc -c <"${dir}/out/photo-organizer-linux-x86_64-v0.1.7.AppImage")"
+    printf 'deb %s\n' "$(wc -c <"${dir}/out/photo-organizer_0.1.7_amd64.deb")"
+  } >"${dir}/out/fake-full-sizes"
   TEST_APPIMAGE_TEMPLATE="${dir}/appimage-payload"
   TEST_DEB_TEMPLATE="${dir}/deb-payload"
   TEST_DEB_CONTROL="${dir}/control"
@@ -906,7 +1053,9 @@ assert_evidence_contains() {
     fail "${desc} (the evidence directory for ${tag} is empty)"
     return 0
   fi
-  if grep -qR -- "${needle}" "${evdir}" 2>/dev/null; then
+  if grep -qR -I \
+    --include='*.txt' --include='*.log' \
+    -- "${needle}" "${evdir}" 2>/dev/null; then
     pass "${desc}"
   else
     fail "${desc} (evidence in ${evdir} does not contain '${needle}')"
@@ -994,6 +1143,85 @@ scenario_test() {
   assert_red "scenario ${name}: broken input is caught as ${tag}" "${tag}"
 }
 
+# A mutation that only BITES on broken input.
+#
+# Assertions like the launch deadline, the render deadline, or "the extractor
+# failed" are unreachable while the artifact is good -- the code path is never
+# entered -- so a mutation on a good artifact cannot fire, and pretending
+# otherwise is how you get a mutation table that proves nothing. The proof that
+# such a check is load-bearing is that DISABLING it makes the broken input stop
+# being reported as `${tag}`.
+#
+# The pristine broken run is repeated here on purpose. If the fixture has
+# drifted so that it no longer produces `tag`, this fails before the mutation is
+# applied, instead of reporting a green mutation against a run that never had
+# the property to begin with.
+mutation_on_broken() {
+  local name="$1" tag="$2"
+  shift 2
+  run_gate "sc-mut-${name}-pristine" "${GATE}"
+  if [[ "${LAST_STATUS}" -eq 0 ]] \
+    || ! printf '%s\n' "${LAST_OUT}" | grep -q "FAIL assertion=${tag}:"; then
+    fail "mutation ${name}: the pristine run on the broken input did not report ${tag}, so there is nothing for the mutation to prove"
+    return 0
+  fi
+  apply_mutation "${name}" "$@"
+  if [[ "${MUTATION_APPLIED}" -ne 1 ]]; then
+    fail "mutation ${name}: the mutation did not apply, so nothing was proven"
+    return 0
+  fi
+  bash -n "${MUTANT_PATH}" 2>/dev/null || {
+    fail "mutation ${name}: the mutated gate is not valid bash"
+    return 0
+  }
+  run_gate "mut-${name}" "${MUTANT_PATH}"
+  if printf '%s\n' "${LAST_OUT}" | grep -q "FAIL assertion=${tag}:"; then
+    fail "mutation ${name}: the broken input is STILL reported as ${tag} after the check was disabled, so that check is not what detected it"
+  else
+    pass "mutation ${name}: disabling the ${tag} check removes ${tag} from the broken-input run (mutant exit ${LAST_STATUS})"
+    MUTATION_COUNT=$((MUTATION_COUNT + 1))
+  fi
+}
+
+# A mutation on a RECORDED value rather than on a verdict.
+#
+# Some of this gate's checks are warnings by design -- the AppImage's bare
+# `Exec=` name is recorded in the summary and the run stays green on purpose,
+# because it is a real packaging defect that is out of scope for this issue.
+# For those, "the gate goes red" is not available as a proof. What IS available,
+# and is still a real proof, is that the recorded value MOVES when the check that
+# produces it is disabled: `appimage_desktop_exec_resolves=no` has to become
+# `yes`. Both directions are asserted, so a mutation that fails to apply -- or a
+# value that was a hard-coded string rather than a computed one -- cannot pass.
+mutation_flips_evidence() {
+  local name="$1" before="$2" after="$3"
+  shift 3
+  local evdir
+  run_gate "mut-${name}-pristine" "${GATE}"
+  evdir="$(evidence_dir_for "mut-${name}-pristine")"
+  if ! grep -qR -I --include='*.txt' --include='*.log' -- "${before}" "${evdir}" 2>/dev/null; then
+    fail "mutation ${name}: the pristine run did not record '${before}', so there is nothing for the mutation to move"
+    return 0
+  fi
+  apply_mutation "${name}" "$@"
+  if [[ "${MUTATION_APPLIED}" -ne 1 ]]; then
+    fail "mutation ${name}: the mutation did not apply, so nothing was proven"
+    return 0
+  fi
+  bash -n "${MUTANT_PATH}" 2>/dev/null || {
+    fail "mutation ${name}: the mutated gate is not valid bash"
+    return 0
+  }
+  run_gate "mut-${name}" "${MUTANT_PATH}"
+  evdir="$(evidence_dir_for "mut-${name}")"
+  if grep -qR -I --include='*.txt' --include='*.log' -- "${after}" "${evdir}" 2>/dev/null; then
+    pass "mutation ${name}: disabling the check moves the recorded value from '${before}' to '${after}'"
+    MUTATION_COUNT=$((MUTATION_COUNT + 1))
+  else
+    fail "mutation ${name}: the mutated run did not record '${after}', so the recorded value is not produced by the check this mutation disabled"
+  fi
+}
+
 reset_env() {
   unset TEST_POLL TEST_LAUNCH_TIMEOUT TEST_RENDER_TIMEOUT TEST_TREE_MODE \
     TEST_ID_MODE TEST_ID_X TEST_ID_Y TEST_ROOT_W TEST_ROOT_H TEST_ROOT_MODE \
@@ -1001,7 +1229,8 @@ reset_env() {
     TEST_SETTLE_DIFF TEST_COMPARE_GARBAGE TEST_COMPARE_SETTLE_GARBAGE \
     TEST_DEB_TEMPLATE TEST_DEB_CONTROL \
     TEST_DEB_X_FAIL TEST_DEB_F_MISSING TEST_APPIMAGE_TEMPLATE \
-    TEST_APPIMAGE_EXTRACT_FAIL TEST_APP_BEHAVIOUR TEST_IMPORT_SINK 2>/dev/null || true
+    TEST_APPIMAGE_EXTRACT_FAIL TEST_APP_BEHAVIOUR TEST_IMPORT_SINK \
+    TEST_GATE_TIMEOUT TEST_SETTLE_SECONDS 2>/dev/null || true
   unset FAKE_XWININFO_TREE_MODE FAKE_XWININFO_ID_MODE 2>/dev/null || true
   build_farm
   unset LINUX_SMOKE_UNDER_XVFB DISPLAY 2>/dev/null || true
@@ -1046,10 +1275,13 @@ assert_evidence_contains "the AppImage's bare-name desktop Exec is reported as u
 # Asserted against the recorded xvfb-run ARGUMENTS, not against the evidence
 # directory. The evidence directory contains `xvfb_server_args=-screen 0
 # 1280x800x24 ...` because the gate records the string it *intends* to pass, so
-# grepping the evidence for `-screen 0 1280x800x24` matched the gate's own
-# constant and would have gone green even if the gate passed something else to
-# xvfb-run entirely. The fake xvfb-run writes what it was actually given.
-if grep -qx -- '-screen 0 1280x800x24' "${WORK}/xvfb-args-happy.txt" 2>/dev/null; then
+# grepping the evidence for it matched the gate's own constant and would have
+# gone green even if the gate passed something else to xvfb-run entirely. The
+# fake xvfb-run writes the argv it was actually handed, one token per line, and
+# the gate passes the whole `--server-args=...` value as ONE token -- so the
+# needle is that single token, matched as a fixed string.
+if grep -qxF -- '--server-args=-screen 0 1280x800x24 -nolisten tcp' \
+  "${WORK}/xvfb-args-happy.txt" 2>/dev/null; then
   pass "the gate asked Xvfb for the 1280x800x24 screen it asserts against"
 else
   fail "the gate asked Xvfb for the 1280x800x24 screen it asserts against (recorded args: $(tr '\n' ' ' <"${WORK}/xvfb-args-happy.txt" 2>/dev/null))"
@@ -1080,6 +1312,23 @@ scenario_test "app-dies-at-launch" app_exited_during_launch
 reset_env
 make_good_artifacts "${WORK}/s2" die-late
 TEST_LAUNCH_TIMEOUT=8
+# The app has to be alive when the render finishes and dead by the survival
+# check that immediately follows it -- a window of a couple of milliseconds. A
+# pure timer cannot be aimed at that, and this scenario was flaky for exactly
+# that reason: it passed or failed depending on how fast the machine happened to
+# be, which is not a test.
+#
+# `LINUX_SMOKE_SETTLE_SECONDS=3` is what makes it deterministic, and it is not
+# padding. The stability loop sleeps once per attempt, and it has NO liveness
+# check inside it -- by design, because the survival check belongs after the
+# stability proof, not inside it. So a three-second settle sleep is a
+# three-second window in which the app's own one-second self-kill lands with the
+# render already succeeded. The app is guaranteed to die during the sleep and
+# guaranteed to still have been alive for the render: the two facts are separated
+# by seconds, not by microseconds. The stability verdict is unaffected (a settled
+# screen diffs to 0 however long you wait) and the assertion that fires is the
+# one this scenario is about.
+TEST_SETTLE_SECONDS=3
 scenario_test "app-dies-after-first-frame" app_exited_after_first_frame
 
 reset_env
@@ -1140,6 +1389,13 @@ scenario_test "root-query-returns-no-geometry" root_geometry
 
 reset_env
 make_good_artifacts "${WORK}/s12" ok
+# `id_mode=forced` is required, not decorative. The fake `xwininfo -id` answers
+# about the window it was asked about by looking the id up in the same tree the
+# probe read, so a TEST_ID_X/TEST_ID_Y override is IGNORED unless the forced mode
+# is selected. Without it this scenario silently tested nothing: the forced
+# position was discarded, the window came back at the origin, and the run stayed
+# green.
+TEST_ID_MODE=forced
 TEST_ID_X=10000
 TEST_ID_Y=10000
 scenario_test "window-mostly-offscreen" window_offscreen
@@ -1201,6 +1457,14 @@ TEST_DEB_TEMPLATE="${WORK}/s19/deb-payload"
 TEST_DEB_CONTROL="${WORK}/s19/control"
 scenario_test "appimage-too-small" appimage_size
 
+# Truncated, but still comfortably over the 1 MiB size floor, so `appimage_size`
+# cannot be what catches it. What has to catch it is the extractor: the squashfs
+# image is the tail of the file, so a cut artifact does not mount.
+reset_env
+make_good_artifacts "${WORK}/s19b" ok
+truncate -s 1100000 "${WORK}/s19b/out/photo-organizer-linux-x86_64-v0.1.7.AppImage"
+scenario_test "appimage-truncated-but-still-oversized" appimage_payload_extract
+
 # The payload is missing the engine binary.
 reset_env
 make_good_artifacts "${WORK}/s20" ok
@@ -1219,6 +1483,14 @@ TEST_DEB_TEMPLATE="${WORK}/s21/deb-payload"
 TEST_DEB_CONTROL="${WORK}/s21/control"
 scenario_test "appimage-payload-not-an-elf" appimage_payload_not_elf
 
+# A valid ELF that is not this architecture. Reached only because require_elf
+# reads e_machine, not just the magic: with the magic alone this artifact was a
+# pass, and it is exactly the artifact the runner cannot execute.
+reset_env
+make_good_artifacts "${WORK}/s21b" ok
+make_appimage_template "${WORK}/s21b/appimage-payload" wrong_arch=1
+scenario_test "appimage-payload-is-the-wrong-architecture" appimage_payload_not_elf
+
 reset_env
 make_good_artifacts "${WORK}/s22" ok
 # not_elf makes private_gallery_app a text file AND leaves it non-executable
@@ -1230,6 +1502,15 @@ TEST_APPIMAGE_TEMPLATE="${WORK}/s22/appimage-payload"
 TEST_DEB_TEMPLATE="${WORK}/s22/deb-payload"
 TEST_DEB_CONTROL="${WORK}/s22/control"
 scenario_test "deb-engine-not-an-elf" deb_binary_not_elf
+
+# The same wrong-architecture defect on the .deb leg.
+reset_env
+make_good_artifacts "${WORK}/s22c" ok
+make_deb_template "${WORK}/s22c/deb-payload" wrong_arch=1
+TEST_APPIMAGE_TEMPLATE="${WORK}/s22c/appimage-payload"
+TEST_DEB_TEMPLATE="${WORK}/s22c/deb-payload"
+TEST_DEB_CONTROL="${WORK}/s22c/control"
+scenario_test "deb-engine-is-the-wrong-architecture" deb_binary_not_elf
 
 # The exec-bit check on its own: a present, ELF, but non-executable engine binary.
 reset_env
@@ -1316,6 +1597,15 @@ reset_env
 make_good_artifacts "${WORK}/s32" ok
 TEST_DEB_X_FAIL=1
 scenario_test "deb-cannot-be-unpacked" deb_extract_failed
+
+# A zero-byte .deb is the other truncation, and the one a real dpkg-deb rejects
+# outright. Asserted separately from the injected-extractor-failure above: that
+# one proves the gate reacts to an extractor that says no, this one proves the
+# gate is fed an artifact that any extractor must say no to.
+reset_env
+make_good_artifacts "${WORK}/s32b" ok
+: >"${WORK}/s32b/out/photo-organizer_0.1.7_amd64.deb"
+scenario_test "deb-truncated-to-zero-bytes" deb_extract_failed
 
 reset_env
 make_good_artifacts "${WORK}/s33" ok
@@ -1456,8 +1746,45 @@ mut "appimage-payload-elf" appimage_payload_not_elf \
   's/if \[\[ "${magic}" != "7f454c46" \]\]; then/if [[ "${magic}" == "7f454c46" ]]; then/'
 
 reset_env
-mut "appimage-desktop-exec-abs" appimage_desktop_exec_unresolvable \
-  's/if \[\[ -x "${PAYLOAD}${appimage_desktop_exec}" \]\]; then/if [[ ! -x "${PAYLOAD}${appimage_desktop_exec}" ]]; then/'
+# The architecture half of require_elf, which the magic half cannot reach: the
+# mutant still rejects non-ELF files and still rejects wrong EI_CLASS, so if this
+# only bites because of the fixture rather than the mutation the suite would show
+# it immediately.
+mut "engine-architecture" appimage_payload_not_elf \
+  's/if \[\[ "${machine}" != "3e00" \]\]; then/if [[ "${machine}" == "3e00" ]]; then/'
+
+reset_env
+# The hard `appimage_desktop_exec_unresolvable` failure is only reached when the
+# desktop entry names an ABSOLUTE path that is not in the payload. The good
+# fixture carries the repo's real bare `Exec=photo-organizer`, which is the
+# recorded packaging warning, not this failure -- so the fixture is rebuilt with
+# a broken absolute Exec and the `-x` test is then disabled to show that it is
+# what caught it.
+make_good_artifacts "${WORK}/mut-appimage-desktop-exec-abs" ok
+make_appimage_template "${WORK}/mut-appimage-desktop-exec-abs/appimage-payload" \
+  desktop_exec=/opt/photo-organizer/does-not-exist
+TEST_APPIMAGE_TEMPLATE="${WORK}/mut-appimage-desktop-exec-abs/appimage-payload"
+mutation_on_broken "appimage-desktop-exec-abs" appimage_desktop_exec_unresolvable \
+  's/if \[\[ -x "${PAYLOAD}${appimage_desktop_exec}" \]\]; then/if [[ -n "${appimage_desktop_exec}" ]]; then/'
+
+reset_env
+# The bare-name case is a RECORDED warning, not a verdict, so it is proven by
+# showing the recorded value moves. It is proven in the "resolves" direction
+# because that is the only one available: the recorded failure text is a
+# constant, so forcing the check false on the DEFAULT fixture just re-records
+# the same "no". Here the fixture's bare `Exec=AppRun` genuinely resolves, the
+# pristine run records `yes`, and disabling the `-x` test turns that into `no`.
+# With the `resolves=no` assertion on the happy run, both recorded values are
+# then proven computed rather than hard-coded.
+make_good_artifacts "${WORK}/mut-appimage-desktop-exec-warn" ok
+make_appimage_template "${WORK}/mut-appimage-desktop-exec-warn/appimage-payload" \
+  desktop_exec=AppRun
+TEST_APPIMAGE_TEMPLATE="${WORK}/mut-appimage-desktop-exec-warn/appimage-payload"
+TEST_DEB_TEMPLATE="${WORK}/mut-appimage-desktop-exec-warn/deb-payload"
+TEST_DEB_CONTROL="${WORK}/mut-appimage-desktop-exec-warn/control"
+mutation_flips_evidence "appimage-desktop-exec-warn" \
+  "appimage_desktop_exec_resolves=yes" "appimage_desktop_exec_resolves=no" \
+  's%if \[\[ -x "${PAYLOAD}/${appimage_desktop_exec}" || -x "${PAYLOAD}/usr/bin/${appimage_desktop_exec}" \]\]; then%if false; then%'
 
 reset_env
 mut "artifact-discovery-appimage" artifact_discovery \
@@ -1468,12 +1795,16 @@ mut "artifact-discovery-deb" artifact_discovery \
   's/if ((\${#DEBS\[@\]} == 0)); then/if ((\${#DEBS[@]} > 0)); then/'
 
 reset_env
-# One expression, not two. The second was `s/X/X/`, which changes nothing: a
-# mutation that cannot move a single character cannot prove anything, and the
-# mutation runner is right to report it as not applied. The window_deadline half
-# of this assertion is covered on its own by the `launch-timeout` mutation.
+# Raise the size floor above every window in the good fixture, so the probe sees
+# top-level windows and rejects all of them. This is the assertion's real
+# question -- "are the windows we found big enough to be the app?" -- and the
+# replacement is load-bearing in a way the old expression was not: the previous
+# `((area >= min_area))` -> `((area < min_area))` swap made the probe select the
+# 10x10 helper window instead, which is `window_offscreen`, a different
+# assertion. `window_too_small`'s reachability is also covered directly by the
+# `window-present-but-tiny` scenario.
 mut "window-area-floor" window_area_too_small \
-  's/((area >= min_area)) || continue/((area < min_area)) || continue/'
+  's/min_area=$((ROOT_W \* ROOT_H \* LINUX_SMOKE_MIN_WINDOW_PERCENT \/ 100))/min_area=$((ROOT_W * ROOT_H * 999))/'
 
 reset_env
 mut "window-map-state" window_not_visible \
@@ -1533,13 +1864,31 @@ mut "crash-signature-scan" crash_signature \
   "s/hits=\"\$(grep -Ein \"\${re}\" \"\${file}\" || true)\"/hits=\"\$(grep -Ein '.' \"\${file}\" || true)\"/"
 
 reset_env
-mut "launch-timeout" launch_timeout \
-  's/if ((SECONDS >= window_deadline)); then/if ((SECONDS >= 0)); then/' \
-  's/if ((saw_small == 1)); then/if ((saw_small == 2)); then/'
+# The launch deadline only fires when NO window ever appears, so it is
+# unreachable on a good artifact and cannot be proven by a good-artifact
+# mutation. It is proven on broken input instead: with the deadline branch
+# disabled the empty-tree run does not merely stop reporting launch_timeout, it
+# never terminates -- the harness kills it at 10s (exit 124) and the tag is
+# gone. `LAUNCH_TIMEOUT=3` keeps the pristine run honest and fast; it has to be
+# well under the harness wall clock or the pristine run would itself be killed.
+make_good_artifacts "${WORK}/mut-launch-timeout" ok
+TEST_TREE_MODE=empty
+TEST_LAUNCH_TIMEOUT=3
+TEST_POLL=1
+TEST_GATE_TIMEOUT=10
+mutation_on_broken "launch-timeout" launch_timeout \
+  's/if ((SECONDS >= window_deadline)); then/if false; then/'
 
 reset_env
-mut "render-timeout" render_not_complex \
-  's/if ((SECONDS >= render_deadline)); then/if ((SECONDS >= 0)); then/'
+# Same shape, for the render deadline: with a flat frame and the deadline
+# disabled the render loop spins forever instead of failing.
+make_good_artifacts "${WORK}/mut-render-timeout" ok
+TEST_COLOURS=1
+TEST_RENDER_TIMEOUT=3
+TEST_POLL=1
+TEST_GATE_TIMEOUT=10
+mutation_on_broken "render-timeout" render_not_complex \
+  's/if ((SECONDS >= render_deadline)); then/if false; then/'
 
 reset_env
 mut "metric-selfcheck-colours" metric_selfcheck_colours \
@@ -1571,8 +1920,21 @@ mut "root-geometry" root_geometry \
   's/if \[\[ -z "${dims}" \]\]; then/if [[ -n "${dims}" ]]; then/'
 
 reset_env
-mut "deb-extractor" deb_extract_failed \
-  's/^if command -v dpkg-deb >\/dev\/null 2>&1; then$/if false; then/'
+# `deb_extract_failed` has three producers and a good fixture reaches none of
+# them, so a good-artifact mutation is impossible here. The first attempt was
+# `if command -v dpkg-deb` -> `if false`, which does not fail the gate at all:
+# it just selects the bsdtar fallback, which then SUCCEEDS, and the run stays
+# green. The dimension that matters is the one the scenario already covers -- the
+# no-extractor-at-all path. What has to be proven here is that a failing
+# extractor is FATAL, so the broken input is a .deb that cannot be unpacked and
+# the mutation makes the failure branch unreachable: the run then dies later and
+# honestly, on `deb_layout_missing`, because the extraction directory is empty.
+# That is the load-bearing difference -- swallowing the failure still reddens the
+# run, but with a different and much less informative reason.
+make_good_artifacts "${WORK}/mut-deb-extractor" ok
+TEST_DEB_X_FAIL=1
+mutation_on_broken "deb-extractor" deb_extract_failed \
+  's/if ! dpkg-deb -x "${DEB}"/if false \&\& dpkg-deb -x "${DEB}"/'
 
 reset_env
 mut "deb-layout" deb_layout_missing \

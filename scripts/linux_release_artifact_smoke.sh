@@ -639,6 +639,22 @@ verify_window_mapped() {
   if [[ -z "${x}" || -z "${y}" ]]; then
     fail window_geometry_unreadable "could not read the position of window ${id}"
   fi
+  # Nothing read out of a tool's stdout reaches arithmetic or the crop geometry
+  # without passing an integer check first. `xwininfo` prints these fields with
+  # `%ld`, so they are plain digits, but a signed reading is accepted here on
+  # purpose (an explicit `+0` is harmless) and any other text is a hard failure
+  # rather than a value that later gets used as a number. It was not hypothetical:
+  # a `+0` reaching `compute_crop_geom` produced a crop geometry of
+  # `1280x720++0++0`, which is not a geometry ImageMagick can parse, and the
+  # evidence summary recorded the garbage verbatim.
+  for pair in "Width:${w}" "Height:${h}" "X:${x}" "Y:${y}"; do
+    if [[ ! "${pair#*:}" =~ ^-?[0-9]+$ ]]; then
+      fail window_geometry_unreadable \
+        "window ${id} reported ${pair%%:*}='${pair#*:}', which is not an integer"
+    fi
+  done
+  x="${x#+}"
+  y="${y#+}"
   PROBE_W="${w}"
   PROBE_H="${h}"
   PROBE_X="${x}"
@@ -1124,13 +1140,40 @@ done
 # `private_gallery_app` would pass every existence and permission check and then
 # fail at exec, 120 seconds into the leg.
 require_elf() {
-  local file="$1" tag="$2" magic
-  magic="$(od -An -tx1 -N4 "${file}" 2>/dev/null | tr -d ' \n' || true)"
+  local file="$1" tag="$2"
+  local hdr magic class data machine
+  hdr="$(od -An -tx1 -N20 "${file}" 2>/dev/null | tr -d ' \n' || true)"
+  # byte 0-3 is the magic, one hex pair per byte and no separators.
+  magic="${hdr:0:8}"
+  class="${hdr:8:2}"
+  data="${hdr:10:2}"
+  # Bytes 18-19 are e_machine, in the file's own byte order. Bytes 16-17 are
+  # e_type (2 = ET_EXEC, 3 = ET_DYN) and come FIRST in the header, so reading
+  # 16-17 as the machine gets 0x0300 on an ordinary PIE binary -- which is the
+  # first version of this check, and it rejected the real artifact.
+  machine="${hdr:36:4}"
   if [[ "${magic}" != "7f454c46" ]]; then
     fail "${tag}" "${file} is not an ELF object (leading bytes '${magic:-none}', expected 7f454c46 = \\x7fELF)"
   fi
+  # The magic alone proves nothing about architecture: `7f454c46` is the first
+  # four bytes of EVERY ELF object, 32-bit ARM and RISC-V included, and a gate
+  # that stopped here would report a pass on an artifact it cannot execute. EI_CLASS
+  # is byte 4 and EI_DATA is byte 5; both are read so the e_machine comparison
+  # below is a stated byte order rather than a blind one.
+  if [[ "${class}" != "02" || "${data}" != "01" ]]; then
+    fail "${tag}" \
+      "${file} is not a little-endian 64-bit ELF (EI_CLASS=0x${class:-none}, EI_DATA=0x${data:-none}, expected 0x02/0x01)"
+  fi
+  # EM_X86_64 == 62 == 0x3e, little-endian, hence the `3e00` on disk. This is the
+  # architecture assertion the release gate owes: the runner launches it, so the
+  # bytes have to be the ones this runner can launch.
+  if [[ "${machine}" != "3e00" ]]; then
+    fail "${tag}" \
+      "${file} is not x86-64 (e_machine=0x${machine:-none}, expected 0x3e00 = EM_X86_64); this gate launches the artifact on x86-64"
+  fi
 }
 require_elf "${PAYLOAD}/private_gallery_app" appimage_payload_not_elf
+require_elf "${PAYLOAD}/galleryd" appimage_payload_not_elf
 record "appimage_payload" "${PAYLOAD}"
 log "appimage: payload layout verified (AppRun, ELF private_gallery_app, galleryd, ml_sidecar, desktop entry)"
 
@@ -1205,6 +1248,7 @@ done
 # because a truncated or text-mode-converted file satisfies every existence and
 # permission check and then fails at exec.
 require_elf "${DEB_ROOT}/opt/photo-organizer/private_gallery_app" deb_binary_not_elf
+require_elf "${DEB_ROOT}/opt/photo-organizer/galleryd" deb_binary_not_elf
 for required_rel in \
   "opt/photo-organizer/AppRun" \
   "opt/photo-organizer/private_gallery_app" \
