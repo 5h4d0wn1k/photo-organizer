@@ -242,7 +242,7 @@ CROP_GEOM=""
 # Which leg is being run, and what to call it in an assertion message. Set by
 # run_leg, read by verify_window_mapped when it reports an unattributable window,
 # which is the one failure whose text has to be readable on its own.
-probe_leg=""
+# probe_leg set by run_leg
 leg_label=""
 
 log() {
