@@ -145,6 +145,17 @@ set -euo pipefail
 # 120s. The app maps its window about 5s after exec locally; CI runners are
 # slower, and this gate must not be the flaky thing in the release.
 : "${LINUX_SMOKE_LAUNCH_TIMEOUT:=120}"
+# The token a probed window's WM_CLASS (or its name) must carry to be accepted as
+# the app's when PID ancestry could not settle it. Empty DISABLES the fallback,
+# which is the right setting for a machine where no such token can be trusted --
+# with it empty, an unattributable window is a hard failure and there is no second
+# way in. The default is the shipped binary's name, which is also the basename
+# GTK puts in WM_CLASS for a Flutter Linux app.
+: "${LINUX_SMOKE_EXPECT_WINDOW_MATCH:=photo-organizer}"
+# How far up the PPID chain the attribution walk is willing to go. Not an
+# assertion threshold; a bound so a pathological /proc cannot hang the gate on its
+# own diagnosis. A healthy `setsid --wait` chain is two or three links.
+: "${LINUX_SMOKE_ANCESTRY_LIMIT:=16}"
 # 60s of retrying the colour probe, so a slow first paint is not a failure but a
 # permanently blank window still is.
 : "${LINUX_SMOKE_RENDER_TIMEOUT:=60}"
@@ -228,6 +239,11 @@ PROBE_H=0
 PROBE_X=0
 PROBE_Y=0
 CROP_GEOM=""
+# Which leg is being run, and what to call it in an assertion message. Set by
+# run_leg, read by verify_window_mapped when it reports an unattributable window,
+# which is the one failure whose text has to be readable on its own.
+probe_leg=""
+leg_label=""
 
 log() {
   printf '[%s] %s\n' "${SMOKE_NAME}" "$*"
@@ -639,12 +655,110 @@ probe_window() {
   return 0
 }
 
+# ---------------------------------------------------------------------------
+# Process ancestry, for window attribution
+# ---------------------------------------------------------------------------
+#
+# `xwininfo -id` names the PID of the client that mapped the window. Whether that
+# process is the launched leg is a question about the process table, and /proc
+# answers it directly. It is the strongest attribution available without a window
+# manager: a name or a WM_CLASS is a string the app chose, so a stale or
+# coincidental match is possible, while a PPID chain is not a claim anyone makes.
+#
+# Depth is bounded, and the bound is not arbitrary. `setsid --wait` puts the launch
+# in its own session and the app is its child, so a healthy chain is two or three
+# links; a dozen is generous for a wrapper chain, and a bound matters because an
+# unbounded walk on a machine with a deep or looping /proc would hang the gate on
+# its own diagnosis. Reaching PID 1 first is the normal ending and is not an
+# error -- it just means the answer was no.
+#
+# Both helpers read /proc and nothing else. `ps` is not used: its output format is
+# not a contract, its behaviour under a PID race is not defined, and this is a
+# verdict path, so the answer has to come from the kernel's own files or not at all.
+LINUX_SMOKE_ANCESTRY_LIMIT="${LINUX_SMOKE_ANCESTRY_LIMIT:-16}"
+
+# ancestor_chain <pid> -- "pid pp pp pp ... 1", for the evidence record. Never
+# fails: an unreadable /proc entry ends the walk, because the answer to "is this
+# our window" is allowed to be "no" and is not allowed to be "the gate crashed".
+ancestor_chain() {
+  local pid="$1" out="" i=0 cur="$1" ppid
+  while [[ "${cur}" =~ ^[0-9]+$ ]] && ((cur > 1)) && ((i < LINUX_SMOKE_ANCESTRY_LIMIT)); do
+    out+="${cur} "
+    if [[ ! -r "/proc/${cur}/stat" ]]; then
+      break
+    fi
+    # /proc/PID/stat is "pid (comm) state ppid ...". comm is parenthesised and may
+    # itself contain spaces and parentheses, so the fields after it are found from
+    # the LAST ')' rather than by cutting on whitespace -- `photo organizer`
+    # would otherwise shift every field by one.
+    ppid="$(sed -e 's/^.*) //' -e 's/^[^ ]* //' "/proc/${cur}/stat" 2>/dev/null || true)"
+    [[ "${ppid}" =~ ^[0-9]+$ ]] || break
+    cur="${ppid}"
+    i=$((i + 1))
+  done
+  printf '%s' "${out% }"
+}
+
+# is_ancestor_or_self <pid> <ancestor> -- is <pid> the process <ancestor>, or a
+# descendant of it? Walks up from <pid> and compares, so the answer does not
+# depend on the walk having been the same length on both sides.
+is_ancestor_or_self() {
+  local pid="$1" ancestor="$2" cur="$1" i=0 ppid
+  [[ "${pid}" =~ ^[0-9]+$ && "${ancestor}" =~ ^[0-9]+$ ]] || return 1
+  while ((i < LINUX_SMOKE_ANCESTRY_LIMIT)); do
+    [[ "${cur}" == "${ancestor}" ]] && return 0
+    ((cur > 1)) || return 1
+    if [[ ! -r "/proc/${cur}/stat" ]]; then
+      return 1
+    fi
+    ppid="$(sed -e 's/^.*) //' -e 's/^[^ ]* //' "/proc/${cur}/stat" 2>/dev/null || true)"
+    [[ "${ppid}" =~ ^[0-9]+$ ]] || return 1
+    cur="${ppid}"
+    i=$((i + 1))
+  done
+  return 1
+}
+
 # The authoritative follow-up. The tree output prints geometry for unmapped
 # windows too, so "the window exists" is not "the window is on screen".
 # `xwininfo -id` is the query that answers that, and it re-reads the geometry from
 # the window itself rather than trusting a tree line.
+#
+# It is also where the window is ATTRIBUTED, which is a different question and the
+# one the whole gate turns on. Everything downstream -- the area floor, IsViewable,
+# the colour floor, the settle bound, the teardown-crash check -- is satisfied by
+# *a* window. `probe_window` picks the largest top-level one, and on a bare Xvfb
+# with no window manager the only top-levels ought to be the app's. "Ought to be"
+# is not a proof, and the gate honours a caller-set LINUX_SMOKE_UNDER_XVFB=1 with
+# an ambient DISPLAY, so on a developer's real desktop it adopts the largest
+# window on their screen. The two legs also run sequentially on one X server, so
+# a surviving leg-1 window can satisfy leg 2's probe.
+#
+# Measured as a false pass: a foreign top-level 1279x799 -- larger than the app's
+# 1280x720 -- added to the suite's own `good_tree` fixture was selected instead of
+# the app, and the gate then completed its entire render proof against it. 124 of
+# 125 assertions stayed green. The one red assertion noticed the *geometry*, not
+# the *attribution*, which is the whole point: the render evidence would have been
+# of somebody else's window.
+#
+# So the window must be the app's. Two independent ways, because either alone has
+# a way to be wrong on a real runner:
+#
+#   * PID ancestry, the strong one. `xwininfo -id` reports the PID of the X client
+#     that mapped the window; /proc says whether that process is the launched leg
+#     or descends from it. This is a fact about the process table, not about a
+#     string anyone chose.
+#   * The window's own identity -- WM_CLASS, or its name -- matching an expected
+#     token. Weaker, because a title is chosen by the app and a stale match is
+#     possible, but it survives a window created by a process that is not a
+#     descendant (a portal helper, a re-exec that lost its parent) and it is what
+#     the Android gate uses, which requires the package name on the focused-window
+#     line.
+#
+# Either is enough, and the evidence records WHICH one carried the attribution, so
+# a reader is never left guessing whether the strong property held.
 verify_window_mapped() {
-  local id="$1" out state w h x y
+  local id="$1" out state w h x y pid class
   if ! out="$(xwininfo -id "${id}" 2>&1)"; then
     fail window_geometry_unreadable "xwininfo -id ${id} failed: ${out}"
   fi
@@ -653,6 +767,33 @@ verify_window_mapped() {
     fail window_not_visible \
       "window ${id} exists but its Map State is '${state:-unknown}', not IsViewable"
   fi
+
+  # --- attribution, before anything is measured off this window ---
+  pid="$(printf '%s\n' "${out}" | awk '/^[[:space:]]*PID:/ {print $2; exit}')"
+  class="$(printf '%s\n' "${out}" | sed -n 's/^[[:space:]]*WM_CLASS(STRING) = "\(.*\)", "\(.*\)"$/\1 \2/p' | head -1)"
+  local how="" chain="" ancestor=0
+  if [[ -n "${pid}" && "${pid}" =~ ^[0-9]+$ ]] && ((pid > 1)); then
+    chain="$(ancestor_chain "${pid}")"
+    if [[ -n "${APP_PID}" ]] && is_ancestor_or_self "${pid}" "${APP_PID}"; then
+      how="pid-ancestry"
+      ancestor=1
+    fi
+  fi
+  if ((ancestor == 0)) && [[ -n "${LINUX_SMOKE_EXPECT_WINDOW_MATCH}" ]]; then
+    if [[ " ${class} " == *" ${LINUX_SMOKE_EXPECT_WINDOW_MATCH} "* ]] \
+       || grep -qF -- "${LINUX_SMOKE_EXPECT_WINDOW_MATCH}" <<<"${class}"; then
+      how="window-identity"
+    fi
+  fi
+  record "$(probe_leg)_window_pid" "${pid:-<none>}"
+  record "$(probe_leg)_window_wm_class" "${class:-<none>}"
+  record "$(probe_leg)_window_attributed_by" "${how:-none}"
+  if [[ -z "${how}" ]]; then
+    record "$(probe_leg)_window_ancestry" "${chain:-<unreadable>}"
+    fail window_not_attributed \
+      "window ${id} is the largest top-level on ${DISPLAY:-<unset>} but nothing ties it to ${leg_label:-the app}: its PID is '${pid:-<none>}' (ancestry: ${chain:-<unreadable>}) and its WM_CLASS is '${class:-<none>}' against an expected '${LINUX_SMOKE_EXPECT_WINDOW_MATCH:-<none>}'. Rendering it would prove that some window rendered, not that the app did."
+  fi
+  log "window ${id} attributed to the app by ${how} (pid ${pid:-none}, class ${class:-none})"
 
   w="$(printf '%s\n' "${out}" | awk '/^[[:space:]]+Width:/ {print $2; exit}')"
   h="$(printf '%s\n' "${out}" | awk '/^[[:space:]]+Height:/ {print $2; exit}')"
@@ -956,6 +1097,10 @@ file_bytes() {
 run_leg() {
   local leg="$1"
   shift
+
+  # Read back by verify_window_mapped: the evidence keys and the assertion text
+  # both need to name the leg, and this is the only place that knows it.
+  leg_label="the ${leg} leg"
 
   local leg_dir="${SCRATCH}/${leg}"
   local home="${leg_dir}/home"
