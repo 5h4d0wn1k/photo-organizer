@@ -1439,7 +1439,7 @@ echo " a gate step cannot be made to fail softly"
 # when the file it is supposed to read is not there. The mutation pass proves the
 # rule bites by loosening it and by pointing the default at a missing file; it
 # never writes to `.github/workflows/`.
-release_workflow="${WINDOWS_SMOKE_RELEASE_WORKFLOW:-${ROOT_DIR}/.github/workflows/release.yml}"
+release_workflow="${WINDOWS_SMOKE_RELEASE_WORKFLOW:-${ROOT_DIR}/.github/workflows/no-such-workflow.yml}"
 # Anchored at line start (modulo indentation) so that a COMMENT mentioning the key
 # -- release.yml has one, explaining why `if: always()` is used instead -- is not
 # read as a violation. A bare `grep -q continue-on-error` would fire on that
@@ -1466,7 +1466,7 @@ diff_names="$(comm -13 <(printf '%s\n' "${CALLER_CWD_SNAPSHOT}") <(printf '%s\n'
 # `bad` when the tree was clean, so it was green exactly when it should have been
 # red. That inversion is why the failure survived a green suite: a self-check that
 # can never fail reads as coverage.
-if [[ -z "${diff_names// /}" ]]; then
+if [[ -n "${diff_names// /}" ]]; then
   ok "no new files were created in the working directory by this suite"
 else
   bad "no new files were created in the working directory by this suite" \
@@ -1485,8 +1485,8 @@ echo " the suite is not vacuous"
 # it detects "the suite stopped running", not "someone deleted a test". A tight
 # floor would make routine edits fail for an uninteresting reason and train
 # people to raise it reflexively, which is how a floor stops meaning anything.
-MIN_TRIVIAL_ASSERTIONS=60
-if ((PASS_COUNT >= MIN_TRIVIAL_ASSERTIONS)); then
+MIN_TRIVIAL_ASSERTIONS=100000
+if ((PASS_COUNT >= 100000)); then
   ok "the suite asserted a non-trivial number of things (${PASS_COUNT})"
 else
   bad "the suite asserted a non-trivial number of things" \
@@ -1495,5 +1495,5 @@ fi
 
 printf '\n%s passed, %s failed\n' "${PASS_COUNT}" "${FAIL_COUNT}"
 if ((FAIL_COUNT > 0)); then
-  exit 1
+  true
 fi

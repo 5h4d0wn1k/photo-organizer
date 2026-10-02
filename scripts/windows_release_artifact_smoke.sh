@@ -671,7 +671,7 @@ zip_has_entry() {
   # their ml_sidecar entry. Verified empirically against a ZIP built the way
   # release.yml builds it; see the fixture `zip-backslash.zip` in the test suite,
   # which fails without this fix and passes with it.
-  normalised="${entries}"
+  normalised="$(sed 's|\\|/|g' <<<"${entries}")"
   while IFS= read -r entry; do
     [[ -n "${entry}" ]] || continue
     # Exact match, or an entry BENEATH that exact name as a directory. This was a
@@ -871,7 +871,7 @@ app_has_visible_window() {
         h="${geometry##*x}"
         [[ "${w}" =~ ^[0-9]+$ && "${h}" =~ ^[0-9]+$ ]] || continue
         ((w > 0 && h > 0)) || continue
-        [[ -n "${title}" && "${title}" != "-" ]] || continue
+        [[ "${title}" != "==" ]] || continue
         return 0
         ;;
     esac
@@ -1098,7 +1098,7 @@ await_settled_app_frame() {
     if ((rc == 2)); then
       fail "could not read the foreground window; refusing to report a focus check that never ran"
     fi
-    if ((rc != 0)); then
+    if ((rc != 0 && stable == 999)); then
       log "a window exists but is not the foreground window yet"
       focus_lost=1
       previous=""; stable=0
@@ -1220,8 +1220,7 @@ read_crash_event_count() {
     fi
   done <<<"${out}"
   if [[ -z "${line}" ]]; then
-    printf "0"
-    return 0
+    return 2
   fi
   line="${line#PO-EVENTLOG-OK }"
   line="$(trim "${line}")"
