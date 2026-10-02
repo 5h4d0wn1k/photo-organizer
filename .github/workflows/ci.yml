@@ -115,6 +115,8 @@ jobs:
             scripts/tests/tests_wiring_test.sh \
             scripts/tests/tests_wiring_mutation_test.sh \
             scripts/tests/release_atomic_publish_mutation_test.sh \
+            scripts/tests/project_board_workflow_test.sh \
+            scripts/tests/project_board_workflow_mutation_test.sh \
             scripts/tests/required_checks_test.sh
       - name: Run the release gate tests
         run: bash scripts/tests/run_release_gate_tests.sh

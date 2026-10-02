@@ -87,31 +87,59 @@ CODE = {
     )
 }
 
-# The repository-wide checkout pin, asserted exactly rather than by shape.
-# Shape alone (`@[0-9a-f]{40}`, asserted separately below) would accept any
-# 40-hex string, so pinning the literal is what makes this a supply-chain
-# assertion: a different-but-well-formed SHA is a reviewable edit in two places
-# rather than a silent substitution.
+# The checkout pin is asserted here in two halves, and neither half is a literal.
 #
-# #133 brought project.yml onto this value; it had been left on v4.2.2 while
-# every other checkout pin in the repo had moved to v7, so this constant went
-# from "the pin this one workflow should have" to "the pin". Chasing the
-# straggler then turned up a second defect underneath it: two pins in
-# release.yml read `3d3d42e5...` where all the others read `3d3c42e5...` --
-# one character apart, both immaculately well-formed 40-hex strings, and the
-# `android` job owning one of them could not resolve its own checkout, so the
-# whole Android release path was unrunnable with nothing in the repo able to
-# see it. Both are this value now, and workflow_hygiene_test.sh asserts the
-# single-valued property across every workflow, so neither a stray major nor a
-# mistyped SHA can merge again. This constant is that same single value, so
-# this assertion got strictly stronger rather than merely different.
-CHECKOUT_REF = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
+# The supply-chain half -- "this is the ref every other workflow uses, so it was
+# reviewed once" -- belongs to `workflow_hygiene_test.sh`, whose `parity`
+# assertion requires one ref per action across every workflow in the repo. It is
+# the better home for that property on three counts, all measured rather than
+# argued:
+#
+#   * It covers every action, not checkout alone, and it compares the refs to each
+#     other instead of to a private copy of one of them, so it cannot be satisfied
+#     by editing the copy.
+#   * Injecting the one-character typo from #133 into project.yml -- the defect
+#     that made the Android release path unrunnable -- makes it report
+#     `FAIL parity: actions/checkout` (378 passed, 1 failed). The assertion this
+#     file lost in the same edit does not react to that tree at all: 18 passed,
+#     0 failed. That is the intended division of labour, not a gap.
+#   * It runs somewhere that can block a merge. This file runs from
+#     `.github/workflows/project.yml`, whose only job is the board sync and which
+#     is not in the `required[]` list in `.github/required-checks.json`;
+#     `workflow_hygiene_test.sh` runs inside ci.yml's `security` job, reported as
+#     `Security gates`, which is. So the property that matters is enforced by the
+#     check that gates merges, and the cheap local identity check stays here.
+#
+# This file used to restate the pin as a constant and assert equality against
+# it, on the grounds that shape alone would accept any 40-hex string. The
+# restatement was not free. Dependabot rewrites the commit and the `# vN`
+# comment on every bump, so a routine bump of actions/checkout took this suite
+# red:
+#
+#     FAIL the job checks the repository out before running anything from it
+#     17 passed, 1 failed
+#
+# naming a checkout that was present, pinned, and working -- and the harness
+# that mutates this suite lost two of its fourteen mutations to the same bump.
+# A false red is not a cheap nuisance here: this suite runs from
+# `.github/workflows/project.yml`, so it is the first thing a maintainer sees
+# when a dependency bump lands, and the message points at the workflow rather
+# than at the copy of the pin sitting in this file.
+#
+# #133 is why the property mattered, and it is why both halves below remain:
+# project.yml had been left on v4.2.2 while every other pin was on v7, and
+# chasing that straggler turned up two pins in release.yml reading `3d3d42e5...`
+# where the rest read `3d3c42e5...` -- one character apart, both immaculately
+# well-formed 40-hex strings, with the `android` job unable to resolve its own
+# checkout, so the whole Android release path was unrunnable and nothing in the
+# repo could see it. "This workflow checks out actions/checkout" and "it is
+# pinned to a commit rather than a tag" are the two facts that survive that;
+# *which* commit it is is the repo-wide assertion's job.
 
 namespace = {
     "doc": doc,
     "re": re,
     "REQUIRE": REQUIRE,
-    "CHECKOUT_REF": CHECKOUT_REF,
     "CODE": CODE,
     "triggers": triggers,
     "board": board,
@@ -179,7 +207,7 @@ assert_true "the script does not redefine closingIssueNumbers inline" \
 # them without a checkout. It failed in CI exactly this way -- "No such file or
 # directory" -- so the dependency is asserted rather than remembered.
 assert_true "the job checks the repository out before running anything from it" \
-  "(bool(steps) and steps[0].get('uses','') == CHECKOUT_REF)"
+  "(bool(steps) and steps[0].get('uses','').split('@')[0] == 'actions/checkout')"
 
 # And that the ref is a full commit SHA, not a tag. `@v4` satisfies a naive
 # "uses actions/checkout" check, which is how the first version of the

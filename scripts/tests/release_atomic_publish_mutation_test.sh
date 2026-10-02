@@ -139,11 +139,449 @@ mutate() {
   restore
 }
 
+# Derive a workflow's own text instead of restating it, so a Dependabot bump
+# cannot silently disarm a mutation.
+#
+# Every `uses:` pin in these workflows carries a commit SHA and a `# vN` comment,
+# and Dependabot rewrites both on every bump. A `mutate` call that spells either
+# one out therefore stops matching the file the moment the action is bumped --
+# not because the assertion under test changed, but because the needle is stale.
+# The harness then reports the mutation as non-applying, which is the exact
+# signature of "the assertion does not bite". It is a false refusal: it names a
+# defect that does not exist and points the reader at the wrong file.
+#
+# Measured on this harness before the fix, rewriting each action's commit and its
+# `# vN` comment the way Dependabot does:
+#
+#   download-artifact v4 -> v5 alone                   45 run, 44 bit, 1 could not apply
+#   download-artifact v4 -> v5, attest-build-provenance
+#     v4.2.2 -> v5 and sbom-action v0.24.2 -> v0.25.0,
+#     all three at once                                45 run, 42 bit, 3 could not apply
+#   checkout v7 -> v8 and action-gh-release v3 -> v4   45 run, 45 bit
+#
+# The three that died are the three whose literals sat in a needle. The last pair
+# changed nothing because their literals sit in *replacements* -- the deliberately
+# broken state a mutation writes, which never has to exist in the file, so a
+# version bump cannot break it. That is why a harness can sit green for months
+# with a stale pin in it and still look healthy: the replacements are the only
+# SHAs a bump could have broken, and by luck they were the ones written out of.
+#
+# This file held eight commit-SHA literals across five distinct commits: three in
+# needles (download-artifact, attest-build-provenance, sbom-action) and five in
+# replacements (checkout twice, action-gh-release three times). All eight are now
+# derived, and the guard below keeps them that way.
+#
+# The mutations that died were titled "the macOS artifact is never downloaded",
+# "the SBOM step is deleted entirely" and "the Linux attestation step is
+# silently replaced by a checkout". All three assertions are healthy; all three
+# were measuring "is this SHA still current".
+#
+# So the pin is read from the file. Five shapes are needed, and each is refused
+# rather than guessed when its selector is missing or ambiguous -- a helper that
+# picked one of two candidates would make a mutation apply to whichever step
+# sorted first while its name claimed another.
+#
+# Every refusal is a distinct exit code so a caller cannot mistake one for
+# another: 2 unreadable file, 3 no such step, 4 ambiguous step, 5 action not
+# pinned, 6 action pinned to more than one commit, 7 step has no `uses:`,
+# 8 unknown mode, 9 bad or missing argument, 10 the file has no single `uses:`
+# depth.
+#
+#   wf_derive step-uses    FILE STEP      the step's own `uses:` line, verbatim
+#   wf_derive step-action  FILE STEP      its `- name:` line and `uses:` line
+#   wf_derive step-block   FILE STEP      the whole step, up to the next step
+#   wf_derive step-swap    FILE STEP ACT  the step's name with its action
+#                                         replaced by ACT, keeping ACT's real
+#                                         pin and the step's own indentation
+#   wf_derive action-line  FILE ACT IND  a `uses:` line for ACT at indentation
+#                                         IND, for a step the mutation invents;
+#                                         IND may be `from-file` to take the one
+#                                         depth every `uses:` line in FILE uses
+#
+# `step-action` is two lines where one would do because several actions are
+# pinned more than once: `actions/download-artifact` appears 7 times in
+# release.yml, so a needle naming only the ref would be ambiguous and `apply`
+# would refuse it.
+#
+# `step-swap` takes its indentation from the step it is rewriting rather than
+# from the line that currently pins ACT, because the two can otherwise disagree.
+# Every action in release.yml happens to sit at indentation 8 today, so no current
+# bump is exposed to that; the disagreement was introduced here by hand and
+# measured: a replacement that rewrote the ref without the leading spaces dedented
+# `uses:` out of the step, the workflow stopped parsing, and the suite failed on
+# the parse instead of on the assertion the mutation names. `preflight` catches the
+# unparseable case, so it fails loudly -- but it reports the wrong defect, and a
+# replacement that happens to parse would be tested against the wrong step.
+#
+# `action-line` is the one mode with no step to take an indent from, so it is also
+# the one that can be handed a wrong depth. Measured on release.yml by inserting a
+# `uses:` line at each depth above each of its 63 step-start lines, then asking
+# PyYAML two separate questions -- does the file still parse, and did any step
+# gain a `uses:` key it did not have:
+#
+#   depth  0, 2, 4, 6       0 of 63 parse, 0 retargets
+#                          (rejected by `preflight`)
+#   depth  8               54 of 63 parse, and 23 of those put the key *inside the
+#                          neighbouring step* as a duplicate key. PyYAML keeps the
+#                          last one, so the mutation silently retargets a step it
+#                          never named, and `preflight` cannot see it.
+#   depth 10               34 of 63 parse, 0 retargets
+#   depth 12, 14, 16       14 of 63 parse, 0 retargets
+#                          (the line lands in a neighbouring step's `run:` heredoc
+#                          or `with:`, never as a step key)
+#
+# So the depth that needs deriving is 8, and it is the *shallowest* depth that
+# parses, not the deepest. An earlier version of this comment named 10 and 12,
+# which are among the depths that parse most often and never once retarget -- it
+# reported the measurement without running it. `from-file` exists for exactly this
+# reason: it takes the depth from the file and refuses when the file has no single
+# depth, which is the only situation in which there is no honest answer to hand
+# back.
+wf_derive() {
+  python3 - "$@" <<'PYTHON'
+import re
+import sys
+
+mode = sys.argv[1]
+path = sys.argv[2]
+name = sys.argv[3]
+extra = sys.argv[4] if len(sys.argv) > 4 else None
+
+try:
+    lines = open(path, encoding="utf-8").read().splitlines(keepends=True)
+except OSError as exc:
+    print(f"cannot read {path}: {exc}", file=sys.stderr)
+    sys.exit(2)
+
+
+def die(code, message):
+    print(message, file=sys.stderr)
+    sys.exit(code)
+
+
+def step_start(step_name):
+    pattern = re.compile(r"^[ ]*- name: " + re.escape(step_name) + r"[ \t]*$")
+    hits = [i for i, line in enumerate(lines) if pattern.match(line)]
+    if not hits:
+        die(3, f"no step named {step_name!r} in {path}; "
+               f"the needle would restate a step that is not there")
+    if len(hits) > 1:
+        die(4, f"{len(hits)} steps named {step_name!r} in {path}; "
+               f"a derived needle would be ambiguous, so none was chosen")
+    return hits[0]
+
+
+def step_indent(start):
+    return len(re.match(r"^[ ]*", lines[start]).group(0))
+
+
+def step_span(start):
+    """Indices of the step's own lines: its name through the line before the
+    next step. Blank separators are kept, because removing a step from the file
+    without its trailing blank line is a different edit from removing the step --
+    and the blank really is there, because `derive` puts back the newline a `$( )`
+    would have stripped.
+
+    `- name:` alone does not bound a step list. The last step of a job is
+    followed by the *next job's* header, so a scan that stopped only at
+    `- name:` handed the caller the next job's `runs-on:`, `steps:` and first
+    step as though they belonged to this one. Measured on the two-job fixture
+    below, `step-block` for the first job's only step returned 132 bytes
+    reaching into job two. So the scan also stops at the first line indented
+    less than the step's own `- name:`. Blank and comment lines are skipped
+    rather than treated as boundaries, so a blank separator inside the step
+    still does not end it."""
+    base = step_indent(start)
+    for i in range(start + 1, len(lines)):
+        if re.match(r"^[ ]*- name: ", lines[i]):
+            return range(start, i)
+        body = lines[i].strip()
+        if body and not body.startswith("#") and \
+                len(lines[i]) - len(lines[i].lstrip(" ")) < base:
+            return range(start, i)
+    return range(start, len(lines))
+
+
+def uses_index(start):
+    """The index of the step's own `uses:` key, or None.
+
+    Bounded three ways, each forced by a real fixture rather than imagined:
+
+      * to the step's key indentation. This used to accept any indent at all, so
+        a line inside a `run: |` heredoc was read as the step's action. In the
+        fixture below PyYAML reports that step's keys as `name` and `run` -- it
+        has no `uses:` whatsoever -- and the unbounded scan still returned the
+        heredoc line with exit 0, so `step-uses`, `step-action` and `step-swap`
+        all reported success for a step with nothing to derive.
+      * to lines outside a block scalar. A `run: |` or `path: |` header means
+        everything indented deeper than the key is the scalar's content, so
+        those lines are skipped until a sibling key comes back.
+      * to the step's own span, so a later step's `uses:` is never returned.
+
+    Returning None is the honest answer here and the callers already refuse on
+    it (exit 7): a step with no `uses:` is a real thing to find, and returning
+    the nearest line that looks like one is how a harness ends up asserting
+    against the wrong step."""
+    base = step_indent(start)
+    keys = " " * (base + 2)
+    in_block = False
+    for i in range(start + 1, len(lines)):
+        if re.match(r"^[ ]*- name: ", lines[i]):
+            break
+        body = lines[i].strip()
+        if not body or body.startswith("#"):
+            continue
+        indent = len(lines[i]) - len(lines[i].lstrip(" "))
+        if indent < base:
+            break
+        if in_block:
+            if indent > base + 2:
+                continue
+            in_block = False
+        if not lines[i].startswith(keys):
+            continue
+        if lines[i].startswith(keys + "uses: "):
+            return i
+        if re.match(re.escape(keys) + r"(run|script|path): [|>]", lines[i]):
+            in_block = True
+    return None
+
+
+def pinned_line(action):
+    """The one `uses:` line pinning `action` in this file, or refuse. The ref
+    is what the mutation needs; which step it came from is irrelevant.
+
+    Both spellings count. A step is usually `- name:` on one line and `uses:` on
+    the next, but `- uses:` on a single line is equally valid and appears elsewhere
+    in this repo's workflows. Matching only the first form was measured to be a
+    blind spot: with the action pinned both ways to *different* commits, the
+    helper returned the `- name:` form's commit and reported success, so a
+    replacement built from it would have pinned a commit the file does not use.
+    """
+    pattern = re.compile(r"^([ ]*)(?:- )?uses: " + re.escape(action)
+                         + r"@([0-9a-f]{40})(.*)$")
+    hits = [(m, i) for i, line in enumerate(lines) if (m := pattern.match(line))]
+    refs = {m.group(2) for m, _ in hits}
+    if not hits:
+        die(5, f"{action} is not pinned in {path}; "
+               f"a replacement built from it would name an action that is not used")
+    if len(refs) > 1:
+        die(6, f"{action} is pinned to {len(refs)} different commits in {path}: "
+               f"{sorted(refs)}; no single replacement would be honest")
+    return hits[0][0]
+
+
+def uses_depth():
+    """The one indentation the `uses:` keys of this file sit at, or refuse.
+
+    "A `uses:` key" here is a line whose first token is `uses:`, which is a named
+    step's key at indentation 8 in these workflows and a job-level
+    reusable-workflow call at indentation 4. Both are counted, so a workflow that
+    has both is refused rather than resolved by picking the more common depth. The
+    refusal is the conservative direction and it is the right one: a line written
+    at the wrong depth is not always a parse error, and a parse error would at
+    least be loud.
+
+    A single-line `- uses:` step is *not* counted. Its `uses:` is not the first
+    token on its line, it belongs to a structure this mode is not trying to
+    extend, and its depth is two less than the named form's -- so counting it
+    would manufacture a second depth out of a spelling difference rather than a
+    real one. `pinned_line` still reads both spellings."""
+    depths = {
+        len(m.group(1))
+        for m in (re.match(r"^([ ]*)uses: ", line) for line in lines)
+        if m
+    }
+    if not depths:
+        die(10, f"{path} has no `uses:` key, so there is no depth to write one at")
+    if len(depths) > 1:
+        die(10, f"{path} puts `uses:` keys at {sorted(depths)} spaces of "
+               f"indentation; a derived line would have to guess which one is "
+               f"meant, so none was written")
+    return " " * depths.pop()
+
+
+if mode == "step-uses":
+    start = step_start(name)
+    i = uses_index(start)
+    if i is None:
+        die(7, f"step {name!r} in {path} has no `uses:` line")
+    sys.stdout.write(lines[i])
+
+elif mode == "step-action":
+    start = step_start(name)
+    i = uses_index(start)
+    if i is None:
+        die(7, f"step {name!r} in {path} has no `uses:` line")
+    sys.stdout.write(lines[start])
+    sys.stdout.write(lines[i])
+
+elif mode == "step-block":
+    start = step_start(name)
+    sys.stdout.write("".join(lines[i] for i in step_span(start)))
+
+elif mode == "step-swap":
+    if extra is None:
+        die(9, "step-swap needs an action to swap in")
+    start = step_start(name)
+    i = uses_index(start)
+    if i is None:
+        die(7, f"step {name!r} in {path} has no `uses:` line to replace")
+    target = pinned_line(extra)
+    indent = re.match(r"^([ ]*)", lines[i]).group(1)
+    comment = target.group(3).rstrip("\n")
+    sys.stdout.write(lines[start])
+    sys.stdout.write(f"{indent}uses: {extra}@{target.group(2)}{comment}\n")
+
+elif mode == "action-line":
+    # A `uses:` line for an action, at an indentation the caller states. Used
+    # where the mutation invents a step that is not in the file, so there is no
+    # step to take an indent from. `from-file` is preferred over a literal and is
+    # the only form the caller uses; the literal is kept so a future caller with a
+    # genuinely mixed-depth workflow can still be deliberate about it.
+    if extra is None:
+        die(9, "action-line needs an indentation, or the word from-file, to write "
+               "the uses: line at")
+    if extra == "from-file":
+        extra = uses_depth()
+    elif extra.strip():
+        die(9, f"action-line takes an indentation or from-file, not text: {extra!r}")
+    target = pinned_line(name)
+    comment = target.group(3).rstrip("\n")
+    sys.stdout.write(f"{extra}uses: {name}@{target.group(2)}{comment}\n")
+
+else:
+    die(8, f"unknown mode {mode!r}; expected one of: "
+           f"step-uses, step-action, step-block, step-swap, action-line")
+PYTHON
+}
+
+# derive <what> <wf_derive args...> -- read the workflow, or stop here.
+#
+# Every derivation goes through this rather than a bare `$(wf_derive ...)`. A
+# command substitution is a subshell, so wf_derive's `exit 1` on a refusal would
+# leave the variable empty and let the harness carry on, and `apply` would then
+# report an empty anchor under a heading that reads as "these assertions do not
+# bite" -- accusing healthy assertions because the harness's own selector was
+# wrong. Reproduced by putting the derivations back inline and renaming the one
+# step they select, so all three derived values came back empty:
+#
+#     - the Linux attestation step is silently replaced by a checkout, so a step
+#       named [Attest build provenance] attests nothing: could not apply the
+#       mutation (ANCHOR IS NOT UNIQUE (N occurrences): '')
+#     - the SBOM step is deleted entirely: could not apply the mutation
+#       (ANCHOR IS NOT UNIQUE (N occurrences): '')
+#     - the macOS artifact is never downloaded: could not apply the mutation
+#       (ANCHOR IS NOT UNIQUE (N occurrences): '')
+#
+# Three mutations, three empty needles. N is release.yml's byte count plus one,
+# because `''.count('')` over a file of B bytes is B+1 -- tens of thousands of
+# "occurrences" of a needle that does not exist. The number is left as N rather
+# than a literal: it moves every time release.yml gains a line, and a quoted
+# measurement that is already stale on the day it is written is the failure this
+# comment is in the file to describe.
+#
+# This was reproduced rather than recalled. The inline form never reached a
+# commit -- it existed only in the working tree between authoring and this fix --
+# so the reproduction puts it back by rewriting the two call shapes, and the
+# block above is that run's output, not a transcript remembered from the bug.
+# An earlier version of this comment quoted a block headed "(2)" containing one
+# entry, and a byte count 12 off the file. Both were unreproducible, which is
+# worse than quoting nothing.
+#
+# Going through a file rather than `$( )` keeps the derivation in this shell, so
+# the exit is real. One scratch file is reused rather than made per call: wf_derive
+# runs a handful of times per pass and this is not a hot path, but a fresh
+# tempfile per call would be a cleanup obligation on each one.
+derive() {
+  local what="$1" rc=0
+  shift
+  wf_derive "$@" >"${DERIVE_SCRATCH}.out" 2>"${DERIVE_SCRATCH}.err" || rc=$?
+  if ((rc != 0)); then
+    printf 'HARNESS REFUSAL: cannot derive %s (wf_derive exited %d)\n' "${what}" "${rc}" >&2
+    sed 's/^/  /' "${DERIVE_SCRATCH}.err" >&2
+    printf '\nThe harness is naming something the workflow does not contain, so no\n' >&2
+    printf 'mutation below was tested. This is not a missing assertion.\n' >&2
+    exit 1
+  fi
+  # A sentinel, because `$( )` strips every trailing newline and `step-block`
+  # returns exactly that: the last line of a step plus the blank line that
+  # separates it from the next one. Without the sentinel the newline is gone by
+  # the time the value reaches `apply`, so removing a step with `new=` left three
+  # blank lines behind where the step used to be -- and `step_span`'s "blank
+  # separators are kept" was true of the scratch file and false of the anchor.
+  # With a sentinel appended, the captured text ends in the sentinel rather than
+  # in a newline, so there is nothing for `$( )` to strip and DERIVED holds
+  # wf_derive's bytes exactly.
+  DERIVED="$(cat "${DERIVE_SCRATCH}.out"; printf '\001')"
+  DERIVED="${DERIVED%$'\001'}"
+}
+
 MUTATIONS_RUN=0
 MUTATIONS_BITING=0
 mismatches=()
 
+# The suite must be green before anything is mutated, or "this mutation bit" and
+# "the suite was already broken" are the same report. Measured on this harness's
+# parent commit: with project.yml's Checkout step moved to the end of its job,
+# the suite printed 16 passed / 2 failed and exited 1, and the harness still
+# reported 13 bit, 1 did not and exited 0 -- a full-looking result produced by a
+# harness measuring a suite that was already red. A red baseline is refused here
+# for the same reason a bad derivation is: it is not a missing assertion, and
+# reporting it as one is how a reader loses an afternoon.
+baseline_out="$(PYTHONDONTWRITEBYTECODE=1 bash "${SUITE}" 2>&1)"
+baseline_rc=$?
+if [[ ${baseline_rc} -ne 0 ]]; then
+  printf 'HARNESS REFUSAL: %s is already red (exit %d) before any mutation ran,\n' \
+    "${SUITE##*/}" "${baseline_rc}" >&2
+  printf 'so a mutation reported as biting here would prove nothing:\n' >&2
+  grep -E '^[[:space:]]*(FAIL|!!) ' <<<"${baseline_out}" | head -10 | sed 's/^/  /' >&2
+  exit 1
+fi
+printf '  ok   baseline green: %s\n' \
+  "$(grep -E '^[[:space:]]*[0-9]+ passed' <<<"${baseline_out}" || echo 'suite exited 0')"
+
+# Everything this harness needs out of release.yml, read once from the
+# pristine file. `mutate` restores release.yml before every attempt, so the
+# text derived here is the text `apply` will look for -- and deriving once
+# puts the whole dependency on the workflow's shape in one place instead
+# of scattering it through the argument list of five separate mutations.
+# ${WORK} is the scratch dir the EXIT trap already cleans up.
+DERIVE_SCRATCH="${WORK}/derive"
+
+# the [Attest build provenance] step as the workflow writes it
+derive "the [Attest build provenance] step as the workflow writes it" \
+  step-action "${WORKFLOW}" 'Attest build provenance'
+ATTEST_STEP="${DERIVED}"
+
+# the [Attest build provenance] step with its action swapped for a checkout
+derive "the [Attest build provenance] step with its action swapped for a checkout" \
+  step-swap "${WORKFLOW}" 'Attest build provenance' actions/checkout
+ATTEST_AS_CHECKOUT="${DERIVED}"
+
+# the [Generate SBOM] step as the workflow writes it
+derive "the [Generate SBOM] step as the workflow writes it" \
+  step-action "${WORKFLOW}" 'Generate SBOM'
+SBOM_STEP="${DERIVED}"
+
+# the [Generate SBOM] step with its action swapped for a checkout
+derive "the [Generate SBOM] step with its action swapped for a checkout" \
+  step-swap "${WORKFLOW}" 'Generate SBOM' actions/checkout
+SBOM_AS_CHECKOUT="${DERIVED}"
+
+# the whole [Download macOS artifact] step
+derive "the whole [Download macOS artifact] step" \
+  step-block "${WORKFLOW}" 'Download macOS artifact'
+MACOS_STEP="${DERIVED}"
+
 echo "== one publisher, and it is the only one that can write =="
+
+# The one action whose pin a mutation has to invent a step for. `release.yml`
+# pins it once, so the derived line is unambiguous; the helper refuses if that
+# ever stops being true rather than guessing.
+derive "the action-gh-release uses: line to invent a publish step with" \
+  action-line "${WORKFLOW}" softprops/action-gh-release from-file
+SOFTPROPTS_USES="${DERIVED}"
 
 echo "== nothing reaches the release that was never downloaded =="
 
@@ -154,17 +592,17 @@ mutate "a platform job publishes again, independently" \
   '          path: |
             photo-organizer-linux-x86_64-*.AppImage
             photo-organizer_*_amd64.deb' \
-  '          path: |
+  "          path: |
             photo-organizer-linux-x86_64-*.AppImage
             photo-organizer_*_amd64.deb
 
       - name: Release Linux
-        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
+${SOFTPROPTS_USES}
         with:
           files: photo-organizer-linux-x86_64-*.AppImage
           append_body: true
           body: |
-            Linux build.' \
+            Linux build." \
   "exactly one job may publish"
 
 # The token, not the publish step. A job that cannot publish but holds the token
@@ -227,10 +665,8 @@ mutate "the Linux provenance attestation loses its attestations scope" \
   "the \`linux\` attestation step needs id-token: write and attestations: write"
 
 mutate "the Linux attestation step is silently replaced by a checkout, so a step named [Attest build provenance] attests nothing" \
-  '      - name: Attest build provenance
-        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2' \
-  '      - name: Attest build provenance
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7' \
+  "${ATTEST_STEP}" \
+  "${ATTEST_AS_CHECKOUT}" \
   "the \`linux\` job is expected to attest its build provenance"
 
 # Both `always()` guards previously compared the raw string to the literal
@@ -375,10 +811,8 @@ mutate "the SBOM is generated but no longer uploaded as a release asset" \
   "the Linux artifact upload must include sbom.spdx.json"
 
 mutate "the SBOM step is deleted entirely" \
-  '      - name: Generate SBOM
-        uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2' \
-  '      - name: Generate SBOM
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7' \
+  "${SBOM_STEP}" \
+  "${SBOM_AS_CHECKOUT}" \
   "job must still generate the SBOM it uploads"
 
 # The preflight was described as failing "in seconds, not after two and a half hours of
@@ -462,13 +896,7 @@ mutate "reachability stops being transitive" \
 echo "== nothing reaches the release, and the checksum is not re-derived =="
 
 mutate "the macOS artifact is never downloaded" \
-  '      - name: Download macOS artifact
-        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4
-        with:
-          name: macos-artifact
-          path: incoming/macos
-
-' \
+  "${MACOS_STEP}" \
   '' \
   'must download `macos-artifact`'
 
@@ -575,11 +1003,11 @@ mutate "the publish step loses fail_on_unmatched_files and can create an empty r
 # to prevent it.
 mutate "a second publish step is added inside \`release\`, before staging" \
   '      - name: Stage every platform artifact, refusing an incomplete set' \
-  '      - name: Sneak publish before staging
-        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
+  "      - name: Sneak publish before staging
+${SOFTPROPTS_USES}
         with:
           files: incoming/android/*
-      - name: Stage every platform artifact, refusing an incomplete set' \
+      - name: Stage every platform artifact, refusing an incomplete set" \
   "exactly one publish step may exist anywhere in the workflow"
 
 # Same shape, but placed after the real publish step, so only the ordering
@@ -588,12 +1016,12 @@ mutate "a second publish step is added inside \`release\`, before staging" \
 # step. Without a position assertion this ordering defect would survive.
 mutate "a publish step is appended after the real one, so something runs post-publish" \
   '          fail_on_unmatched_files: true' \
-  '          fail_on_unmatched_files: true
+  "          fail_on_unmatched_files: true
 
       - name: Late publish after the release is live
-        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
+${SOFTPROPTS_USES}
         with:
-          files: incoming/macos/*' \
+          files: incoming/macos/*" \
   "must be the last step of \`release\`"
 
 # The real step keeps `fail_on_unmatched_files`, and the join over all publish
@@ -641,6 +1069,38 @@ mutate "the preflight stops using the shared signing policy script" \
   '          mode="$(bash scripts/android_release_signing.sh mode | tail -n 1)"' \
   '          mode="release"' \
   "the preflight must resolve signing through the shared policy script"
+
+# The guard on everything above. Deriving the pins is only worth something while
+# it stays derived, and the way it rots is quiet: the harness keeps reporting a
+# full set of bites right up until the next Dependabot bump, and only then does a
+# mutation refuse to apply -- reported as "could not apply the mutation", which
+# reads as a missing assertion and is not one. So the file is checked for the
+# thing it must no longer contain. A commit SHA in a needle, in a replacement, or
+# in a comment is equally a failure: quoting a pin in prose is the habit this
+# file is trying to break, and a reviewer copying it back out of a comment is
+# exactly how the coupling returns.
+self="${BASH_SOURCE[0]}"
+# Case-insensitively, on purpose. Measured: a run of 40 UPPERCASE hex digits
+# passed the lowercase form of this guard while `grep -i` caught it. Hex has no
+# case, so restricting the scan to lowercase made the guard weaker than the thing
+# it guards against -- and a guard that can be defeated by a keyboard is not a
+# guard. The evasion that is left, and is not closed here, is a SHA split across
+# a line boundary: the obvious fix is to join the lines before scanning, which
+# manufactures false positives out of ordinary text that happens to straddle a
+# line, and a guard that cries wolf gets deleted.
+literal_pins="$(grep -ioE '[0-9a-f]{40}' "${self}" | tr 'A-F' 'a-f' | sort -u || true)"
+if [[ -n "${literal_pins}" ]]; then
+  # Reported on its own rather than appended to `mismatches`: that array is
+  # headed NON-BITING / WRONG-RED / INVALID MUTATIONS, and a literal pin is none
+  # of those. It is a statement about this file, and a maintainer looking for it
+  # under a heading about mutations will not find it.
+  printf 'GUARD FAILED: this harness spells out a commit SHA again, so a Dependabot\n' >&2
+  printf 'bump would refuse these mutations and report a missing assertion:\n' >&2
+  printf '  %s\n' "${literal_pins}" >&2
+  printf 'Read the pin out of the workflow with wf_derive instead.\n' >&2
+  exit 1
+fi
+printf '  ok   no literal commit SHA anywhere in this file; every pin is read from the workflow\n'
 
 restore
 final_out="$(PYTHONDONTWRITEBYTECODE=1 bash "${SUITE}" 2>&1)"
