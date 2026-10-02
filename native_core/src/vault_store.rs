@@ -13,7 +13,7 @@ use thiserror::Error;
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
-use crate::{config::AppConfig, domain::Asset};
+use crate::{config::AppConfig, domain::Asset, domain::VaultKeyStorage};
 
 const KEYRING_SERVICE: &str = "private-gallery-vaults";
 pub const CHUNK_BYTES: usize = 64 * 1024 * 1024;
@@ -317,17 +317,26 @@ pub fn key_reference(vault_id: Uuid, key_version: u32) -> String {
     format!("vault-key:{vault_id}:v{key_version}")
 }
 
+/// Which vault-key store applies to this config.
+///
+/// Tests have no OS keyring, so they always use the file store; every other
+/// build follows the declared configuration. The environment variable is read
+/// in exactly one place -- `AppConfig::from_env` -- so a key-store decision
+/// can never again be taken silently at a call site (issue #110).
+fn vault_key_storage(config: &AppConfig) -> VaultKeyStorage {
+    if cfg!(test) {
+        return VaultKeyStorage::File;
+    }
+    config.vault_key_storage
+}
+
 fn load_or_create_vault_key(
     config: &AppConfig,
     vault_id: Uuid,
     key_version: u32,
 ) -> Result<Zeroizing<[u8; 32]>, VaultStoreError> {
     let key_id = key_reference(vault_id, key_version);
-    if cfg!(test)
-        || std::env::var("PRIVATE_GALLERY_VAULT_KEY_STORAGE")
-            .map(|value| value == "file")
-            .unwrap_or(false)
-    {
+    if vault_key_storage(config) == VaultKeyStorage::File {
         return load_or_create_file_key(config, &key_id);
     }
 
@@ -352,11 +361,7 @@ fn load_existing_vault_key(
     key_version: u32,
 ) -> Result<Zeroizing<[u8; 32]>, VaultStoreError> {
     let key_id = key_reference(vault_id, key_version);
-    if cfg!(test)
-        || std::env::var("PRIVATE_GALLERY_VAULT_KEY_STORAGE")
-            .map(|value| value == "file")
-            .unwrap_or(false)
-    {
+    if vault_key_storage(config) == VaultKeyStorage::File {
         return load_existing_file_key(config, &key_id);
     }
 

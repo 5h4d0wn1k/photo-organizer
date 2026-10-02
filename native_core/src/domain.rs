@@ -570,6 +570,23 @@ pub enum ModelTask {
     SemanticEmbedding,
 }
 
+/// Where vault AES keys live.
+///
+/// `OsKeychain` is the only default the vision allows: key material stays in
+/// the OS-protected store (libsecret / Keychain / DPAPI). `File` keeps keys
+/// as hex in `<runtime_root>/security/vault-keys/` -- same trust domain as
+/// the ciphertext -- and exists solely for headless deployments with no
+/// keyring (containers, CI). It is never silent: selecting it logs a startup
+/// warning, is reported by `GET /security/encryption/status`, and is
+/// documented in `docs/security-model.md`. See issue #110.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum VaultKeyStorage {
+    #[default]
+    OsKeychain,
+    File,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ModelInstallStatus {

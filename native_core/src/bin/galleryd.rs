@@ -13,6 +13,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let config = AppConfig::from_env();
+    if config.vault_key_storage == native_core::domain::VaultKeyStorage::File {
+        tracing::warn!(
+            "vault AES keys are stored as files under {}/security/vault-keys \
+             (PRIVATE_GALLERY_VAULT_KEY_STORAGE=file). Key material shares a \
+             trust domain with the ciphertext; use the OS keychain wherever a \
+             keyring exists. See docs/security-model.md.",
+            config.runtime_root.display()
+        );
+    }
     let service = Arc::new(GalleryService::new(config.clone())?);
     let listener = TcpListener::bind(config.bind_address()).await?;
     let app = router(AppState { service });

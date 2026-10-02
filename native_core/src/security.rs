@@ -51,7 +51,22 @@ pub fn open_database(path: &Path) -> Result<Connection, SecurityError> {
 }
 
 pub fn encryption_status(config: &AppConfig) -> EncryptionStatus {
-    match read_state(config) {
+    // Vault key storage is reported here rather than only at startup so an
+    // operator can tell from the product -- not just the logs -- that keys
+    // are on disk (issue #110). The file store shares a trust domain with
+    // the ciphertext; that must be visible, not discoverable.
+    let vault_file_warning = matches!(
+        config.vault_key_storage,
+        crate::domain::VaultKeyStorage::File
+    )
+    .then(|| {
+        " Vault AES keys are stored as files under <runtime_root>/security/vault-keys \
+         (PRIVATE_GALLERY_VAULT_KEY_STORAGE=file): key material shares a trust \
+         domain with the ciphertext. Use the OS keychain wherever a keyring exists."
+            .to_string()
+    })
+    .unwrap_or_default();
+    let mut status = match read_state(config) {
         Ok(Some(state)) => {
             let key_available = load_key_for_state(&config.database_path(), &state).is_ok();
             EncryptionStatus {
@@ -89,7 +104,9 @@ pub fn encryption_status(config: &AppConfig) -> EncryptionStatus {
             sensitive_indexing_allowed: false,
             warning: format!("Unable to read encryption status: {error}"),
         },
-    }
+    };
+    status.warning.push_str(&vault_file_warning);
+    status
 }
 
 pub fn activate_encryption(
@@ -439,4 +456,56 @@ fn io_error(error: std::io::Error) -> SecurityError {
 
 pub fn database_sha256(path: &Path) -> Option<String> {
     imports::derive_content_hash_from_file(path).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::VaultKeyStorage;
+
+    fn config_with_key_storage(storage: VaultKeyStorage) -> (AppConfig, PathBuf) {
+        let root = std::env::temp_dir().join(format!(
+            "pg-sec-status-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        // Bypass from_env: this test pins the knob directly, so it holds no
+        // matter what the ambient environment contains.
+        let config = AppConfig {
+            runtime_root: root.clone(),
+            vault_key_storage: storage,
+            ..AppConfig::default()
+        };
+        (config, root)
+    }
+
+    /// #110: file-backed vault keys must be visible in the product, not just
+    /// the logs. The status warning is what an operator actually reads.
+    #[test]
+    fn file_key_storage_is_reported_in_encryption_status() {
+        let (config, root) = config_with_key_storage(VaultKeyStorage::File);
+        let status = encryption_status(&config);
+        assert!(
+            status.warning.contains("vault-keys") || status.warning.contains("Vault AES keys"),
+            "file key storage must be disclosed in the status warning, got: {}",
+            status.warning
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// And the default must stay silent on this point: no warning text about
+    /// on-disk keys when the keychain holds them, or operators learn to
+    /// ignore the warning that matters.
+    #[test]
+    fn keychain_key_storage_reports_no_file_warning() {
+        let (config, root) = config_with_key_storage(VaultKeyStorage::OsKeychain);
+        let status = encryption_status(&config);
+        assert!(
+            !status.warning.contains("vault-keys") && !status.warning.contains("Vault AES keys"),
+            "keychain mode must not warn about on-disk keys, got: {}",
+            status.warning
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
 }
