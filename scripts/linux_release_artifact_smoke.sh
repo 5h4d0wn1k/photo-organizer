@@ -785,11 +785,11 @@ verify_window_mapped() {
       how="window-identity"
     fi
   fi
-  record "$(probe_leg)_window_pid" "${pid:-<none>}"
-  record "$(probe_leg)_window_wm_class" "${class:-<none>}"
-  record "$(probe_leg)_window_attributed_by" "${how:-none}"
+  record "${probe_leg:-unknown}_window_pid" "${pid:-<none>}"
+  record "${probe_leg:-unknown}_window_wm_class" "${class:-<none>}"
+  record "${probe_leg:-unknown}_window_attributed_by" "${how:-none}"
   if [[ -z "${how}" ]]; then
-    record "$(probe_leg)_window_ancestry" "${chain:-<unreadable>}"
+    record "${probe_leg:-unknown}_window_ancestry" "${chain:-<unreadable>}"
     fail window_not_attributed \
       "window ${id} is the largest top-level on ${DISPLAY:-<unset>} but nothing ties it to ${leg_label:-the app}: its PID is '${pid:-<none>}' (ancestry: ${chain:-<unreadable>}) and its WM_CLASS is '${class:-<none>}' against an expected '${LINUX_SMOKE_EXPECT_WINDOW_MATCH:-<none>}'. Rendering it would prove that some window rendered, not that the app did."
   fi
@@ -1101,6 +1101,7 @@ run_leg() {
   # Read back by verify_window_mapped: the evidence keys and the assertion text
   # both need to name the leg, and this is the only place that knows it.
   leg_label="the ${leg} leg"
+  probe_leg="${leg}"
 
   local leg_dir="${SCRATCH}/${leg}"
   local home="${leg_dir}/home"
