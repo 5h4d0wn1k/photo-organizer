@@ -1,9 +1,34 @@
-opencv-python-headless
-face-recognition
-tqdm
-dlib
-tk
-numpy
-pillow
-scikit-learn
-scikit-image
+# Legacy face sorter (tools/quick-face-sort) — NOT part of the product, NOT
+# referenced by CI, the app, or the daemon. Pinned so a fresh install resolves
+# deterministically instead of floating to whatever is newest (see #85).
+#
+# This list was wrong in both directions. Checked against the code (the tool
+# imports only cv2, face_recognition, tkinter and stdlib) and against the
+# pinned face-recognition 1.3.0 sdist, not against the previous list:
+#
+#   removed  tk  PyPI `tk` 0.1.0 is TensorKit (Kai Jin, uploaded 2019-07-08,
+#            not yanked) — a deep-learning helper between Python and C++,
+#            unrelated to this tool. An earlier version of this comment called
+#            it "a stub", which is false. The tool uses `tkinter`, which ships
+#            with Python, so the distribution was never a dependency.
+#   removed  tqdm, scikit-learn, scikit-image
+#            Imported by neither the tool nor face-recognition 1.3.0. tqdm
+#            survived only in a stale comment at main.py:126; the progress bar
+#            is `tkinter.ttk.Progressbar`.
+#   added    click, face-recognition-models
+#            Both are hard dependencies of face-recognition 1.3.0 and were
+#            resolving unpinned, which is what made the determinism claim above
+#            false. face-recognition-models 0.3.0 is a 95.5 MB sdist.
+#
+# Not verified to install and run together: `dlib` needs a native toolchain and
+# builds from source. The pins are version-level, not hash-level — #136 covers
+# why that matters for the suites CI actually runs, and hash-pinning a legacy
+# tool CI never runs is separate work. These pins imply Python >= 3.12
+# (numpy 2.5.3). Anyone reviving this tool owns re-verifying the whole set.
+opencv-python-headless==5.0.0.93
+face-recognition==1.3.0
+face-recognition-models==0.3.0
+click==8.5.0
+dlib==20.0.1
+numpy==2.5.3
+pillow==12.3.0
