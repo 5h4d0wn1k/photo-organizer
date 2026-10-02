@@ -1,19 +1,12 @@
 #!/usr/bin/env bash
 #
-# Runs every test for the release artifact gates: the Android signing policy, the
-# Android install/launch/render gate, the Linux AppImage+.deb install/launch/render
-# gate, and the structural invariants of the release workflow.
+# Runs every test for the Android release gate: the signing policy, the
+# install/launch/render gate, and the structural invariants of the release
+# workflow.
 #
 # These are the tests that cover the code which decides whether an artifact
-# users cannot install reaches a release (issues #97 and #98). They need no
-# device, no emulator and no network, so they run in seconds and belong in the
-# inner loop.
-#
-# A suite here tests the GATE's logic, not the artifact: every one runs on
-# synthetic fixtures on a bare runner. What actually installs and launches a
-# release artifact is the gate itself, wired in release.yml -- a suite in this
-# list is evidence the check discriminates, never evidence a real artifact
-# passed it.
+# users cannot install reaches a release (issue #97). They need no device, no
+# emulator and no network, so they run in seconds and belong in the inner loop.
 #
 # Usage: scripts/tests/run_release_gate_tests.sh
 
@@ -27,6 +20,7 @@ SUITES=(
   android_release_signing_test.sh
   apksigner_gate_test.sh
   android_release_artifact_smoke_test.sh
+  windows_release_artifact_smoke_test.sh
   linux_release_artifact_smoke_test.sh
 )
 
