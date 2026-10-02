@@ -52,6 +52,17 @@ __pycache__/
 *.py[cod]
 .gradle-home/
 
+# Release-gate evidence. Written by a gate run, so it appears in whatever
+# directory the run was pointed at -- which for a local run is inside the
+# working tree. These are artefacts of a QA run, never sources: the Android
+# gate defaults its evidence dir to `.` and the Linux gate to
+# ./linux-smoke-evidence, so without this a single local run leaves untracked
+# files that look like a change. Ignored rather than deleted, because the
+# evidence is the point of the gate and a reviewer's machine should not have to
+# remember to preserve it.
+/android-smoke-evidence/
+/linux-smoke-evidence/
+
 # The interpreter venv `make venv` builds for the hash-pinned test suites.
 # Ignored so a developer's local venv cannot be committed by accident.
 .venv-test/

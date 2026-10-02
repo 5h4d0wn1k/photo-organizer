@@ -229,6 +229,11 @@ mutate "a suite is dropped from the release-gate driver's array" \
   "apksigner_gate_test.sh is executed by a CI step"
 
 # The array emptied, so the loop has nothing left to iterate.
+# The whole SUITES array is emptied, so the assertion that fires is whichever
+# suite happens to sort first, not this one specifically. Naming one suite in the
+# needle would be asserting an accident of list order; the property under test is
+# that the driver stops executing suites at all, and "is executed by a CI step"
+# is what that looks like from outside.
 mutate "the release-gate driver's suite list is emptied" \
   "${DRIVER}" \
   'SUITES=(
@@ -236,9 +241,10 @@ mutate "the release-gate driver's suite list is emptied" \
   android_release_signing_test.sh
   apksigner_gate_test.sh
   android_release_artifact_smoke_test.sh
+  linux_release_artifact_smoke_test.sh
 )' \
   'SUITES=()' \
-  "release_workflow_test.sh is executed by a CI step"
+  "is executed by a CI step"
 
 # The driver itself stops being run, so the four suites it loops over silently stop
 # being in a required check.

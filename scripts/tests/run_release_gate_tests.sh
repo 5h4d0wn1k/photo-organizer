@@ -20,6 +20,8 @@ SUITES=(
   android_release_signing_test.sh
   apksigner_gate_test.sh
   android_release_artifact_smoke_test.sh
+  windows_release_artifact_smoke_test.sh
+  linux_release_artifact_smoke_test.sh
 )
 
 # Suites print this exact string when an assertion could not run. Keep it in sync
