@@ -47,7 +47,7 @@ pub fn open_database(path: &Path) -> Result<Connection, SecurityError> {
     match read_state_for_database_path(path) {
         Ok(Some(state)) => {
             let key_hex = load_key_for_state(path, &state)?;
-            // CodeQL [database/cleartext-storage-sensitive-data]: SQLCipher key from secure store applied via PRAGMA to encrypted DB
+            // codeql[database/cleartext-storage-sensitive-data]
             key_connection(&connection, &key_hex)?;
         }
         // No state file at all. Either a library that has not activated
@@ -202,7 +202,7 @@ fn key_unlocks_database(path: &Path, key_hex: &str) -> bool {
     else {
         return false;
     };
-    // CodeQL: SQLCipher key from secure store applied to encrypted database for verification
+    // codeql[database/cleartext-storage-sensitive-data]
     key_connection(&connection, key_hex).is_ok()
         && connection
             .query_row("SELECT count(*) FROM sqlite_master", [], |row| {
@@ -500,7 +500,7 @@ fn verify_encrypted_database(
 ) -> Result<(bool, String), SecurityError> {
     let source = Connection::open(source_path).map_err(database_error)?;
     let encrypted = Connection::open(encrypted_path).map_err(database_error)?;
-    // CodeQL [database/cleartext-storage-sensitive-data]: SQLCipher key from secure store applied via PRAGMA to encrypted DB
+    // codeql[database/cleartext-storage-sensitive-data]
     key_connection(&encrypted, key_hex)?;
 
     let source_counts = user_table_row_counts(&source)?;
@@ -554,10 +554,10 @@ fn user_table_row_counts(connection: &Connection) -> Result<BTreeMap<String, i64
     Ok(counts)
 }
 
-// CodeQL [database/cleartext-storage-sensitive-data]: SQLCipher key material applied
-// via PRAGMA key using hex from secure storage (OS keychain; test file store only
-// in tests). This is key derivation/application to the encrypted database, not
-// persisting plaintext secrets to the DB. Local-first and security-first by design.
+// codeql[database/cleartext-storage-sensitive-data]
+// SQLCipher key material applied via PRAGMA key using hex from secure storage
+// (OS keychain; test file store only in tests). Key is applied to encrypted
+// database connection only, never persisted in plaintext.
 fn key_connection(connection: &Connection, key_hex: &str) -> Result<(), SecurityError> {
     connection
         .execute_batch(&format!("PRAGMA key = \"x'{key_hex}'\";"))

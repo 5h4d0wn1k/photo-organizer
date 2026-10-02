@@ -684,6 +684,90 @@ jobs:
           rm -rf "${scratch}"
           echo "re-verified the artifact about to be published"
 
+  linux-smoke:
+    name: Linux install+launch smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    needs: linux
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Install Xvfb dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            xvfb \
+            xauth \
+            imagemagick \
+            x11-utils \
+            libfuse2t64 \
+            dbus-x11
+
+      - name: Download Linux artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v4
+        with:
+          name: linux-artifacts
+          path: linux-artifacts
+
+      - name: Run Linux artifact smoke gate
+        env:
+          LINUX_SMOKE_EVIDENCE_DIR: ${{ github.workspace }}/linux-smoke-evidence
+        run: |
+          set -euo pipefail
+          mkdir -p "${LINUX_SMOKE_EVIDENCE_DIR}"
+          bash scripts/linux_release_artifact_smoke.sh linux-artifacts
+
+      - name: Upload Linux smoke evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: linux-smoke-evidence
+          path: linux-smoke-evidence/
+          if-no-files-found: error
+
+  windows-smoke:
+    name: Windows install+launch smoke
+    runs-on: windows-latest
+    timeout-minutes: 60
+    needs: windows
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Download Windows artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v4
+        with:
+          name: windows-artifact
+          path: windows-artifact
+
+      - name: Run Windows artifact smoke gate
+        shell: bash
+        env:
+          WINDOWS_SMOKE_EVIDENCE_DIR: ${{ github.workspace }}/windows-smoke-evidence
+        run: |
+          set -euo pipefail
+          mkdir -p "${WINDOWS_SMOKE_EVIDENCE_DIR}"
+          # Find the ZIP
+          ZIP="$(find windows-artifact -name "*.zip" -type f | head -n 1)"
+          if [[ -z "${ZIP}" ]]; then
+            echo "No ZIP found in windows-artifact" >&2
+            exit 1
+          fi
+          bash scripts/windows_release_artifact_smoke.sh "${ZIP}"
+
+      - name: Upload Windows smoke evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: windows-smoke-evidence
+          path: windows-smoke-evidence/
+          if-no-files-found: error
+
   ios:
     name: iOS (unsigned .app)
     # Fail fast: a missing keystore must not cost five long platform builds.
