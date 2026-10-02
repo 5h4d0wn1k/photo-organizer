@@ -76,3 +76,7 @@ if ((degraded != 0)); then
 fi
 
 printf '\nrelease gate tests passed\n'
+run_test "macos_release_artifact_smoke_test.sh"
+run_test "macos_release_artifact_mutation_test.sh"
+run_test "ios_release_artifact_smoke_test.sh"
+run_test "ios_release_artifact_mutation_test.sh"
