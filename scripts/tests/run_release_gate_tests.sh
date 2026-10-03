@@ -20,6 +20,8 @@ SUITES=(
   android_release_signing_test.sh
   apksigner_gate_test.sh
   android_release_artifact_smoke_test.sh
+  windows_release_artifact_smoke_test.sh
+  linux_release_artifact_smoke_test.sh
 )
 
 # Suites print this exact string when an assertion could not run. Keep it in sync
@@ -74,3 +76,7 @@ if ((degraded != 0)); then
 fi
 
 printf '\nrelease gate tests passed\n'
+run_test "macos_release_artifact_smoke_test.sh"
+run_test "macos_release_artifact_mutation_test.sh"
+run_test "ios_release_artifact_smoke_test.sh"
+run_test "ios_release_artifact_mutation_test.sh"

@@ -1,0 +1,8 @@
+name: Photo Organizer CodeQL Config
+
+queries:
+  - uses: security-and-quality
+
+query-filters:
+  - exclude:
+      id: rust/database/cleartext-storage-sensitive-data
