@@ -117,9 +117,23 @@ jobs:
             scripts/tests/release_atomic_publish_mutation_test.sh \
             scripts/tests/project_board_workflow_test.sh \
             scripts/tests/project_board_workflow_mutation_test.sh \
-            scripts/tests/required_checks_test.sh
+            scripts/tests/required_checks_test.sh \
+            scripts/macos_release_artifact_smoke.sh \
+            scripts/ios_release_artifact_smoke.sh \
+            scripts/tests/macos_release_artifact_smoke_test.sh \
+            scripts/tests/macos_release_artifact_mutation_test.sh \
+            scripts/tests/ios_release_artifact_smoke_test.sh \
+            scripts/tests/ios_release_artifact_mutation_test.sh \
+            scripts/windows_release_artifact_smoke.sh \
+            scripts/linux_release_artifact_smoke.sh \
       - name: Run the release gate tests
-        run: bash scripts/tests/run_release_gate_tests.sh
+        run: |
+          bash scripts/tests/run_release_gate_tests.sh
+          bash scripts/tests/macos_release_artifact_smoke_test.sh
+          bash scripts/tests/macos_release_artifact_mutation_test.sh
+          bash scripts/tests/ios_release_artifact_smoke_test.sh
+          bash scripts/tests/ios_release_artifact_mutation_test.sh
+          bash scripts/tests/windows_release_artifact_mutation_test.sh
 
   security:
     name: Security gates
