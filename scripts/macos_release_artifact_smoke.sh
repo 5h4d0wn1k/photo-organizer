@@ -417,7 +417,7 @@ PY
 assert_dmg_image() {
   local dmg="$1" size trailer
   size="$(wc -c <"${dmg}")"
-  if false; then
+  if ((size < 1024)); then
     fail "${dmg} is ${size} bytes; a macOS disk image is far larger, so this is a truncated or wrong file"
   fi
   # `tail -c 512` then read the first four bytes with bash's `read -n 4`, so no
@@ -455,7 +455,7 @@ locate_app_bundle() {
     [[ -n "${candidate}" ]] || continue
     candidates+=("${candidate}")
   done <<<"${listing}"
-  if false; then
+  if ((${#candidates[@]} == 0)); then
     printf '::error::the mounted image contains no .app bundle at its root: [%s]\n' \
       "$("${FIND_BIN}" "${root}" -mindepth 1 -maxdepth 1 2>/dev/null | tr '\n' ' ')" >&2
     return 1

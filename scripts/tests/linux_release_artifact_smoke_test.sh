@@ -355,6 +355,55 @@ esac
 FAKE_EOF
   chmod +x "${FARM}/xwininfo"
 
+  cat >"${FARM}/xprop" <<'FAKE_EOF'
+#!/usr/bin/env bash
+# fake xprop. `xwininfo` has never printed a PID or a WM_CLASS on any release, so
+# attribution asks `xprop` for both properties. This fake answers exactly the two
+# the gate reads and nothing else. FAKE_XPROP_MODE picks the shape a scenario
+# needs:
+#
+#   good    (default) WM_CLASS matches the expected token and _NET_WM_PID is
+#           unset. Attribution succeeds by window-identity, which is realistic:
+#           a toolkit window sets WM_CLASS, while _NET_WM_PID is a de-facto
+#           convention and may be absent.
+#   none    the client set neither property, so attribution must fail.
+#   foreign a WM_CLASS and a PID that belong to something other than the app.
+#   broken  xprop itself fails; the gate must read that as no proof, not a pass.
+set -uo pipefail
+mode="${FAKE_XPROP_MODE:-good}"
+prop=""
+while (($#)); do
+  case "$1" in
+    -id) shift 2 ;;
+    -*) shift ;;
+    *) prop="$1"; shift ;;
+  esac
+done
+if [[ "${mode}" == "broken" ]]; then
+  echo "xprop: unable to open display" >&2
+  exit 1
+fi
+case "${prop}" in
+  _NET_WM_PID)
+    case "${mode}" in
+      foreign) printf '_NET_WM_PID(CARDINAL) = %s\n' "${PPID}" ;;
+      *) exit 0 ;;
+    esac
+    ;;
+  WM_CLASS)
+    case "${mode}" in
+      none | broken) exit 0 ;;
+      foreign) printf 'WM_CLASS(STRING) = "foreign-instance", "foreign-class"\n' ;;
+      *) printf 'WM_CLASS(STRING) = "%s", "%s"\n' \
+           "${FAKE_XPROP_CLASS_INSTANCE:-photo-organizer}" \
+           "${FAKE_XPROP_CLASS:-photo-organizer}" ;;
+    esac
+    ;;
+  *) exit 0 ;;
+esac
+FAKE_EOF
+  chmod +x "${FARM}/xprop"
+
   cat >"${FARM}/import" <<'FAKE_EOF'
 #!/usr/bin/env bash
 # fake import: writes a stand-in PNG where the real one would write a capture.
@@ -958,6 +1007,7 @@ run_gate() {
     FAKE_XWININFO_ROOT_W="${TEST_ROOT_W:-1280}" \
     FAKE_XWININFO_ROOT_H="${TEST_ROOT_H:-800}" \
     FAKE_XWININFO_ROOT_MODE="${TEST_ROOT_MODE:-good}" \
+    FAKE_XPROP_MODE="${TEST_XPROP_MODE:-good}" \
     FAKE_CONVERT_COLOURS="${TEST_COLOURS:-500}" \
     FAKE_COMPARE_SETTLE_DIFF="${TEST_SETTLE_DIFF:-0}" \
     FAKE_COMPARE_FORMAT="${TEST_COMPARE_FORMAT:-}" \
@@ -1303,6 +1353,7 @@ mutation_flips_evidence() {
 reset_env() {
   unset TEST_POLL TEST_LAUNCH_TIMEOUT TEST_RENDER_TIMEOUT TEST_TREE_MODE \
     TEST_ID_MODE TEST_ID_X TEST_ID_Y TEST_ROOT_W TEST_ROOT_H TEST_ROOT_MODE \
+    TEST_XPROP_MODE \
     TEST_COLOURS \
     TEST_SETTLE_DIFF TEST_COMPARE_GARBAGE TEST_COMPARE_SETTLE_GARBAGE \
     TEST_COMPARE_FORMAT \
@@ -1481,6 +1532,22 @@ reset_env
 make_good_artifacts "${WORK}/s11b" ok
 TEST_ROOT_MODE=no-geometry
 scenario_test "root-query-returns-no-geometry" root_geometry
+
+# Attribution is a release-blocking property in its own right: a gate that
+# rendered the largest window it found without proving it belonged to the app
+# would certify whatever happened to be on screen. These two scenarios remove
+# each route in turn -- a client that set no _NET_WM_PID and no WM_CLASS, and a
+# window whose properties name a different process -- and require the named
+# assertion to catch it.
+reset_env
+make_good_artifacts "${WORK}/s11c" ok
+TEST_XPROP_MODE=none
+scenario_test "window-not-attributed" window_not_attributed
+
+reset_env
+make_good_artifacts "${WORK}/s11d" ok
+TEST_XPROP_MODE=foreign
+scenario_test "window-attributed-to-a-foreign-client" window_not_attributed
 
 reset_env
 make_good_artifacts "${WORK}/s12" ok
@@ -2191,6 +2258,27 @@ else
     fail "a mutation did not stay on the line it named (diff touched ${mut_diff_lines} lines)"
   fi
 fi
+
+# ---------------------------------------------------------------------------
+# 4b. The /proc ancestry helpers, tested directly
+# ---------------------------------------------------------------------------
+# Attribution has two routes. The identity route is exercised end-to-end by every
+# green run (the fake xprop's WM_CLASS matches the expected token) and required to
+# fail by the two attribution scenarios above. The ancestry route reads /proc and
+# nothing else, so it can be tested directly against this suite's own process
+# tree -- which the fake farm cannot reach, because the gate's APP_PID is internal
+# to a gate process the farm never sees. Extracted from the gate rather than
+# re-implemented here, so the test reads the shipped code.
+eval "$(sed -n '/^ancestor_chain()/,/^}/p' "${GATE}")"
+eval "$(sed -n '/^is_ancestor_or_self()/,/^}/p' "${GATE}")"
+LINUX_SMOKE_ANCESTRY_LIMIT="${LINUX_SMOKE_ANCESTRY_LIMIT:-16}"
+ancestry_self_chain="$(ancestor_chain "$$")"
+check "ancestry: ancestor_chain starts at the pid it was given" \
+  "$([[ "${ancestry_self_chain}" == "$$" || "${ancestry_self_chain}" == "$$ "* ]] && echo 1 || echo 0)"
+check "ancestry: a process is a descendant of its own parent" \
+  "$(is_ancestor_or_self "$$" "${PPID}" && echo 1 || echo 0)"
+check "ancestry: init is not a descendant of this process" \
+  "$(is_ancestor_or_self 1 "$$" && echo 0 || echo 1)"
 
 # ---------------------------------------------------------------------------
 # 5. Usage

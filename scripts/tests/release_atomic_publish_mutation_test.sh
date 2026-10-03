@@ -885,9 +885,34 @@ mutate "the macos-smoke job stops running its gate script" \
   "\`macos-smoke\` must run \`scripts/macos_release_artifact_smoke.sh\`"
 
 mutate "the ios job stops running the simulator gate" \
-  '          bash scripts/ios_release_artifact_smoke.sh "${SIM_APP}"' \
+  '          bash scripts/ios_release_artifact_smoke.sh "app/build/ios/iphonesimulator/Runner.app"' \
   '          true' \
-  "the \`ios\` job must run the committed iOS artifact smoke gate on a simulator slice"
+  "the \`ios\` job must invoke \`scripts/ios_release_artifact_smoke.sh\`"
+
+# The pieces that make the iOS gate mean something: a host daemon, a session
+# injected into the debug build, a probe tied to an app-only path, and a
+# simulator slice `simctl` can install. Each is separately load-bearing -- drop
+# one and the gate fails closed and blocks the release, but the workflow suite
+# would not notice the regression without these.
+mutate "the ios job stops starting the host daemon it probes" \
+  '          target/release/galleryd >"${WORK}/galleryd.log" 2>&1 &' \
+  '          "${SOME_OTHER_DAEMON}" >"${WORK}/galleryd.log" 2>&1 &' \
+  "the \`ios\` job must start a host galleryd"
+
+mutate "the ios job stops injecting the debug session" \
+  '          export IOS_SMOKE_LAUNCH_ARGUMENTS="--private-gallery-desktop-url ${BASE} --private-gallery-bearer-token ${bearer}"' \
+  '          export SESSION_ARGS_FOR_THE_GATE="--private-gallery-desktop-url ${BASE} --private-gallery-bearer-token ${bearer}"' \
+  "the \`ios\` job must set IOS_SMOKE_LAUNCH_ARGUMENTS"
+
+mutate "the ios job stops supplying a backend probe" \
+  '          export IOS_SMOKE_BACKEND_PROBE="${probe}"' \
+  '          export BACKEND_PROBE_PATH="${probe}"' \
+  "the \`ios\` job must set IOS_SMOKE_BACKEND_PROBE"
+
+mutate "the ios job stops building the simulator slice the gate can install" \
+  '          flutter build ios --simulator' \
+  '          flutter build ios --release' \
+  "the \`ios\` job must build the simulator slice"
 
 mutate "the macos-smoke job stops depending on the macOS build it consumes" \
   '  macos-smoke:

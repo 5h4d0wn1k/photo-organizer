@@ -831,11 +831,16 @@ jobs:
           channel: stable
           cache: true
 
-      - name: Hermetic iOS cross-compile (aarch64-apple-ios; vendored sqlcipher-openssl)
+      - name: Hermetic iOS cross-compile (device + simulator + host slices; vendored sqlcipher-openssl)
         run: |
           set -euo pipefail
           rustup target add aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios
+          # Device slice: shipped in the release .app (aarch64-apple-ios).
           cargo build --manifest-path native_core/Cargo.toml --bin galleryd --release --target aarch64-apple-ios --locked
+          # Simulator slice: installed into the simulator .app the gate inspects.
+          cargo build --manifest-path native_core/Cargo.toml --bin galleryd --release --target aarch64-apple-ios-sim --locked
+          # Host slice: the real backend the launched simulator app is pointed at.
+          cargo build --manifest-path native_core/Cargo.toml --bin galleryd --release --locked
 
       - name: Build Flutter iOS (unsigned, no codesign)
         run: flutter build ios --release --no-codesign
@@ -850,28 +855,92 @@ jobs:
           cp -R ml_sidecar "${APP_PATH}/ml_sidecar"
           ditto -c -k --keepParent "${APP_PATH}" "photo-organizer-ios-${GITHUB_REF_NAME}.zip"
 
-      # The simulator slice is the only iOS surface a free runner can install,
-      # cold-launch and screenshot (simctl cannot accept an iPhoneOS bundle).
-      # It is built here, in the same job, so the gate that proves the bundle
-      # installs and paints gates the artifact this job publishes. It does not
-      # prove installability on a physical iPhone -- see the gate's header.
-      - name: Build iOS simulator slice and run install/launch/render gate
-        env:
-          IOS_SMOKE_EVIDENCE_DIR: ${{ github.workspace }}/ios-smoke-evidence
+      # The device .app above is an `iphoneos` bundle: `simctl install` cannot
+      # accept it, so the only iOS surface a free runner can prove is the
+      # simulator slice. It is built here, in the same job, and the gate below is
+      # a release blocker -- if it fails, nothing publishes.
+      #
+      # iOS forbids an app from spawning galleryd, so unlike the desktop gates
+      # the backend cannot be the in-bundle daemon. Instead this job starts a host
+      # galleryd, initializes a vault and pairs a session, then hands the session
+      # to the debug build through IOS_SMOKE_LAUNCH_ARGUMENTS. AppDelegate serves
+      # those arguments over `private_gallery/launch_invite` (compiled out of
+      # release builds), the app calls GET /mobile/workspace, and the probe below
+      # fails unless the daemon logged that call. No harness step issues it, so a
+      # hit can only be the launched app.
+      - name: "Build Flutter iOS simulator slice (Debug; launch transport is #if DEBUG)"
+        working-directory: app
         run: |
           set -euo pipefail
-          mkdir -p "${IOS_SMOKE_EVIDENCE_DIR}"
-          cargo build --manifest-path native_core/Cargo.toml --bin galleryd --release --target aarch64-apple-ios-sim --locked
-          (cd app && flutter build ios --simulator --release)
-          SIM_APP="app/build/ios/iphonesimulator/Runner.app"
-          if [[ ! -d "${SIM_APP}" ]]; then
-            echo "simulator app not found at ${SIM_APP}" >&2
-            exit 1
-          fi
+          # No --release: Flutter rejects combining --simulator with --release,
+          # and the injected-session transport is compiled only when DEBUG is
+          # defined, which the simulator Debug config sets.
+          flutter build ios --simulator
+          SIM_APP="build/ios/iphonesimulator/Runner.app"
+          test -d "${SIM_APP}"
           mkdir -p "${SIM_APP}/Frameworks"
-          cp -R target/aarch64-apple-ios-sim/release/galleryd "${SIM_APP}/Frameworks/race"
-          cp -R ml_sidecar "${SIM_APP}/ml_sidecar"
-          bash scripts/ios_release_artifact_smoke.sh "${SIM_APP}"
+          cp -R ../target/aarch64-apple-ios-sim/release/galleryd "${SIM_APP}/Frameworks/race"
+          cp -R ../ml_sidecar "${SIM_APP}/ml_sidecar"
+
+      - name: iOS simulator install/launch/render + backend gate
+        run: |
+          set -euo pipefail
+          WORK="${RUNNER_TEMP}/ios-smoke"
+          EVIDENCE="${GITHUB_WORKSPACE}/ios-smoke-evidence"
+          rm -rf "${WORK}" "${EVIDENCE}"
+          mkdir -p "${WORK}" "${EVIDENCE}"
+
+          export PRIVATE_GALLERY_LIBRARY_ROOT="${WORK}/library"
+          export PRIVATE_GALLERY_RUNTIME_ROOT="${WORK}/runtime"
+          export PRIVATE_GALLERY_BIND_HOST=127.0.0.1
+          export PRIVATE_GALLERY_BIND_PORT=4821
+          # tower_http logs each request (with its uri) at debug; without this the
+          # probe has nothing to read and would fail even though the app did reach
+          # us, which is a false negative this job must not produce.
+          export RUST_LOG="info,tower_http=debug"
+          target/release/galleryd >"${WORK}/galleryd.log" 2>&1 &
+          daemon_pid=$!
+          trap 'kill "${daemon_pid}" 2>/dev/null || true' EXIT
+
+          BASE="http://127.0.0.1:4821"
+          for _ in $(seq 1 60); do
+            curl -fsS "${BASE}/health" >/dev/null 2>&1 && break
+            sleep 1
+          done
+          curl -fsS "${BASE}/health" >/dev/null
+
+          # A fresh daemon has no vault and pairing answers 404 until one exists,
+          # so initialize the library before asking for a pairing session.
+          curl -fsS -X POST "${BASE}/library/settings" \
+            -H 'content-type: application/json' \
+            -d "$(jq -nc --arg root "${WORK}/library" \
+              '{library_root:$root, default_import_mode:"copy", original_storage_policy:"encrypted_only"}')" \
+            >/dev/null
+
+          pairing_json="$(curl -fsS -X POST "${BASE}/pairing/sessions" \
+            -H 'content-type: application/json' \
+            -d "$(jq -nc '{device_name:"ios-sim-gate", platform:"ios"}')")"
+          pairing_token="$(jq -r '.pairing_token' <<<"${pairing_json}")"
+          test -n "${pairing_token}" && test "${pairing_token}" != "null"
+          pair_resp="$(curl -fsS -X POST "${BASE}/mobile/pair" \
+            -H 'content-type: application/json' \
+            -d "$(jq -nc --arg t "${pairing_token}" \
+              '{pairing_token:$t, device_name:"ios-sim-gate", platform:"ios"}')")"
+          bearer="$(jq -r '.bearer_token' <<<"${pair_resp}")"
+          test -n "${bearer}" && test "${bearer}" != "null"
+
+          # The probe answers only "did the launched app reach the backend". It
+          # reads the daemon log for a path no harness step issues. Written with
+          # printf so the shebang lands in column 0 (the gate execs it directly).
+          probe="${WORK}/backend-probe.sh"
+          printf '#!/usr/bin/env bash\nset -euo pipefail\ngrep -F %s %s\n' \
+            "'/mobile/workspace'" "'${WORK}/galleryd.log'" >"${probe}"
+          chmod +x "${probe}"
+
+          export IOS_SMOKE_EVIDENCE_DIR="${EVIDENCE}"
+          export IOS_SMOKE_LAUNCH_ARGUMENTS="--private-gallery-desktop-url ${BASE} --private-gallery-bearer-token ${bearer}"
+          export IOS_SMOKE_BACKEND_PROBE="${probe}"
+          bash scripts/ios_release_artifact_smoke.sh "app/build/ios/iphonesimulator/Runner.app"
 
       - name: Upload iOS smoke evidence
         if: always()
@@ -1069,24 +1138,37 @@ jobs:
 
             ## Installability evidence
 
-            The Android APK was installed and cold-launched in CI on real Android
-            system images (API 30 and API 35): install, cold launch, a stable
-            visually-complex frame, and a clean crash buffer / ApplicationExitInfo.
-            A build failing any of those checks could not have been published,
-            because this job needs the gate that runs them.
+            Every platform artifact is install/launch-gated in CI before it can be
+            published: the `release` job needs each platform's smoke job, so a
+            build that fails its gate cannot have been published.
 
-            What that does **not** prove, stated plainly so it is not read as a
-            stronger guarantee than it is:
+            * **Android** — installed and cold-launched on real Android system
+              images (API 30 and API 35): install, cold launch, a stable
+              visually-complex frame, and a clean crash buffer / ApplicationExitInfo.
+            * **Linux** — the packaged artifact is installed, the daemon cold-launched
+              and its window attributed to the process on a headless X server.
+            * **Windows** — the packaged artifact is installed and the daemon
+              cold-launched on a native Windows runner.
+            * **macOS** — the published DMG is mounted and the `.app` inside it is
+              installed and launched on a macOS runner.
+            * **iOS** — the simulator slice of the same app is installed,
+              cold-launched and rendered on an iPhone Simulator, and a debug build
+              is proven to reach a host backend. The shipped device `.app` is an
+              `iphoneos` bundle that `simctl` cannot install; it is built and
+              packaged, not install-tested.
 
-            * Those images are x86_64. The arm64-v8a and armeabi-v7a slices are
-              checked structurally by reading the archive before the device is
+            What those checks do **not** prove, stated plainly so they are not read
+            as a stronger guarantee than they are:
+
+            * The Android images are x86_64. The arm64-v8a and armeabi-v7a slices
+              are checked structurally by reading the archive before the device is
               touched, not by installing them on arm hardware.
             * On API 31+ the system splash is drawn inside the app's own window, so a
               stable focused frame does not by itself prove the app's own UI painted.
+            * The desktop gates prove install, launch and process/window health, not
+              feature behaviour; the iOS gate runs the simulator build, not the
+              device build on real hardware.
             * A signed release can only be proven installable over the *previous*
               signed release by sideloading it onto a device that already has it.
               CI has no such device; that check is manual and is listed in
               docs/RELEASE_CHECKLIST.md.
-            * The Linux, Windows, macOS and iOS artifacts are not install-tested in
-              CI. They are built, packaged and published, and that is all this
-              workflow proves about them.

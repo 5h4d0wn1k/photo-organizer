@@ -83,12 +83,13 @@
 #      This gate therefore does NOT treat install/launch/render as a pass. After
 #      those succeed it runs `assert_backend_is_reachable`, which fails the
 #      artifact unless a probe supplied through IOS_SMOKE_BACKEND_PROBE answers.
-#      On the artifact release.yml builds today the answer is no -- nothing about
-#      the shipped app can reach a backend -- so the gate exits non-zero even
-#      after a perfect install, launch and render. A gate that reported
-#      "installed and painted" as PASS would be declaring a non-functional
-#      artifact healthy, which is the partial-release shape these gates exist to
-#      prevent.
+#      iOS forbids the app from spawning galleryd, so the harness must provide a
+#      host daemon and point the debug build at it with
+#      IOS_SMOKE_LAUNCH_ARGUMENTS; the probe must then prove the app reached it.
+#      Without a probe the gate exits non-zero even after a perfect install,
+#      launch and render. A gate that reported "installed and painted" as PASS
+#      would be declaring a non-functional artifact healthy, which is the
+#      partial-release shape these gates exist to prevent.
 #
 # WHAT A DEVICE ARCHIVE WOULD ADDITIONALLY REQUIRE -- none of it available on a
 # free runner, which is why it is not attempted here rather than faked:
@@ -184,10 +185,17 @@
 #   IOS_SMOKE_NAME                   evidence file prefix (matrix-safe)
 #   IOS_SMOKE_BACKEND_PROBE          command that answers "is there a reachable
 #                                    galleryd backend?". UNSET BY DEFAULT, and
-#                                    that unset value is a FAILURE: this app has
-#                                    no working backend on iOS and the gate
-#                                    refuses to call the artifact healthy.
+#                                    that unset value is a FAILURE: without a
+#                                    probe nothing establishes that the app
+#                                    reaches a backend, and the gate refuses to
+#                                    call the artifact healthy.
 #   IOS_SMOKE_BACKEND_TIMEOUT_SECONDS backend probe deadline
+#   IOS_SMOKE_LAUNCH_ARGUMENTS       extra `simctl launch` arguments. A debug
+#                                    build accepts --private-gallery-desktop-url
+#                                    and --private-gallery-bearer-token and then
+#                                    talks to that daemon, which is what lets a
+#                                    harness point the app at a real backend.
+#                                    No value may contain whitespace.
 
 set -euo pipefail
 
@@ -212,6 +220,12 @@ MIN_DISTINCT_COLORS="${IOS_SMOKE_MIN_DISTINCT_COLORS:-32}"
 # today and the gate fails until an iOS-viable transport exists.
 BACKEND_PROBE="${IOS_SMOKE_BACKEND_PROBE:-}"
 BACKEND_TIMEOUT_SECONDS="${IOS_SMOKE_BACKEND_TIMEOUT_SECONDS:-60}"
+# Extra arguments handed to `simctl launch`, so a harness can inject a paired
+# session into a debug build (the app's AppDelegate reads
+# --private-gallery-desktop-url / --private-gallery-bearer-token and serves the
+# private_gallery/launch_invite channel). No value may contain whitespace: the
+# gate splits on it. Empty by default, which launches the app bare.
+LAUNCH_ARGUMENTS="${IOS_SMOKE_LAUNCH_ARGUMENTS:-}"
 CRASH_DIR="${IOS_SMOKE_CRASH_DIR:-${HOME}/Library/Logs/DiagnosticReports}"
 EVIDENCE_DIR="${IOS_SMOKE_EVIDENCE_DIR:-.}"
 SMOKE_NAME="${IOS_SMOKE_NAME:-ios-smoke}"
@@ -834,10 +848,10 @@ print_limitation() {
       try. local_daemon_launcher.dart returns attempted:false, started:false on
       every non-desktop platform.
       Install, launch and render are therefore NOT sufficient for a PASS. The
-      gate additionally requires a backend probe (IOS_SMOKE_BACKEND_PROBE) to
-      answer; with it unset -- how release.yml invokes the gate today, i.e. not
-      at all -- the gate exits non-zero even after a perfect render, which is the
-      truthful verdict for an artifact with no reachable backend.
+      gate additionally requires a backend probe (IOS_SMOKE_BACKEND_PROBE) that
+      proves the app reached a host daemon the harness supplied; with it unset
+      the gate exits non-zero even after a perfect render, which is the truthful
+      verdict for an artifact nothing established a backend for.
 
   A device archive would additionally require an Apple Developer Program
   membership (paid), an Apple Distribution certificate in the runner keychain,
@@ -1186,7 +1200,19 @@ cold_launch() {
   if is_app_running; then
     fail "${BUNDLE_ID} is already running on ${SIM_NAME} before launch; this must be a cold launch"
   fi
-  output="$("${XCRUN}" simctl launch "${SIM_UDID}" "${BUNDLE_ID}" 2>&1)" || rc=$?
+  # Build the launch command as an array so empty LAUNCH_ARGUMENTS never expands
+  # to a stray empty argument (and so `set -u` is happy). A harness uses this to
+  # inject a debug session; see IOS_SMOKE_LAUNCH_ARGUMENTS.
+  local -a launch_cmd=("${XCRUN}" simctl launch "${SIM_UDID}" "${BUNDLE_ID}")
+  if [[ -n "${LAUNCH_ARGUMENTS}" ]]; then
+    local -a launch_extra=()
+    read -r -a launch_extra <<<"${LAUNCH_ARGUMENTS}"
+    local arg
+    for arg in "${launch_extra[@]}"; do
+      [[ -n "${arg}" ]] && launch_cmd+=("${arg}")
+    done
+  fi
+  output="$("${launch_cmd[@]}" 2>&1)" || rc=$?
   printf '%s\n' "${output}" >>"${SUMMARY_PATH}"
   if ((rc != 0)); then
     printf '%s\n' "${output}" >&2
@@ -1492,12 +1518,14 @@ assert_backend_is_reachable() {
     printf 'daemon at %s: present, executable, and carries a simulator slice\n' "${NATIVE_BINARY}"
     printf 'what that establishes: the Mach-O can be LOADED by the loader.\n'
     printf 'It does NOT establish that it can be SPAWNED as a child process.\n'
-    printf 'iOS forbids that, and local_daemon_launcher.dart:24-32 refuses to\n'
-    printf 'try on any non-desktop platform, so no backend is ever reached.\n'
+    printf 'iOS forbids that, and local_daemon_launcher.dart refuses to try on a\n'
+    printf 'non-desktop platform. A host daemon is reached only when the launch\n'
+    printf 'injected a session (IOS_SMOKE_LAUNCH_ARGUMENTS) and the probe proved\n'
+    printf 'the app used it.\n'
   } >>"${BACKEND_EVIDENCE_PATH}"
 
   if [[ -z "${probe}" ]]; then
-    BACKEND_REASON="the artifact cannot be shown to reach a backend: IOS_SMOKE_BACKEND_PROBE is unset, so no probe could answer. This app's only backend is the daemon at ${NATIVE_BINARY}, iOS forbids an app from spawning it, and local_daemon_launcher.dart:24-32 returns attempted:false on every non-desktop platform. Install+launch+render passed; usefulness did not."
+    BACKEND_REASON="the artifact cannot be shown to reach a backend: IOS_SMOKE_BACKEND_PROBE is unset, so no probe could answer. iOS forbids the app from spawning galleryd, so a backend must be provided by the harness (IOS_SMOKE_LAUNCH_ARGUMENTS points a debug build at it) and a probe must prove the app reached it. Install+launch+render passed; usefulness did not."
     return 1
   fi
   if [[ ! -x "${probe}" ]]; then

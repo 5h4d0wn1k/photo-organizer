@@ -386,6 +386,10 @@ case "${verb}" in
     ;;
   launch)
     launch_n="$(bump launch)"
+    # Record the full argv so the suite can assert exactly what the gate handed
+    # to `simctl launch` -- in particular that a debug session is passed verbatim
+    # and that no stray empty argument appears when none is configured.
+    printf '%s\n' "$@" >"$(state_dir)/.launch-args"
     : >"$(state_dir)/.launched"
     if [[ "$(value_or LAUNCH_FAIL 0)" == "1" ]]; then
       printf 'An error was encountered processing the command (domain=NSPOSIXErrorDomain, code=3):\nUnable to lookup in current state: %s\n' "${FAKE_XCRUN_BUNDLE_ID}" >&2
@@ -1024,7 +1028,7 @@ scenario_with() {
 # the scenario, and clearing those here would delete the fixture under them.
 reset_device_state() {
   rm -f "${WORK_DIR}"/.count-* "${WORK_DIR}/.installed" "${WORK_DIR}/.launched" \
-    "${WORK_DIR}/.booted"
+    "${WORK_DIR}/.launch-args" "${WORK_DIR}/.booted"
   rm -rf "${WORK_DIR}/app-container"
 }
 
@@ -1033,7 +1037,7 @@ reset_state() {
   # is a fresh process per invocation). A counter left over from an earlier case
   # would make the next one behave differently depending on test order.
   rm -f "${WORK_DIR}"/.count-* "${WORK_DIR}/.installed" "${WORK_DIR}/.launched" \
-    "${WORK_DIR}/.booted"
+    "${WORK_DIR}/.launch-args" "${WORK_DIR}/.booted"
   rm -rf "${WORK_DIR}/app-container"
   rm -f "${CRASH_DIR}"/*.ips "${CRASH_DIR}"/*.crash "${CRASH_DIR}"/*.diag 2>/dev/null || true
   rm -f "${WORK_DIR}/evidence"/* 2>/dev/null || true
@@ -1680,6 +1684,72 @@ scenario_with "RUNNING_BEFORE_LAUNCH=1"
 expect_fail "an app that is already running is not a cold launch" \
   "already running" "${WORK_DIR}/Runner.app"
 scenario_with "RUNNING_BEFORE_LAUNCH="
+
+echo " launch arguments (debug-session injection)"
+# The gate exists to prove the app reaches a backend, and on iOS the only path
+# that lets a simulator build be pointed at one is extra `simctl launch` argv:
+# AppDelegate serves them over its debug-only channel. If the gate drops or
+# mangles those arguments the app opens bare and the backend probe can never be
+# satisfied, so each property here is asserted against the argv `simctl launch`
+# actually received, not against a comment.
+# Read the recorded argv as one marked line per argument. A plain `cat` would
+# strip a TRAILING blank line, which is exactly where a stray empty argument
+# hides: `simctl launch udid bundle ""` records `udid\nbundle\n\n`, and command
+# substitution collapses that back to `udid\nbundle`, so the empty argument
+# reads as absent. The marker keeps an empty argument visible, which is what
+# makes the two "no extra argument" cases below load-bearing.
+launch_argv_recorded() {
+  sed -e 's/^/arg:/' "${WORK_DIR}/.launch-args" 2>/dev/null || printf ''
+}
+
+scenario_with "SCREENSHOT=${WORK_DIR}/rich.png"
+if run_smoke_capped "${WORK_DIR}/Runner.app" \
+  "IOS_SMOKE_LAUNCH_ARGUMENTS=--private-gallery-desktop-url http://127.0.0.1:4821 --private-gallery-bearer-token tok123" \
+  >"${OUT}" 2>&1; then
+  recorded="$(launch_argv_recorded)"
+  expected="$(printf 'arg:%s\n' "${SIM_UDID}" "${BUNDLE_ID}" \
+    --private-gallery-desktop-url "http://127.0.0.1:4821" \
+    --private-gallery-bearer-token tok123)"
+  if [[ "${recorded}" == "${expected}" ]]; then
+    ok "a configured debug session is passed to simctl launch verbatim, in order"
+  else
+    bad "a configured debug session is passed to simctl launch verbatim, in order" \
+      "expected argv [$(tr '\n' ' ' <<<"${expected}")]; got [$(tr '\n' ' ' <<<"${recorded}")]"
+  fi
+else
+  bad "a configured debug session is passed to simctl launch verbatim, in order" \
+    "the gate failed: $(cat "${OUT}")"
+fi
+
+scenario_with "SCREENSHOT=${WORK_DIR}/rich.png"
+if run_smoke_capped "${WORK_DIR}/Runner.app" >"${OUT}" 2>&1; then
+  recorded="$(launch_argv_recorded)"
+  expected="$(printf 'arg:%s\n' "${SIM_UDID}" "${BUNDLE_ID}")"
+  if [[ "${recorded}" == "${expected}" ]]; then
+    ok "no debug session means simctl launch receives no extra argument"
+  else
+    bad "no debug session means simctl launch receives no extra argument" \
+      "expected argv [$(tr '\n' ' ' <<<"${expected}")]; got [$(tr '\n' ' ' <<<"${recorded}")]"
+  fi
+else
+  bad "no debug session means simctl launch receives no extra argument" \
+    "the gate failed: $(cat "${OUT}")"
+fi
+
+scenario_with "SCREENSHOT=${WORK_DIR}/rich.png"
+if run_smoke_capped "${WORK_DIR}/Runner.app" "IOS_SMOKE_LAUNCH_ARGUMENTS= " >"${OUT}" 2>&1; then
+  recorded="$(launch_argv_recorded)"
+  expected="$(printf 'arg:%s\n' "${SIM_UDID}" "${BUNDLE_ID}")"
+  if [[ "${recorded}" == "${expected}" ]]; then
+    ok "a whitespace-only debug session does not become a stray empty argument"
+  else
+    bad "a whitespace-only debug session does not become a stray empty argument" \
+      "expected argv [$(tr '\n' ' ' <<<"${expected}")]; got [$(tr '\n' ' ' <<<"${recorded}")]"
+  fi
+else
+  bad "a whitespace-only debug session does not become a stray empty argument" \
+    "the gate failed: $(cat "${OUT}")"
+fi
 
 scenario_with "RUNNING=0"
 expect_fail "an app that never appears in launchd fails" \

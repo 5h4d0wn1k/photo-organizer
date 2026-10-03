@@ -35,7 +35,8 @@ Screenshots land in [`docs/screenshots/`](docs/screenshots/) at v1.0.
 
 - The daemon API binds to `127.0.0.1:4821` by default; non-loopback binding is
   refused unless `PRIVATE_GALLERY_ALLOW_REMOTE_MOBILE=1` is set explicitly, and
-  remote clients are limited to `/health` and authenticated `/mobile/*` routes.
+  remote clients are limited to `/health`, static `/local-web/*` assets, and
+  authenticated `/mobile/*` routes.
 - **On-device ML only in v1** — OCR runs through the local Tesseract CLI, scene
   tags are computed locally, and model downloads are hash-verified and
   opt-in. No cloud AI, analytics SDKs, telemetry, or remote geocoding.

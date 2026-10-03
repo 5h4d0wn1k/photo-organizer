@@ -423,7 +423,7 @@ else
     "need ImageMagick's import/convert/compare (or IM7's magick); install the imagemagick package"
 fi
 
-for t in xwininfo setsid find grep sed awk cat date mktemp od stat \
+for t in xwininfo xprop setsid find grep sed awk cat date mktemp od stat \
   sha256sum readlink wc sort tr cut basename dirname sleep env chmod cp \
   mkdir rm; do
   require_tool "${t}"
@@ -432,6 +432,10 @@ done
 IMAGEMAGICK_LOG="${EVIDENCE_DIR}/linux-smoke-${SMOKE_NAME}-imagemagick.log"
 record "imagemagick" "${IMPORT_CMD[*]}"
 record "xwininfo" "$(xwininfo -version 2>&1 | tr '\n' ' ' | cut -c1-100)"
+# Attribution reads X properties, and `xprop` is the tool that does that; the
+# version is recorded so a reader can tell which property-printing build the
+# evidence came from.
+record "xprop" "$(xprop -version 2>&1 | tr '\n' ' ' | cut -c1-100 || true)"
 
 # ---------------------------------------------------------------------------
 # Metric self-check
@@ -659,9 +663,9 @@ probe_window() {
 # Process ancestry, for window attribution
 # ---------------------------------------------------------------------------
 #
-# `xwininfo -id` names the PID of the client that mapped the window. Whether that
-# process is the launched leg is a question about the process table, and /proc
-# answers it directly. It is the strongest attribution available without a window
+# `xprop -id` reads the `_NET_WM_PID` property the client set on the window.
+# Whether that process is the launched leg is a question about the process table,
+# and /proc answers it directly. It is the strongest attribution available without a window
 # manager: a name or a WM_CLASS is a string the app chose, so a stale or
 # coincidental match is possible, while a PPID chain is not a claim anyone makes.
 #
@@ -690,8 +694,11 @@ ancestor_chain() {
     # /proc/PID/stat is "pid (comm) state ppid ...". comm is parenthesised and may
     # itself contain spaces and parentheses, so the fields after it are found from
     # the LAST ')' rather than by cutting on whitespace -- `photo organizer`
-    # would otherwise shift every field by one.
-    ppid="$(sed -e 's/^.*) //' -e 's/^[^ ]* //' "/proc/${cur}/stat" 2>/dev/null || true)"
+    # would otherwise shift every field by one. The pattern must capture the ppid
+    # field alone: leaving the rest of the line makes the numeric guard below fail
+    # for every process, which silently turns the whole ancestry walk into "no"
+    # and leaves attribution to WM_CLASS alone.
+    ppid="$(sed -e 's/^.*) [^ ]* \([0-9][0-9]*\) .*/\1/' "/proc/${cur}/stat" 2>/dev/null || true)"
     [[ "${ppid}" =~ ^[0-9]+$ ]] || break
     cur="${ppid}"
     i=$((i + 1))
@@ -711,7 +718,7 @@ is_ancestor_or_self() {
     if [[ ! -r "/proc/${cur}/stat" ]]; then
       return 1
     fi
-    ppid="$(sed -e 's/^.*) //' -e 's/^[^ ]* //' "/proc/${cur}/stat" 2>/dev/null || true)"
+    ppid="$(sed -e 's/^.*) [^ ]* \([0-9][0-9]*\) .*/\1/' "/proc/${cur}/stat" 2>/dev/null || true)"
     [[ "${ppid}" =~ ^[0-9]+$ ]] || return 1
     cur="${ppid}"
     i=$((i + 1))
@@ -744,10 +751,10 @@ is_ancestor_or_self() {
 # So the window must be the app's. Two independent ways, because either alone has
 # a way to be wrong on a real runner:
 #
-#   * PID ancestry, the strong one. `xwininfo -id` reports the PID of the X client
-#     that mapped the window; /proc says whether that process is the launched leg
-#     or descends from it. This is a fact about the process table, not about a
-#     string anyone chose.
+#   * PID ancestry, the strong one. `xprop -id ... _NET_WM_PID` reports the PID the
+#     X client declared for the window; /proc says whether that process is the
+#     launched leg or descends from it. This is a fact about the process table, not
+#     about a string anyone chose.
 #   * The window's own identity -- WM_CLASS, or its name -- matching an expected
 #     token. Weaker, because a title is chosen by the app and a stale match is
 #     possible, but it survives a window created by a process that is not a
@@ -769,8 +776,17 @@ verify_window_mapped() {
   fi
 
   # --- attribution, before anything is measured off this window ---
-  pid="$(printf '%s\n' "${out}" | awk '/^[[:space:]]*PID:/ {print $2; exit}')"
-  class="$(printf '%s\n' "${out}" | sed -n 's/^[[:space:]]*WM_CLASS(STRING) = "\(.*\)", "\(.*\)"$/\1 \2/p' | head -1)"
+  # Geometry and map state come from `xwininfo -id`. Attribution does NOT: on no
+  # release of x11-utils does `xwininfo` print a PID or a WM_CLASS -- the man
+  # page's own sample output has neither -- so reading them from it yielded two
+  # empty strings on every real runner and the gate could never attribute a
+  # window, let alone pass. Both are X properties, and `xprop` is the tool that
+  # reads a property. A client that set neither leaves both empty, which is the
+  # correct input to the two routes below: no proof, no pass.
+  pid="$(xprop -id "${id}" _NET_WM_PID 2>/dev/null \
+    | awk -F' = ' '/^_NET_WM_PID\(CARDINAL\)/ {print $2; exit}' | tr -d '[:space:]')"
+  class="$(xprop -id "${id}" WM_CLASS 2>/dev/null \
+    | sed -n 's/^WM_CLASS(STRING) = "\(.*\)", "\(.*\)"[[:space:]]*$/\1 \2/p' | head -1)"
   local how="" chain="" ancestor=0
   if [[ -n "${pid}" && "${pid}" =~ ^[0-9]+$ ]] && ((pid > 1)); then
     chain="$(ancestor_chain "${pid}")"

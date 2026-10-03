@@ -523,6 +523,31 @@ run_mutation "G3" \
   'record_summary PASS "${app}"' \
   'the summary verdict is RENDER-ONLY, never PASS, when the backend is unproven'
 
+# Group (h): the debug-session injection.
+#
+# The backend probe is satisfied only if the app was actually pointed at a
+# backend, and on iOS that happens solely through extra `simctl launch` argv.
+# A gate that drops or mangles those arguments cannot produce the proof it
+# claims, so each property is read from the argv the fake `simctl launch`
+# received.
+run_mutation "H1" \
+  'drop the injected debug session so the app opens bare' \
+  '  if [[ -n "${LAUNCH_ARGUMENTS}" ]]; then' \
+  '  if [[ -z "${LAUNCH_ARGUMENTS}" ]]; then' \
+  'a configured debug session is passed to simctl launch verbatim, in order'
+
+run_mutation "H2" \
+  'append the raw debug session before splitting it, adding an empty argument when unset' \
+  '  local -a launch_cmd=("${XCRUN}" simctl launch "${SIM_UDID}" "${BUNDLE_ID}")' \
+  '  local -a launch_cmd=("${XCRUN}" simctl launch "${SIM_UDID}" "${BUNDLE_ID}" "${LAUNCH_ARGUMENTS}")' \
+  'no debug session means simctl launch receives no extra argument'
+
+run_mutation "H3" \
+  'stop splitting the debug session, so a whitespace value becomes an argument' \
+  '    read -r -a launch_extra <<<"${LAUNCH_ARGUMENTS}"' \
+  '    launch_extra=("${LAUNCH_ARGUMENTS}")' \
+  'a whitespace-only debug session does not become a stray empty argument'
+
 # --- summary ---------------------------------------------------------------
 restore
 note ""

@@ -28,7 +28,7 @@
 - Reset and delete flow for the People feature, including face templates and labels.
 - Minimal permissions only, with no background location.
 - Explicit separation between organization features, sync, and diagnostics.
-- For Tailscale/HTTPS mobile access, expose only `/mobile/*` and `/health` while the daemon stays loopback-bound. For hotspot/LAN development access, non-loopback binding is allowed only when `PRIVATE_GALLERY_ALLOW_REMOTE_MOBILE=1` is set. Non-loopback clients are restricted to `/mobile/*` and `/health`; desktop control APIs remain loopback-only and should return `403` remotely. Tailscale Serve identity headers are also treated as remote access even when the proxy connects to the daemon over loopback.
+- For Tailscale/HTTPS mobile access, expose only `/mobile/*`, `/local-web/*`, and `/health` while the daemon stays loopback-bound. For hotspot/LAN development access, non-loopback binding is allowed only when `PRIVATE_GALLERY_ALLOW_REMOTE_MOBILE=1` is set. Non-loopback clients are restricted to `/mobile/*`, `/local-web/*`, and `/health`; desktop control APIs remain loopback-only and should return `403` remotely. Tailscale Serve identity headers are also treated as remote access even when the proxy connects to the daemon over loopback.
 - Cloud bootstrap invites use random one-time secrets, store only SHA-256 secret hashes, expire quickly, and are claimed through a database-side function so acceptance is atomic.
 
 ## Current MVP Reality

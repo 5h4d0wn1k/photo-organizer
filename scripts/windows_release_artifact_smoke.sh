@@ -871,7 +871,7 @@ app_has_visible_window() {
         h="${geometry##*x}"
         [[ "${w}" =~ ^[0-9]+$ && "${h}" =~ ^[0-9]+$ ]] || continue
         ((w > 0 && h > 0)) || continue
-        [[ "${title}" != "==" ]] || continue
+        [[ -n "${title}" && "${title}" != "-" ]] || continue
         return 0
         ;;
     esac
@@ -1098,7 +1098,7 @@ await_settled_app_frame() {
     if ((rc == 2)); then
       fail "could not read the foreground window; refusing to report a focus check that never ran"
     fi
-    if ((rc != 0 && stable == 999)); then
+    if ((rc != 0)); then
       log "a window exists but is not the foreground window yet"
       focus_lost=1
       previous=""; stable=0
@@ -1183,9 +1183,9 @@ assert_no_panic_output() {
   combined="$(cat "${STDOUT_PATH}" "${STDERR_PATH}" 2>/dev/null || true)"
   printf '%s\n' "${combined}" >"${PROCESS_OUTPUT_PATH}"
   for marker in \
-    "zzz-no-such-rust-panic-marker-zzz" \
-    "zzz-no-such-rust-backtrace-marker-zzz" \
-    "zzz-no-such-dart-marker-zzz" \
+    "panicked at" \
+    "RUST_BACKTRACE" \
+    "Unhandled exception" \
     "UnhandledException" \
     "ACCESS_VIOLATION" \
     "Exception code:" \

@@ -244,13 +244,40 @@ for smoke_job, build_job, gate_script in (
         gate_script in runs_of(smoke_job),
         f"`{smoke_job}` must run `{gate_script}`",
     )
-# iOS has no separate smoke job: the simulator slice is built and gated inside
-# the `ios` job (simctl cannot install an iPhoneOS bundle, and rebuilding the
-# slice in a second job would double the expensive macOS cross-compile). The
-# gate must therefore run in `ios` itself, and `ios` is already in `release.needs`.
+# iOS is install/launch-gated in the release path, with a real backend.
+#
+# `scripts/ios_release_artifact_smoke.sh` is fail-closed on
+# `IOS_SMOKE_BACKEND_PROBE`: it refuses to report success unless the launched app
+# can be shown to reach a backend. iOS forbids an app from spawning galleryd, so
+# the `ios` job supplies a host daemon, injects the session into the debug build
+# through `IOS_SMOKE_LAUNCH_ARGUMENTS`, and proves the app reached it. If any
+# piece is dropped the gate fails closed and blocks the release, which is the
+# point: an ungated iOS artifact must not ship as "verified".
+ios_runs = runs_of("ios")
 expect(
-    "scripts/ios_release_artifact_smoke.sh" in runs_of("ios"),
-    "the `ios` job must run the committed iOS artifact smoke gate on a simulator slice",
+    "ios_release_artifact_smoke.sh" in ios_runs,
+    "the `ios` job must invoke `scripts/ios_release_artifact_smoke.sh`; an iOS "
+    "artifact is otherwise shipped ungated",
+)
+expect(
+    "IOS_SMOKE_BACKEND_PROBE" in ios_runs,
+    "the `ios` job must set IOS_SMOKE_BACKEND_PROBE; the gate is fail-closed on it "
+    "and would block every release",
+)
+expect(
+    "IOS_SMOKE_LAUNCH_ARGUMENTS" in ios_runs,
+    "the `ios` job must set IOS_SMOKE_LAUNCH_ARGUMENTS so the debug build is "
+    "pointed at the host daemon the probe checks",
+)
+expect(
+    "flutter build ios --simulator" in ios_runs,
+    "the `ios` job must build the simulator slice `simctl` can install "
+    "(`flutter build ios --simulator`); the device .app cannot be installed",
+)
+expect(
+    "target/release/galleryd" in ios_runs and "/mobile/workspace" in ios_runs,
+    "the `ios` job must start a host galleryd and prove the app reached it "
+    "(the probe reads GET /mobile/workspace from the daemon log)",
 )
 # `if:` on a job runs it even when its dependencies failed, which is exactly the
 # mechanism by which a four-platform release escapes while Android is red.

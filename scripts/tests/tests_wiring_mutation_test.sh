@@ -236,6 +236,12 @@ mutate "the release-gate driver's suite list is emptied" \
   android_release_signing_test.sh
   apksigner_gate_test.sh
   android_release_artifact_smoke_test.sh
+  windows_release_artifact_smoke_test.sh
+  linux_release_artifact_smoke_test.sh
+  macos_release_artifact_smoke_test.sh
+  macos_release_artifact_mutation_test.sh
+  ios_release_artifact_smoke_test.sh
+  ios_release_artifact_mutation_test.sh
 )' \
   'SUITES=()' \
   "release_workflow_test.sh is executed by a CI step"
@@ -244,8 +250,8 @@ mutate "the release-gate driver's suite list is emptied" \
 # being in a required check.
 mutate "no workflow invokes the release-gate driver" \
   "${CI}" \
-  '        run: bash scripts/tests/run_release_gate_tests.sh' \
-  '        run: bash -c true' \
+  '          bash scripts/tests/run_release_gate_tests.sh' \
+  '          bash -c true' \
   "the release-gate driver is invoked by a workflow"
 
 echo "== the matcher must not be defeatable =="
