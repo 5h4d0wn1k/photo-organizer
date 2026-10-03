@@ -127,7 +127,8 @@ jobs:
             scripts/windows_release_artifact_smoke.sh \
             scripts/linux_release_artifact_smoke.sh \
       - name: Run the release gate tests
-        run: bash scripts/tests/run_release_gate_tests.sh
+        run: |
+          bash scripts/tests/run_release_gate_tests.sh
           bash scripts/tests/macos_release_artifact_smoke_test.sh
           bash scripts/tests/macos_release_artifact_mutation_test.sh
           bash scripts/tests/ios_release_artifact_smoke_test.sh
