@@ -867,7 +867,10 @@ pub struct DevicePairing {
     /// otherwise kept only in memory once the pairing is persisted.
     pub pairing_token: String,
     /// SHA-256 hex of `pairing_token`. This is what is stored at rest and what
-    /// mobile pairing requests are matched against.
+    /// mobile pairing requests are matched against. Not serialized back to a
+    /// client: it is secret-derived material and the plaintext token is already
+    /// the only value the desktop invite needs.
+    #[serde(skip_serializing)]
     pub pairing_token_hash: String,
     pub created_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,

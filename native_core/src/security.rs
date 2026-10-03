@@ -16,6 +16,7 @@ use crate::{
     config::AppConfig,
     domain::{EncryptionActivationResult, EncryptionStatus},
     imports,
+    service::constant_time_eq,
 };
 
 const KEYRING_SERVICE: &str = "private-gallery";
@@ -406,7 +407,7 @@ pub fn activate_encryption(
         backup_path: String::new(),
     };
     let stored_key_hex = load_key_for_state(&database_path, &pending_state)?;
-    if stored_key_hex != key_hex {
+    if !constant_time_eq(stored_key_hex.as_bytes(), key_hex.as_bytes()) {
         return Err(SecurityError::KeyStorage(
             "secure storage returned a different encryption key than the one just stored"
                 .to_string(),

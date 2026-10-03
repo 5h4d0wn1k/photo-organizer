@@ -1102,7 +1102,13 @@ impl GalleryService {
         state.mobile_uploads[upload_index].updated_at = Utc::now();
         refresh_derived_views(state);
         ensure_distributed_defaults(state);
-        refresh_blob_records(&self.config, state);
+        if let Err(error) = refresh_blob_records_strict(&self.config, state) {
+            state.mobile_uploads[upload_index].status = MobileUploadStatus::Failed;
+            state.mobile_uploads[upload_index].error_detail = Some(error.to_string());
+            state.mobile_uploads[upload_index].updated_at = Utc::now();
+            self.persist_locked_state(state)?;
+            return Err(error);
+        }
         ensure_file_namespace_defaults(state);
         if let Some(entry) = state
             .file_entries
@@ -3465,7 +3471,7 @@ impl GalleryService {
 
         state.assets.extend(new_assets);
         ensure_distributed_defaults(&mut state);
-        refresh_blob_records(&self.config, &mut state);
+        refresh_blob_records_strict(&self.config, &mut state)?;
         ensure_file_namespace_defaults(&mut state);
         session.status = ImportSessionStatus::Committed;
         session.import_mode = effective_mode;
@@ -3572,7 +3578,7 @@ impl GalleryService {
         state.jobs.insert(0, job.clone());
         refresh_derived_views(&mut state);
         ensure_distributed_defaults(&mut state);
-        refresh_blob_records(&self.config, &mut state);
+        refresh_blob_records_strict(&self.config, &mut state)?;
         ensure_file_namespace_defaults(&mut state);
         self.persist_locked_state(&state)?;
         Ok(ImportAssetResponse { asset, job })
@@ -6398,14 +6404,44 @@ fn replaceable_bootstrap_vault_index(state: &LibraryState) -> Option<usize> {
     Some(0)
 }
 
+// Best-effort repair used by read paths and startup. A seal failure must never
+// abort a read, but it is also never silent: `refresh_blob_records_impl` rolls
+// back any recoverable plaintext copy and the failure is logged here.
 fn refresh_blob_records(config: &AppConfig, state: &mut LibraryState) -> bool {
+    match refresh_blob_records_impl(config, state, false) {
+        Ok(changed) => changed,
+        Err(error) => {
+            tracing::warn!(%error, "blob record refresh failed; keeping the previous records");
+            false
+        }
+    }
+}
+
+// Strict variant for the paths that CREATE assets. Reporting a successful import
+// while the managed original is still plaintext would make the encrypted-only
+// default a lie, so those paths must fail instead. `refresh_blob_records_impl`
+// removes a managed plaintext copy only when the original source still exists
+// (a `Copy`), so failing here cannot lose data.
+fn refresh_blob_records_strict(
+    config: &AppConfig,
+    state: &mut LibraryState,
+) -> Result<bool, ServiceError> {
+    refresh_blob_records_impl(config, state, true)
+}
+
+fn refresh_blob_records_impl(
+    config: &AppConfig,
+    state: &mut LibraryState,
+    strict: bool,
+) -> Result<bool, ServiceError> {
     let Some(vault) = state.vaults.first().cloned() else {
-        return false;
+        return Ok(false);
     };
     let Some(local_device) = local_device_id(state) else {
-        return false;
+        return Ok(false);
     };
     let mut changed = false;
+    let mut seal_failures: Vec<(Uuid, String)> = Vec::new();
     refresh_asset_availability(state);
     changed |= ensure_vault_key_envelopes(state);
     let library_root = PathBuf::from(effective_library_root(state, config));
@@ -6438,7 +6474,7 @@ fn refresh_blob_records(config: &AppConfig, state: &mut LibraryState) -> bool {
         if blob_needs_local_seal(state, blob_id, &library_root) {
             let source_path = asset_file_path(&asset, &library_root);
             if source_path.is_file() {
-                if let Ok(sealed) = vault_store::seal_asset(
+                match vault_store::seal_asset(
                     config,
                     &library_root,
                     vault.id,
@@ -6447,42 +6483,47 @@ fn refresh_blob_records(config: &AppConfig, state: &mut LibraryState) -> bool {
                     &asset,
                     &source_path,
                 ) {
-                    if let Some(blob) = state
-                        .blob_records
-                        .iter_mut()
-                        .find(|blob| blob.id == blob_id)
-                    {
-                        blob.encrypted_hash = sealed.encrypted_hash;
-                        blob.chunk_count = sealed.chunks.len() as u32;
-                        blob.encryption_key_version = vault.key_version;
-                        blob.bytes = asset.bytes;
-                        blob.content_hash = asset.content_hash.clone();
-                    }
-                    state.blob_chunks.retain(|chunk| chunk.blob_id != blob_id);
-                    state
-                        .blob_chunks
-                        .extend(sealed.chunks.into_iter().map(|chunk| BlobChunk {
-                            id: Uuid::new_v4(),
+                    Ok(sealed) => {
+                        if let Some(blob) = state
+                            .blob_records
+                            .iter_mut()
+                            .find(|blob| blob.id == blob_id)
+                        {
+                            blob.encrypted_hash = sealed.encrypted_hash;
+                            blob.chunk_count = sealed.chunks.len() as u32;
+                            blob.encryption_key_version = vault.key_version;
+                            blob.bytes = asset.bytes;
+                            blob.content_hash = asset.content_hash.clone();
+                        }
+                        state.blob_chunks.retain(|chunk| chunk.blob_id != blob_id);
+                        state
+                            .blob_chunks
+                            .extend(sealed.chunks.into_iter().map(|chunk| BlobChunk {
+                                id: Uuid::new_v4(),
+                                blob_id,
+                                chunk_index: chunk.chunk_index,
+                                content_hash: chunk.content_hash,
+                                encrypted_hash: chunk.encrypted_hash,
+                                bytes: chunk.bytes,
+                                encrypted_bytes: chunk.encrypted_bytes,
+                                local_path: Some(chunk.local_path),
+                                nonce_hex: Some(chunk.nonce_hex),
+                                aad: Some(chunk.aad),
+                            }));
+                        changed = true;
+                        changed |= enforce_original_storage_policy(
+                            config,
+                            state,
+                            asset.id,
                             blob_id,
-                            chunk_index: chunk.chunk_index,
-                            content_hash: chunk.content_hash,
-                            encrypted_hash: chunk.encrypted_hash,
-                            bytes: chunk.bytes,
-                            encrypted_bytes: chunk.encrypted_bytes,
-                            local_path: Some(chunk.local_path),
-                            nonce_hex: Some(chunk.nonce_hex),
-                            aad: Some(chunk.aad),
-                        }));
-                    changed = true;
-                    changed |= enforce_original_storage_policy(
-                        config,
-                        state,
-                        asset.id,
-                        blob_id,
-                        &library_root,
-                        vault.id,
-                        vault.key_version,
-                    );
+                            &library_root,
+                            vault.id,
+                            vault.key_version,
+                        );
+                    }
+                    Err(error) => {
+                        seal_failures.push((asset.id, error.to_string()));
+                    }
                 }
             } else if !state
                 .blob_chunks
@@ -6568,7 +6609,53 @@ fn refresh_blob_records(config: &AppConfig, state: &mut LibraryState) -> bool {
         }
     }
 
-    changed
+    if !seal_failures.is_empty() {
+        for (asset_id, error) in &seal_failures {
+            if let Some(asset) = state
+                .assets
+                .iter()
+                .find(|asset| asset.id == *asset_id)
+                .cloned()
+            {
+                rollback_failed_seal_plaintext(&asset, &library_root);
+            }
+            tracing::warn!(%asset_id, %error, "failed to encrypt managed original");
+        }
+        if strict {
+            let detail = seal_failures
+                .iter()
+                .map(|(asset_id, error)| format!("{asset_id}: {error}"))
+                .collect::<Vec<_>>()
+                .join("; ");
+            return Err(ServiceError::Storage(format!(
+                "failed to encrypt managed original(s); refusing to report success: {detail}"
+            )));
+        }
+    }
+
+    Ok(changed)
+}
+
+// Remove a managed plaintext original after a failed seal, but only when the
+// import source still exists, so the removal can never destroy the only copy.
+// A `Move` (source already moved into the library) or a `Reference` is left
+// untouched and the caller fails loudly instead.
+fn rollback_failed_seal_plaintext(asset: &crate::domain::Asset, library_root: &Path) {
+    if asset.import_mode == ImportMode::Reference {
+        return;
+    }
+    let original_path = asset_file_path(asset, library_root);
+    let source_path = PathBuf::from(&asset.source_path);
+    if original_path == source_path || !original_path.is_file() || !source_path.exists() {
+        return;
+    }
+    if let Err(error) = fs::remove_file(&original_path) {
+        tracing::warn!(
+            %error,
+            path = %original_path.display(),
+            "failed to remove unencrypted managed original after a failed seal"
+        );
+    }
 }
 
 fn ensure_vault_key_envelopes(state: &mut LibraryState) -> bool {
@@ -7178,7 +7265,7 @@ fn hash_pairing_token(token: &str) -> String {
 
 /// Compare two byte slices without branching on their contents, so request
 /// timing does not reveal a common prefix of a secret.
-fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+pub(crate) fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
     if left.len() != right.len() {
         return false;
     }
@@ -11812,6 +11899,93 @@ mod tests {
                 .windows(original_bytes.len())
                 .any(|window| window == original_bytes)
         );
+    }
+
+    #[tokio::test]
+    async fn failed_seal_aborts_import_and_removes_managed_plaintext() {
+        let runtime_root = temp_root("failed-seal-rollback");
+        let library_root = runtime_root.join("library");
+        let source = runtime_root.join("photo.jpg");
+        let original_bytes = b"plaintext-original-that-must-not-be-retained";
+        fs::write(&source, original_bytes).expect("write source");
+        let config = AppConfig {
+            runtime_root: runtime_root.clone(),
+            ..AppConfig::default()
+        };
+        let service = GalleryService::new(config.clone()).expect("service");
+        service
+            .update_library_settings(UpdateLibrarySettingsRequest {
+                library_root: library_root.to_string_lossy().to_string(),
+                default_import_mode: ImportMode::Copy,
+                original_storage_policy: None,
+            })
+            .await
+            .expect("settings");
+        let vault_id = service.vaults().await[0].id;
+
+        // `seal_asset` writes to `vaults/<vault_id>/blobs/<blob_id>/...`, so a
+        // regular file where the vault directory belongs makes every seal fail
+        // deterministically, without touching the key storage.
+        let vault_dir = library_root.join("vaults").join(vault_id.to_string());
+        fs::create_dir_all(vault_dir.parent().expect("vaults parent")).expect("vaults dir");
+        fs::write(&vault_dir, b"not a directory").expect("obstruction");
+
+        let request = ImportAssetRequest {
+            source_path: source.to_string_lossy().to_string(),
+            original_filename: "photo.jpg".to_string(),
+            media_kind: MediaKind::Photo,
+            mime_type: "image/jpeg".to_string(),
+            bytes: original_bytes.len() as u64,
+            content_hash: None,
+            captured_at: None,
+            place_hint: None,
+            import_mode: Some(ImportMode::Copy),
+        };
+        let failed = service.import_asset(request.clone()).await;
+        assert!(
+            failed.is_err(),
+            "an import whose managed original could not be encrypted must fail, not report success"
+        );
+        assert!(
+            !library_contains_plaintext(&library_root, original_bytes),
+            "a failed seal must not leave the managed plaintext original behind"
+        );
+
+        // The failure must be recoverable: clear the obstruction, restart (so the
+        // unpersisted in-memory asset is discarded), and the same import succeeds.
+        fs::remove_file(&vault_dir).expect("clear obstruction");
+        let restarted = GalleryService::new(config).expect("restart");
+        let imported = restarted
+            .import_asset(request)
+            .await
+            .expect("import after the seal failure is cleared");
+        let managed = library_root.join(&imported.asset.relative_original_path);
+        assert!(
+            !managed.exists(),
+            "encrypted-only policy removes the plaintext once sealing succeeds"
+        );
+    }
+
+    fn library_contains_plaintext(root: &std::path::Path, needle: &[u8]) -> bool {
+        for entry in fs::read_dir(root)
+            .ok()
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+        {
+            let path = entry.path();
+            if path.is_dir() {
+                if library_contains_plaintext(&path, needle) {
+                    return true;
+                }
+            } else if fs::read(&path)
+                .map(|bytes| bytes == needle)
+                .unwrap_or(false)
+            {
+                return true;
+            }
+        }
+        false
     }
 
     #[tokio::test]
