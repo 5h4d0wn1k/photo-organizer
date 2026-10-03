@@ -208,8 +208,11 @@ publish_with = publish_step.get("with") or {}
 for upstream in (
     "release-signing-preflight",
     "linux",
+    "linux-smoke",
     "windows",
+    "windows-smoke",
     "macos",
+    "macos-smoke",
     "ios",
     "android-verify",
 ):
@@ -220,6 +223,34 @@ for upstream in (
 expect(
     len(needs_of("release")) == len(set(needs_of("release"))),
     "`release` lists a dependency twice",
+)
+
+# --- every artifact with a smoke gate must actually be gated ------------------
+# The Linux and Windows gate jobs below were added without listing them in
+# `release.needs`, so they *ran* and reported failure while `release` still
+# published. A gate that does not gate publication is a comment. Each smoke job
+# must (a) depend only on the build job whose bytes it consumes, and (b) invoke
+# its committed gate script, and (c) block `release`.
+for smoke_job, build_job, gate_script in (
+    ("linux-smoke", "linux", "scripts/linux_release_artifact_smoke.sh"),
+    ("windows-smoke", "windows", "scripts/windows_release_artifact_smoke.sh"),
+    ("macos-smoke", "macos", "scripts/macos_release_artifact_smoke.sh"),
+):
+    expect(
+        sorted(needs_of(smoke_job)) == [build_job],
+        f"`{smoke_job}` must need only `{build_job}`",
+    )
+    expect(
+        gate_script in runs_of(smoke_job),
+        f"`{smoke_job}` must run `{gate_script}`",
+    )
+# iOS has no separate smoke job: the simulator slice is built and gated inside
+# the `ios` job (simctl cannot install an iPhoneOS bundle, and rebuilding the
+# slice in a second job would double the expensive macOS cross-compile). The
+# gate must therefore run in `ios` itself, and `ios` is already in `release.needs`.
+expect(
+    "scripts/ios_release_artifact_smoke.sh" in runs_of("ios"),
+    "the `ios` job must run the committed iOS artifact smoke gate on a simulator slice",
 )
 # `if:` on a job runs it even when its dependencies failed, which is exactly the
 # mechanism by which a four-platform release escapes while Android is red.

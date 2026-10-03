@@ -830,13 +830,16 @@ mutate "a long platform build stops waiting for the fast-fail preflight" \
 
 echo "== every upstream gates the publication =="
 
-for upstream in release-signing-preflight linux windows macos ios android-verify; do
+for upstream in release-signing-preflight linux linux-smoke windows windows-smoke macos macos-smoke ios android-verify; do
   mutate "\`release\` stops needing \`${upstream}\`" \
     "    needs:
       - release-signing-preflight
       - linux
+      - linux-smoke
       - windows
+      - windows-smoke
       - macos
+      - macos-smoke
       - ios
       - android-verify" \
     "$(python3 - "${upstream}" <<'PYTHON'
@@ -846,8 +849,11 @@ drop = sys.argv[1]
 entries = [
     "release-signing-preflight",
     "linux",
+    "linux-smoke",
     "windows",
+    "windows-smoke",
     "macos",
+    "macos-smoke",
     "ios",
     "android-verify",
 ]
@@ -858,14 +864,54 @@ PYTHON
     "\`release\` must need \`${upstream}\`"
 done
 
+# The Linux/Windows smoke jobs shipped without being listed in `release.needs`,
+# so they ran and went red while `release` still published. The loop above proves
+# the gating; the assertions below prove each smoke job still points at its own
+# gate script and depends only on the build it consumes. Without these, a smoke
+# job could be reduced to `run: true` and stay in `needs`, gating nothing.
+mutate "the linux-smoke job stops running its gate script" \
+  '          bash scripts/linux_release_artifact_smoke.sh linux-artifacts' \
+  '          true' \
+  "\`linux-smoke\` must run \`scripts/linux_release_artifact_smoke.sh\`"
+
+mutate "the windows-smoke job stops running its gate script" \
+  '          bash scripts/windows_release_artifact_smoke.sh "${ZIP}"' \
+  '          true' \
+  "\`windows-smoke\` must run \`scripts/windows_release_artifact_smoke.sh\`"
+
+mutate "the macos-smoke job stops running its gate script" \
+  '          bash scripts/macos_release_artifact_smoke.sh "${DMG}"' \
+  '          true' \
+  "\`macos-smoke\` must run \`scripts/macos_release_artifact_smoke.sh\`"
+
+mutate "the ios job stops running the simulator gate" \
+  '          bash scripts/ios_release_artifact_smoke.sh "${SIM_APP}"' \
+  '          true' \
+  "the \`ios\` job must run the committed iOS artifact smoke gate on a simulator slice"
+
+mutate "the macos-smoke job stops depending on the macOS build it consumes" \
+  '  macos-smoke:
+    name: macOS install+launch smoke
+    runs-on: macos-latest
+    timeout-minutes: 45
+    needs: macos' \
+  '  macos-smoke:
+    name: macOS install+launch smoke
+    runs-on: macos-latest
+    timeout-minutes: 45' \
+  "\`macos-smoke\` must need only \`macos\`"
+
 # `if: always()` is what #82 proposed and is the exact opposite of atomic
 # publication: it runs the publish job even when a dependency failed.
 mutate "the publish job runs even when a dependency failed" \
   '    needs:
       - release-signing-preflight
       - linux
+      - linux-smoke
       - windows
+      - windows-smoke
       - macos
+      - macos-smoke
       - ios
       - android-verify
     permissions:
@@ -873,8 +919,11 @@ mutate "the publish job runs even when a dependency failed" \
   '    needs:
       - release-signing-preflight
       - linux
+      - linux-smoke
       - windows
+      - windows-smoke
       - macos
+      - macos-smoke
       - ios
       - android-verify
     if: always()

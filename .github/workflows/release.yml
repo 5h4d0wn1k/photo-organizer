@@ -768,6 +768,45 @@ jobs:
           path: windows-smoke-evidence/
           if-no-files-found: error
 
+  macos-smoke:
+    name: macOS install+launch smoke
+    runs-on: macos-latest
+    timeout-minutes: 45
+    needs: macos
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Download macOS artifact for smoke
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v4
+        with:
+          name: macos-artifact
+          path: macos-artifact
+
+      - name: Run macOS artifact smoke gate
+        env:
+          MACOS_SMOKE_EVIDENCE_DIR: ${{ github.workspace }}/macos-smoke-evidence
+        run: |
+          set -euo pipefail
+          mkdir -p "${MACOS_SMOKE_EVIDENCE_DIR}"
+          # Mount and launch the exact published DMG, not a rebuilt bundle.
+          DMG="$(find macos-artifact -name '*.dmg' -type f | head -n 1)"
+          if [[ -z "${DMG}" ]]; then
+            echo "No DMG found in macos-artifact" >&2
+            exit 1
+          fi
+          bash scripts/macos_release_artifact_smoke.sh "${DMG}"
+
+      - name: Upload macOS smoke evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: macos-smoke-evidence
+          path: macos-smoke-evidence/
+          if-no-files-found: error
+
   ios:
     name: iOS (unsigned .app)
     # Fail fast: a missing keystore must not cost five long platform builds.
@@ -811,6 +850,37 @@ jobs:
           cp -R ml_sidecar "${APP_PATH}/ml_sidecar"
           ditto -c -k --keepParent "${APP_PATH}" "photo-organizer-ios-${GITHUB_REF_NAME}.zip"
 
+      # The simulator slice is the only iOS surface a free runner can install,
+      # cold-launch and screenshot (simctl cannot accept an iPhoneOS bundle).
+      # It is built here, in the same job, so the gate that proves the bundle
+      # installs and paints gates the artifact this job publishes. It does not
+      # prove installability on a physical iPhone -- see the gate's header.
+      - name: Build iOS simulator slice and run install/launch/render gate
+        env:
+          IOS_SMOKE_EVIDENCE_DIR: ${{ github.workspace }}/ios-smoke-evidence
+        run: |
+          set -euo pipefail
+          mkdir -p "${IOS_SMOKE_EVIDENCE_DIR}"
+          cargo build --manifest-path native_core/Cargo.toml --bin galleryd --release --target aarch64-apple-ios-sim --locked
+          (cd app && flutter build ios --simulator --release)
+          SIM_APP="app/build/ios/iphonesimulator/Runner.app"
+          if [[ ! -d "${SIM_APP}" ]]; then
+            echo "simulator app not found at ${SIM_APP}" >&2
+            exit 1
+          fi
+          mkdir -p "${SIM_APP}/Frameworks"
+          cp -R target/aarch64-apple-ios-sim/release/galleryd "${SIM_APP}/Frameworks/race"
+          cp -R ml_sidecar "${SIM_APP}/ml_sidecar"
+          bash scripts/ios_release_artifact_smoke.sh "${SIM_APP}"
+
+      - name: Upload iOS smoke evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ios-smoke-evidence
+          path: ios-smoke-evidence/
+          if-no-files-found: error
+
       - name: Upload iOS artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
@@ -851,8 +921,11 @@ jobs:
     needs:
       - release-signing-preflight
       - linux
+      - linux-smoke
       - windows
+      - windows-smoke
       - macos
+      - macos-smoke
       - ios
       - android-verify
     permissions:
