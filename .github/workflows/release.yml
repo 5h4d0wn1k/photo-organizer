@@ -116,6 +116,12 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2
         with:
           toolchain: stable
+          # Stated here rather than inherited. The action already defaults to
+          # `deny`, so this changes no behaviour today -- its whole value is that
+          # the policy is now visible in this file and a change to the action's
+          # default can no longer move it silently. See the windows job for the
+          # one linker warning that `deny` legitimately has to tolerate.
+          build-warnings: deny
 
       - name: Restore Rust cache
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
@@ -248,6 +254,12 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2
         with:
           toolchain: stable
+          # Stated here rather than inherited. The action already defaults to
+          # `deny`, so this changes no behaviour today -- its whole value is that
+          # the policy is now visible in this file and a change to the action's
+          # default can no longer move it silently. See the windows job for the
+          # one linker warning that `deny` legitimately has to tolerate.
+          build-warnings: deny
 
       - name: Set up Flutter
         uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2
@@ -256,7 +268,45 @@ jobs:
           cache: true
 
       - name: Build Rust daemon
-        run: cargo build --manifest-path native_core/Cargo.toml --bin galleryd --release --locked
+        # `cargo rustc` rather than `cargo build`, for exactly one reason: this is
+        # the only link in the whole release that has to tolerate a linker warning.
+        #
+        # OpenSSL is compiled from source (rusqlite's
+        # bundled-sqlcipher-vendored-openssl), and its vendored
+        # openssl/Configurations/10-main.conf hardcodes:
+        #
+        #     lib_cflags => add("/Zi /Fdossl_static.pdb")
+        #
+        # So every OpenSSL object asks the linker for a PDB that the OpenSSL build
+        # never leaves where link.exe looks for it, and link.exe answers, once per
+        # object:
+        #
+        #     warning LNK4099: PDB 'ossl_static.pdb' was not found with
+        #       'libopenssl_sys-....rlib(libcrypto-lib-slh_adrs.obj)' or at
+        #       'D:\a\photo-organizer\photo-organizer\target\release\deps\ossl_static.pdb';
+        #       linking object as if no debug info
+        #
+        # MSVC relays that through rustc's `linker_messages` lint, and the
+        # `build-warnings: deny` set on the step above turns it into a hard error:
+        # that is the entire Windows leg of failed release run 37184543519.
+        #
+        # `/IGNORE:4099` is scoped to that one warning number by construction.
+        # Every other LNK#### still reaches `linker_messages` and still denies the
+        # build, so this is a named exception rather than a relaxed policy.
+        #
+        # Chosen over making the PDB actually exist -- dropping `/Zi` in favour of
+        # `/Z7`, or letting OpenSSL emit one -- because debug info would embed the
+        # runner's absolute source paths into a shipped binary. A local-first
+        # product should not ship the path of the machine that built it.
+        #
+        # Passed as `-C link-arg` on this one target instead of via RUSTFLAGS, so
+        # it cannot reach the Flutter build and cannot invalidate the job's
+        # dependency build cache for the benefit of one link line. A misspelt
+        # flag cannot pass quietly either: link.exe answers LNK4044, which denies
+        # the build exactly like any other linker warning.
+        run: >
+          cargo rustc --manifest-path native_core/Cargo.toml --bin galleryd
+          --release --locked -- -C link-arg=/IGNORE:4099
 
       - name: Build Flutter Windows
         env:
@@ -302,6 +352,12 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2
         with:
           toolchain: stable
+          # Stated here rather than inherited. The action already defaults to
+          # `deny`, so this changes no behaviour today -- its whole value is that
+          # the policy is now visible in this file and a change to the action's
+          # default can no longer move it silently. See the windows job for the
+          # one linker warning that `deny` legitimately has to tolerate.
+          build-warnings: deny
 
       - name: Set up Flutter
         uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2
@@ -360,6 +416,12 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2
         with:
           toolchain: stable
+          # Stated here rather than inherited. The action already defaults to
+          # `deny`, so this changes no behaviour today -- its whole value is that
+          # the policy is now visible in this file and a change to the action's
+          # default can no longer move it silently. See the windows job for the
+          # one linker warning that `deny` legitimately has to tolerate.
+          build-warnings: deny
 
       - name: Set up Flutter
         uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2
@@ -824,6 +886,12 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2
         with:
           toolchain: stable
+          # Stated here rather than inherited. The action already defaults to
+          # `deny`, so this changes no behaviour today -- its whole value is that
+          # the policy is now visible in this file and a change to the action's
+          # default can no longer move it silently. See the windows job for the
+          # one linker warning that `deny` legitimately has to tolerate.
+          build-warnings: deny
 
       - name: Set up Flutter
         uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2

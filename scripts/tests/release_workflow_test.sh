@@ -1967,6 +1967,191 @@ else
   ok 'no multi-line inline emulator script: block may reappear'
 fi
 
+# The Rust warning policy has to be stated in this file, and the one linker warning
+# Windows has to tolerate has to be named rather than relaxed away.
+#
+# Release run 37184543519 lost the Windows leg to:
+#
+#   warning LNK4099: PDB 'ossl_static.pdb' was not found with
+#     'libopenssl_sys-....rlib(libcrypto-lib-slh_adrs.obj)' ...; linking object as
+#     if no debug info
+#   note: `#[warn(linker_messages)]` on by default
+#   error: warnings are denied by `build.warnings` configuration
+#
+# Two separate facts hide in that. The warning itself is benign -- the linker says
+# outright that it is proceeding without debug info, and the PDB it is missing never
+# existed. What actually broke the build is that `build.warnings = deny` was applied
+# by a third-party action's hidden default:
+#
+#   if [[ ( ! -v CARGO_BUILD_WARNINGS ) && $_srt_CARGO_BUILD_WARNINGS != "" ]]; then
+#     echo "CARGO_BUILD_WARNINGS=$_srt_CARGO_BUILD_WARNINGS" >> $GITHUB_ENV
+#   fi
+#
+# with `_srt_CARGO_BUILD_WARNINGS: deny` quoted from that run's own log. Nothing in
+# this repository said so. A build-breaking policy was inherited rather than chosen,
+# and that is the part that would have kept biting.
+#
+# Note both values appear in this file's own comments above. Every check below
+# therefore reads the parsed `run:` blocks and `with:` maps, never raw text: a
+# grep over the file would be satisfied by the explanation of the bug.
+
+WIN_FACTS="$(python3 - "${WORKFLOW}" <<'PYTHON'
+import re
+import sys
+
+import yaml
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    workflow = yaml.safe_load(handle)
+
+jobs = workflow.get("jobs") or {}
+
+daemon_jobs = []
+warnings = []
+ignore_jobs = []
+ignore_tokens = []
+
+
+def step_runs(job):
+    """Each step's `run:` block, whitespace-normalised to a single line.
+
+    Two reasons this is per-step and not one blob per job. Whitespace is collapsed
+    because the cargo invocations are line-wrapped in the YAML -- the android job
+    has `cargo` at the end of one line and `build` at the start of the next, so a
+    match that cannot span a newline misses it. And it is per-step so that a match
+    cannot run from one command to a later, unrelated one.
+    """
+    return [
+        " ".join(str(step.get("run", "")).split())
+        for step in (jobs[job].get("steps") or [])
+    ]
+
+
+def build_warnings(job):
+    """The value on the setup-rust-toolchain step, or MISSING.
+
+    Read from the parsed `with:` map, which is the only place a workflow input can
+    live -- a comment cannot produce a key here, however exactly it is worded.
+    """
+    for step in jobs[job].get("steps") or []:
+        if "actions-rust-lang/setup-rust-toolchain" in str(step.get("uses", "")):
+            with_ = step.get("with") or {}
+            if "build-warnings" in with_:
+                return str(with_["build-warnings"])
+            return "MISSING"
+    return "NO_TOOLCHAIN_STEP"
+
+
+for job in sorted(jobs):
+    runs = step_runs(job)
+    # The cargo invocation itself, and not merely the word `galleryd`. Matching the
+    # bare word would also match `cp target/release/galleryd` in the packaging step,
+    # so deleting the build would leave the job still looking like a daemon builder.
+    #
+    # `cargo` is allowed a subcommand in between: the android job runs
+    # `cargo ndk -t arm64-v8a … build --bin galleryd`, and a pattern anchored on
+    # `cargo build` misses it -- which is how this suite spent one round red before
+    # the android job was noticed.
+    if any(
+        re.search(r"\bcargo\b.*?\b(?:build|rustc)\b.*?--bin\s+galleryd\b", run)
+        for run in runs
+    ):
+        daemon_jobs.append(job)
+
+    # Only `run:` blocks. The comment in release.yml spells /IGNORE:4099 out in
+    # prose, and a text search over the whole job would be satisfied by it.
+    tokens = [token for run in runs for token in re.findall(r"/IGNORE[^\s'\"]*", run)]
+    if tokens:
+        ignore_jobs.append(job)
+        ignore_tokens.extend(tokens)
+
+# The warning policy is only read by jobs that actually run cargo. Seven of the
+# jobs in this file -- `release`, the five `*-smoke` gates, `android-verify` and
+# `release-signing-preflight` -- never invoke it; they unpack and launch artifacts.
+# Demanding the policy of them would be asking for a toolchain step they have no
+# use for, so the set is derived from the daemon-building jobs above.
+for job in daemon_jobs:
+    warnings.append(f"{job}={build_warnings(job)}")
+
+print(",".join(daemon_jobs))
+print(" ".join(warnings))
+print(",".join(ignore_jobs))
+print(" ".join(sorted(set(ignore_tokens))))
+PYTHON
+)"
+
+WIN_DAEMON_JOBS="$(printf '%s\n' "${WIN_FACTS}" | sed -n 1p)"
+WIN_WARNINGS="$(printf '%s\n' "${WIN_FACTS}" | sed -n 2p)"
+WIN_IGNORE_JOBS="$(printf '%s\n' "${WIN_FACTS}" | sed -n 3p)"
+WIN_IGNORE_TOKENS="$(printf '%s\n' "${WIN_FACTS}" | sed -n 4p)"
+
+# The set of daemon-building jobs is asserted literally, not just "every job that
+# builds galleryd states the policy". The looser form is satisfied by an empty set:
+# delete all five Rust builds and the per-job check passes on nothing, while the
+# release silently stops building a daemon at all.
+EXPECTED_DAEMON_JOBS="android,ios,linux,macos,windows"
+if [[ "${WIN_DAEMON_JOBS}" != "${EXPECTED_DAEMON_JOBS}" ]]; then
+  bad 'every platform job builds the Rust daemon' \
+    "found '${WIN_DAEMON_JOBS:-<none>}', expected '${EXPECTED_DAEMON_JOBS}'; the warning-policy check below is only meaningful if it has jobs to check"
+else
+  ok "every platform job builds the Rust daemon (${WIN_DAEMON_JOBS})"
+fi
+
+# Stated, not inherited. `deny` is also the action's own default today, so this
+# asserts the property that matters -- the policy is in this file, where a reviewer
+# and the next reader can see it, and a change upstream can no longer move it.
+WIN_BAD_WARNINGS="$(printf '%s\n' "${WIN_WARNINGS}" | tr ' ' '\n' |
+  grep -v '^$' | grep -v '=deny$' | tr '\n' ' ')"
+if [[ -n "${WIN_BAD_WARNINGS}" ]]; then
+  bad 'every daemon-building job states build-warnings: deny on its own toolchain step' \
+    "not stated as deny: ${WIN_BAD_WARNINGS} (found: ${WIN_WARNINGS}); while this is inherited from actions-rust-lang/setup-rust-toolchain's hidden default, no warning anywhere in the build fails the release and nothing in this repository records that"
+else
+  ok "every daemon-building job states build-warnings: deny (${WIN_WARNINGS})"
+fi
+
+# The exception is a named warning number, on Windows only.
+#
+# Asserted as an exact token rather than as "contains /IGNORE", because a bare
+# `/IGNORE` suppresses every linker warning there is and would sail past a
+# substring check -- that is the difference between an exception and a policy
+# change, so the test has to be able to tell them apart.
+if [[ "${WIN_IGNORE_JOBS}" != "windows" ]]; then
+  bad '/IGNORE is used on the windows job and nowhere else' \
+    "found it in: '${WIN_IGNORE_JOBS:-<nowhere>}'; the LNK4099 exception is specific to MSVC linking the vendored OpenSSL, and on any other job it would silence linker warnings nothing else is checking"
+elif [[ "${WIN_IGNORE_TOKENS}" != "/IGNORE:4099" ]]; then
+  bad 'the windows linker exception names exactly LNK4099' \
+    "found '${WIN_IGNORE_TOKENS}'; expected exactly '/IGNORE:4099'. A bare /IGNORE silences every linker warning, and a different number suppresses a warning nobody has looked at while leaving this one to fail the build"
+else
+  ok "the windows linker exception names exactly LNK4099 and nothing else"
+fi
+
+# The Windows daemon build has to actually carry it. The token check above can be
+# satisfied by the flag appearing anywhere in the job, so pin it to the link line.
+if python3 - "${WORKFLOW}" <<'PYTHON'
+import sys
+
+import yaml
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    workflow = yaml.safe_load(handle)
+
+for step in (workflow["jobs"]["windows"].get("steps") or []):
+    if str(step.get("name", "")) == "Build Rust daemon":
+        run = " ".join(str(step.get("run", "")).split())
+        sys.exit(
+            0
+            if "-C link-arg=/IGNORE:4099" in run
+            else 1
+        )
+sys.exit(1)
+PYTHON
+then
+  ok 'the Windows daemon build passes -C link-arg=/IGNORE:4099 to the linker'
+else
+  bad 'the Windows daemon build passes -C link-arg=/IGNORE:4099 to the linker' \
+    'the Windows "Build Rust daemon" step does not carry it; LNK4099 will reach linker_messages again and build-warnings: deny will fail the release build'
+fi
+
 printf '\n%s passed, %s failed\n' "${PASS_COUNT}" "${FAIL_COUNT}"
 if ((FAIL_COUNT > 0)); then
   exit 1
