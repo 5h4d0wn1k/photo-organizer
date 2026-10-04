@@ -647,18 +647,27 @@ EOF
 # already knew, so the suite and the gate agreed with each other and both
 # disagreed with every real device in the matrix. Two more lines than the old
 # fixture had, and both of them matter.
-printf 'ACTIVITY MANAGER PROCESS EXIT INFO (dumpsys activity exit-info)\n' \
-  'Last Timestamp of Persistence Into Persistent Storage: 1970-01-01 00:00:00.000\n' \
-  >"${WORK_DIR}/header-only-exit-info.txt"
+# A heredoc, not `printf`. Written as a `printf` whose format had no conversion,
+# this fixture needed its second line passed as an *argument* -- which printf
+# neither converts nor newline-terminates, so the fixture silently ended without a
+# trailing newline (SC2182), and the trailing newline is what real dumpsys output
+# has. The heredoc says the same two lines, terminates them the way the device
+# does, and cannot be misread by shellcheck as an ignored argument.
+cat >"${WORK_DIR}/header-only-exit-info.txt" <<'EOF'
+ACTIVITY MANAGER PROCESS EXIT INFO (dumpsys activity exit-info)
+Last Timestamp of Persistence Into Persistent Storage: 1970-01-01 00:00:00.000
+EOF
 
 # The two older header spellings, kept as separate fixtures rather than folded
 # into one. They are real output from other API levels, so a fix that taught the
 # gate the API 35 spelling by replacing its knowledge -- instead of adding to it
 # -- would have been invisible here and would have broken those levels.
-printf 'ACTIVITY MANAGER LRU PROCESSES (dumpsys activity exit-info)\n' \
-  >"${WORK_DIR}/header-only-exit-info-lru.txt"
-printf '  Historical Process Exit for com.privategallery.app\n' \
-  >"${WORK_DIR}/header-only-exit-info-historical.txt"
+cat >"${WORK_DIR}/header-only-exit-info-lru.txt" <<'EOF'
+ACTIVITY MANAGER LRU PROCESSES (dumpsys activity exit-info)
+EOF
+cat >"${WORK_DIR}/header-only-exit-info-historical.txt" <<'EOF'
+  Historical Process Exit for com.privategallery.app
+EOF
 
 # A header that is real but quoted *mid-line* rather than standing at the start of
 # a line, and which contains no `ApplicationExitInfo` block and no `reason=` field.
@@ -667,8 +676,9 @@ printf '  Historical Process Exit for com.privategallery.app\n' \
 # start of a line would be untested and could be dropped without the suite
 # noticing -- and dropping it is what would let a service complaint quoted inside a
 # record pass as a section header.
-printf '  description=ACTIVITY MANAGER PROCESS EXIT INFO (dumpsys activity exit-info)\n' \
-  >"${WORK_DIR}/header-inside-record.txt"
+cat >"${WORK_DIR}/header-inside-record.txt" <<'EOF'
+  description=ACTIVITY MANAGER PROCESS EXIT INFO (dumpsys activity exit-info)
+EOF
 
 cat >"${WORK_DIR}/crash-java.txt" <<'EOF'
 09-26 00:00:01.000  1000  1000 E AndroidRuntime: FATAL EXCEPTION: main
