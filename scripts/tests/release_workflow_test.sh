@@ -430,6 +430,131 @@ expect(
     "step's refusal into a green job with nothing staged",
 )
 
+# Both checks above are scoped to `release` -- each pins a distinct message the
+# mutation harness matches on -- but the property is not `release`-specific at
+# all. `continue-on-error: true` anywhere in this workflow reports a failed step
+# to `needs` as success, and that is the exact v0.1.7 shape: a platform whose
+# install/launch/crash gate is red, or whose artifact checksum failed to
+# re-derive, still lets the release publish. The key was never scanned outside
+# `release`, and the review demonstrated six mutations that all stayed green:
+#
+#   linux-smoke  "Run Linux artifact smoke gate"                        (step)
+#   macos-smoke  "Run macOS artifact smoke gate"                        (step)
+#   android-verify "Re-verify the artifact about to be published"       (step)
+#   ios          "iOS simulator install/launch/render + backend gate"   (step)
+#   android-smoke                                                     (job)
+#   linux-smoke                                                       (job)
+#
+# release.yml sets this key nowhere today, so a blanket workflow-wide ban has
+# zero false positives and cannot be satisfied by a whitelist someone forgot to
+# update. Steps that must still run after a failure -- the Android job removing
+# its materialized signing key -- keep `if: always()` and must NOT gain
+# `continue-on-error`; that cleanup step is asserted separately below, so this
+# blanket ban cannot be quietly defeated by relaxing that one.
+workflow_continue_on_error = []
+for workflow_job_id, workflow_job in jobs.items():
+    workflow_job = workflow_job or {}
+    if workflow_job.get("continue-on-error"):
+        workflow_continue_on_error.append(f"{workflow_job_id}: (job-level)")
+    for workflow_step in workflow_job.get("steps") or []:
+        if isinstance(workflow_step, dict) and workflow_step.get("continue-on-error"):
+            label = workflow_step.get("name") or workflow_step.get("uses") or "(unnamed)"
+            workflow_continue_on_error.append(f"{workflow_job_id}: {label}")
+expect(
+    not workflow_continue_on_error,
+    "no job in release.yml may set `continue-on-error` at step or job level -- it "
+    "reports a failed install/launch/crash/verify gate to `needs` as success, which "
+    "is the v0.1.7 partial-release shape reached through a key this suite had never "
+    "scanned outside `release`. Offending: " + ", ".join(workflow_continue_on_error),
+)
+
+# The AGENTS.md drop-gate has two halves: the gate must FAIL on a bad launch, and
+# the run must carry EVIDENCE (screenshot / crash buffer / exit-info) a human can
+# look at. The second half is enforced entirely by an upload step, so on the
+# evidence path the upload step is itself a gate.
+#
+# `actions/upload-artifact` defaults `if-no-files-found` to `warn`, and these five
+# steps are guarded by `if: always()` -- they run precisely when the gate above
+# them failed. Without `error`, a gate script that reports success but writes no
+# screenshot leaves the step warning, the job green, and the release publishing
+# with the evidence half silently absent. release.yml:595-599 states the
+# requirement in a comment; nothing asserted it, so deleting that one line from
+# any evidence upload left every other assertion green.
+#
+# Classified structurally -- "runs regardless of prior failure" -- instead of by
+# job or step name, so a newly added unconditional upload inherits the
+# requirement rather than relying on someone remembering it.
+ALWAYS_RUNNING_GUARDS = ("always()", "!cancelled()", "failure()")
+unconditional_uploads = [
+    (unconditional_job, unconditional_step)
+    for unconditional_job, unconditional_spec in jobs.items()
+    for unconditional_step in ((unconditional_spec or {}).get("steps") or [])
+    if isinstance(unconditional_step, dict)
+    and "upload-artifact" in str(unconditional_step.get("uses", ""))
+    and any(
+        guard in str(unconditional_step.get("if") or "")
+        for guard in ALWAYS_RUNNING_GUARDS
+    )
+]
+expect(
+    len(unconditional_uploads) > 0,
+    "the workflow still contains at least one upload that runs regardless of prior "
+    "failure -- if that becomes false this assertion is vacuous and would silently "
+    "stop checking anything. Found: " + str(len(unconditional_uploads)),
+)
+lenient_evidence_uploads = [
+    f"{unconditional_job}: {unconditional_step.get('name') or '(unnamed)'}"
+    for unconditional_job, unconditional_step in unconditional_uploads
+    if ((unconditional_step.get("with") or {}).get("if-no-files-found")) != "error"
+]
+expect(
+    not lenient_evidence_uploads,
+    "every upload that runs regardless of prior failure must set "
+    "`if-no-files-found: error` -- the action's default is `warn`, so a gate that "
+    "produces no evidence uploads nothing and still reports success, silently "
+    "dropping the 'evidenced on the runner harness' half of the drop-gate. "
+    "Offending step(s): " + ", ".join(lenient_evidence_uploads),
+)
+
+# ...and the converse. `if-no-files-found: error` only means anything on a step
+# that actually runs when the gate fails, so `if: always()` is the other half of
+# the same property and is asserted separately -- an evidence upload that only
+# runs on success leaves a red install/launch with no evidence at all, which is
+# the exact hole AGENTS.md forbids ("Gates are hard ... or explicitly degraded
+# with reported cause -- never silently skipped").
+#
+# `android-verify` is deliberately not in this list: it re-derives a checksum
+# and asserts a signature scheme rather than launching anything, so it has no
+# screenshot or crash buffer to preserve. Listing it would have forced a fake
+# evidence upload into the workflow.
+EVIDENCE_CARRYING_GATES = (
+    "android-smoke",
+    "linux-smoke",
+    "windows-smoke",
+    "macos-smoke",
+    "ios",
+)
+gates_without_evidence = [
+    evidence_gate
+    for evidence_gate in EVIDENCE_CARRYING_GATES
+    if not any(
+        "upload-artifact" in str(evidence_step.get("uses", ""))
+        and any(
+            guard in str(evidence_step.get("if") or "")
+            for guard in ALWAYS_RUNNING_GUARDS
+        )
+        for evidence_step in ((jobs.get(evidence_gate) or {}).get("steps") or [])
+        if isinstance(evidence_step, dict)
+    )
+]
+expect(
+    not gates_without_evidence,
+    "every install/launch gate must keep an unconditional evidence upload -- an "
+    "evidence upload guarded by `success()` (or nothing) is skipped exactly when "
+    "the gate is red, so the failure ships with nothing to inspect. Job(s) with "
+    "no `if: always()` upload: " + ", ".join(gates_without_evidence),
+)
+
 # The action's default is `fail_on_unmatched_files: false`, which CREATES a release
 # with zero assets when the glob matches nothing -- the v0.1.7 shape, live and
 # public. Asserted separately from `continue-on-error` so that even if a future
