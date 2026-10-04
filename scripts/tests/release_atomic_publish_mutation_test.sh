@@ -1116,11 +1116,18 @@ echo "== a gate's evidence cannot be lost to a swallowed failure =="
 # would mean spelling the action pin, and this harness refuses literal 40-hex
 # pins on purpose (a Dependabot bump must invalidate these mutations, not leave
 # them silently unapplicable).
+# SC2034 below is a false positive on both of these, not sloppiness: the loop
+# further down refers to them *by name* and reads them through
+# ${!lenient_mutation}, which shellcheck does not follow. Verified against both
+# 0.9.0 (the version CI installs from apt) and 0.11.0 -- each reports SC2034 for
+# both variables, so the suppression is needed and is not hiding anything else.
 derive "the whole [Upload Linux smoke evidence] step" \
   step-block "${WORKFLOW}" 'Upload Linux smoke evidence'
+# shellcheck disable=SC2034 # read below by name, not by value
 LINUX_EVIDENCE_STEP="${DERIVED}"
 derive "the whole [Upload iOS smoke evidence] step" \
   step-block "${WORKFLOW}" 'Upload iOS smoke evidence'
+# shellcheck disable=SC2034 # read below by name, not by value
 IOS_EVIDENCE_STEP="${DERIVED}"
 
 # `warn` is the action's own default, so this is the regression verbatim rather
