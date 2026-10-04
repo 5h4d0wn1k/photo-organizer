@@ -1999,7 +1999,13 @@ if [[ -z "${IOS_JOB}" ]]; then
     "no jobs.ios.env.IPHONEOS_DEPLOYMENT_TARGET in release.yml; rustc links at its own minimum of iOS 10.0 while clang takes the SDK default, and the two disagree about which runtime symbols exist"
 elif [[ "${IOS_JOB}" != "13.0" ]]; then
   bad 'the ios job pins IPHONEOS_DEPLOYMENT_TARGET to a sane minimum' \
-    "it is '${IOS_JOB}'; below 13.0 the linker cannot bind ___chkstk_darwin, which libSystem provides from iOS 13, so the vendored OpenSSL objects fail to link"
+    "it is '${IOS_JOB}'; this assertion requires exactly 13.0. The reason that value was
+     chosen is that below 13.0 the linker cannot bind ___chkstk_darwin, which
+     libSystem provides from iOS 13, so the vendored OpenSSL objects fail to link.
+     Note this is equality against 13.0 and not a floor: raising the pin to 14.0
+     alongside project.pbxproj would also fail this, and that failure would need the
+     pin and the pbxproj minimum reconsidered together rather than this message
+     taken at face value."
 else
   ok "the ios job pins IPHONEOS_DEPLOYMENT_TARGET (${IOS_JOB})"
 fi
@@ -2031,20 +2037,45 @@ def walk(node, path):
             walk(value, f"{path}[{index}]")
 
 
-walk(workflow.get("jobs") or {}, "")
-print(";".join(f"{where}={value}" for value, where in sorted(found)))
+# From the workflow root, not from `jobs`. A workflow-level `env:` would otherwise be
+# invisible here while this assertion's own message claimed to cover every pin in
+# the file.
+walk(workflow, "")
+# One pin per line, tab-separated. A `;`-joined single line cannot be counted by
+# `sort -u | wc -l`, which is how the first version of this check came to be
+# incapable of failing: `awk -F= '{print $NF}'` over one line yields exactly one
+# field, `distinct` was always 1, and the `bad` branch was unreachable.
+#
+# It was verified as such rather than reasoned about. Adding
+# `env: {IPHONEOS_DEPLOYMENT_TARGET: "14.0"}` to the macos job left the suite at
+# **75 passed, 0 failed**, printing
+#   ok  every IPHONEOS_DEPLOYMENT_TARGET pin in release.yml agrees
+#       (ios.env=13.0;macos.env=14.0)
+# -- displaying the contradiction it was written to catch, while passing.
+print("\n".join(f"{where}\t{value}" for value, where in sorted(found)))
 PYTHON
 )"
 if [[ -z "${IOS_ALL_PINS}" ]]; then
   bad 'IPHONEOS_DEPLOYMENT_TARGET is pinned somewhere in release.yml' \
     'found none'
 else
-  distinct="$(printf '%s\n' "${IOS_ALL_PINS}" | awk -F= '{print $NF}' | sort -u | wc -l)"
-  if [[ "${distinct}" -eq 1 ]]; then
-    ok "every IPHONEOS_DEPLOYMENT_TARGET pin in release.yml agrees (${IOS_ALL_PINS})"
-  else
+  distinct="$(printf '%s\n' "${IOS_ALL_PINS}" | cut -f2- | sort -u | wc -l)"
+  readable="$(printf '%s\n' "${IOS_ALL_PINS}" | tr '\t' '=' | tr '\n' ' ')"
+  # A step-level `env:` wins over the job-level one at runtime, and the cross-compile
+  # step is where the value that matters is read. The job-level assertion above reads
+  # only `jobs.ios.env`, so a step-level override would reintroduce the original skew
+  # -- rustc at its own 10.0 floor, clang at whatever the step says -- with a green
+  # gate. Also verified rather than reasoned about: a step-level `12.0` over a
+  # job-level `13.0` passed the whole suite before this check existed.
+  step_pins="$(printf '%s\n' "${IOS_ALL_PINS}" | grep -c 'steps\[' || true)"
+  if [[ "${distinct}" -ne 1 ]]; then
     bad 'every IPHONEOS_DEPLOYMENT_TARGET pin in release.yml agrees' \
-      "found ${distinct} different values: ${IOS_ALL_PINS}; two jobs building for iOS at different minimums is the same skew this asserts against pbxproj"
+      "found ${distinct} different values: ${readable}; two jobs building for iOS at different minimums is the same skew this asserts against pbxproj"
+  elif [[ "${step_pins}" -ne 0 ]]; then
+    bad 'IPHONEOS_DEPLOYMENT_TARGET is pinned at job level, not on an individual step' \
+      "${readable}; a step-level env: overrides the job-level one at runtime, and the step that links the daemon is where that value is actually read. Pin it once on the ios job."
+  else
+    ok "every IPHONEOS_DEPLOYMENT_TARGET pin in release.yml agrees, at job level (${readable})"
   fi
 fi
 
