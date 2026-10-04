@@ -1,0 +1,24 @@
+# CodeQL queries this repository suppresses, and why each suppression is sound.
+#
+# Format, pipe-delimited, one row per suppressed query:
+#
+#   <query-id> | <query name> | <security severity> | <justification> | <verification URL>
+#
+# This file is the justification of record. `.github/codeql/codeql-config.yml` is
+# the mechanism. A query excluded there but absent here, or listed here but not
+# excluded there, fails `scripts/tests/workflow_hygiene_test.sh` -- both
+# directions are asserted, because they fail differently and both matter:
+#
+#   * A stale row here hides an exclusion that nobody can justify any more.
+#   * A missing row here hides an exclusion that silently does nothing, which is
+#     exactly the state this file was introduced to end. The one suppression that
+#     used to exist named `rust/database/cleartext-storage-sensitive-data`, which
+#     is not a CodeQL query id; it matched nothing and the query reported a
+#     high-severity alert on every run regardless.
+#
+# Column 1 is the value the exclusion must match exactly. Re-verify it against the
+# URL in column 5 whenever `github/codeql-action` is upgraded. Query ids are
+# stable, but which suite a query belongs to -- and therefore whether it runs at
+# all under the `security-and-quality` selection in the config -- is not.
+
+rust/cleartext-storage-database | Cleartext storage of sensitive information in a database | 7.5 | Every database the daemon opens is opened through `security::open_database`, which applies a SQLCipher key before any read or write, so the database file is encrypted at rest and nothing this query calls "cleartext storage" is readable by anyone who obtains the file. The only thing the query actually finds in this repository is key material reaching `PRAGMA key` -- and that key is what encrypts the database, not a secret stored in cleartext inside it. The query's own recommendation is to "either encrypt the entire database, or ensure that each piece of sensitive information is encrypted before being stored", which is precisely what SQLCipher does. This suppression is only sound while that centralization holds, so the hygiene suite also asserts the invariant structurally: outside a `#[cfg(test)]` module, `rusqlite::Connection::open` may appear in `native_core/src/security.rs` and nowhere else in the daemon. | https://codeql.github.com/codeql-query-help/rust/rust-cleartext-storage-database/

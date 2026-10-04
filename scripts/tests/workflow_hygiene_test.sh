@@ -796,6 +796,334 @@ PYTHON
   done <<<"${dependabot_findings}"
 fi
 
+# --- CodeQL suppressions must name a real query and be justified for this repo
+#
+# `.github/codeql/codeql-config.yml` excluded
+# `rust/database/cleartext-storage-sensitive-data`. There is no such CodeQL
+# query: the real id is `rust/cleartext-storage-database`. The exclusion
+# therefore matched nothing, the query ran anyway, and it flagged
+# `security.rs:564` -- the SQLCipher `PRAGMA key` call -- as a high-severity
+# alert on every analysis. No assertion covered that file, so nothing noticed.
+#
+# An exclusion naming no query is worse than no exclusion: it reads as coverage
+# while providing none. The four inline `// codeql[...]` comments in
+# `security.rs` were the same illusion at source level, so they are gone too.
+#
+# These assertions make that state unrepresentable, and they fail closed:
+#   * the config's exclusion shape must be recognised (an `include` filter or a
+#     `tags:` selector is reported, never silently skipped -- a filter this suite
+#     cannot interpret is an exclusion it cannot justify);
+#   * every excluded id must have a justification row, and every justification
+#     row must correspond to a real exclusion;
+#   * a justification must be complete: name, numeric severity, rationale, and
+#     an https URL to re-verify the id against after a CodeQL upgrade;
+#   * the mechanism must live in the config, not in source comments;
+#   * and the invariant that makes the one suppression sound -- every database is
+#     opened through `security::open_database` -- must hold structurally, with a
+#     non-vacuity check so that deleting the subject cannot make it pass.
+# Stderr is captured to a file rather than interleaved into the finding stream,
+# so a python traceback cannot be parsed as a verdict. See the fail-closed check
+# on its exit status below.
+codeql_stderr="$(mktemp)"
+codeql_findings="$(
+  python3 - "${ROOT_DIR}" 2>"${codeql_stderr}" <<'PYTHON'
+import os
+import re
+import sys
+
+root = sys.argv[1]
+config_path = os.path.join(root, ".github", "codeql", "codeql-config.yml")
+justify_path = os.path.join(root, ".github", "codeql", "suppressed-queries.txt")
+rust_root = os.path.join(root, "native_core", "src")
+
+# Details travel through a pipe-delimited channel, so a pipe or newline inside a
+# value would split one failure into two misattributed ones.
+def emit(label, ok, detail=""):
+    detail = str(detail).replace("|", "/").replace("\n", " ").strip()
+    print("{}|{}|{}".format(label, "ok" if ok else "bad", detail))
+
+# --- the mechanism: which query ids the config excludes ---------------------
+excluded = []
+config_ok = os.path.isfile(config_path)
+emit("codeql: config file is present", config_ok,
+     "" if config_ok else "missing .github/codeql/codeql-config.yml")
+if config_ok:
+    import yaml
+    with open(config_path, encoding="utf-8") as handle:
+        config = yaml.safe_load(handle) or {}
+
+    raw_filters = config.get("query-filters")
+    if raw_filters is None:
+        emit("codeql: config declares query-filters", False,
+             "no query-filters key, so no query is excluded at all")
+    elif not isinstance(raw_filters, list) or not raw_filters:
+        emit("codeql: config declares query-filters", False,
+             "query-filters is not a non-empty list")
+    else:
+        # Emitted in the healthy branch too, not just when it fails: the
+        # label-set assertion below requires every check to report a verdict, so
+        # a check that only speaks up when broken would read as one that never
+        # ran.
+        emit("codeql: config declares query-filters", True,
+             "{} exclusion(s) declared".format(len(raw_filters)))
+        unrecognised = []
+        for entry in raw_filters:
+            if (isinstance(entry, dict) and isinstance(entry.get("exclude"), dict)
+                    and isinstance(entry["exclude"].get("id"), str)
+                    and entry["exclude"]["id"].strip()):
+                excluded.append(entry["exclude"]["id"].strip())
+            else:
+                unrecognised.append(entry)
+        # Fail closed on a filter shape this suite cannot read. It is better to
+        # stop and say so than to report "all exclusions justified" for an
+        # exclusion nobody has looked at.
+        emit("codeql: every query-filter is an exclusion this suite can justify",
+             not unrecognised,
+             # `{{id: ...}}`, not `{id: ...}`: a literal brace in a format string
+             # is a field reference, and `.format()` raised `KeyError: 'id'`
+             # right here -- which aborted the whole block below, so this suite
+             # reported "428 passed, 0 failed" having silently lost 11 of the 12
+             # checks in it. The label-set assertion further down now makes any
+             # partial drop loud.
+             "{} filter(s) not in `exclude: {{id: ...}}` shape: {}".format(
+                 len(unrecognised), unrecognised) if unrecognised else
+             "{} exclusion(s) read".format(len(excluded)))
+
+        duplicates = sorted({q for q in excluded if excluded.count(q) > 1})
+        emit("codeql: no duplicate exclusions", not duplicates,
+             "excluded more than once: " + ", ".join(duplicates) if duplicates
+             else "{} unique".format(len(set(excluded))))
+
+# --- the justification of record -------------------------------------------
+rows = []
+justify_ok = os.path.isfile(justify_path)
+emit("codeql: justification file is present", justify_ok,
+     "" if justify_ok else "missing .github/codeql/suppressed-queries.txt")
+if justify_ok:
+    with open(justify_path, encoding="utf-8") as handle:
+        for lineno, raw in enumerate(handle, 1):
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            rows.append((lineno, [field.strip() for field in line.split("|")]))
+
+justified = {fields[0]: (lineno, fields) for lineno, fields in rows if fields}
+
+# --- every excluded id is justified ----------------------------------------
+unjustified = [q for q in excluded if q not in justified]
+emit("codeql: every excluded query has a justification", not unjustified,
+     "excluded but unjustified: " + ", ".join(unjustified) if unjustified else
+     "{} exclusion(s) justified".format(len(excluded)))
+
+# --- every justification is a real exclusion -------------------------------
+# The mirror image of the assertion above, and it fails for a different reason:
+# a stale row is an exclusion whose justification no longer matches reality, and
+# it hides that exclusion from anyone auditing the config alone.
+stale = sorted(q for q in justified if q not in set(excluded))
+emit("codeql: no stale justification rows", not stale,
+     "justified but not excluded: " + ", ".join(stale) if stale else
+     "{} row(s) all correspond to an exclusion".format(len(rows)))
+
+# `ids`, not line numbers. `rows` holds `(lineno, fields)` pairs, so indexing a
+# row as `row[0]` yields the line -- and every line is unique by construction, so
+# the first version of this check compared line numbers and could never report a
+# duplicate, which is to say it could never report anything.
+justified_ids = [fields[0] for _, fields in rows if fields]
+dup_rows = sorted({q for q in justified_ids if justified_ids.count(q) > 1})
+emit("codeql: no duplicate justification rows", not dup_rows,
+     "justified more than once: " + ", ".join(dup_rows) if dup_rows else
+     "{} row(s)".format(len(rows)))
+
+# --- each justification is complete ----------------------------------------
+incomplete, bad_severity, bad_url = [], [], []
+for lineno, fields in rows:
+    label = "line {}".format(lineno)
+    if len(fields) != 5 or not all(fields[1:]):
+        incomplete.append("{} ({} field(s))".format(label, len(fields)))
+        continue
+    if not re.fullmatch(r"\d+(\.\d+)?", fields[2]):
+        bad_severity.append("{} severity={!r}".format(label, fields[2]))
+    if not fields[4].startswith("https://"):
+        bad_url.append("{} url={!r}".format(label, fields[4]))
+
+emit("codeql: every justification row is complete", not incomplete,
+     "not 5 non-empty fields: " + "; ".join(incomplete) if incomplete else
+     "{} row(s) complete".format(len(rows)))
+emit("codeql: every justification records a numeric severity", not bad_severity,
+     "; ".join(bad_severity) if bad_severity else "all severities numeric")
+emit("codeql: every justification records an https verification URL", not bad_url,
+     "; ".join(bad_url) if bad_url else "all URLs are https")
+
+# --- the mechanism lives in the config, not in source comments -------------
+# `// codeql[<id>]` reads like a suppression and was not one. Nothing in the
+# repo may reintroduce that shape: if inline suppression is ever wanted, it goes
+# through the config and the justification file like every other exclusion.
+SOURCE_DIRS = ("native_core/src", "app/lib", "scripts", "ml_sidecar")
+SOURCE_EXT = (".rs", ".dart", ".py", ".sh")
+directive = re.compile(r"codeql\s*\[")
+# The pattern is written in this file and in its mutation harness, because
+# detecting it requires naming it and proving it bites requires reproducing it.
+# Those two paths are the only carve-out, and it is exactly two paths: any other
+# file, test harness included, is still scanned, so the pattern cannot hide in a
+# new test file either.
+SELF = (
+  "scripts/tests/workflow_hygiene_test.sh",
+  "scripts/tests/workflow_hygiene_mutation_test.sh",
+)
+offenders = []
+for rel in SOURCE_DIRS:
+    base = os.path.join(root, rel)
+    for dirpath, _dirnames, filenames in os.walk(base):
+        for filename in filenames:
+            if not filename.endswith(SOURCE_EXT):
+                continue
+            path = os.path.join(dirpath, filename)
+            relative = os.path.relpath(path, root)
+            if relative in SELF:
+                continue
+            with open(path, encoding="utf-8", errors="replace") as handle:
+                for lineno, line in enumerate(handle, 1):
+                    if directive.search(line):
+                        offenders.append("{}:{}".format(relative, lineno))
+emit("codeql: no inline `codeql[...]` suppression directives in source",
+     not offenders,
+     "inline directives (suppress nothing; move to the config): "
+     + ", ".join(offenders) if offenders else
+     "all suppressions are in the config")
+
+# --- the invariant that makes the exclusion sound ---------------------------
+# `rust/cleartext-storage-database` is suppressed because every database is
+# opened through `security::open_database` and therefore encrypted at rest. If
+# some module opened a `Connection` itself, that suppression would be hiding a
+# genuine finding: a plaintext database the query was right to report.
+OPEN_CALL = re.compile(r"Connection::open")
+CENTRAL_MODULE = os.path.join("native_core", "src", "security.rs")
+# Matched as a whole signature, not as a prefix: a plain `find("pub fn
+# open_database")` is still satisfied by `pub fn open_database_REMOVED`, so
+# renaming the function away -- exactly the mutation this guards -- would have
+# left the check passing on a function that no longer exists.
+CENTRAL_SIG = re.compile(r"\bpub fn open_database\s*\(")
+offenders = []
+for dirpath, _dirnames, filenames in os.walk(rust_root):
+    for filename in filenames:
+        if not filename.endswith(".rs"):
+            continue
+        path = os.path.join(dirpath, filename)
+        with open(path, encoding="utf-8", errors="replace") as handle:
+            text = handle.read()
+        # Everything from the first `#[cfg(test)]` on is test code: those
+        # connections are in-memory fixtures or temp files the test itself made,
+        # not the daemon's databases.
+        cut = text.find("#[cfg(test)]")
+        production = text if cut < 0 else text[:cut]
+        opens = len(OPEN_CALL.findall(production))
+        if opens == 0:
+            continue
+        if os.path.relpath(path, root) != CENTRAL_MODULE:
+            offenders.append("{} opens {} connection(s) outside a test module"
+                             .format(os.path.relpath(path, root), opens))
+emit("codeql: every database is opened through the encrypted path", not offenders,
+     "; ".join(offenders) if offenders else
+     "Connection::open outside tests appears only in " + CENTRAL_MODULE)
+
+# Non-vacuity, by name rather than by count. If `open_database` stopped opening
+# the connection, or stopped existing, the assertion above would pass for having
+# no subject at all -- the same silence it exists to end. Pin the one function
+# that carries the invariant, so the suppression cannot outlive its premise.
+central_path = os.path.join(root, CENTRAL_MODULE)
+subject_ok = False
+subject_detail = CENTRAL_MODULE + " has no pub fn open_database("
+if os.path.isfile(central_path):
+    with open(central_path, encoding="utf-8", errors="replace") as handle:
+        central_text = handle.read()
+    central_cut = central_text.find("#[cfg(test)]")
+    central_production = central_text if central_cut < 0 else central_text[:central_cut]
+    signature = CENTRAL_SIG.search(central_production)
+    if signature is None:
+        subject_detail = CENTRAL_MODULE + " no longer defines pub fn open_database("
+    else:
+        # The body runs to the first line that closes it at column 0.
+        following = central_production[signature.start():]
+        end = following.find("\n}")
+        body = following if end < 0 else following[:end]
+        if OPEN_CALL.search(body):
+            subject_ok = True
+            subject_detail = "pub fn open_database opens the connection itself"
+        else:
+            subject_detail = ("pub fn open_database exists but no longer calls "
+                              "Connection::open, so nothing encrypts the database")
+emit("codeql: the encrypted-path invariant still has a subject", subject_ok,
+     subject_detail)
+PYTHON
+)"
+codeql_rc=$?
+# Fail closed on a crash inside the block. A python exception, or a runner
+# without PyYAML, must not read as "these twelve checks had nothing to say" --
+# that is precisely how the `KeyError` below once turned this suite green while
+# deleting eleven of its assertions. A block that dies is a failed block.
+#
+# `codeql_seen` is the ledger of every check that reported, whoever reported it:
+# the label below comes from this shell, the rest from the python block. It is
+# built up front so a check that *failed* is still recorded as having run -- the
+# question is whether it was evaluated, not whether it passed.
+codeql_suite_label="codeql: the suppression checks ran to completion"
+codeql_seen="${codeql_suite_label}"$'\n'
+if [[ ${codeql_rc} -ne 0 ]]; then
+  bad "${codeql_suite_label}" \
+    "$(printf 'python3 exited %s, so the checks in that block did not run.\n%s\nTheir absence must not read as a pass.' \
+        "${codeql_rc}" "$(sed 's/^/Traceback detail: /' "${codeql_stderr}")")"
+  codeql_findings=""
+else
+  ok "${codeql_suite_label}"
+fi
+rm -f "${codeql_stderr}"
+
+while IFS='|' read -r codeql_label codeql_verdict codeql_detail; do
+  [[ -n "${codeql_label}" ]] || continue
+  codeql_seen+="${codeql_label}"$'\n'
+  if [[ "${codeql_verdict}" == "ok" ]]; then
+    ok "${codeql_label}"
+  else
+    bad "${codeql_label}" "${codeql_detail}"
+  fi
+done <<<"${codeql_findings}"
+
+# Every one of these labels must be reported. A count floor would not do: the
+# crash above removed eleven of twelve and left the total *higher* than any
+# plausible guess, and the suite stayed green. Pinning the label set means an
+# emit that stops running is named in the failure, instead of being inferred
+# from arithmetic that the crash already invalidated.
+expected_codeql_labels=(
+  "codeql: the suppression checks ran to completion"
+  "codeql: config file is present"
+  "codeql: config declares query-filters"
+  "codeql: every query-filter is an exclusion this suite can justify"
+  "codeql: no duplicate exclusions"
+  "codeql: justification file is present"
+  "codeql: every excluded query has a justification"
+  "codeql: no stale justification rows"
+  "codeql: no duplicate justification rows"
+  "codeql: every justification row is complete"
+  "codeql: every justification records a numeric severity"
+  "codeql: every justification records an https verification URL"
+  'codeql: no inline `codeql[...]` suppression directives in source'
+  "codeql: every database is opened through the encrypted path"
+  "codeql: the encrypted-path invariant still has a subject"
+)
+missing_codeql_labels=()
+for expected_codeql_label in "${expected_codeql_labels[@]}"; do
+  grep -qxF "${expected_codeql_label}" <<<"${codeql_seen}" ||
+    missing_codeql_labels+=("${expected_codeql_label}")
+done
+if ((${#missing_codeql_labels[@]} == 0)); then
+  ok "codeql: every suppression check reported a verdict"
+else
+  bad "codeql: every suppression check reported a verdict" \
+    "$(printf '%s of %s check(s) never reported, so the suite did not evaluate them:\n%s' \
+        "${#missing_codeql_labels[@]}" "${#expected_codeql_labels[@]}" \
+        "$(printf '  %s\n' "${missing_codeql_labels[@]}")")"
+fi
+
 # Floor, not a target. Set to the number of *real* assertions above, so that
 # deleting one -- or neutering a gate by removing the line that records a pin,
 # which drops the total without removing any visible check -- fails the suite
