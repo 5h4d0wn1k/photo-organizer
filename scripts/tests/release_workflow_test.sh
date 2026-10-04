@@ -1047,6 +1047,100 @@ PYTHON
       "the probe could not rewrite the SUITES list; the assertions above did not run"
   fi
   rm -rf "${probe_root}"
+
+  # The driver shards its long mutation pass: it runs N concurrent copies of one
+  # suite and folds them into a single PASS/FAIL/DEGRADED result. Nothing else
+  # runs that branch, so a shard that silently stops being spawned, or a failing
+  # shard that stops failing the pass, would go unnoticed. This probe narrows
+  # SUITES to the sharded suite and swaps in a fake that records which shard it
+  # was handed, so both the union and the aggregation are checked.
+  #
+  # The expected shard set is pinned to what the committed driver declares. If
+  # someone un-shards the pass (count 1) or drops a shard, the union assertion
+  # fails rather than quietly accepting a subset of the mutations.
+  shard_root="$(mktemp -d)"
+  mkdir -p "${shard_root}/scripts/tests"
+  cp "${runner}" "${shard_root}/scripts/tests/run_release_gate_tests.sh"
+  if python3 - "${shard_root}/scripts/tests/run_release_gate_tests.sh" <<'PYTHON'
+import re
+import sys
+
+path = sys.argv[1]
+with open(path) as handle:
+    source = handle.read()
+narrowed, count = re.subn(
+    r"SUITES=\(\n(?:  \S+\n)+\)",
+    "SUITES=(\n  ios_release_artifact_mutation_test.sh\n)",
+    source,
+)
+if count != 1:
+    sys.exit("could not narrow the SUITES list; the runner's shape changed")
+with open(path, "w") as handle:
+    handle.write(narrowed)
+PYTHON
+  then
+    shard_runner="${shard_root}/scripts/tests/run_release_gate_tests.sh"
+    shard_suite="${shard_root}/scripts/tests/ios_release_artifact_mutation_test.sh"
+    shard_log="$(mktemp)"
+
+    # Each shard must be handed its own index, and every index must run.
+    # The literal below is the committed shard count; a drop is a hard failure.
+    cat >"${shard_suite}" <<SHARD_SUITE
+#!/usr/bin/env bash
+printf '%s\n' "\${MUTATION_SHARD}" >>"${shard_log}"
+exit 0
+SHARD_SUITE
+    if bash "${shard_runner}" >/dev/null 2>&1; then
+      ok "the committed runner exits 0 when every shard of a sharded suite passes"
+    else
+      bad "the committed runner exits 0 when every shard of a sharded suite passes" \
+        "the sharded path failed on a clean probe"
+    fi
+    shards_seen="$(sort -n -u "${shard_log}" | tr '\n' ' ')"
+    if [[ "${shards_seen}" == "0 1 2 3 4 5 6 7 " ]]; then
+      ok "every shard of the sharded suite runs (the union is the full set)"
+    else
+      bad "every shard of the sharded suite runs (the union is the full set)" \
+        "shards seen: ${shards_seen:-<none>}"
+    fi
+
+    # A failure in any one shard must fail the whole pass, not be averaged away.
+    cat >"${shard_suite}" <<'SHARD_SUITE'
+#!/usr/bin/env bash
+if [[ "${MUTATION_SHARD}" == "3" ]]; then
+  exit 1
+fi
+exit 0
+SHARD_SUITE
+    if bash "${shard_runner}" >/dev/null 2>&1; then
+      bad "the committed runner fails the pass when one shard fails" \
+        "a failing shard was reported as a clean pass"
+    else
+      ok "the committed runner fails the pass when one shard fails"
+    fi
+
+    # A shard that skipped its assertions must degrade the pass exactly as a whole
+    # suite does, or a shard missing a prerequisite hides behind a green pass.
+    cat >"${shard_suite}" <<'SHARD_SUITE'
+#!/usr/bin/env bash
+if [[ "${MUTATION_SHARD}" == "5" ]]; then
+  printf 'RELEASE_GATE_SUITE_DEGRADED: probe shard\n'
+fi
+exit 0
+SHARD_SUITE
+    if bash "${shard_runner}" >/dev/null 2>&1; then
+      bad "the committed runner degrades the pass when one shard is degraded" \
+        "a skipped shard was reported as a clean pass"
+    else
+      ok "the committed runner degrades the pass when one shard is degraded"
+    fi
+
+    rm -f "${shard_log}"
+    rm -rf "${shard_root}"
+  else
+    bad "the runner's SUITES list can be narrowed to the sharded suite" \
+      "the probe could not rewrite the SUITES list; the assertions above did not run"
+  fi
 else
   bad "run_release_gate_tests.sh exists" "${runner} not found"
 fi

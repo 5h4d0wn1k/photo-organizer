@@ -29,16 +29,19 @@ set -uo pipefail
 ROOT_DIR="${PO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 SUITE="${ROOT_DIR}/scripts/tests/release_workflow_test.sh"
 WORKFLOW="${ROOT_DIR}/.github/workflows/release.yml"
+DRIVER="${ROOT_DIR}/scripts/tests/run_release_gate_tests.sh"
 
 WORK="$(mktemp -d)"
 trap 'restore; rm -rf "${WORK}"' EXIT
 
 cp "${WORKFLOW}" "${WORK}/workflow.orig"
 cp "${SUITE}" "${WORK}/suite.orig"
+cp "${DRIVER}" "${WORK}/driver.orig"
 
 restore() {
   cp "${WORK}/workflow.orig" "${WORKFLOW}"
   cp "${WORK}/suite.orig" "${SUITE}"
+  cp "${WORK}/driver.orig" "${DRIVER}"
 }
 
 # apply <file> <old> <new> -- replace exactly one occurrence, then read the file
@@ -1143,6 +1146,18 @@ mutate "the preflight stops using the shared signing policy script" \
   '          mode="$(bash scripts/android_release_signing.sh mode | tail -n 1)"' \
   '          mode="release"' \
   "the preflight must resolve signing through the shared policy script"
+
+echo "== the release-gate driver runs every shard of its sharded pass =="
+
+# The driver splits the iOS mutation pass across concurrent shards and the probe
+# in release_workflow_test.sh pins the union of those shards. Collapsing the pass
+# to one shard must turn that assertion red, or the probe's "the union is the
+# full set" line could be vacuous -- green because no shard ran at all.
+mutate "the release-gate driver un-shards the iOS mutation pass" \
+  "    ios_release_artifact_mutation_test.sh) printf '8' ;;" \
+  "    ios_release_artifact_mutation_test.sh) printf '1' ;;" \
+  "every shard of the sharded suite runs (the union is the full set)" \
+  "${DRIVER}"
 
 # The guard on everything above. Deriving the pins is only worth something while
 # it stays derived, and the way it rots is quiet: the harness keeps reporting a

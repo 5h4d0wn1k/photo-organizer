@@ -62,7 +62,10 @@ jobs:
   release-gate:
     name: Release gate (artifact + signing policy)
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # The driver shards the iOS mutation pass, but the macOS mutation pass runs
+    # whole and is the long pole; this bound only needs to catch a hang, so it is
+    # generous rather than tight.
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       # Pin the interpreter rather than inheriting whatever python3 the runner
@@ -126,13 +129,14 @@ jobs:
             scripts/tests/ios_release_artifact_mutation_test.sh \
             scripts/windows_release_artifact_smoke.sh \
             scripts/linux_release_artifact_smoke.sh \
+      # The driver runs every suite. Its two mutation passes each re-run their
+      # whole gate once per mutation (~1.5 hours serial, dominated by the iOS
+      # pass), so the driver shards the iOS pass internally and runs every shard
+      # concurrently -- same mutations, less wall time, and no way to skip one.
+      # The windows mutation pass is not a driver suite, so it is named here.
       - name: Run the release gate tests
         run: |
           bash scripts/tests/run_release_gate_tests.sh
-          bash scripts/tests/macos_release_artifact_smoke_test.sh
-          bash scripts/tests/macos_release_artifact_mutation_test.sh
-          bash scripts/tests/ios_release_artifact_smoke_test.sh
-          bash scripts/tests/ios_release_artifact_mutation_test.sh
           bash scripts/tests/windows_release_artifact_mutation_test.sh
 
   security:
