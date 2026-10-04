@@ -43,7 +43,7 @@ jobs:
   # nothing else; no secret value reaches a command line or the log.
   release-signing-preflight:
     name: Android release signing preflight
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
       contents: read
@@ -86,7 +86,7 @@ jobs:
     # Fail fast: a missing keystore must not cost five long platform builds.
     needs:
       - release-signing-preflight
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 120
     permissions:
       contents: read
@@ -347,7 +347,7 @@ jobs:
     # Fail fast: a missing keystore must not cost five long platform builds.
     needs:
       - release-signing-preflight
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 120
     permissions:
       # This job only builds and uploads; `release` owns the publication.
@@ -533,7 +533,7 @@ jobs:
   # release.
   android-smoke:
     name: Android install+launch smoke (API ${{ matrix.api-level }})
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 75
     needs: android
     permissions:
@@ -612,7 +612,7 @@ jobs:
   # check on a different runner with a different checkout.
   android-verify:
     name: Android (verify APK)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     needs: [android, android-smoke]
     permissions:
@@ -686,7 +686,7 @@ jobs:
 
   linux-smoke:
     name: Linux install+launch smoke
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     needs: linux
     permissions:
@@ -973,7 +973,7 @@ jobs:
   # green, so a release is either complete or it does not exist.
   release:
     name: Publish release
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
       # Deliberately NO `if: always()`. That condition is what #82 proposed, and
       # it is the opposite of what atomic publication needs: `always()` runs the

@@ -689,20 +689,20 @@ mutate "the Linux attestation step is silently replaced by a checkout, so a step
 mutate "the publish job runs even when a dependency failed (job level, literal form)" \
   '  release:
     name: Publish release
-    runs-on: ubuntu-latest' \
+    runs-on: ubuntu-24.04' \
   '  release:
     name: Publish release
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     if: always()' \
   "must carry no job-level"
 
 mutate "the publish job runs even when a dependency failed (job level, expression form)" \
   '  release:
     name: Publish release
-    runs-on: ubuntu-latest' \
+    runs-on: ubuntu-24.04' \
   '  release:
     name: Publish release
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     if: ${{ always() }}' \
   "must carry no job-level"
 
@@ -710,20 +710,20 @@ mutate "the publish job runs even when a dependency failed (job level, expressio
 mutate "the publish job runs when a dependency failed via !cancelled(), which is not the string always()" \
   '  release:
     name: Publish release
-    runs-on: ubuntu-latest' \
+    runs-on: ubuntu-24.04' \
   '  release:
     name: Publish release
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     if: ${{ !cancelled() }}' \
   "must carry no job-level"
 
 mutate "always() is hidden inside a compound condition" \
   '  release:
     name: Publish release
-    runs-on: ubuntu-latest' \
+    runs-on: ubuntu-24.04' \
   '  release:
     name: Publish release
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     if: "${{ success() || failure() }}"' \
   "must carry no job-level"
 
@@ -744,7 +744,7 @@ mutate "the publish step runs even when the staging step refused (step level)" \
 mutate "a job depends on \`release\`, the terminal publisher" \
   '  release-signing-preflight:' \
   '  debug-consumer:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs:
       - release
     steps:
@@ -789,14 +789,14 @@ mutate "the release body drops the ephemeral-key warning" \
 # used the step name and matched zero times.
 mutate "the preflight stops publishing signing_mode to the release body" \
   '    name: Android release signing preflight
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
       contents: read
     outputs:
       signing_mode: ${{ steps.signing.outputs.mode }}' \
   '    name: Android release signing preflight
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
       contents: read
@@ -1128,7 +1128,7 @@ mutate "a second job publishes through the gh CLI instead of the release action"
   '  release-signing-preflight:' \
   '  sneaky-publish:
     name: Sneaky publish
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
     steps:
