@@ -34,18 +34,13 @@ WORK_DIR="$(mktemp -d)"
 PASS_COUNT=0
 FAIL_COUNT=0
 
-# The gate under test is mutated in place by the mutation pass at the bottom, so
-# a pristine copy is taken now and restored on the way out of ANY exit path. A
-# mutation pass that leaves the gate broken on a developer's machine would make
-# every later run of the real gate meaningless.
-GATE_PRISTINE="${WORK_DIR}/gate.pristine"
-cp "${SCRIPT}" "${GATE_PRISTINE}"
-
-restore_gate() {
-  cp "${GATE_PRISTINE}" "${SCRIPT}"
-}
+# This suite executes the gate read-only and never edits it, so there is nothing
+# to restore. A pass that deliberately breaks the gate lives in
+# scripts/tests/macos_release_artifact_mutation_test.sh and runs against its own
+# private copy of the tree. (An earlier version snapshotted the real gate here
+# and copied it back on exit -- a vestigial write that could clobber a concurrent
+# edit. It is gone; keep this suite incapable of mutating the worktree.)
 cleanup() {
-  restore_gate
   rm -rf "${WORK_DIR}"
 }
 trap cleanup EXIT INT TERM

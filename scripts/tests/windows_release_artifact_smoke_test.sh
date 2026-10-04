@@ -571,24 +571,43 @@ PY
 }
 
 # --- PE fixtures -------------------------------------------------------------
+# A formula for the smallest image the gate's assert_pe_executable accepts: an
+# AMD64, PE32+ executable. The gate walks the DOS header, the PE signature, the
+# COFF machine type and the optional-header magic, so the stub has to be a
+# genuine (if empty) PE image -- a bare `MZ` prefix is exactly what the gate
+# exists to reject.
+#
 # make_pe_bytes <path> [size]
 make_pe_bytes() {
   python3 - "$@" <<'PY'
+import struct
 import sys
+
 path = sys.argv[1]
-try:
-    with open('/tmp/minpe64.exe','rb') as f:
-        b = f.read()
-except Exception:
-    b = b''
+# 0x200 comfortably clears the optional-header magic at e_lfanew + 24 + 2, so
+# every field the gate reads is inside the file.
+image = bytearray(0x200)
+image[0:2] = b"MZ"
+e_lfanew = 0x40
+struct.pack_into("<I", image, 0x3C, e_lfanew)         # e_lfanew
+image[e_lfanew:e_lfanew + 4] = b"PE\x00\x00"          # PE signature
+coff = e_lfanew + 4
+struct.pack_into("<H", image, coff, 0x8664)           # IMAGE_FILE_MACHINE_AMD64
+struct.pack_into("<H", image, coff + 2, 0)            # NumberOfSections
+struct.pack_into("<I", image, coff + 4, 0)            # TimeDateStamp
+struct.pack_into("<I", image, coff + 8, 0)            # PointerToSymbolTable
+struct.pack_into("<I", image, coff + 12, 0)           # NumberOfSymbols
+struct.pack_into("<H", image, coff + 16, 0)           # SizeOfOptionalHeader
+struct.pack_into("<H", image, coff + 18, 0x0002)      # IMAGE_FILE_EXECUTABLE_IMAGE
+struct.pack_into("<H", image, coff + 20, 0x20B)       # PE32+ optional-header magic
 if len(sys.argv) > 2:
-    n = int(sys.argv[2])
-    if len(b) >= n:
-        b = b[:n]
+    size = int(sys.argv[2])
+    if size < len(image):
+        image = image[:size]
     else:
-        b = b + b'\x00' * (n - len(b))
-with open(path,'wb') as f:
-    f.write(b)
+        image = image + b"\x00" * (size - len(image))
+with open(path, "wb") as handle:
+    handle.write(bytes(image))
 PY
 }
 
@@ -602,18 +621,27 @@ PY
 # fail here, at creation, with the true cause -- not downstream as a misleading
 # gate failure.
 make_zip() {
-  python3 - "$@" <<'PY'
-import sys, zipfile, os
+  local path="$1"
+  shift
+  # A valid AMD64/PE32+ template. The gate refuses anything that is not one, so
+  # a bare MZ stub would make every "the packaged executable is well-formed" case
+  # fail for a reason that has nothing to do with the packaging under test.
+  local pe_template="${WORK_DIR}/pe-template.exe"
+  make_pe_bytes "${pe_template}" || return 1
+  python3 - "${path}" "${pe_template}" "$@" <<'PY'
+import sys, zipfile
 
 path = sys.argv[1]
-entries = sys.argv[2:]
-# Load PE template
-pe_data = b''
-try:
-    with open('/tmp/minpe64.exe','rb') as f:
-        pe_data = f.read()
-except Exception:
-    pe_data = b'MZ\x90'*20  # fallback
+pe_path = sys.argv[2]
+entries = sys.argv[3:]
+# Read the template from the shared builder rather than a fixed path: a missing
+# or too-short template is a broken fixture and must fail loudly here, not fall
+# back to bytes no real packaging would produce.
+with open(pe_path, "rb") as f:
+    pe_data = f.read()
+if len(pe_data) < 0x40:
+    print(f"FATAL: PE template {pe_path} is too short to be a PE image", file=sys.stderr)
+    sys.exit(1)
 
 with zipfile.ZipFile(path, "w") as z:
     for entry in entries:
@@ -1016,6 +1044,38 @@ make_zip "${WORK_DIR}/zip-decoy-entries.zip" \
 expect_fail "a decoy entry that only shares a prefix is not accepted as the required entry" \
   "does not contain the required entry galleryd.exe" \
   run_smoke_on_zip "${WORK_DIR}/zip-decoy-entries.zip"
+
+echo " the packaged executable is refused on its bytes, not its name"
+# A file NAMED private_gallery_app.exe is not an executable. The gate walks the PE
+# headers, so a truncated or mis-copied binary -- here a bare `MZ` prefix with no PE
+# header -- must be refused before the launch step, which cannot see the difference:
+# a Win32 launcher will happily start a file whose bytes are not a PE image. This is
+# the artifact-level defect the byte check exists for, and it is separate from the
+# name-based entry checks above.
+python3 - "${WORK_DIR}/zip-bad-pe.zip" <<'PY' || exit 1
+import sys, zipfile
+
+path = sys.argv[1]
+# 0x200 bytes that begin with `MZ` but carry no PE signature at the offset their
+# (all-zero) DOS header points to. This is what a truncated download looks like.
+stub = bytearray(0x200)
+stub[0:2] = b"MZ"
+with zipfile.ZipFile(path, "w") as z:
+    z.writestr("private_gallery_app.exe", bytes(stub))
+    z.writestr("galleryd.exe", bytes(stub))
+    z.writestr("ml_sidecar/private_gallery_ml_sidecar.py", b"fake packaged content for the sidecar")
+PY
+# The fixture must really lack a PE header, or the assertion below would pass on a
+# well-formed archive and prove nothing.
+if unzip -p "${WORK_DIR}/zip-bad-pe.zip" private_gallery_app.exe \
+  | python3 -c 'import sys; b=sys.stdin.buffer.read(); sys.exit(0 if b[:2] == b"MZ" and b[0x40:0x44] != b"PE\x00\x00" else 1)'; then
+  ok "the bad-PE fixture carries an executable with no PE header"
+else
+  bad "the bad-PE fixture carries an executable with no PE header" \
+    "the fixture is not actually a non-PE executable, so the assertion below proves nothing"
+fi
+expect_fail "a packaged executable that is not a PE image is rejected" \
+  "not the expected Windows PE image" run_smoke_on_zip "${WORK_DIR}/zip-bad-pe.zip"
 
 echo " launch failures"
 scenario_with "CRASH_ON_START_CODE=3221225477"
@@ -1439,7 +1499,7 @@ echo " a gate step cannot be made to fail softly"
 # when the file it is supposed to read is not there. The mutation pass proves the
 # rule bites by loosening it and by pointing the default at a missing file; it
 # never writes to `.github/workflows/`.
-release_workflow="${WINDOWS_SMOKE_RELEASE_WORKFLOW:-${ROOT_DIR}/.github/workflows/no-such-workflow.yml}"
+release_workflow="${WINDOWS_SMOKE_RELEASE_WORKFLOW:-${ROOT_DIR}/.github/workflows/release.yml}"
 # Anchored at line start (modulo indentation) so that a COMMENT mentioning the key
 # -- release.yml has one, explaining why `if: always()` is used instead -- is not
 # read as a violation. A bare `grep -q continue-on-error` would fire on that
@@ -1447,7 +1507,7 @@ release_workflow="${WINDOWS_SMOKE_RELEASE_WORKFLOW:-${ROOT_DIR}/.github/workflow
 if [[ ! -f "${release_workflow}" ]]; then
   bad "the release workflow has no continue-on-error on any step" \
     "the workflow was not found at ${release_workflow}, so the check could not run"
-elif grep -nE 'continue-on-error' "${release_workflow}" \
+elif grep -nE '^[[:space:]]*continue-on-error[[:space:]]*:' "${release_workflow}" \
   >"${WORK_DIR}/continue-on-error.log" 2>&1; then
   bad "the release workflow has no continue-on-error on any step" \
     "a step can fail softly and still let the release proceed: $(tr '\n' '|' <"${WORK_DIR}/continue-on-error.log")"

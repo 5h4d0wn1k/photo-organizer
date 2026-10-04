@@ -63,7 +63,11 @@ WORK="$(mktemp -d)"
 cleanup() {
   rm -rf "${WORK}"
 }
-trap cleanup EXIT
+# EXIT alone does not run for an untrapped SIGTERM/SIGINT, so a timeout or Ctrl-C
+# would abandon the private tree. Trap the signals too. The tree is private, so this
+# is about not leaking a large temp tree rather than about protecting the worktree;
+# the macOS/Windows siblings trap the same set.
+trap cleanup EXIT INT TERM HUP
 
 # The whole `scripts/` tree is COPIED and mutated in place.
 #
@@ -153,6 +157,14 @@ SUITE_RED_BUT_WRONG=0
 SUITE_STILL_GREEN=0
 DECLARED_FAILURES=()
 
+# A silent shrink is the mine: if a future edit deletes mutations, or a shard
+# filter matches nothing, the harness would report success on a smaller -- or
+# empty -- set. MIN_MUTATIONS is the count this file declares and is a lower
+# bound; DECLARED_MUTATIONS counts every declaration before shard filtering, so
+# an empty shard can never read as a pass.
+MIN_MUTATIONS=36
+DECLARED_MUTATIONS=0
+
 note() {
   printf '%s\n' "$1"
 }
@@ -174,6 +186,7 @@ run_mutation() {
   # no matter how the set is split.
   idx="${MUTATION_INDEX}"
   MUTATION_INDEX=$((MUTATION_INDEX + 1))
+  DECLARED_MUTATIONS=$((DECLARED_MUTATIONS + 1))
   if ((idx % SHARDS != SHARD)); then
     return 0
   fi
@@ -452,7 +465,7 @@ run_mutation "E6" \
 # removed and the suite stays green, the suite does not test the finding.
 run_mutation "F1" \
   'stop failing when no backend probe can answer' \
-  '    BACKEND_REASON="the artifact cannot be shown to reach a backend: IOS_SMOKE_BACKEND_PROBE is unset, so no probe could answer. This app'"'"'s only backend is the daemon at ${NATIVE_BINARY}, iOS forbids an app from spawning it, and local_daemon_launcher.dart:24-32 returns attempted:false on every non-desktop platform. Install+launch+render passed; usefulness did not."
+  '    BACKEND_REASON="the artifact cannot be shown to reach a backend: IOS_SMOKE_BACKEND_PROBE is unset, so no probe could answer. iOS forbids the app from spawning galleryd, so a backend must be provided by the harness (IOS_SMOKE_LAUNCH_ARGUMENTS points a debug build at it) and a probe must prove the app reached it. Install+launch+render passed; usefulness did not."
     return 1' \
   '    BACKEND_REASON=""
     return 0' \
@@ -558,11 +571,19 @@ if ((SHARDS > 1)); then
   note "result says nothing about the mutations they own."
 fi
 note "mutations run in this shard: ${TOTAL}"
+note "mutations declared: ${DECLARED_MUTATIONS} (floor ${MIN_MUTATIONS})"
 note "  biting:                              ${BIT}"
 note "  NOT biting (suite stayed green):     ${SUITE_STILL_GREEN}"
 note "  NOT biting (wrong assertion red):    ${SUITE_RED_BUT_WRONG}"
 note "  NOT biting (mutation did not apply): ${NOT_BIT}"
 note "================================================================"
+
+if ((DECLARED_MUTATIONS < MIN_MUTATIONS)); then
+  DECLARED_FAILURES+=("the harness declared ${DECLARED_MUTATIONS} mutations, below the floor of ${MIN_MUTATIONS}")
+fi
+if ((SHARDS > 1)) && ((TOTAL == 0)); then
+  DECLARED_FAILURES+=("shard ${SHARD} of ${SHARDS} ran zero mutations")
+fi
 
 if ((${#DECLARED_FAILURES[@]} > 0)); then
   note ""

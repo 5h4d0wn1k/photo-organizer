@@ -161,9 +161,9 @@ RUN_PID=""
 # and in LIMITATIONS, which is exactly why disclosing it was the wrong design:
 # the release is still published, and a reader of the release notes never sees
 # this log. So the flag is now an invariant instead: reaching the render loop or
-# the end of main with it unset is a hard `fail`, and the only summary wording is
-# the unconditional `pre-launch diff: armed`. There is deliberately no DISABLED
-# fallback to be reached.
+# the end of main with it unset is a hard `fail`, and the summary wording is
+# unconditional (the single `printf` below is the only place it is ever emitted).
+# There is deliberately no DISABLED fallback to be reached.
 DIFF_ENABLED=0
 
 trim() {
@@ -1067,7 +1067,7 @@ await_settled_app_frame() {
     rc=0
     process_is_alive "${RUN_PID}" || rc=$?
     if ((rc == 2)); then
-      rc=1
+      fail "could not query the process table; refusing to report a liveness check that never ran"
     fi
     if ((rc != 0)); then
       local exit_code

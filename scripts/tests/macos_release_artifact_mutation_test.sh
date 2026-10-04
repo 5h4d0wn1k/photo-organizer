@@ -49,9 +49,7 @@ set -uo pipefail
 MODE_VERIFY_ONLY=""
 MODE_LIST=""
 
-ROOT_DIR="${PO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
-SUITE="${ROOT_DIR}/scripts/tests/macos_release_artifact_smoke_test.sh"
-GATE="${ROOT_DIR}/scripts/macos_release_artifact_smoke.sh"
+SOURCE_ROOT="${PO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 
 for arg in "$@"; do
   case "${arg}" in
@@ -67,8 +65,53 @@ for arg in "$@"; do
   esac
 done
 
+# --- sharding ---------------------------------------------------------------
+#
+# A full pass re-runs the whole suite once per mutation, and the macOS suite
+# takes about two minutes -- the whole set is over an hour, longer than the
+# required check's timeout. `MUTATION_SHARDS=N MUTATION_SHARD=i` runs only the
+# mutations where `index % N == i`, so the set can be split across concurrent
+# shards. Every shard 0..N-1 is always run, so the union is the full mutation
+# set: nothing is skipped to make the pass fast. Default: one shard (everything).
+SHARDS="${MUTATION_SHARDS:-1}"
+SHARD="${MUTATION_SHARD:-0}"
+if [[ ! "${SHARDS}" =~ ^[1-9][0-9]*$ ]]; then
+  printf 'FATAL: MUTATION_SHARDS must be a positive integer; got %q\n' "${SHARDS}" >&2
+  exit 2
+fi
+if [[ ! "${SHARD}" =~ ^[0-9]+$ ]] || ((SHARD >= SHARDS)); then
+  printf 'FATAL: MUTATION_SHARD must be 0..%s; got %q\n' "$((SHARDS - 1))" "${SHARD}" >&2
+  exit 2
+fi
+
 WORK="$(mktemp -d)"
-trap 'restore; rm -rf "${WORK}"' EXIT
+# The trap only deletes the private tree: the run never mutates anything outside
+# it, so there is no worktree snapshot to restore even if the shard is killed.
+# (restore() still exists -- it resets the copy between mutations in one shard.)
+trap 'rm -rf "${WORK}"' EXIT INT TERM HUP
+
+# The whole `scripts/` tree is COPIED and mutated in place.
+#
+# A shard re-runs the suite once per mutation and keeps the gate mutated for the
+# whole run. Two shards sharing one file would each be testing the other's edit,
+# and each would restore a different snapshot at the end -- exactly the kind of
+# cross-talk the concurrent fan-out in run_release_gate_tests.sh must not have.
+# Copying gives every shard a private tree, which is what makes that fan-out
+# safe, and it means a killed shard can never leave the developer's worktree
+# mutated.
+mkdir -p "${WORK}/tree"
+cp -R "${SOURCE_ROOT}/scripts" "${WORK}/tree/scripts"
+
+ROOT_DIR="${WORK}/tree"
+SUITE="${ROOT_DIR}/scripts/tests/macos_release_artifact_smoke_test.sh"
+GATE="${ROOT_DIR}/scripts/macos_release_artifact_smoke.sh"
+
+for required in "${SUITE}" "${GATE}"; do
+  if [[ ! -f "${required}" ]]; then
+    printf 'FATAL: %s does not exist\n' "${required}" >&2
+    exit 2
+  fi
+done
 
 cp "${GATE}" "${WORK}/gate.orig"
 cp "${SUITE}" "${WORK}/suite.orig"
@@ -128,8 +171,18 @@ pass_count() {
   grep -Eo '[0-9]+ passed' <<<"$1" | head -1 | grep -Eo '[0-9]+' || printf 0
 }
 
+# MIN_MUTATIONS is a lower bound, not a target. Without it a future edit that
+# deletes a mutation, or a shard filter that matches nothing, would let the
+# harness report success over a smaller -- or empty -- set: a silent shrink must
+# never read as a pass. DECLARED_MUTATIONS counts every declaration before any
+# shard filtering, so a shard that runs zero mutations and an unsharded run that
+# lost one are both caught.
+MIN_MUTATIONS=36
+DECLARED_MUTATIONS=0
+
 MUTATIONS_RUN=0
 MUTATIONS_BITING=0
+MUTATION_INDEX=0
 mismatches=()
 
 # Per-mutation knobs, set around the mutate() call that needs them.
@@ -155,12 +208,25 @@ mutate() {
     old="${old#@suite:}"
     new="${new#@suite:}"
   fi
-  MUTATIONS_RUN=$((MUTATIONS_RUN + 1))
+  local index=${MUTATION_INDEX}
+  MUTATION_INDEX=$((MUTATION_INDEX + 1))
+  # Counted before MODE_LIST and before the shard filter: every declaration is
+  # counted on every invocation so the floor sees the full set, not the shard's.
+  DECLARED_MUTATIONS=$((DECLARED_MUTATIONS + 1))
 
   if [[ -n "${MODE_LIST}" ]]; then
     printf '%s | %s\n' "${name}" "${needle}"
     return
   fi
+
+  # Shard selection. The index is captured above, before MODE_LIST, so a mutation
+  # keeps its index -- and therefore its shard -- on every run and in every mode.
+  # The driver always spawns every shard 0..N-1, so the union is the full set.
+  if (( index % SHARDS != SHARD )); then
+    return
+  fi
+
+  MUTATIONS_RUN=$((MUTATIONS_RUN + 1))
 
   if ! apply "${target}" "${old}" "${new}" 2>"${WORK}/apply.err"; then
     mismatches+=("${name}: COULD NOT APPLY -- $(tr '\n' ' ' <"${WORK}/apply.err")")
@@ -392,11 +458,23 @@ mutate "the first complex frame is accepted without requiring stability" \
   'if ((stable_captures >= 0)); then'
 
 # A silent downgrade from "the app's window" to "whatever is on the desktop" is
-# the quiet that turns a gate into a comment.
+# the quiet that turns a gate into a comment. This removes the announcement that
+# a window-scoped capture failed and the frame came from the whole screen; the
+# suite's guard on *that* announcement is 'a window-scoped capture that fails
+# falls back and says so', which is the assertion the needle must name.
 mutate "the full-screen capture fallback is taken silently" \
-  'the full-screen fallback is announced in the log, not taken silently' \
+  'a window-scoped capture that fails falls back and says so' \
   'log "${CAPTURE_FALLBACK_REASON}; falling back to a full-screen capture (the window assertion still gates this frame)"' \
   'true'
+
+# ...and the same quiet on the path that never had a window id to begin with:
+# there the full-screen capture is the *primary* answer, not a downgrade, so the
+# verdict must still name that scope or "whatever is on the desktop" reads like
+# the app's own frame. This is the assertion the mutation above used to name.
+mutate "the full-screen capture is not identified as such" \
+  'the full-screen fallback is announced in the log, not taken silently' \
+  'log "settled app frame (${scope} capture): ${colors}+ distinct colours, identical across two consecutive captures"' \
+  'log "settled app frame: ${colors}+ distinct colours, identical across two consecutive captures"'
 
 echo "== crash detection must actually look =="
 
@@ -514,7 +592,13 @@ exit 0' \
 fi
 exit 0'
 MUTATE_ENV=
-MUTATE_RC=1
+# This one exits 0 on purpose, and the zero exit IS the symptom: the counter the
+# suite would derive a non-zero status from is the very thing the mutation
+# disabled, so `bad` cannot move FAIL_COUNT below it either. The suite still
+# notices in-process -- the needle is its own counter assertion -- and that is
+# what the harness checks here. Expecting rc=1 would be expecting the suite to
+# exit on a counter it no longer has.
+MUTATE_RC=0
 
 # A `bad` that stopped counting is the same defect from the other side: the suite
 # would print failures and exit 0. The needle is the suite's own assertion about
@@ -523,6 +607,7 @@ mutate "the suite no longer counts a failure" \
   "the suite's own counters move when an assertion is recorded" \
   '@suite:  FAIL_COUNT=$((FAIL_COUNT + 1))' \
   '@suite:  FAIL_COUNT=$((FAIL_COUNT + 0))'
+MUTATE_RC=1
 
 restore
 
@@ -550,9 +635,17 @@ if [[ ${final_rc} -ne 0 ]]; then
   printf '%s\n' "${final_out}" | grep -E '^[[:space:]]*FAIL ' | head -5 | sed 's/^/        /' >&2
 fi
 
-printf 'mutations: %d run, %d bit, suite after restore: %s\n' \
+printf 'mutations: %d run, %d bit, declared: %d (floor %d), suite after restore: %s\n' \
   "${MUTATIONS_RUN}" "${MUTATIONS_BITING}" \
+  "${DECLARED_MUTATIONS}" "${MIN_MUTATIONS}" \
   "$(grep -E '^[0-9]+ passed' <<<"${final_out}" || echo 'no summary')"
+
+if ((DECLARED_MUTATIONS < MIN_MUTATIONS)); then
+  mismatches+=("the harness declared ${DECLARED_MUTATIONS} mutations, below the floor of ${MIN_MUTATIONS}")
+fi
+if ((SHARDS > 1)) && ((MUTATIONS_RUN == 0)); then
+  mismatches+=("shard ${SHARD} of ${SHARDS} ran zero mutations")
+fi
 
 if ((${#mismatches[@]} > 0)); then
   printf '\nNON-BITING / WRONG-RED / INVALID MUTATIONS (%d):\n' "${#mismatches[@]}" >&2

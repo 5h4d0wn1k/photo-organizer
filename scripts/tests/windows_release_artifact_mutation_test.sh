@@ -68,28 +68,73 @@ set -uo pipefail
 export SMOKE_LAUNCH_TIMEOUT=5
 export SMOKE_RENDER_TIMEOUT=4
 
-ROOT_DIR="${PO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
-SUITE="${ROOT_DIR}/scripts/tests/windows_release_artifact_smoke_test.sh"
-GATE="${ROOT_DIR}/scripts/windows_release_artifact_smoke.sh"
+# --- sharding ---------------------------------------------------------------
+#
+# A full pass re-runs the whole suite once per mutation, and this suite takes
+# minutes, so the whole set is long enough to exceed the required check's
+# timeout. `MUTATION_SHARDS=N MUTATION_SHARD=i` runs only the mutations where
+# `index % N == i`, so the set can be split across concurrent shards. Every
+# shard 0..N-1 is always run, so the union is the full mutation set: nothing is
+# skipped to make the pass fast. Default: one shard (everything).
+SHARDS="${MUTATION_SHARDS:-1}"
+SHARD="${MUTATION_SHARD:-0}"
+if [[ ! "${SHARDS}" =~ ^[1-9][0-9]*$ ]]; then
+  printf 'FATAL: MUTATION_SHARDS must be a positive integer; got %q\n' "${SHARDS}" >&2
+  exit 2
+fi
+if [[ ! "${SHARD}" =~ ^[0-9]+$ ]] || ((SHARD >= SHARDS)); then
+  printf 'FATAL: MUTATION_SHARD must be 0..%s; got %q\n' "$((SHARDS - 1))" "${SHARD}" >&2
+  exit 2
+fi
+
+SOURCE_ROOT="${PO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 
 WORK="$(mktemp -d)"
 # EXIT alone is not enough. bash does not run an EXIT trap for an untrapped
 # SIGTERM, so a `timeout`, a `kill` from a CI step that ran long, or a Ctrl-C would
-# leave a MUTATED gate and suite sitting in the working tree -- the harness's whole
-# job is to put them back. This trap was found by exactly that: a 90-second timeout
-# on a diagnostic driver landed between the two edits of the compound mutation and
-# left MIN_TRIVIAL_ASSERTIONS at the mutated value.
-trap 'restore; rm -rf "${WORK}"' EXIT INT TERM HUP
+# leave the private tree behind. This trap was found by exactly that: a 90-second
+# timeout on a diagnostic driver landed between the two edits of a compound
+# mutation and left MIN_TRIVIAL_ASSERTIONS at the mutated value.
+#
+# It only has to delete the private tree: nothing the run mutates lives outside it
+# (see below), so there is no worktree snapshot to restore.
+trap 'rm -rf "${WORK}"' EXIT INT TERM HUP
+
+# The whole relevant tree is COPIED and mutated in place: `scripts/` because the
+# gate and suite live there, and `.github/` because the suite's soft-fail guard
+# reads `.github/workflows/release.yml` from its own root.
+#
+# A shard re-runs the suite once per mutation and keeps the gate mutated for the
+# whole run. Two shards sharing one file would each be testing the other's edit,
+# and each would restore a different snapshot at the end -- exactly the cross-talk
+# the concurrent fan-out in run_release_gate_tests.sh must not have. Copying gives
+# every shard a private tree, which is what makes that fan-out safe, and it means
+# a killed shard can never leave the developer's worktree mutated.
+#
+# Only two files are ever mutated, both of them files this work produced: the gate
+# and its suite. Nothing under `.github/workflows/` is touched, even in the copy --
+# a mid-run kill there would leave a mutated workflow behind, and other agents are
+# editing those files in parallel. The suite's workflow guard is therefore proven
+# to bite by mutating the GUARD (its rule, and the file it resolves to), not by
+# planting a violation in the workflow it reads.
+mkdir -p "${WORK}/tree"
+cp -R "${SOURCE_ROOT}/scripts" "${WORK}/tree/scripts"
+cp -R "${SOURCE_ROOT}/.github" "${WORK}/tree/.github"
+
+ROOT_DIR="${WORK}/tree"
+SUITE="${ROOT_DIR}/scripts/tests/windows_release_artifact_smoke_test.sh"
+GATE="${ROOT_DIR}/scripts/windows_release_artifact_smoke.sh"
+
+for required in "${SUITE}" "${GATE}" "${ROOT_DIR}/.github/workflows/release.yml"; do
+  if [[ ! -f "${required}" ]]; then
+    printf 'FATAL: %s does not exist\n' "${required}" >&2
+    exit 2
+  fi
+done
 
 cp "${GATE}" "${WORK}/gate.orig"
 cp "${SUITE}" "${WORK}/suite.orig"
 
-# Only two files are ever mutated, both of them files this work produced:
-# the gate and its suite. Nothing under `.github/workflows/` is touched, even
-# transiently -- a mid-run kill there would leave a mutated workflow behind, and
-# other agents are editing those files in parallel. The suite's workflow guard is
-# therefore proven to bite by mutating the GUARD (its rule, and the file it
-# resolves to), not by planting a violation in the workflow it reads.
 restore() {
   cp "${WORK}/gate.orig" "${GATE}"
   cp "${WORK}/suite.orig" "${SUITE}"
@@ -181,6 +226,18 @@ needle_matches() {
 mutate() {
   local name="$1" old="$2" new="$3" needle="$4"
   local target="${5:-${GATE}}"
+  local index=${MUTATION_INDEX}
+  MUTATION_INDEX=$((MUTATION_INDEX + 1))
+  # Count the declaration BEFORE the shard skip, so the floor measures what the file
+  # declares rather than what this shard happened to run.
+  DECLARED_MUTATIONS=$((DECLARED_MUTATIONS + 1))
+  # Shard selection: this mutation belongs to exactly one shard. The index is
+  # captured before the skip, so a mutation keeps its index -- and its shard --
+  # on every run. The driver always spawns every shard 0..N-1, so the union of
+  # the shards is the full mutation set.
+  if (( index % SHARDS != SHARD )); then
+    return
+  fi
   MUTATIONS_RUN=$((MUTATIONS_RUN + 1))
   restore
   local line
@@ -230,6 +287,13 @@ mutate() {
 #      is what CI reads as success.
 mutate_exit_code_guard() {
   local name="the suite reports failures but still exits 0"
+  local index=${MUTATION_INDEX}
+  MUTATION_INDEX=$((MUTATION_INDEX + 1))
+  # Count the declaration BEFORE the shard skip, exactly as mutate() does.
+  DECLARED_MUTATIONS=$((DECLARED_MUTATIONS + 1))
+  if (( index % SHARDS != SHARD )); then
+    return
+  fi
   MUTATIONS_RUN=$((MUTATIONS_RUN + 1))
   local induced='the suite asserted a non-trivial number of things'
   local floor_old='MIN_TRIVIAL_ASSERTIONS=60'
@@ -289,8 +353,17 @@ fi'
   restore
 }
 
+# THE MINE THIS FLOOR DEFENDS AGAINST: a shard filter matching nothing, or a
+# future edit that deletes a declaration, shrinks the set silently and still reports
+# success -- a smaller or empty run reads exactly like a clean pass. MIN_MUTATIONS is
+# the count this file declares in a full unsharded run, so it is a LOWER BOUND: a run
+# below it is a broken harness, not a green one.
+MIN_MUTATIONS=29
+DECLARED_MUTATIONS=0
+
 MUTATIONS_RUN=0
 MUTATIONS_BITING=0
+MUTATION_INDEX=0
 mismatches=()
 
 echo "== is it really the released artifact? =="
@@ -333,6 +406,17 @@ mutate "entry matching accepts anything that merely starts with the required nam
   'if [[ "${entry}" == "${name}" || "${entry}" == "${name}/"* ]]; then' \
   'if [[ "${entry}" == "${name}"* ]]; then' \
   "a decoy entry that only shares a prefix"
+
+# The bytes, not the name. `private_gallery_app.exe` that is not a 64-bit PE image is
+# exactly what a truncated or mis-copied binary looks like, and the launch step
+# cannot see it: a real Win32 launcher would fail obliquely and a fake one would
+# start anything. Removing the header walk must let the bad-PE fixture through and
+# turn the named assertion red.
+mutate "a packaged executable that is not a PE image is accepted" \
+  '  assert_pe_executable "${exe_path}" ||
+    fail "the packaged executable is not the expected Windows PE image (see the errors above)"' \
+  '  log "packaged executable: ${exe_path} (PE header check disabled by mutation)"' \
+  "a packaged executable that is not a PE image is rejected"
 
 # The harness must not damage the artifact it is gating. The original defect here was
 # the fake pwsh reading PowerShell's own flags as the helper's arguments and starting
@@ -602,7 +686,14 @@ mutate "the suite stops checking the working directory for contamination" \
 
 restore
 
-printf '\n%s mutations run, %s bit\n' "${MUTATIONS_RUN}" "${MUTATIONS_BITING}"
+printf '\n%s mutations run, %s bit (declared %s, floor %s)\n' \
+  "${MUTATIONS_RUN}" "${MUTATIONS_BITING}" "${DECLARED_MUTATIONS}" "${MIN_MUTATIONS}"
+if ((DECLARED_MUTATIONS < MIN_MUTATIONS)); then
+  mismatches+=("the harness declared ${DECLARED_MUTATIONS} mutations, below the floor of ${MIN_MUTATIONS}")
+fi
+if ((SHARDS > 1)) && ((MUTATIONS_RUN == 0)); then
+  mismatches+=("shard ${SHARD} of ${SHARDS} ran zero mutations")
+fi
 if ((${#mismatches[@]} > 0)); then
   printf '\nproblems:\n' >&2
   for problem in "${mismatches[@]}"; do

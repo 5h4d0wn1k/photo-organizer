@@ -56,6 +56,13 @@ MUTATION_APPLIED=0
 SCENARIO_COUNT=0
 FAILED_NAMES=()
 
+# Same token every release-gate suite uses. When an assertion cannot run on this
+# machine (for example shellcheck is not installed) the suite prints this marker
+# so the driver classifies the suite as DEGRADED -- a hard failure -- rather than
+# PASS. A missing tool must never silently shrink what the gate proves.
+DEGRADED_MARKER='RELEASE_GATE_SUITE_DEGRADED:'
+DEGRADED_COUNT=0
+
 cleanup() {
   reap_strays
   rm -rf "${WORK}"
@@ -1385,7 +1392,10 @@ if command -v shellcheck >/dev/null 2>&1; then
   shellcheck --severity=warning "${GATE}" >/dev/null 2>&1
   check "the gate is shellcheck-clean at --severity=warning" "$([[ $? -eq 0 ]] && echo 1 || echo 0)"
 else
-  printf '# shellcheck not available; skipping the lint assertion (not a pass)\n'
+  DEGRADED_COUNT=$((DEGRADED_COUNT + 1))
+  printf '# shellcheck not available; the lint assertion did NOT run (not a pass)\n'
+  printf '# %s shellcheck is not available, so the shellcheck-clean assertion did not run\n' \
+    "${DEGRADED_MARKER}"
 fi
 
 # ---------------------------------------------------------------------------
@@ -2308,6 +2318,7 @@ printf '1..%d\n' "$((PASS_COUNT + FAIL_COUNT))"
 printf '# scenarios: %d\n' "${SCENARIO_COUNT}"
 printf '# mutations proven load-bearing: %d (applied: %d)\n' "${MUTATION_COUNT}" "${MUTATION_APPLIED_COUNT}"
 printf '# assertions: %d passed, %d failed\n' "${PASS_COUNT}" "${FAIL_COUNT}"
+printf '# degraded assertions: %d (could not run on this machine)\n' "${DEGRADED_COUNT}"
 if [[ "${FAIL_COUNT}" -ne 0 ]]; then
   printf '# failing tests:\n'
   for n in "${FAILED_NAMES[@]}"; do

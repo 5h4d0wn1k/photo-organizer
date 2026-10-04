@@ -29,6 +29,10 @@
   ],
   "advisory": [
     {
+      "context": "Release gate suite",
+      "reason": "The release-gate matrix legs (one suite per runner). Not required individually: the aggregate `Release gate (artifact + signing policy)` is the single required context and fails unless every leg succeeds, so adding a suite never needs a ruleset change."
+    },
+    {
       "context": "label",
       "reason": "Cosmetic. A mislabeled PR says nothing about correctness."
     },

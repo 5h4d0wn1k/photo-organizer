@@ -24,6 +24,7 @@ SUITES=(
   linux_release_artifact_smoke_test.sh
   macos_release_artifact_smoke_test.sh
   macos_release_artifact_mutation_test.sh
+  windows_release_artifact_mutation_test.sh
   ios_release_artifact_smoke_test.sh
   ios_release_artifact_mutation_test.sh
 )
@@ -44,6 +45,8 @@ DEGRADED_MARKER='RELEASE_GATE_SUITE_DEGRADED:'
 shards_for_suite() {
   case "$1" in
     ios_release_artifact_mutation_test.sh) printf '8' ;;
+    macos_release_artifact_mutation_test.sh) printf '8' ;;
+    windows_release_artifact_mutation_test.sh) printf '8' ;;
     *) printf '1' ;;
   esac
 }
@@ -84,7 +87,12 @@ record_suite_result() {
   fi
 }
 
-for suite in "${SUITES[@]}"; do
+# run_suite <suite> -- run exactly one suite, sharded when it declares shards,
+# and record PASS/FAIL/DEGRADED. Extracted so the local "run everything" path and
+# the CI "--only-suite" path execute the identical code: a matrix leg cannot drift
+# from what a local full run does.
+run_suite() {
+  local suite="$1" shards shard log rc suite_log
   shards="$(shards_for_suite "${suite}")"
   if ((shards > 1)); then
     printf '\n==> %s (%s shards, run concurrently)\n' "${suite}" "${shards}"
@@ -119,7 +127,7 @@ for suite in "${SUITES[@]}"; do
     cat "${suite_log}"
     record_suite_result "${suite}" "${rc}" "${suite_log}" "${shards}"
     rm -f "${suite_log}"
-    continue
+    return
   fi
 
   printf '\n==> %s\n' "${suite}"
@@ -131,7 +139,55 @@ for suite in "${SUITES[@]}"; do
     record_suite_result "${suite}" 1 "${suite_log}" 1
   fi
   rm -f "${suite_log}"
+}
+
+usage() {
+  cat >&2 <<'EOF'
+usage: run_release_gate_tests.sh [--only-suite NAME]
+
+  (no arguments)      run every release-gate suite (local full run)
+  --only-suite NAME   run exactly one committed suite (one CI matrix leg)
+EOF
+}
+
+only_suite=""
+while (($#)); do
+  case "$1" in
+    --only-suite)
+      if (($# < 2)); then
+        printf 'FATAL: --only-suite needs a suite name\n' >&2
+        usage
+        exit 2
+      fi
+      only_suite="$2"
+      shift 2
+      ;;
+    -h | --help)
+      usage
+      exit 0
+      ;;
+    *)
+      printf 'FATAL: unknown argument: %s\n' "$1" >&2
+      usage
+      exit 2
+      ;;
+  esac
 done
+
+if [[ -n "${only_suite}" ]]; then
+  # Fail closed on an unknown suite. A typo in a CI matrix leg must not run
+  # nothing and be reported as a passing leg.
+  if ! printf '%s\n' "${SUITES[@]}" | grep -qxF "${only_suite}"; then
+    printf 'FATAL: %s is not a release-gate suite\n' "${only_suite}" >&2
+    usage
+    exit 2
+  fi
+  run_suite "${only_suite}"
+else
+  for suite in "${SUITES[@]}"; do
+    run_suite "${suite}"
+  done
+fi
 
 printf '\n==> summary\n'
 for line in "${results[@]}"; do

@@ -29,6 +29,7 @@ set -uo pipefail
 ROOT_DIR="${PO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 SUITE="${ROOT_DIR}/scripts/tests/release_workflow_test.sh"
 WORKFLOW="${ROOT_DIR}/.github/workflows/release.yml"
+CI="${ROOT_DIR}/.github/workflows/ci.yml"
 DRIVER="${ROOT_DIR}/scripts/tests/run_release_gate_tests.sh"
 
 WORK="$(mktemp -d)"
@@ -36,11 +37,13 @@ trap 'restore; rm -rf "${WORK}"' EXIT
 
 cp "${WORKFLOW}" "${WORK}/workflow.orig"
 cp "${SUITE}" "${WORK}/suite.orig"
+cp "${CI}" "${WORK}/ci.orig"
 cp "${DRIVER}" "${WORK}/driver.orig"
 
 restore() {
   cp "${WORK}/workflow.orig" "${WORKFLOW}"
   cp "${WORK}/suite.orig" "${SUITE}"
+  cp "${WORK}/ci.orig" "${CI}"
   cp "${WORK}/driver.orig" "${DRIVER}"
 }
 
@@ -1158,6 +1161,85 @@ mutate "the release-gate driver un-shards the iOS mutation pass" \
   "    ios_release_artifact_mutation_test.sh) printf '1' ;;" \
   "every shard of the sharded suite runs (the union is the full set)" \
   "${DRIVER}"
+
+echo "== the release-gate matrix and its aggregate actually gate =="
+
+# The gate is fanned out over one job per suite and aggregated by the single
+# required check. release_workflow_test.sh binds the matrix to the driver's own
+# SUITES list and executes the aggregate's result step; these mutations prove
+# each of those assertions bites.
+mutate "the suite matrix drops a suite the driver still runs" \
+  '          - ios_release_artifact_mutation_test.sh
+' \
+  '' \
+  "lists exactly the driver's SUITES" \
+  "${CI}"
+
+mutate "a matrix leg stops being bound to its own suite" \
+  'bash scripts/tests/run_release_gate_tests.sh --only-suite "${{ matrix.suite }}"' \
+  'bash scripts/tests/run_release_gate_tests.sh' \
+  "runs exactly its own suite" \
+  "${CI}"
+
+mutate "the aggregate stops running when a leg fails" \
+  '    if: ${{ !cancelled() }}
+' \
+  '' \
+  "runs even when a leg fails" \
+  "${CI}"
+
+mutate "the aggregate result step stops binding the legs' result" \
+  '        env:
+          RELEASE_GATE_SUITES_RESULT: ${{ needs.release-gate-suites.result }}
+' \
+  '' \
+  "binds needs.<matrix>.result" \
+  "${CI}"
+
+# The comparison is inverted, so the gate now accepts a failed leg. The
+# structural substring check still passes (the run text still contains `success`
+# and `exit 1`); only EXECUTING the step catches it. This is the mutation that
+# shows the behavioural assertion is load-bearing rather than a second spelling
+# of the same substring check.
+mutate "the aggregate accepts a failed leg (the comparison is inverted)" \
+  '          if [[ "${RELEASE_GATE_SUITES_RESULT}" != "success" ]]; then' \
+  '          if [[ "${RELEASE_GATE_SUITES_RESULT}" == "success" ]]; then' \
+  "fails a leg that failed" \
+  "${CI}"
+
+mutate "the aggregate hides a failed result behind continue-on-error" \
+  '      - name: Require every release-gate suite to have passed
+' \
+  '      - name: Require every release-gate suite to have passed
+        continue-on-error: true
+' \
+  "hides a failure behind continue-on-error" \
+  "${CI}"
+
+# A conjunct on the aggregate's `if:` is the subtle form of the same skip. The
+# pre-hardening assertion searched for the `!cancelled()` token, which
+# `!cancelled() && github.event_name != 'pull_request'` still contains -- so on a
+# pull_request event the single REQUIRED check is skipped, and GitHub reports a
+# skipped required job as Success. The exact-value comparison is what catches it.
+mutate "the aggregate's run condition gains a conjunct that can skip it on a pull_request" \
+  '    if: ${{ !cancelled() }}
+' \
+  '    if: ${{ !cancelled() && github.event_name != '\''pull_request'\'' }}
+' \
+  "runs even when a leg fails" \
+  "${CI}"
+
+# Job-level `continue-on-error` is the coarser version of the step-level hole
+# already covered above: GitHub marks the whole aggregate green even when a leg
+# failed, and the single REQUIRED check reports Success with the failure behind it.
+mutate "the aggregate job hides every failed leg behind a job-level continue-on-error" \
+  '    if: ${{ !cancelled() }}
+' \
+  '    if: ${{ !cancelled() }}
+    continue-on-error: true
+' \
+  "hides a failure behind continue-on-error" \
+  "${CI}"
 
 # The guard on everything above. Deriving the pins is only worth something while
 # it stays derived, and the way it rots is quiet: the harness keeps reporting a

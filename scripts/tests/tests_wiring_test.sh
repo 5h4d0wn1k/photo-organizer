@@ -414,5 +414,25 @@ else
   ok "no step runs \`bash -c true\` in place of a suite"
 fi
 
+# --- the release-artifact mutation-harness floor policy ----------------------
+# The release-artifact mutation harnesses are the ones the release gate fans out
+# across parallel CI legs. Each must declare a MIN_MUTATIONS floor so that
+# deleting a mutation -- or a shard filter that matches nothing -- turns the pass
+# red instead of quietly shrinking what the gate proves. This asserts the floor
+# exists; the harness itself asserts the floor is met at runtime.
+missing_floor=""
+for harness in "${TESTS_DIR}"/*_release_artifact_mutation_test.sh; do
+  [[ -e "${harness}" ]] || continue
+  if ! grep -q '^MIN_MUTATIONS=' "${harness}"; then
+    missing_floor+="$(basename "${harness}") "
+  fi
+done
+if [[ -n "${missing_floor// /}" ]]; then
+  no "every release-artifact mutation harness declares a MIN_MUTATIONS floor" \
+    "missing in: ${missing_floor}(without a floor a harness can lose coverage while staying green)"
+else
+  ok "every release-artifact mutation harness declares a MIN_MUTATIONS floor"
+fi
+
 printf '  %d passed, %d failed\n' "${PASS_COUNT}" "${FAIL_COUNT}"
 [[ ${FAIL_COUNT} -eq 0 ]]

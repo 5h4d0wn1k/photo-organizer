@@ -59,13 +59,40 @@ jobs:
   # The release gate decides whether an APK that users cannot install can reach
   # a release (issue #97). Its logic is shell, so it gets real tests here rather
   # than being trusted because it is "just CI glue".
-  release-gate:
-    name: Release gate (artifact + signing policy)
+  #
+  # The gate is fanned out over one job per suite (`release-gate-suites`, below)
+  # and `release-gate` is the single required check that aggregates them. A
+  # matrix leg is its own check name, so requiring the legs individually would
+  # mean adding a ruleset context every time a suite is added -- and a required
+  # check that is missing is a check that never blocks. One stable required
+  # context (`Release gate (artifact + signing policy)`) is kept while the work
+  # inside it runs in parallel. The suite list below must equal the driver's
+  # SUITES; scripts/tests/release_workflow_test.sh asserts exactly that, so a
+  # suite cannot be added to the driver and silently left out of CI.
+  release-gate-suites:
+    name: Release gate suite
     runs-on: ubuntu-latest
-    # The driver shards the iOS mutation pass, but the macOS mutation pass runs
-    # whole and is the long pole; this bound only needs to catch a hang, so it is
-    # generous rather than tight.
-    timeout-minutes: 60
+    # Each leg runs exactly one suite. The mutation legs shard internally: the
+    # driver starts every shard concurrently, so a leg is bounded by one shard
+    # (~10 minutes), not by the whole pass. The bound only needs to catch a hang.
+    timeout-minutes: 30
+    strategy:
+      # One failed leg must not cancel the others: the whole set has to report,
+      # so a single failure cannot hide a second, independent one.
+      fail-fast: false
+      matrix:
+        suite:
+          - release_workflow_test.sh
+          - android_release_signing_test.sh
+          - apksigner_gate_test.sh
+          - android_release_artifact_smoke_test.sh
+          - windows_release_artifact_smoke_test.sh
+          - linux_release_artifact_smoke_test.sh
+          - macos_release_artifact_smoke_test.sh
+          - macos_release_artifact_mutation_test.sh
+          - windows_release_artifact_mutation_test.sh
+          - ios_release_artifact_smoke_test.sh
+          - ios_release_artifact_mutation_test.sh
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       # Pin the interpreter rather than inheriting whatever python3 the runner
@@ -79,6 +106,38 @@ jobs:
       # Pinning 3.13 -- the newest minor with a wheel for this pin -- makes that
       # impossible, and makes a future runner image change unable to alter what
       # these suites run against.
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.13"
+      - name: Install hash-pinned test dependencies
+        run: |
+          set -euo pipefail
+          # --require-hashes verifies the digest of the artifact pip actually
+          # downloads; --only-binary=:all: forbids building from source. A suite
+          # must not install its own dependency at test time (issue #136): that
+          # made a required check's result depend on the network.
+          python -m pip install --disable-pip-version-check --require-hashes --only-binary=:all: \
+            -r scripts/requirements-test.txt
+      # The driver is the source of truth for the suite list, so a leg runs the
+      # same dispatcher a local full run uses, for exactly one suite. An unknown
+      # name is a hard error, so a typo cannot run nothing and report success.
+      - name: Run the release gate suite
+        run: bash scripts/tests/run_release_gate_tests.sh --only-suite "${{ matrix.suite }}"
+
+  # The aggregate. `needs:` alone is not enough: a job whose dependencies failed
+  # is SKIPPED, and a skipped required check is not a red one. `if:
+  # !cancelled()` makes this job run even when a leg failed, and the final step
+  # then refuses to report success unless every leg succeeded.
+  release-gate:
+    name: Release gate (artifact + signing policy)
+    needs: [release-gate-suites]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      # See the release-gate-suites job above for why the interpreter is pinned
+      # and why the install is hash-verified.
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.13"
@@ -123,21 +182,30 @@ jobs:
             scripts/tests/required_checks_test.sh \
             scripts/macos_release_artifact_smoke.sh \
             scripts/ios_release_artifact_smoke.sh \
+            scripts/windows_release_artifact_smoke.sh \
+            scripts/linux_release_artifact_smoke.sh \
             scripts/tests/macos_release_artifact_smoke_test.sh \
             scripts/tests/macos_release_artifact_mutation_test.sh \
             scripts/tests/ios_release_artifact_smoke_test.sh \
             scripts/tests/ios_release_artifact_mutation_test.sh \
-            scripts/windows_release_artifact_smoke.sh \
-            scripts/linux_release_artifact_smoke.sh \
-      # The driver runs every suite. Its two mutation passes each re-run their
-      # whole gate once per mutation (~1.5 hours serial, dominated by the iOS
-      # pass), so the driver shards the iOS pass internally and runs every shard
-      # concurrently -- same mutations, less wall time, and no way to skip one.
-      # The windows mutation pass is not a driver suite, so it is named here.
-      - name: Run the release gate tests
+            scripts/tests/windows_release_artifact_smoke_test.sh \
+            scripts/tests/windows_release_artifact_mutation_test.sh \
+            scripts/tests/linux_release_artifact_smoke_test.sh \
+      # This is what makes the required check mean "every release-gate suite
+      # passed": `needs.release-gate-suites.result` is `success` only when every
+      # matrix leg succeeded. A failed leg makes it `failure`; a leg skipped
+      # because the whole run was cancelled is already excluded by the job's
+      # `if: !cancelled()`.
+      - name: Require every release-gate suite to have passed
+        env:
+          RELEASE_GATE_SUITES_RESULT: ${{ needs.release-gate-suites.result }}
         run: |
-          bash scripts/tests/run_release_gate_tests.sh
-          bash scripts/tests/windows_release_artifact_mutation_test.sh
+          set -euo pipefail
+          if [[ "${RELEASE_GATE_SUITES_RESULT}" != "success" ]]; then
+            printf '::error::the release-gate suites did not all pass (result: %s); refusing to report the release gate green\n' "${RELEASE_GATE_SUITES_RESULT}" >&2
+            exit 1
+          fi
+          printf 'every release-gate suite passed\n'
 
   security:
     name: Security gates
