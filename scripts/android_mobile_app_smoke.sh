@@ -83,7 +83,8 @@ node_bounds_for_text() {
 tap_text() {
   local serial="$1"
   local text="$2"
-  local dump_file="${TMP_DIR}/$(tr -c 'A-Za-z0-9._-' '_' <<<"${serial}")-window.xml"
+  local dump_file
+  dump_file="${TMP_DIR}/$(tr -c 'A-Za-z0-9._-' '_' <<<"${serial}")-window.xml"
   local bounds=""
   for _ in {1..12}; do
     dump_ui "${serial}" "${dump_file}" || true
@@ -104,7 +105,8 @@ tap_text() {
 wait_for_any_text() {
   local serial="$1"
   shift
-  local dump_file="${TMP_DIR}/$(tr -c 'A-Za-z0-9._-' '_' <<<"${serial}")-wait.xml"
+  local dump_file
+  dump_file="${TMP_DIR}/$(tr -c 'A-Za-z0-9._-' '_' <<<"${serial}")-wait.xml"
   for _ in {1..30}; do
     dump_ui "${serial}" "${dump_file}" || true
     for expected in "$@"; do

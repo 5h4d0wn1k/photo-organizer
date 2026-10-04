@@ -16,7 +16,7 @@ concurrency:
 jobs:
   rust:
     name: Rust service
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 50
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -35,7 +35,7 @@ jobs:
 
   flutter:
     name: Flutter app
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     defaults:
       run:
@@ -59,10 +59,40 @@ jobs:
   # The release gate decides whether an APK that users cannot install can reach
   # a release (issue #97). Its logic is shell, so it gets real tests here rather
   # than being trusted because it is "just CI glue".
-  release-gate:
-    name: Release gate (artifact + signing policy)
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
+  #
+  # The gate is fanned out over one job per suite (`release-gate-suites`, below)
+  # and `release-gate` is the single required check that aggregates them. A
+  # matrix leg is its own check name, so requiring the legs individually would
+  # mean adding a ruleset context every time a suite is added -- and a required
+  # check that is missing is a check that never blocks. One stable required
+  # context (`Release gate (artifact + signing policy)`) is kept while the work
+  # inside it runs in parallel. The suite list below must equal the driver's
+  # SUITES; scripts/tests/release_workflow_test.sh asserts exactly that, so a
+  # suite cannot be added to the driver and silently left out of CI.
+  release-gate-suites:
+    name: Release gate suite
+    runs-on: ubuntu-24.04
+    # Each leg runs exactly one suite. The mutation legs shard internally: the
+    # driver starts every shard concurrently, so a leg is bounded by one shard
+    # (~10 minutes), not by the whole pass. The bound only needs to catch a hang.
+    timeout-minutes: 30
+    strategy:
+      # One failed leg must not cancel the others: the whole set has to report,
+      # so a single failure cannot hide a second, independent one.
+      fail-fast: false
+      matrix:
+        suite:
+          - release_workflow_test.sh
+          - android_release_signing_test.sh
+          - apksigner_gate_test.sh
+          - android_release_artifact_smoke_test.sh
+          - windows_release_artifact_smoke_test.sh
+          - linux_release_artifact_smoke_test.sh
+          - macos_release_artifact_smoke_test.sh
+          - macos_release_artifact_mutation_test.sh
+          - windows_release_artifact_mutation_test.sh
+          - ios_release_artifact_smoke_test.sh
+          - ios_release_artifact_mutation_test.sh
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       # Pin the interpreter rather than inheriting whatever python3 the runner
@@ -76,7 +106,39 @@ jobs:
       # Pinning 3.13 -- the newest minor with a wheel for this pin -- makes that
       # impossible, and makes a future runner image change unable to alter what
       # these suites run against.
-      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.13"
+      - name: Install hash-pinned test dependencies
+        run: |
+          set -euo pipefail
+          # --require-hashes verifies the digest of the artifact pip actually
+          # downloads; --only-binary=:all: forbids building from source. A suite
+          # must not install its own dependency at test time (issue #136): that
+          # made a required check's result depend on the network.
+          python -m pip install --disable-pip-version-check --require-hashes --only-binary=:all: \
+            -r scripts/requirements-test.txt
+      # The driver is the source of truth for the suite list, so a leg runs the
+      # same dispatcher a local full run uses, for exactly one suite. An unknown
+      # name is a hard error, so a typo cannot run nothing and report success.
+      - name: Run the release gate suite
+        run: bash scripts/tests/run_release_gate_tests.sh --only-suite "${{ matrix.suite }}"
+
+  # The aggregate. `needs:` alone is not enough: a job whose dependencies failed
+  # is SKIPPED, and a skipped required check is not a red one. `if:
+  # !cancelled()` makes this job run even when a leg failed, and the final step
+  # then refuses to report success unless every leg succeeded.
+  release-gate:
+    name: Release gate (artifact + signing policy)
+    needs: [release-gate-suites]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      # See the release-gate-suites job above for why the interpreter is pinned
+      # and why the install is hash-verified.
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: "3.13"
       - name: Install hash-pinned test dependencies
@@ -96,34 +158,32 @@ jobs:
           # are not treated as failures because shellcheck's rule set shifts
           # between releases, which would make this job fail for reasons that
           # have nothing to do with the artifact gate.
-          shellcheck --severity=warning \
-            scripts/android_release_signing.sh \
-            scripts/android_release_artifact_smoke.sh \
-            scripts/android_release_verify_signature.sh \
-            scripts/production-readiness-check.sh \
-            scripts/dev-check.sh \
-            scripts/tests/release_workflow_test.sh \
-            scripts/tests/android_release_signing_test.sh \
-            scripts/tests/apksigner_gate_test.sh \
-            scripts/tests/android_release_artifact_smoke_test.sh \
-            scripts/tests/run_release_gate_tests.sh \
-            scripts/tests/gen_test_requirements_test.sh \
-            scripts/tests/suites_offline_test.sh \
-            scripts/tests/workflow_hygiene_test.sh \
-            scripts/tests/workflow_hygiene_mutation_test.sh \
-            scripts/tests/gen_test_requirements_mutation_test.sh \
-            scripts/tests/tests_wiring_test.sh \
-            scripts/tests/tests_wiring_mutation_test.sh \
-            scripts/tests/release_atomic_publish_mutation_test.sh \
-            scripts/tests/project_board_workflow_test.sh \
-            scripts/tests/project_board_workflow_mutation_test.sh \
-            scripts/tests/required_checks_test.sh
-      - name: Run the release gate tests
-        run: bash scripts/tests/run_release_gate_tests.sh
+          # Lint every script under scripts/, not a hand-maintained list. The
+          # hand-list rotted: it omitted the two android_mobile smoke scripts,
+          # which then carried SC2155/SC2034 warnings no check could see. `find`
+          # rather than a glob so a script added in a new subdirectory is covered
+          # too, and no future script can be silently left unlinted.
+          mapfile -t gate_scripts < <(find scripts -name '*.sh' -type f | sort)
+          shellcheck --severity=warning "${gate_scripts[@]}"
+      # This is what makes the required check mean "every release-gate suite
+      # passed": `needs.release-gate-suites.result` is `success` only when every
+      # matrix leg succeeded. A failed leg makes it `failure`; a leg skipped
+      # because the whole run was cancelled is already excluded by the job's
+      # `if: !cancelled()`.
+      - name: Require every release-gate suite to have passed
+        env:
+          RELEASE_GATE_SUITES_RESULT: ${{ needs.release-gate-suites.result }}
+        run: |
+          set -euo pipefail
+          if [[ "${RELEASE_GATE_SUITES_RESULT}" != "success" ]]; then
+            printf '::error::the release-gate suites did not all pass (result: %s); refusing to report the release gate green\n' "${RELEASE_GATE_SUITES_RESULT}" >&2
+            exit 1
+          fi
+          printf 'every release-gate suite passed\n'
 
   security:
     name: Security gates
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -131,7 +191,7 @@ jobs:
           fetch-depth: 0
       # See the identical step in the release-gate job for why the interpreter
       # is pinned and why the install is hash-verified.
-      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: "3.13"
       - name: Install hash-pinned test dependencies

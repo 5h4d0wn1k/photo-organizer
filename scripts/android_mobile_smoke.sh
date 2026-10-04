@@ -2,7 +2,6 @@
 
 set -euo pipefail
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 HOST_BASE_URL="${PRIVATE_GALLERY_SMOKE_HOST_BASE_URL:-http://127.0.0.1:4821}"
 DEVICE_BASE_URL="${PRIVATE_GALLERY_SMOKE_DEVICE_BASE_URL:-http://127.0.0.1:4821}"
 LIBRARY_ROOT="${PRIVATE_GALLERY_SMOKE_LIBRARY_ROOT:-/tmp/private-gallery-android-smoke-library}"
@@ -423,7 +422,8 @@ upload_payload_chunks() {
     if [[ "${remaining}" -lt "${this_chunk}" ]]; then
       this_chunk="${remaining}"
     fi
-    local chunk_file="${TMP_DIR}/$(sanitize_id "${serial}")-${label}-chunk-${chunk_index}.bin"
+    local chunk_file
+    chunk_file="${TMP_DIR}/$(sanitize_id "${serial}")-${label}-chunk-${chunk_index}.bin"
     dd if="${payload_file}" of="${chunk_file}" bs=1 skip="${offset}" count="${this_chunk}" status=none
     local response_file
     response_file="$(push_chunk_and_put "${serial}" "${bearer}" "${upload_id}" "${offset}" "${chunk_file}" "${label}-${chunk_index}")"
@@ -496,7 +496,6 @@ declare -A SAFE_SERIAL_BY_SERIAL
 declare -A BEARER_BY_SERIAL
 declare -A DEVICE_ID_BY_SERIAL
 declare -A ASSET_ID_BY_SERIAL
-declare -A PAYLOAD_FILE_BY_SERIAL
 declare -A PAYLOAD_HASH_BY_SERIAL
 declare -A PAYLOAD_BYTES_BY_SERIAL
 declare -A SEARCH_LABEL_BY_SERIAL
@@ -590,7 +589,6 @@ for serial in "${DEVICE_SERIALS[@]}"; do
   make_payload_file "${serial}" "${safe_model}" "${payload_file}" "${label}"
   payload_hash="$(sha256sum "${payload_file}" | awk '{print $1}')"
   payload_bytes="$(wc -c <"${payload_file}" | tr -d ' ')"
-  PAYLOAD_FILE_BY_SERIAL["${serial}"]="${payload_file}"
   PAYLOAD_HASH_BY_SERIAL["${serial}"]="${payload_hash}"
   PAYLOAD_BYTES_BY_SERIAL["${serial}"]="${payload_bytes}"
 

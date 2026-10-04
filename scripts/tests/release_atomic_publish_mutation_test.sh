@@ -29,16 +29,22 @@ set -uo pipefail
 ROOT_DIR="${PO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 SUITE="${ROOT_DIR}/scripts/tests/release_workflow_test.sh"
 WORKFLOW="${ROOT_DIR}/.github/workflows/release.yml"
+CI="${ROOT_DIR}/.github/workflows/ci.yml"
+DRIVER="${ROOT_DIR}/scripts/tests/run_release_gate_tests.sh"
 
 WORK="$(mktemp -d)"
 trap 'restore; rm -rf "${WORK}"' EXIT
 
 cp "${WORKFLOW}" "${WORK}/workflow.orig"
 cp "${SUITE}" "${WORK}/suite.orig"
+cp "${CI}" "${WORK}/ci.orig"
+cp "${DRIVER}" "${WORK}/driver.orig"
 
 restore() {
   cp "${WORK}/workflow.orig" "${WORKFLOW}"
   cp "${WORK}/suite.orig" "${SUITE}"
+  cp "${WORK}/ci.orig" "${CI}"
+  cp "${WORK}/driver.orig" "${DRIVER}"
 }
 
 # apply <file> <old> <new> -- replace exactly one occurrence, then read the file
@@ -683,20 +689,20 @@ mutate "the Linux attestation step is silently replaced by a checkout, so a step
 mutate "the publish job runs even when a dependency failed (job level, literal form)" \
   '  release:
     name: Publish release
-    runs-on: ubuntu-latest' \
+    runs-on: ubuntu-24.04' \
   '  release:
     name: Publish release
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     if: always()' \
   "must carry no job-level"
 
 mutate "the publish job runs even when a dependency failed (job level, expression form)" \
   '  release:
     name: Publish release
-    runs-on: ubuntu-latest' \
+    runs-on: ubuntu-24.04' \
   '  release:
     name: Publish release
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     if: ${{ always() }}' \
   "must carry no job-level"
 
@@ -704,20 +710,20 @@ mutate "the publish job runs even when a dependency failed (job level, expressio
 mutate "the publish job runs when a dependency failed via !cancelled(), which is not the string always()" \
   '  release:
     name: Publish release
-    runs-on: ubuntu-latest' \
+    runs-on: ubuntu-24.04' \
   '  release:
     name: Publish release
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     if: ${{ !cancelled() }}' \
   "must carry no job-level"
 
 mutate "always() is hidden inside a compound condition" \
   '  release:
     name: Publish release
-    runs-on: ubuntu-latest' \
+    runs-on: ubuntu-24.04' \
   '  release:
     name: Publish release
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     if: "${{ success() || failure() }}"' \
   "must carry no job-level"
 
@@ -738,7 +744,7 @@ mutate "the publish step runs even when the staging step refused (step level)" \
 mutate "a job depends on \`release\`, the terminal publisher" \
   '  release-signing-preflight:' \
   '  debug-consumer:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs:
       - release
     steps:
@@ -783,14 +789,14 @@ mutate "the release body drops the ephemeral-key warning" \
 # used the step name and matched zero times.
 mutate "the preflight stops publishing signing_mode to the release body" \
   '    name: Android release signing preflight
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
       contents: read
     outputs:
       signing_mode: ${{ steps.signing.outputs.mode }}' \
   '    name: Android release signing preflight
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
       contents: read
@@ -830,13 +836,16 @@ mutate "a long platform build stops waiting for the fast-fail preflight" \
 
 echo "== every upstream gates the publication =="
 
-for upstream in release-signing-preflight linux windows macos ios android-verify; do
+for upstream in release-signing-preflight linux linux-smoke windows windows-smoke macos macos-smoke ios android-verify; do
   mutate "\`release\` stops needing \`${upstream}\`" \
     "    needs:
       - release-signing-preflight
       - linux
+      - linux-smoke
       - windows
+      - windows-smoke
       - macos
+      - macos-smoke
       - ios
       - android-verify" \
     "$(python3 - "${upstream}" <<'PYTHON'
@@ -846,8 +855,11 @@ drop = sys.argv[1]
 entries = [
     "release-signing-preflight",
     "linux",
+    "linux-smoke",
     "windows",
+    "windows-smoke",
     "macos",
+    "macos-smoke",
     "ios",
     "android-verify",
 ]
@@ -858,14 +870,79 @@ PYTHON
     "\`release\` must need \`${upstream}\`"
 done
 
+# The Linux/Windows smoke jobs shipped without being listed in `release.needs`,
+# so they ran and went red while `release` still published. The loop above proves
+# the gating; the assertions below prove each smoke job still points at its own
+# gate script and depends only on the build it consumes. Without these, a smoke
+# job could be reduced to `run: true` and stay in `needs`, gating nothing.
+mutate "the linux-smoke job stops running its gate script" \
+  '          bash scripts/linux_release_artifact_smoke.sh linux-artifacts' \
+  '          true' \
+  "\`linux-smoke\` must run \`scripts/linux_release_artifact_smoke.sh\`"
+
+mutate "the windows-smoke job stops running its gate script" \
+  '          bash scripts/windows_release_artifact_smoke.sh "${ZIP}"' \
+  '          true' \
+  "\`windows-smoke\` must run \`scripts/windows_release_artifact_smoke.sh\`"
+
+mutate "the macos-smoke job stops running its gate script" \
+  '          bash scripts/macos_release_artifact_smoke.sh "${DMG}"' \
+  '          true' \
+  "\`macos-smoke\` must run \`scripts/macos_release_artifact_smoke.sh\`"
+
+mutate "the ios job stops running the simulator gate" \
+  '          bash scripts/ios_release_artifact_smoke.sh "app/build/ios/iphonesimulator/Runner.app"' \
+  '          true' \
+  "the \`ios\` job must invoke \`scripts/ios_release_artifact_smoke.sh\`"
+
+# The pieces that make the iOS gate mean something: a host daemon, a session
+# injected into the debug build, a probe tied to an app-only path, and a
+# simulator slice `simctl` can install. Each is separately load-bearing -- drop
+# one and the gate fails closed and blocks the release, but the workflow suite
+# would not notice the regression without these.
+mutate "the ios job stops starting the host daemon it probes" \
+  '          target/release/galleryd >"${WORK}/galleryd.log" 2>&1 &' \
+  '          "${SOME_OTHER_DAEMON}" >"${WORK}/galleryd.log" 2>&1 &' \
+  "the \`ios\` job must start a host galleryd"
+
+mutate "the ios job stops injecting the debug session" \
+  '          export IOS_SMOKE_LAUNCH_ARGUMENTS="--private-gallery-desktop-url ${BASE} --private-gallery-bearer-token ${bearer}"' \
+  '          export SESSION_ARGS_FOR_THE_GATE="--private-gallery-desktop-url ${BASE} --private-gallery-bearer-token ${bearer}"' \
+  "the \`ios\` job must set IOS_SMOKE_LAUNCH_ARGUMENTS"
+
+mutate "the ios job stops supplying a backend probe" \
+  '          export IOS_SMOKE_BACKEND_PROBE="${probe}"' \
+  '          export BACKEND_PROBE_PATH="${probe}"' \
+  "the \`ios\` job must set IOS_SMOKE_BACKEND_PROBE"
+
+mutate "the ios job stops building the simulator slice the gate can install" \
+  '          flutter build ios --simulator' \
+  '          flutter build ios --release' \
+  "the \`ios\` job must build the simulator slice"
+
+mutate "the macos-smoke job stops depending on the macOS build it consumes" \
+  '  macos-smoke:
+    name: macOS install+launch smoke
+    runs-on: macos-latest
+    timeout-minutes: 45
+    needs: macos' \
+  '  macos-smoke:
+    name: macOS install+launch smoke
+    runs-on: macos-latest
+    timeout-minutes: 45' \
+  "\`macos-smoke\` must need only \`macos\`"
+
 # `if: always()` is what #82 proposed and is the exact opposite of atomic
 # publication: it runs the publish job even when a dependency failed.
 mutate "the publish job runs even when a dependency failed" \
   '    needs:
       - release-signing-preflight
       - linux
+      - linux-smoke
       - windows
+      - windows-smoke
       - macos
+      - macos-smoke
       - ios
       - android-verify
     permissions:
@@ -873,8 +950,11 @@ mutate "the publish job runs even when a dependency failed" \
   '    needs:
       - release-signing-preflight
       - linux
+      - linux-smoke
       - windows
+      - windows-smoke
       - macos
+      - macos-smoke
       - ios
       - android-verify
     if: always()
@@ -1048,7 +1128,7 @@ mutate "a second job publishes through the gh CLI instead of the release action"
   '  release-signing-preflight:' \
   '  sneaky-publish:
     name: Sneaky publish
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
     steps:
@@ -1069,6 +1149,97 @@ mutate "the preflight stops using the shared signing policy script" \
   '          mode="$(bash scripts/android_release_signing.sh mode | tail -n 1)"' \
   '          mode="release"' \
   "the preflight must resolve signing through the shared policy script"
+
+echo "== the release-gate driver runs every shard of its sharded pass =="
+
+# The driver splits the iOS mutation pass across concurrent shards and the probe
+# in release_workflow_test.sh pins the union of those shards. Collapsing the pass
+# to one shard must turn that assertion red, or the probe's "the union is the
+# full set" line could be vacuous -- green because no shard ran at all.
+mutate "the release-gate driver un-shards the iOS mutation pass" \
+  "    ios_release_artifact_mutation_test.sh) printf '8' ;;" \
+  "    ios_release_artifact_mutation_test.sh) printf '1' ;;" \
+  "every shard of the sharded suite runs (the union is the full set)" \
+  "${DRIVER}"
+
+echo "== the release-gate matrix and its aggregate actually gate =="
+
+# The gate is fanned out over one job per suite and aggregated by the single
+# required check. release_workflow_test.sh binds the matrix to the driver's own
+# SUITES list and executes the aggregate's result step; these mutations prove
+# each of those assertions bites.
+mutate "the suite matrix drops a suite the driver still runs" \
+  '          - ios_release_artifact_mutation_test.sh
+' \
+  '' \
+  "lists exactly the driver's SUITES" \
+  "${CI}"
+
+mutate "a matrix leg stops being bound to its own suite" \
+  'bash scripts/tests/run_release_gate_tests.sh --only-suite "${{ matrix.suite }}"' \
+  'bash scripts/tests/run_release_gate_tests.sh' \
+  "runs exactly its own suite" \
+  "${CI}"
+
+mutate "the aggregate stops running when a leg fails" \
+  '    if: ${{ !cancelled() }}
+' \
+  '' \
+  "runs even when a leg fails" \
+  "${CI}"
+
+mutate "the aggregate result step stops binding the legs' result" \
+  '        env:
+          RELEASE_GATE_SUITES_RESULT: ${{ needs.release-gate-suites.result }}
+' \
+  '' \
+  "binds needs.<matrix>.result" \
+  "${CI}"
+
+# The comparison is inverted, so the gate now accepts a failed leg. The
+# structural substring check still passes (the run text still contains `success`
+# and `exit 1`); only EXECUTING the step catches it. This is the mutation that
+# shows the behavioural assertion is load-bearing rather than a second spelling
+# of the same substring check.
+mutate "the aggregate accepts a failed leg (the comparison is inverted)" \
+  '          if [[ "${RELEASE_GATE_SUITES_RESULT}" != "success" ]]; then' \
+  '          if [[ "${RELEASE_GATE_SUITES_RESULT}" == "success" ]]; then' \
+  "fails a leg that failed" \
+  "${CI}"
+
+mutate "the aggregate hides a failed result behind continue-on-error" \
+  '      - name: Require every release-gate suite to have passed
+' \
+  '      - name: Require every release-gate suite to have passed
+        continue-on-error: true
+' \
+  "hides a failure behind continue-on-error" \
+  "${CI}"
+
+# A conjunct on the aggregate's `if:` is the subtle form of the same skip. The
+# pre-hardening assertion searched for the `!cancelled()` token, which
+# `!cancelled() && github.event_name != 'pull_request'` still contains -- so on a
+# pull_request event the single REQUIRED check is skipped, and GitHub reports a
+# skipped required job as Success. The exact-value comparison is what catches it.
+mutate "the aggregate's run condition gains a conjunct that can skip it on a pull_request" \
+  '    if: ${{ !cancelled() }}
+' \
+  '    if: ${{ !cancelled() && github.event_name != '\''pull_request'\'' }}
+' \
+  "runs even when a leg fails" \
+  "${CI}"
+
+# Job-level `continue-on-error` is the coarser version of the step-level hole
+# already covered above: GitHub marks the whole aggregate green even when a leg
+# failed, and the single REQUIRED check reports Success with the failure behind it.
+mutate "the aggregate job hides every failed leg behind a job-level continue-on-error" \
+  '    if: ${{ !cancelled() }}
+' \
+  '    if: ${{ !cancelled() }}
+    continue-on-error: true
+' \
+  "hides a failure behind continue-on-error" \
+  "${CI}"
 
 # The guard on everything above. Deriving the pins is only worth something while
 # it stays derived, and the way it rots is quiet: the harness keeps reporting a

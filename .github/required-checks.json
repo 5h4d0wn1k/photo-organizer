@@ -18,16 +18,20 @@
     },
     {
       "context": "Release gate (artifact + signing policy)",
-      "source": "ci.yml job 'release-gate', added by PR #100",
-      "why": "Move to required[] when #100 merges: the gate that decides what ships must never be advisory."
+      "source": "ci.yml job 'release-gate', required by PR #100",
+      "why": "The gate that decides what ships must never be advisory: this one context fans out over every platform artifact leg and the signing policy, and fails unless all of them pass."
     },
     {
       "context": "Dependency review",
-      "source": "dependency-review.yml, already passing",
-      "why": "Move to required[] when #100 merges: dependency changes must not land unreviewed."
+      "source": "dependency-review.yml, required by PR #100",
+      "why": "Dependency changes must not land unreviewed."
     }
   ],
   "advisory": [
+    {
+      "context": "Release gate suite",
+      "reason": "The release-gate matrix legs (one suite per runner). Not required individually: the aggregate `Release gate (artifact + signing policy)` is the single required context and fails unless every leg succeeds, so adding a suite never needs a ruleset change."
+    },
     {
       "context": "label",
       "reason": "Cosmetic. A mislabeled PR says nothing about correctness."

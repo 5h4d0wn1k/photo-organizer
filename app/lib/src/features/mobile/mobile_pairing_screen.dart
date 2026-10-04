@@ -192,7 +192,7 @@ class _MobilePairingScreenState extends State<MobilePairingScreen> {
   }
 
   void _configureLaunchInviteChannel() {
-    if (!Platform.isAndroid) {
+    if (!Platform.isAndroid && !Platform.isIOS) {
       return;
     }
     _launchInviteChannel.setMethodCallHandler((call) async {
@@ -203,7 +203,7 @@ class _MobilePairingScreenState extends State<MobilePairingScreen> {
   }
 
   Future<void> _consumeInitialLaunchInvite() async {
-    if (!Platform.isAndroid) {
+    if (!Platform.isAndroid && !Platform.isIOS) {
       return;
     }
     try {
@@ -254,7 +254,7 @@ class _MobilePairingScreenState extends State<MobilePairingScreen> {
         _bearerToken = bearerToken;
         _pendingInvite = null;
         _mode = _MobileOnboardingMode.paired;
-        _status = 'Debug device session loaded for ${deviceName ?? 'Android'}.';
+        _status = 'Debug device session loaded for ${deviceName ?? (Platform.isIOS ? 'iPhone' : 'Android')}.';
       });
       await _refreshMobileGallery();
       return;

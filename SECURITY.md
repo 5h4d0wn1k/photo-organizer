@@ -30,7 +30,8 @@ Before any beta build:
 - Rust format, clippy, tests, dependency audit, and SBOM generation must pass.
 - Flutter analyze and tests must pass.
 - Mobile sessions must support expiry and revocation.
-- Remote clients must be limited to `/health` and authenticated `/mobile/*`.
+- Remote clients must be limited to `/health`, static `/local-web/*` assets, and
+  authenticated `/mobile/*`.
 - Backup/restore verification must include encrypted vault chunks.
 
 ## Disclosure Timeline

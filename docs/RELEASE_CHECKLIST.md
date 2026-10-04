@@ -43,7 +43,7 @@
 ## Functional Smoke
 
 - Linux daemon starts on loopback.
-- Remote mobile mode only exposes `/health` and authenticated `/mobile/*`.
+- Remote mobile mode only exposes `/health`, static `/local-web/*` assets, and authenticated `/mobile/*`.
 - Two authorized Android phones can pair through Tailscale/HTTPS or an explicitly enabled LAN development URL.
 - `scripts/android_mobile_smoke.sh` passes with `PRIVATE_GALLERY_SMOKE_REQUIRE_DEVICE_COUNT=2`.
 - Android can upload synthetic media larger than Axum's historical default body limit through offset chunks.
@@ -61,7 +61,7 @@
 - The published APK is signature-verified with `apksigner` (APK Signature Scheme v2 and v3 asserted explicitly) before it can be published. v1/JAR signing is off because minSdk is 24.
 - The exact published APK is installed, cold-launched, and proven to render a stable, visually-complex frame on real Android system images (API 30 and API 35) with a clean crash buffer and no adverse `ApplicationExitInfo`, before the APK can be attached to the release. Screenshot, crash buffer, exit-info and logcat are retained as release evidence; a missing evidence directory fails the job rather than passing quietly.
 - Two limits are known and are not regressions. The images are x86_64, so the arm64-v8a and armeabi-v7a slices are checked structurally from the archive and never installed on arm hardware; and on API 31+ the system splash is drawn inside the app's own window, so a stable focused frame cannot be distinguished from the splash. Both are recorded in `AGENTS.md` and in the runbook's *What this does not prove*.
-- This gate covers the APK only. The Linux, Windows, macOS and iOS artifacts are not install-tested in CI (issue #98). Do not describe them as gated.
+- Every platform artifact is install/launch-gated in CI before publication: Android on real system images, Linux under Xvfb, Windows natively, macOS by mounting the published DMG, and iOS by installing/launching the simulator slice and proving it reaches a host backend. The Android arm-hardware and API 31+ splash limits above still apply. The iOS device `.app` is built and packaged but not install-tested (`simctl` cannot install an `iphoneos` bundle), and the desktop gates prove install/launch/process health, not feature behaviour (issue #98 tracks the remaining manual surfaces).
 - One real camera-roll item per phone is intentionally uploaded and visible from the other phone and laptop.
 
 ## Data Protection

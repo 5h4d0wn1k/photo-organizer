@@ -48,12 +48,18 @@ cp "${DRIVER}" "${WORK}/driver.orig"
 cp "${MAKEFILE}" "${WORK}/make.orig"
 cp "${SUITE}" "${WORK}/suite.orig"
 
+# The floor-policy mutation below edits a real release-artifact mutation harness,
+# so it is backed up here and restored by `restore()` like every other subject.
+FLOOR_SUBJECT="${ROOT_DIR}/scripts/tests/macos_release_artifact_mutation_test.sh"
+cp "${FLOOR_SUBJECT}" "${WORK}/floor.orig"
+
 restore() {
   cp "${WORK}/ci.orig" "${CI}"
   cp "${WORK}/project.orig" "${PROJECT}"
   cp "${WORK}/driver.orig" "${DRIVER}"
   cp "${WORK}/make.orig" "${MAKEFILE}"
   cp "${WORK}/suite.orig" "${SUITE}"
+  [[ -f "${WORK}/floor.orig" ]] && cp "${WORK}/floor.orig" "${FLOOR_SUBJECT}"
   rm -f "${SCRATCH_SUITE:-}"
 }
 
@@ -236,6 +242,13 @@ mutate "the release-gate driver's suite list is emptied" \
   android_release_signing_test.sh
   apksigner_gate_test.sh
   android_release_artifact_smoke_test.sh
+  windows_release_artifact_smoke_test.sh
+  linux_release_artifact_smoke_test.sh
+  macos_release_artifact_smoke_test.sh
+  macos_release_artifact_mutation_test.sh
+  windows_release_artifact_mutation_test.sh
+  ios_release_artifact_smoke_test.sh
+  ios_release_artifact_mutation_test.sh
 )' \
   'SUITES=()' \
   "release_workflow_test.sh is executed by a CI step"
@@ -244,7 +257,7 @@ mutate "the release-gate driver's suite list is emptied" \
 # being in a required check.
 mutate "no workflow invokes the release-gate driver" \
   "${CI}" \
-  '        run: bash scripts/tests/run_release_gate_tests.sh' \
+  '        run: bash scripts/tests/run_release_gate_tests.sh --only-suite "${{ matrix.suite }}"' \
   '        run: bash -c true' \
   "the release-gate driver is invoked by a workflow"
 
@@ -356,6 +369,35 @@ else
   else
     MUTATIONS_BITING=$((MUTATIONS_BITING + 1))
     printf '  bites  %s\n' "${compound}"
+  fi
+fi
+restore
+
+echo "== the mutation-harness floor policy =="
+
+# The release-artifact mutation harnesses need a MIN_MUTATIONS floor: without it a
+# deleted mutation leaves the pass green on a smaller set. Removing the floor from
+# a real harness must turn the wiring suite red on the floor assertion and nothing
+# else. The line is removed rather than reworded so the harness's own
+# `DECLARED_MUTATIONS < MIN_MUTATIONS` check cannot stand in for the policy.
+MUTATIONS_RUN=$((MUTATIONS_RUN + 1))
+restore
+if ! floor_line="$(grep -m1 '^MIN_MUTATIONS=' "${FLOOR_SUBJECT}")"; then
+  mismatches+=("a mutation harness loses its MIN_MUTATIONS floor: no floor line to remove")
+elif ! apply "${FLOOR_SUBJECT}" "${floor_line}" 'MIN_MUTATIONS_REMOVED=0' >/dev/null 2>&1; then
+  mismatches+=("a mutation harness loses its MIN_MUTATIONS floor: could not apply the mutation")
+elif ! preflight "${FLOOR_SUBJECT}"; then
+  mismatches+=("a mutation harness loses its MIN_MUTATIONS floor: INVALID MUTATION -- it breaks the harness")
+else
+  out="$(PYTHONDONTWRITEBYTECODE=1 bash "${SUITE}" 2>&1)"
+  if [[ $? -eq 0 ]]; then
+    mismatches+=("a mutation harness loses its MIN_MUTATIONS floor: SUITE STILL PASSED")
+  elif ! needle_matches "${out}" "every release-artifact mutation harness declares a MIN_MUTATIONS floor"; then
+    mismatches+=("a mutation harness loses its MIN_MUTATIONS floor: went red but not on the floor assertion")
+    mismatches+=("        saw: $(grep -E '^  FAIL ' <<<"${out}" | head -3 | tr '\n' ' ')")
+  else
+    MUTATIONS_BITING=$((MUTATIONS_BITING + 1))
+    printf '  bites  %s\n' "a mutation harness loses its MIN_MUTATIONS floor"
   fi
 fi
 restore

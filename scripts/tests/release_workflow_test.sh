@@ -208,8 +208,11 @@ publish_with = publish_step.get("with") or {}
 for upstream in (
     "release-signing-preflight",
     "linux",
+    "linux-smoke",
     "windows",
+    "windows-smoke",
     "macos",
+    "macos-smoke",
     "ios",
     "android-verify",
 ):
@@ -220,6 +223,61 @@ for upstream in (
 expect(
     len(needs_of("release")) == len(set(needs_of("release"))),
     "`release` lists a dependency twice",
+)
+
+# --- every artifact with a smoke gate must actually be gated ------------------
+# The Linux and Windows gate jobs below were added without listing them in
+# `release.needs`, so they *ran* and reported failure while `release` still
+# published. A gate that does not gate publication is a comment. Each smoke job
+# must (a) depend only on the build job whose bytes it consumes, and (b) invoke
+# its committed gate script, and (c) block `release`.
+for smoke_job, build_job, gate_script in (
+    ("linux-smoke", "linux", "scripts/linux_release_artifact_smoke.sh"),
+    ("windows-smoke", "windows", "scripts/windows_release_artifact_smoke.sh"),
+    ("macos-smoke", "macos", "scripts/macos_release_artifact_smoke.sh"),
+):
+    expect(
+        sorted(needs_of(smoke_job)) == [build_job],
+        f"`{smoke_job}` must need only `{build_job}`",
+    )
+    expect(
+        gate_script in runs_of(smoke_job),
+        f"`{smoke_job}` must run `{gate_script}`",
+    )
+# iOS is install/launch-gated in the release path, with a real backend.
+#
+# `scripts/ios_release_artifact_smoke.sh` is fail-closed on
+# `IOS_SMOKE_BACKEND_PROBE`: it refuses to report success unless the launched app
+# can be shown to reach a backend. iOS forbids an app from spawning galleryd, so
+# the `ios` job supplies a host daemon, injects the session into the debug build
+# through `IOS_SMOKE_LAUNCH_ARGUMENTS`, and proves the app reached it. If any
+# piece is dropped the gate fails closed and blocks the release, which is the
+# point: an ungated iOS artifact must not ship as "verified".
+ios_runs = runs_of("ios")
+expect(
+    "ios_release_artifact_smoke.sh" in ios_runs,
+    "the `ios` job must invoke `scripts/ios_release_artifact_smoke.sh`; an iOS "
+    "artifact is otherwise shipped ungated",
+)
+expect(
+    "IOS_SMOKE_BACKEND_PROBE" in ios_runs,
+    "the `ios` job must set IOS_SMOKE_BACKEND_PROBE; the gate is fail-closed on it "
+    "and would block every release",
+)
+expect(
+    "IOS_SMOKE_LAUNCH_ARGUMENTS" in ios_runs,
+    "the `ios` job must set IOS_SMOKE_LAUNCH_ARGUMENTS so the debug build is "
+    "pointed at the host daemon the probe checks",
+)
+expect(
+    "flutter build ios --simulator" in ios_runs,
+    "the `ios` job must build the simulator slice `simctl` can install "
+    "(`flutter build ios --simulator`); the device .app cannot be installed",
+)
+expect(
+    "target/release/galleryd" in ios_runs and "/mobile/workspace" in ios_runs,
+    "the `ios` job must start a host galleryd and prove the app reached it "
+    "(the probe reads GET /mobile/workspace from the daemon log)",
 )
 # `if:` on a job runs it even when its dependencies failed, which is exactly the
 # mechanism by which a four-platform release escapes while Android is red.
@@ -360,6 +418,16 @@ expect(
     "no step in `release` may set `continue-on-error` -- it swallows the staging step's "
     "refusal and turns the whole job green with nothing staged. Offending step(s): "
     + ", ".join(continue_on_error),
+)
+
+# The same hole one level up. A job-level key marks the entire `release` job
+# green even when the staging step exits non-zero, so the publish step then runs
+# against a `dist/` the refusal prevented from being created. The review that
+# found the step-level hole did not cover this one.
+expect(
+    "continue-on-error" not in (jobs.get("release") or {}),
+    "no job-level `continue-on-error` may be set on `release` -- it turns the staging "
+    "step's refusal into a green job with nothing staged",
 )
 
 # The action's default is `fail_on_unmatched_files: false`, which CREATES a release
@@ -989,8 +1057,326 @@ PYTHON
       "the probe could not rewrite the SUITES list; the assertions above did not run"
   fi
   rm -rf "${probe_root}"
+
+  # The driver shards its long mutation pass: it runs N concurrent copies of one
+  # suite and folds them into a single PASS/FAIL/DEGRADED result. Nothing else
+  # runs that branch, so a shard that silently stops being spawned, or a failing
+  # shard that stops failing the pass, would go unnoticed. This probe narrows
+  # SUITES to the sharded suite and swaps in a fake that records which shard it
+  # was handed, so both the union and the aggregation are checked.
+  #
+  # The expected shard set is pinned to what the committed driver declares. If
+  # someone un-shards the pass (count 1) or drops a shard, the union assertion
+  # fails rather than quietly accepting a subset of the mutations.
+  shard_root="$(mktemp -d)"
+  mkdir -p "${shard_root}/scripts/tests"
+  cp "${runner}" "${shard_root}/scripts/tests/run_release_gate_tests.sh"
+  if python3 - "${shard_root}/scripts/tests/run_release_gate_tests.sh" <<'PYTHON'
+import re
+import sys
+
+path = sys.argv[1]
+with open(path) as handle:
+    source = handle.read()
+narrowed, count = re.subn(
+    r"SUITES=\(\n(?:  \S+\n)+\)",
+    "SUITES=(\n  ios_release_artifact_mutation_test.sh\n)",
+    source,
+)
+if count != 1:
+    sys.exit("could not narrow the SUITES list; the runner's shape changed")
+with open(path, "w") as handle:
+    handle.write(narrowed)
+PYTHON
+  then
+    shard_runner="${shard_root}/scripts/tests/run_release_gate_tests.sh"
+    shard_suite="${shard_root}/scripts/tests/ios_release_artifact_mutation_test.sh"
+    shard_log="$(mktemp)"
+
+    # Each shard must be handed its own index, and every index must run.
+    # The literal below is the committed shard count; a drop is a hard failure.
+    cat >"${shard_suite}" <<SHARD_SUITE
+#!/usr/bin/env bash
+printf '%s\n' "\${MUTATION_SHARD}" >>"${shard_log}"
+exit 0
+SHARD_SUITE
+    if bash "${shard_runner}" >/dev/null 2>&1; then
+      ok "the committed runner exits 0 when every shard of a sharded suite passes"
+    else
+      bad "the committed runner exits 0 when every shard of a sharded suite passes" \
+        "the sharded path failed on a clean probe"
+    fi
+    shards_seen="$(sort -n -u "${shard_log}" | tr '\n' ' ')"
+    if [[ "${shards_seen}" == "0 1 2 3 4 5 6 7 " ]]; then
+      ok "every shard of the sharded suite runs (the union is the full set)"
+    else
+      bad "every shard of the sharded suite runs (the union is the full set)" \
+        "shards seen: ${shards_seen:-<none>}"
+    fi
+
+    # A failure in any one shard must fail the whole pass, not be averaged away.
+    cat >"${shard_suite}" <<'SHARD_SUITE'
+#!/usr/bin/env bash
+if [[ "${MUTATION_SHARD}" == "3" ]]; then
+  exit 1
+fi
+exit 0
+SHARD_SUITE
+    if bash "${shard_runner}" >/dev/null 2>&1; then
+      bad "the committed runner fails the pass when one shard fails" \
+        "a failing shard was reported as a clean pass"
+    else
+      ok "the committed runner fails the pass when one shard fails"
+    fi
+
+    # A shard that skipped its assertions must degrade the pass exactly as a whole
+    # suite does, or a shard missing a prerequisite hides behind a green pass.
+    cat >"${shard_suite}" <<'SHARD_SUITE'
+#!/usr/bin/env bash
+if [[ "${MUTATION_SHARD}" == "5" ]]; then
+  printf 'RELEASE_GATE_SUITE_DEGRADED: probe shard\n'
+fi
+exit 0
+SHARD_SUITE
+    if bash "${shard_runner}" >/dev/null 2>&1; then
+      bad "the committed runner degrades the pass when one shard is degraded" \
+        "a skipped shard was reported as a clean pass"
+    else
+      ok "the committed runner degrades the pass when one shard is degraded"
+    fi
+
+    rm -f "${shard_log}"
+    rm -rf "${shard_root}"
+  else
+    bad "the runner's SUITES list can be narrowed to the sharded suite" \
+      "the probe could not rewrite the SUITES list; the assertions above did not run"
+  fi
 else
   bad "run_release_gate_tests.sh exists" "${runner} not found"
+fi
+
+# The release gate is fanned out over one job per suite and aggregated by the
+# single required check. That shape is what makes one required context mean
+# "every suite passed": a matrix leg is its own check name, so requiring each
+# leg on its own would mean a ruleset edit per new suite -- and a required
+# context that is missing never blocks. The aggregate closes that gap, but only
+# if it genuinely gates on the legs. Nothing else in this file reads the matrix
+# or the aggregate, so the whole wiring can be deleted while every other
+# assertion stays green (issue #97 / #104). These assertions bind the two jobs
+# to the driver's own suite list and to each other.
+#
+# The gate's own step is executed here, not pattern-matched: a substring check
+# for `exit 1` is satisfied by a step that exits 0, which is exactly the false
+# pass the aggregate exists to prevent.
+echo " the release gate is fanned out and the aggregate actually gates"
+if ! ci_matrix_checks="$(
+  python3 - "${ROOT_DIR}/.github/workflows/ci.yml" "${runner}" "${WORK_DIR}" <<'PYTHON'
+import os
+import re
+import sys
+
+import yaml
+
+ci_path, driver_path, work_dir = sys.argv[1], sys.argv[2], sys.argv[3]
+with open(ci_path, encoding="utf-8") as handle:
+    ci = yaml.safe_load(handle)
+with open(driver_path, encoding="utf-8") as handle:
+    driver_source = handle.read()
+
+jobs = ci.get("jobs") or {}
+
+
+def emit(condition, message, detail=""):
+    # One assertion per line, \x1f-separated so the shell can read the message
+    # and its detail without splitting on anything a message might contain.
+    detail = str(detail).replace("\n", " ")
+    print(("ok" if condition else "fail") + "\x1f" + message + "\x1f" + detail)
+
+
+# The driver's SUITES list, parsed exactly the way the shard probes above parse
+# it, so the matrix cannot be declared equal to a stale, hand-copied list.
+driver_match = re.search(r"SUITES=\(\n(?:  \S+\n)+\)", driver_source)
+driver_suites = []
+if driver_match:
+    driver_suites = [
+        line.strip() for line in driver_match.group(0).splitlines()[1:-1] if line.strip()
+    ]
+emit(
+    bool(driver_suites),
+    "run_release_gate_tests.sh declares a parseable, non-empty SUITES list",
+    f"parsed {driver_suites}",
+)
+
+# The one job whose strategy.matrix carries the suite dimension.
+matrix_jobs = {}
+for name, spec in jobs.items():
+    matrix = ((spec or {}).get("strategy") or {}).get("matrix") or {}
+    if isinstance(matrix.get("suite"), list):
+        matrix_jobs[name] = spec
+emit(
+    len(matrix_jobs) == 1,
+    "ci.yml has exactly one job whose strategy.matrix fans out suites",
+    f"found {sorted(matrix_jobs)}",
+)
+
+matrix_name = next(iter(matrix_jobs)) if len(matrix_jobs) == 1 else None
+matrix_spec = matrix_jobs.get(matrix_name, {}) if matrix_name else {}
+ci_suites = (((matrix_spec.get("strategy") or {}).get("matrix") or {}).get("suite")) or []
+
+emit(
+    bool(ci_suites) and sorted(ci_suites) == sorted(driver_suites),
+    "the suite matrix lists exactly the driver's SUITES (nothing missing, nothing extra)",
+    f"driver={driver_suites} ci={ci_suites}",
+)
+emit(
+    len(ci_suites) == len(set(ci_suites)),
+    "the suite matrix lists no suite twice",
+    f"ci={ci_suites}",
+)
+
+matrix_steps = matrix_spec.get("steps") or []
+driver_steps = [
+    step for step in matrix_steps if "run_release_gate_tests.sh" in str(step.get("run", ""))
+]
+emit(
+    len(driver_steps) == 1,
+    "exactly one matrix step invokes the release-gate driver",
+    f"found {len(driver_steps)}",
+)
+driver_run = str(driver_steps[0].get("run", "")) if len(driver_steps) == 1 else ""
+emit(
+    re.search(r"--only-suite\s+[\"']?\$\{\{\s*matrix\.suite\s*\}\}", driver_run) is not None,
+    'each matrix leg runs exactly its own suite (--only-suite "${{ matrix.suite }}")',
+    driver_run,
+)
+emit(
+    ((matrix_spec.get("strategy") or {}).get("fail-fast")) is False,
+    "the suite matrix sets fail-fast: false so one red leg still reports the rest",
+    f"fail-fast={((matrix_spec.get('strategy') or {}).get('fail-fast'))!r}",
+)
+
+
+def needs_of(spec):
+    raw = (spec or {}).get("needs") or []
+    if isinstance(raw, str):
+        return [raw]
+    return list(raw)
+
+
+aggregators = [
+    name
+    for name, spec in jobs.items()
+    if matrix_name and name != matrix_name and matrix_name in needs_of(spec)
+]
+emit(
+    len(aggregators) == 1,
+    "exactly one job aggregates the suite matrix through needs:",
+    f"found {aggregators}",
+)
+
+agg_name = aggregators[0] if len(aggregators) == 1 else None
+agg_spec = jobs.get(agg_name, {}) if agg_name else {}
+agg_if = str(agg_spec.get("if", ""))
+# The aggregate must run even when a leg fails, and for that reason alone: it is
+# the single REQUIRED check, and GitHub reports a skipped required job as
+# Success. A substring test for `!cancelled()` is satisfied by
+# `!cancelled() || true` and by
+# `!cancelled() && github.event_name != 'pull_request'`, both of which can skip
+# the required job while still containing the token. So the expression is
+# normalised -- whitespace removed, an optional `${{ }}` wrapper stripped -- and
+# compared against the one safe value instead of being searched for the token.
+normalized_agg_if = re.sub(r"\s+", "", agg_if)
+if normalized_agg_if.startswith("${{") and normalized_agg_if.endswith("}}"):
+    normalized_agg_if = normalized_agg_if[3:-2]
+emit(
+    normalized_agg_if == "!cancelled()",
+    "the aggregate runs even when a leg fails (its job-if is exactly !cancelled())",
+    f"if={agg_if!r}",
+)
+
+result_expr = f"needs.{matrix_name}.result" if matrix_name else ""
+result_steps = []
+for step in agg_spec.get("steps") or []:
+    env = step.get("env") or {}
+    if result_expr and any(result_expr in str(value) for value in env.values()):
+        result_steps.append(step)
+emit(
+    bool(result_steps),
+    "the aggregate binds needs.<matrix>.result so it can check the legs",
+    f"found {len(result_steps)} step(s)",
+)
+
+result_run = str(result_steps[0].get("run", "")) if result_steps else ""
+emit(
+    "exit 1" in result_run and "success" in result_run,
+    "the aggregate's result step fails unless every leg reported success",
+    result_run,
+)
+
+# Hand the extracted run and its env var to the shell so it can be EXECUTED, not
+# merely inspected.
+if result_steps:
+    env = result_steps[0].get("env") or {}
+    var = next((k for k, v in env.items() if result_expr and result_expr in str(v)), "")
+    with open(os.path.join(work_dir, "agg_result_gate.sh"), "w", encoding="utf-8") as handle:
+        handle.write(result_run)
+    with open(os.path.join(work_dir, "agg_result_var"), "w", encoding="utf-8") as handle:
+        handle.write(var)
+
+# Job-level `continue-on-error` is the same hole one level up: it marks the
+# whole gate job green even when one of its steps failed, so the single REQUIRED
+# check reports Success with a failed leg behind it. Only the step-level keys
+# were checked until now.
+gate_offenders = []
+for gate_job in [name for name in (matrix_name, agg_name) if name]:
+    gate_spec = jobs.get(gate_job, {}) or {}
+    if gate_spec.get("continue-on-error"):
+        gate_offenders.append(f"{gate_job}: (job-level)")
+    for step in gate_spec.get("steps") or []:
+        if step.get("continue-on-error"):
+            gate_offenders.append(f"{gate_job}: {step.get('name') or step.get('uses') or '(run)'}")
+emit(
+    not gate_offenders,
+    "no release-gate job hides a failure behind continue-on-error",
+    f"offenders={gate_offenders}",
+)
+PYTHON
+)"; then
+  bad "the release-gate matrix checker ran to completion" \
+    "the embedded python exited non-zero; the structural assertions are incomplete"
+fi
+while IFS=$'\x1f' read -r verdict message detail; do
+  [[ -n "${verdict}" ]] || continue
+  if [[ "${verdict}" == "ok" ]]; then
+    ok "${message}"
+  else
+    bad "${message}" "${detail}"
+  fi
+done <<<"${ci_matrix_checks}"
+
+# Execute the aggregate's result gate with a failed and a clean outcome. The
+# structural check above is satisfied by a step that runs `exit 1` inside a
+# branch that can never be taken; running it is what proves a failed leg is
+# actually refused.
+agg_gate="${WORK_DIR}/agg_result_gate.sh"
+agg_var_file="${WORK_DIR}/agg_result_var"
+if [[ -s "${agg_gate}" && -s "${agg_var_file}" ]]; then
+  agg_var="$(cat "${agg_var_file}")"
+  if env "${agg_var}=failure" bash "${agg_gate}" >/dev/null 2>&1; then
+    bad "the aggregate result gate fails a leg that failed" \
+      "the committed step exited 0 for result=failure"
+  else
+    ok "the aggregate result gate fails a leg that failed"
+  fi
+  if env "${agg_var}=success" bash "${agg_gate}" >/dev/null 2>&1; then
+    ok "the same result gate passes when every leg succeeded (not vacuous)"
+  else
+    bad "the same result gate passes when every leg succeeded (not vacuous)" \
+      "the committed step exited non-zero for result=success"
+  fi
+else
+  bad "the aggregate result gate can be executed" \
+    "no env-bound result step was extracted from the aggregate"
 fi
 
 echo " the signing key cannot be committed by accident"
