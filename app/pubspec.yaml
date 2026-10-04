@@ -1,7 +1,7 @@
 name: private_gallery_app
 description: Local-first gallery client for the Private Gallery project.
 publish_to: "none"
-version: 0.1.0+1
+version: 0.0.1+1
 
 environment:
   sdk: ">=3.10.3 <4.0.0"
