@@ -1967,6 +1967,124 @@ else
   ok 'no multi-line inline emulator script: block may reappear'
 fi
 
+# The iOS cross-compile must pin IPHONEOS_DEPLOYMENT_TARGET, and it must agree with
+# project.pbxproj.
+#
+# The second half is the point. A pin that disagrees with the Xcode project is the
+# same defect wearing a different number, and the first half alone cannot see it.
+# Release run 37184543519 had no pin at all: rustc linked at its own minimum of
+# iOS 10.0 (`-target arm64-apple-ios10.0.0` on the link line) while clang built the
+# vendored OpenSSL for the SDK default of 26.5, and the link failed with
+# `___chkstk_darwin` undefined -- a libSystem symbol introduced in iOS 13 that a
+# 10.0 link is not allowed to bind.
+#
+# Not a workflow construct that a YAML-shape assertion would catch: this was silent
+# until a release run died on it, and it is invisible to every assertion above.
+IOS_JOB="$(python3 - "${WORKFLOW}" <<'PYTHON'
+import sys
+
+import yaml
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    workflow = yaml.safe_load(handle)
+
+job = (workflow.get("jobs") or {}).get("ios") or {}
+env = job.get("env") or {}
+value = env.get("IPHONEOS_DEPLOYMENT_TARGET")
+print("" if value is None else str(value))
+PYTHON
+)"
+if [[ -z "${IOS_JOB}" ]]; then
+  bad 'the ios job pins IPHONEOS_DEPLOYMENT_TARGET' \
+    "no jobs.ios.env.IPHONEOS_DEPLOYMENT_TARGET in release.yml; rustc links at its own minimum of iOS 10.0 while clang takes the SDK default, and the two disagree about which runtime symbols exist"
+elif [[ "${IOS_JOB}" != "13.0" ]]; then
+  bad 'the ios job pins IPHONEOS_DEPLOYMENT_TARGET to a sane minimum' \
+    "it is '${IOS_JOB}'; below 13.0 the linker cannot bind ___chkstk_darwin, which libSystem provides from iOS 13, so the vendored OpenSSL objects fail to link"
+else
+  ok "the ios job pins IPHONEOS_DEPLOYMENT_TARGET (${IOS_JOB})"
+fi
+
+# Read the pin out of the *parsed* workflow a second time and require every pin in
+# the file to be the same. Two different values in two different jobs would let
+# each assertion pass while the actual build used the other one, which is the
+# failure this section exists to prevent.
+IOS_ALL_PINS="$(python3 - "${WORKFLOW}" <<'PYTHON'
+import sys
+
+import yaml
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    workflow = yaml.safe_load(handle)
+
+found = set()
+
+
+def walk(node, path):
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if key == "IPHONEOS_DEPLOYMENT_TARGET" and isinstance(value, (str, int, float)):
+                found.add((str(value), path))
+            else:
+                walk(value, f"{path}.{key}" if path else str(key))
+    elif isinstance(node, list):
+        for index, value in enumerate(node):
+            walk(value, f"{path}[{index}]")
+
+
+walk(workflow.get("jobs") or {}, "")
+print(";".join(f"{where}={value}" for value, where in sorted(found)))
+PYTHON
+)"
+if [[ -z "${IOS_ALL_PINS}" ]]; then
+  bad 'IPHONEOS_DEPLOYMENT_TARGET is pinned somewhere in release.yml' \
+    'found none'
+else
+  distinct="$(printf '%s\n' "${IOS_ALL_PINS}" | awk -F= '{print $NF}' | sort -u | wc -l)"
+  if [[ "${distinct}" -eq 1 ]]; then
+    ok "every IPHONEOS_DEPLOYMENT_TARGET pin in release.yml agrees (${IOS_ALL_PINS})"
+  else
+    bad 'every IPHONEOS_DEPLOYMENT_TARGET pin in release.yml agrees' \
+      "found ${distinct} different values: ${IOS_ALL_PINS}; two jobs building for iOS at different minimums is the same skew this asserts against pbxproj"
+  fi
+fi
+
+# And the agreement with the Xcode project itself. The lowest target there is the
+# one that governs: a build cannot run on a device older than its lowest declared
+# slice, so a cross-compile pinned lower than that ships a Mach-O the app has not
+# declared, and one pinned higher produces an .app that will not load on the
+# devices project.pbxproj says it supports.
+PBXPROJ="${ROOT_DIR}/app/ios/Runner.xcodeproj/project.pbxproj"
+if [[ ! -f "${PBXPROJ}" ]]; then
+  bad 'project.pbxproj exists for the deployment-target agreement assertion to read' \
+    "not found at ${PBXPROJ}"
+else
+  ok 'project.pbxproj exists for the deployment-target agreement assertion to read'
+  PBX_TARGETS="$(grep -oE 'IPHONEOS_DEPLOYMENT_TARGET = [0-9][0-9.]*' "${PBXPROJ}" |
+    awk '{print $3}' | sort -t. -k1,1n -k2,2n -k3,3n | uniq -c | tr -s ' ')"
+  PBX_LOWEST="$(printf '%s\n' "${PBX_TARGETS}" | head -1 | awk '{print $NF}')"
+  if [[ -z "${PBX_LOWEST}" ]]; then
+    bad 'the Xcode project states an IPHONEOS_DEPLOYMENT_TARGET to compare against' \
+      'no IPHONEOS_DEPLOYMENT_TARGET = <version> line found in project.pbxproj'
+  else
+    # Every target in the project must be the same, not merely present. Two
+    # different values means the app declares two minimums, and "which one governs"
+    # is then a question this file would be answering by guesswork.
+    distinct_pbx="$(printf '%s\n' "${PBX_TARGETS}" | awk '{print $NF}' | sort -u | wc -l)"
+    if [[ "${distinct_pbx}" -ne 1 ]]; then
+      bad 'project.pbxproj declares one deployment target for every target' \
+        "found ${distinct_pbx}: ${PBX_TARGETS}"
+    else
+      ok "project.pbxproj declares one deployment target for every target (${PBX_TARGETS})"
+    fi
+    if [[ "${IOS_JOB}" != "${PBX_LOWEST}" ]]; then
+      bad 'the iOS cross-compile and project.pbxproj agree on the deployment target' \
+        "release.yml pins '${IOS_JOB:-<nothing>}' while project.pbxproj declares ${PBX_LOWEST}; a Mach-O built for a different minimum than the Xcode project declares will not load on the devices it claims to support"
+    else
+      ok "the iOS cross-compile and project.pbxproj agree on the deployment target (${PBX_LOWEST})"
+    fi
+  fi
+fi
+
 printf '\n%s passed, %s failed\n' "${PASS_COUNT}" "${FAIL_COUNT}"
 if ((FAIL_COUNT > 0)); then
   exit 1
