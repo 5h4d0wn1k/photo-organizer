@@ -129,7 +129,14 @@ jobs:
       - name: Build Rust daemon
         run: cargo build --manifest-path native_core/Cargo.toml --bin galleryd --release --locked
 
-      - name: Hermetic CMake cache regen (drop stale CMAKE_CXX_COMPILER pin)
+      # The name used to say "drop stale CMAKE_CXX_COMPILER pin", which described
+      # a workaround for app/linux/CMakeLists.txt setting the compiler as a
+      # directory-scope variable instead of a cache entry. That is fixed at the
+      # source, and a step name that still claims to work around it sends the next
+      # reader looking for a bug that is not there. `rm -rf` stays: it is what
+      # makes the configure hermetic against a cached GTK/Flutter toolchain, which
+      # is the reason worth keeping.
+      - name: Configure from a clean CMake cache
         run: |
           rm -rf app/build/linux
           flutter build linux
