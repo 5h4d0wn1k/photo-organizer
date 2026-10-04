@@ -26,7 +26,15 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        language: ["actions", "java", "kotlin", "python", "rust", "swift"]
+        # The languages this repo actually builds and analyzes on the Linux
+        # runner. java/kotlin/swift were added in f7136a5c and never ran to
+        # completion: CodeQL Swift cannot initialise on ubuntu-latest, and
+        # CodeQL's autobuild cannot drive the Flutter Android (Gradle) or iOS
+        # host projects, so all three jobs failed before producing a result. A
+        # scanner that never runs is noise a real alert can hide in, so they are
+        # removed rather than left red; deliberate Android Kotlin coverage is
+        # tracked in #151.
+        language: ["actions", "python", "rust"]
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -42,7 +50,7 @@ jobs:
           config-file: ./.github/codeql/codeql-config.yml
           queries: security-and-quality
       - name: Autobuild
-        if: matrix.language == 'rust' || matrix.language == 'python' || matrix.language == 'java' || matrix.language == 'kotlin' || matrix.language == 'swift'
+        if: matrix.language == 'rust' || matrix.language == 'python'
         uses: github/codeql-action/autobuild@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4
       - name: Perform CodeQL Analysis
         uses: github/codeql-action/analyze@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4
