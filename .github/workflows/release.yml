@@ -277,9 +277,8 @@ jobs:
         #
         #     lib_cflags => add("/Zi /Fdossl_static.pdb")
         #
-        # So every OpenSSL object asks the linker for a PDB that the OpenSSL build
-        # never leaves where link.exe looks for it, and link.exe answers, once per
-        # object:
+        # So every OpenSSL object carries a reference to a PDB, and link.exe cannot find
+        # that PDB at the path recorded in the object, so it answers once per object:
         #
         #     warning LNK4099: PDB 'ossl_static.pdb' was not found with
         #       'libopenssl_sys-....rlib(libcrypto-lib-slh_adrs.obj)' or at
@@ -294,10 +293,14 @@ jobs:
         # Every other LNK#### still reaches `linker_messages` and still denies the
         # build, so this is a named exception rather than a relaxed policy.
         #
-        # Chosen over making the PDB actually exist -- dropping `/Zi` in favour of
-        # `/Z7`, or letting OpenSSL emit one -- because debug info would embed the
-        # runner's absolute source paths into a shipped binary. A local-first
-        # product should not ship the path of the machine that built it.
+        # Chosen over making the PDB resolvable at link time. `/Fd` is relative, so the
+        # file lands wherever cl.exe was run and pointing the linker at it would mean
+        # shipping debug info at all -- and the runner's absolute source paths with
+        # it. LNK4099's own text is "linking object as if no debug info", so this
+        # exception can only ever *remove* debug info from the artifact, never add
+        # it. For a local-first product that is the right direction: the release
+        # binary does not carry the build machine's debug layout, and the alternative
+        # would put it there.
         #
         # Passed as `-C link-arg` on this one target instead of via RUSTFLAGS, so
         # it cannot reach the Flutter build and cannot invalidate the job's

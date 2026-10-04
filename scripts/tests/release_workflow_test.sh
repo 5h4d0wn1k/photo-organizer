@@ -1997,6 +1997,7 @@ fi
 
 WIN_FACTS="$(python3 - "${WORKFLOW}" <<'PYTHON'
 import re
+import shlex
 import sys
 
 import yaml
@@ -2012,19 +2013,41 @@ ignore_jobs = []
 ignore_tokens = []
 
 
-def step_runs(job):
-    """Each step's `run:` block, whitespace-normalised to a single line.
+def run_code(step):
+    """A step's `run:` block as shell would see it: comments gone.
 
-    Two reasons this is per-step and not one blob per job. Whitespace is collapsed
-    because the cargo invocations are line-wrapped in the YAML -- the android job
-    has `cargo` at the end of one line and `build` at the start of the next, so a
-    match that cannot span a newline misses it. And it is per-step so that a match
-    cannot run from one command to a later, unrelated one.
+    `shlex.split(comments=True)` is what does the work, and it is used rather than a
+    hand-rolled `startswith("#")` filter because a shell comment is not only a whole
+    line -- it is everything from an unquoted `#` to the end of the line. A filter
+    that drops only `#`-leading lines leaves `# TODO: re-add
+    -C link-arg=/IGNORE:4099` sitting at the end of a real command, which is the
+    single most likely way someone removes this flag and leaves the explanation
+    behind.
+
+    That is not hypothetical. Reverting the Windows daemon build to `cargo build`
+    and leaving such a TODO passed all four of this PR's assertions while the flag
+    no longer reached the linker -- precisely the release failure the PR exists to
+    prevent, reported green. The rest of this file already strips comments for the
+    same reason (the staging-step checks, `sed 's/#.*//'`); this is the same
+    treatment, applied where a `run:` block quotes in prose the very string being
+    checked.
+
+    Newlines become tokens rather than lines because the cargo invocations are
+    line-wrapped in the YAML -- the android job has `cargo` at the end of one line
+    and `build` at the start of the next.
     """
-    return [
-        " ".join(str(step.get("run", "")).split())
-        for step in (jobs[job].get("steps") or [])
-    ]
+    try:
+        return shlex.split(str(step.get("run", "")).replace("\\\n", " "), comments=True)
+    except ValueError:
+        # An unbalanced quote means the block is not shell we can reason about, and
+        # guessing is the failure mode this function exists to remove.
+        return []
+
+
+def step_runs(job):
+    """Each step's `run:` block as shell tokens, per-step so a match cannot run
+    from one command to a later, unrelated one."""
+    return [" ".join(run_code(step)) for step in (jobs[job].get("steps") or [])]
 
 
 def build_warnings(job):
@@ -2125,9 +2148,14 @@ else
   ok "the windows linker exception names exactly LNK4099 and nothing else"
 fi
 
-# The Windows daemon build has to actually carry it. The token check above can be
-# satisfied by the flag appearing anywhere in the job, so pin it to the link line.
+# The Windows daemon build has to actually carry it, as a real argument to the
+# compiler. The token check above can be satisfied by the flag appearing anywhere in
+# the job, so this pins it to the link line -- and this one splits the command
+# properly and requires the flag to be a whole argument, with comments removed.
+# A `# TODO: re-add -C link-arg=/IGNORE:4099` in the same run block used to satisfy
+# both checks on its own.
 if python3 - "${WORKFLOW}" <<'PYTHON'
+import shlex
 import sys
 
 import yaml
@@ -2137,12 +2165,18 @@ with open(sys.argv[1], encoding="utf-8") as handle:
 
 for step in (workflow["jobs"]["windows"].get("steps") or []):
     if str(step.get("name", "")) == "Build Rust daemon":
-        run = " ".join(str(step.get("run", "")).split())
-        sys.exit(
-            0
-            if "-C link-arg=/IGNORE:4099" in run
-            else 1
-        )
+        try:
+            argv = shlex.split(str(step.get("run", "")), comments=True)
+        except ValueError:
+            sys.exit(1)
+        # A whole argument, so `-C link-args=/IGNORE:4099` -- which splits on
+        # whitespace and would not do what it looks like -- does not pass, and the
+        # singular `-C link-arg=` is required rather than merely implied by a
+        # substring.
+        if "-C" not in argv:
+            sys.exit(1)
+        sys.exit(0 if argv[argv.index("-C") + 1: argv.index("-C") + 2] ==
+                 ["link-arg=/IGNORE:4099"] else 1)
 sys.exit(1)
 PYTHON
 then
