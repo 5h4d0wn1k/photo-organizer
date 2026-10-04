@@ -177,7 +177,7 @@ pass_count() {
 # never read as a pass. DECLARED_MUTATIONS counts every declaration before any
 # shard filtering, so a shard that runs zero mutations and an unsharded run that
 # lost one are both caught.
-MIN_MUTATIONS=36
+MIN_MUTATIONS=41
 DECLARED_MUTATIONS=0
 
 MUTATIONS_RUN=0
@@ -401,10 +401,99 @@ mutate "an OS-level refusal to launch is tolerated" \
 
 # Without the cold-launch assertion, `open` would merely activate an existing
 # copy and every later observation would describe a warm process.
+#
+# Repointed when the lsappinfo fix landed: the guard used to be a single
+# `if [[ -n "${asn}" ]]`, which no longer exists. This now stops the guard firing
+# at all. The other direction -- the guard firing on a reply that is not a serial
+# number -- is mutation 2 further down; a guard can be wrong in each direction and
+# one mutation cannot cover both.
 mutate "a warm launch is accepted as a cold one" \
   'a warm launch is refused because this gate requires a cold one' \
-  'if [[ -n "${asn}" ]]; then' \
-  'if false; then'
+  '  if [[ "${raw}" =~ ^ASN:0x[0-9a-fA-F]+:0x[0-9a-fA-F]+:$ ]]; then
+    fail "${APP_BUNDLE_ID} is already registered' \
+  '  if false; then
+    fail "${APP_BUNDLE_ID} is already registered'
+
+# ---------------------------------------------------------------------------
+# The `lsappinfo` query itself. These four mutations are the record of how the
+# macOS smoke gate failed in release run 37184543519: the gate aborted at the
+# "already registered with the window server" check, on an app it had just
+# installed, reporting a phantom instance. Three separate defects stacked:
+# an undocumented verb, no shape-check on the reply, and an exit status that
+# killed the gate silently. Each is listed here so none of them can come back
+# unnoticed -- an assertion nobody has seen fail is a comment.
+# ---------------------------------------------------------------------------
+
+# 1. The verb. `findLSApplication` is not a thing `lsappinfo` answers; on the
+#    26.6.2 runner it replies `Unrecognized command: findLSApplication` on
+#    *stdout*. The gate read that error text as a serial number and refused to
+#    launch an app that was not running.
+#
+#    The needle is a plain `expect_pass`, because that is what this mutation
+#    breaks: with the verb reverted, the reply is unparseable on the *healthy*
+#    path too, so the gate fails before it ever launches and every scenario that
+#    expects a pass reports a failure instead.
+mutate "the lsappinfo query reverts to the undocumented verb" \
+  'mounts the published .dmg, cold-launches, renders and passes' \
+  '"${LSAPPINFO_BIN}" find "bundleid=${APP_BUNDLE_ID}" 2>/dev/null' \
+  '"${LSAPPINFO_BIN}" findLSApplication "=${APP_BUNDLE_ID}" 2>/dev/null'
+
+# 2. No shape-check. Even with the right verb, `lsappinfo` writes some errors to
+#    stdout, so a query it declines is indistinguishable from an ASN unless the
+#    reply is matched. Without the match, an unanswerable window server is
+#    reported as "already running" -- the exact failure mode of the release run,
+#    and the one that sends an operator to kill a process that does not exist.
+#
+#    The regex is weakened to `.`, not the branch deleted, and that distinction is
+#    the whole point. Deleting the branch does NOT reproduce the defect: an
+#    unparseable reply would then fall through to the "cannot tell whether" failure,
+#    which still refuses and still tells the operator the truth. The defect only
+#    exists when something *claims* the reply is a serial number, so the mutation
+#    has to make it claim that. A mutation that passes here would have looked like
+#    coverage of this assertion while testing nothing.
+mutate "an unparseable lsappinfo reply is claimed to be a serial number" \
+  'an unanswerable window server is not reported as a warm app' \
+  '  if [[ "${raw}" =~ ^ASN:0x[0-9a-fA-F]+:0x[0-9a-fA-F]+:$ ]]; then
+    fail "${APP_BUNDLE_ID} is already registered' \
+  '  if [[ "${raw}" =~ . ]]; then
+    fail "${APP_BUNDLE_ID} is already registered'
+
+# 3. `lsappinfo_asn`'s own filter. Unreachable from the scenarios, because
+#    `assert_nothing_already_running` refuses the gate before `lsappinfo_asn` is
+#    ever called -- which is exactly why it needed its own unit assertions, and
+#    why this mutation is here: without them, deleting the filter would be
+#    invisible. The needle is one of those unit assertions.
+mutate "lsappinfo_asn passes any reply through unfiltered" \
+  'lsappinfo_asn drops a rejected query instead of passing it on' \
+  '  if [[ "${raw}" =~ ^ASN:0x[0-9a-fA-F]+:0x[0-9a-fA-F]+:$ ]]; then
+    printf '"'"'%s\n'"'"' "${raw}"' \
+  '  if true; then
+    printf '"'"'%s\n'"'"' "${raw}"'
+
+# 4. Propagating the exit status. `lsappinfo` exits non-zero for a query it will
+#    not answer, and the reply -- not the status -- is what the callers need, so
+#    the status is discarded on purpose. Restoring the propagation makes the
+#    assignment at the call site fail, and under `set -e` the gate dies there
+#    with no ERROR line at all: the worst outcome of the three, because the run
+#    leaves no explanation. The needle is the assertion that reads the *message*,
+#    which a silent death cannot produce.
+mutate "the lsappinfo exit status is propagated instead of discarded" \
+  'that refusal quotes lsappinfo'"'"'s own reply so the failure is diagnosable' \
+  '{ "${LSAPPINFO_BIN}" find "bundleid=${APP_BUNDLE_ID}" 2>/dev/null || true; } |' \
+  '{ "${LSAPPINFO_BIN}" find "bundleid=${APP_BUNDLE_ID}" 2>/dev/null; } |'
+
+# 5. Backticks in the diagnostic. The refusal message quoted the `open` command
+#    inside a double-quoted string, so bash executed `open` with no arguments
+#    while assembling the message -- printing the real tool's usage dump into the
+#    CI log immediately above the failure. The gate was correct and the evidence
+#    was a lie about what it had run.
+#
+#    Asserted by observing the fake rather than by grepping the source, so it
+#    also catches the same substitution anywhere else in the message.
+mutate "the cold-launch refusal executes open while writing its own message" \
+  'the already-running refusal does not invoke open' \
+  "and 'open' would only activate it" \
+  'and `open` would only activate it'
 
 # A process that dies on start never reaches the window server.
 mutate "an app that dies on launch is tolerated" \
