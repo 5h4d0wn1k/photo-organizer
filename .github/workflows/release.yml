@@ -1244,7 +1244,6 @@ jobs:
       - windows
       - windows-smoke
       - macos
-      - macos-smoke
       - ios
       - android-verify
     permissions:
