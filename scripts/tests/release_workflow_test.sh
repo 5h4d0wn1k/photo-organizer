@@ -1194,7 +1194,10 @@ SHARD_SUITE
         "the probe run failed, so the log assertions did not run"
     fi
 
-    # A cancelled driver must stop and reap every shard, then keep its logs.
+    # A cancelled driver must stop and reap every shard, and stream progress into
+    # the live runner output before teardown. The observed job cancellation did
+    # not reach the `if: always()` artifact step; the Actions job log preserves
+    # output that was already streamed before cancellation.
     # Separate sessions let the driver signal a whole shard, including a suite
     # blocked in a foreground child, without signalling its own caller.
     cancel_logs="${shard_root}/cancel-logs"
@@ -1202,6 +1205,7 @@ SHARD_SUITE
     mkdir -p "${cancel_logs}" "${shard_pid_dir}"
     cat >"${shard_suite}" <<'SHARD_SUITE'
 #!/usr/bin/env bash
+printf 'SHARD_STARTED %s\n' "${MUTATION_SHARD}"
 sleep 30 &
 sleep_pid=$!
 printf '%s %s\n' "${SHARD_WRAPPER_PID}" "${sleep_pid}" >"${SHARD_PID_DIR}/${MUTATION_SHARD}"
@@ -1211,6 +1215,19 @@ SHARD_SUITE
       bash "${shard_runner}" >"${shard_root}/cancel.out" 2>&1 &
     cancel_pid=$!
     sleep 2
+    missing_live_shards=""
+    for shard_index in $(seq 0 7); do
+      if ! grep -qF "[shard ${shard_index}] SHARD_STARTED ${shard_index}" \
+        "${shard_root}/cancel.out"; then
+        missing_live_shards+="${shard_index} "
+      fi
+    done
+    if [[ -z "${missing_live_shards}" ]]; then
+      ok "every running shard streams progress to the job output before cancellation"
+    else
+      bad "every running shard streams progress to the job output before cancellation" \
+        "shard output was not visible for: ${missing_live_shards}"
+    fi
     kill -TERM "${cancel_pid}" 2>/dev/null || true
     cancel_gone=no
     for _ in $(seq 1 10); do
@@ -1356,23 +1373,17 @@ matrix_spec = matrix_jobs.get(matrix_name, {}) if matrix_name else {}
 # The cost is measured, not guessed: one shard alone took 772s for its 6 mutations
 # on #164, so ~130s per mutation and 45 mutations is ~97.5 CPU-minutes; sharded 8
 # ways over this job's 4 vCPU that is ~26 minutes. 60 is roughly 2x that.
-# A leg that is killed must still leave its per-shard logs somewhere that
-# survives, or the failure cannot be diagnosed at all. That is what the two #164
-# failures were: the runner is torn down mid-leg (~4 minutes in, reproducibly),
-# and the shard logs were anonymous `mktemp` files under /tmp -- on the very
-# machine being destroyed. The job log showed eight
-# `cat: /tmp/tmp.XXXX: No such file or directory` lines and nothing to read.
-#
-# Both halves are required and both are asserted: the driver must write under the
-# checkout (not TMPDIR, which dies with the runner), and the leg must upload it
-# with `if: always()`, because a cancelled step is exactly the case that needs it.
+# An interrupted leg must expose shard progress in the job log as it runs. The
+# observed job cancellation skipped the `if: always()` upload step. Artifacts
+# remain useful when the job reaches that step, but cannot be the only evidence
+# when cancellation stops later steps.
 _matrix_steps = matrix_spec.get("steps") or []
 _log_uploads = [step for step in _matrix_steps
                 if isinstance(step, dict) and "upload-artifact" in str(step.get("uses", ""))]
 emit(
     len(_log_uploads) == 1,
-    "the suite leg uploads the release-gate logs exactly once, or a killed leg "
-    "yields nothing to read",
+    "the suite leg uploads release-gate logs exactly once when the runner reaches "
+    "the upload step",
     f"found {len(_log_uploads)} upload step(s) among {len(_matrix_steps)} step(s)",
 )
 if _log_uploads:
@@ -1380,8 +1391,7 @@ if _log_uploads:
     _up_with = _up.get("with") or {}
     emit(
         str(_up.get("if", "")).strip() == "always()",
-        "the log upload runs even when the leg failed or was cancelled, or a killed "
-        "leg yields nothing",
+        "the log upload runs after failure or cooperative cancellation",
         f"if={_up.get('if')!r}",
     )
     emit(
@@ -1390,25 +1400,22 @@ if _log_uploads:
         f"path={_up_with.get('path')!r}",
     )
 
-# Uploading is only useful if the logs outlive the runner. The driver's default
-# log directory therefore must not be under TMPDIR: on a CI runner /tmp is part of
-# the machine being torn down, which is precisely the event the logs exist to
-# record. Asserted on the driver's own source rather than on ci.yml, because this
-# is the driver's default and a leg that passes RELEASE_GATE_LOG_DIR cannot see it.
+# Uploading is only useful if logs remain in the checkout until the action runs.
+# The driver's default directory therefore must not be under TMPDIR. Asserted on
+# the driver's source rather than on ci.yml, because a leg that passes
+# RELEASE_GATE_LOG_DIR cannot see the default.
 # `[^}]*` cannot work here: the default itself contains `}`, so the group stops
 # at the first one and the pattern never matches a correct assignment.
 _log_default = re.search(r'^LOG_DIR="\$\{RELEASE_GATE_LOG_DIR:-(.+)\}"\s*$', driver_source, re.M)
 _log_default_value = _log_default.group(1) if _log_default else ""
 emit(
     bool(_log_default_value) and "TMPDIR" not in _log_default_value,
-    "the driver's default log directory is not under TMPDIR, or the logs die with "
-    "the runner they exist to record",
+    "the driver's default log directory is not under TMPDIR before artifact upload",
     f"LOG_DIR default={_log_default_value!r}",
 )
 emit(
     "ROOT_DIR" in _log_default_value,
-    "the driver's default log directory is under the checkout, which is what "
-    "upload-artifact can reach after the job is killed",
+    "the driver's default log directory is under the checkout for artifact upload",
     f"LOG_DIR default={_log_default_value!r}",
 )
 
