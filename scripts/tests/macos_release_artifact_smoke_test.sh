@@ -1294,6 +1294,16 @@ else
     "the baseline gate run failed, so the absence checks below would be reading a run that never reached the launch"
 fi
 
+# Inspect the successful cold-launch run before scenario_with clears its state.
+# This catches a pkill inserted only on the normal path before open; the warm
+# launch case below returns early and cannot exercise that path.
+if [[ -f "${FAKE_STATE}/pkill-before-open" ]]; then
+  bad "the gate never kills a process before the cold launch" \
+    "the gate invoked pkill before launching; a warm instance would be terminated and the launch would look cold without being cold"
+else
+  ok "the gate never kills a process before the cold launch"
+fi
+
 # The refusal must not itself run anything. The diagnostic used to quote the word
 # `open` inside a double-quoted string, so bash executed `open` with no arguments
 # while assembling the message -- printing the real tool's usage dump into the CI log
@@ -1316,16 +1326,6 @@ if [[ -f "${FAKE_STATE}/open-invoked" ]]; then
     "the gate ran 'open' while building the failure message, so the message executed a command"
 else
   ok "the already-running refusal does not invoke open"
-fi
-
-# The fake also records whether pkill ran before open. Inspect the state from
-# the successful baseline launch above: resetting scenarios here would erase the
-# evidence and make this assertion pass unconditionally.
-if [[ -f "${FAKE_STATE}/pkill-before-open" ]]; then
-  bad "the gate never kills a process before the cold launch" \
-    "the gate invoked pkill before launching; a warm instance would be terminated and the launch would look cold without being cold"
-else
-  ok "the gate never kills a process before the cold launch"
 fi
 
 # And the window server must be positively answerable, not merely silent. An
