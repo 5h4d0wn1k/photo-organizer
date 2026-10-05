@@ -324,6 +324,20 @@ case "${verb}" in
       printf 'Unrecognized command: %s\n' "${query}"
       exit 1
     fi
+    # A window server that refuses the question *silently*: non-zero exit, nothing
+    # anywhere. This is the shape the gate used to read as "no existing instance",
+    # because `|| true` collapsed it into the same empty reply a genuinely
+    # not-running app produces. Modelled as a knob for the same reason as the
+    # garbage answer below -- with the verb and the query both correct there is no
+    # other way to reach it -- and placed ahead of the bundle-id comparison so it
+    # fires for any bundle id.
+    #
+    # Deliberately distinct from LSAPPINFO_ANSWER=garbage, which puts text where the
+    # gate can see it. A gate that only handles the first has learned nothing about
+    # the second.
+    if [[ -n "$(value_or LSAPPINFO_RC '')" && "$(value_or LSAPPINFO_RC '')" != "0" ]]; then
+      exit "$(value_or LSAPPINFO_RC '')"
+    fi
     if [[ "$(value_or LSAPPINFO_ANSWER '')" == "garbage" ]]; then
       # The window server refusing to answer, reported on stdout. Modelled as a
       # knob because there is no other way to reach it: the verb and the query
@@ -635,8 +649,28 @@ print(plist[sys.argv[1]])
 ' "${key}" "${file}"
 FAKE_PLISTBUDDY
 
+  # `pkill` is faked but never expected to be called. The gate's own comments insist
+  # there is no `pkill` before the launch -- terminating a stray instance would make
+  # the check pass without the launch ever being cold -- but nothing tested it, and the
+  # suite could not have: `gate_env` keeps the real PATH and no fake provided `pkill`,
+  # so adding `pkill -f ... || true` to the gate would have left every assertion green
+  # while destroying the cold-launch guarantee in production.
+  #
+  # This fake exists so the absence is observable instead of assumed. It records the
+  # invocation and does nothing harmful, so a violation produces a red assertion
+  # naming the violation rather than a hung suite.
+  cat >"${FAKE_BIN}/pkill" <<'FAKE_PKILL'
+#!/usr/bin/env bash
+set -uo pipefail
+# shellcheck source=/dev/null
+. "${FAKE_MACOS_BIN}/fake-lib"
+touch_state pkill-invoked
+printf 'pkill %s\n' "$*"
+exit 0
+FAKE_PKILL
+
   local fake
-  for fake in hdiutil open lsappinfo screencapture xattr lipo spctl log find PlistBuddy; do
+  for fake in hdiutil open lsappinfo screencapture xattr lipo spctl log find PlistBuddy pkill; do
     chmod +x "${FAKE_BIN}/${fake}"
   done
 }
@@ -1236,27 +1270,68 @@ scenario_with "LSAPPINFO_ALREADY_RUNNING=1"
 expect_fail "a warm launch is refused because this gate requires a cold one" \
   "requires a cold launch" run_gate
 
-# The refusal above must not itself run anything. The diagnostic used to quote
-# the word `open` inside a double-quoted string, so bash executed `open` with no
-# arguments while assembling the message -- printing the real tool's usage dump
-# into the CI log right above the failure. Asserted by observing the fake rather
-# than by grepping the source, because a grep would have to be re-derived every
-# time the message is reworded, and would miss the same command substitution in
-# any other message.
+# Positive control, and it has to come first.
+#
+# Everything below asserts the ABSENCE of a state file, and an absence assertion is
+# satisfied by a detector that does not work at all -- which is exactly what was
+# happening here: with `touch_state open-invoked` deleted from the fake, this whole
+# block still reported **116 passed, 0 failed**, because nothing ever wrote the file
+# to find and nothing checked that it was written on the ordinary path. So prove the
+# detector fires before trusting it to prove anything is absent.
+scenario_with
+if run_gate >"${WORK_DIR}/open-detector.log" 2>&1; then
+  if [[ -f "${FAKE_STATE}/open-invoked" ]]; then
+    ok "the fake records that open was invoked, so the absence checks below can bite"
+  else
+    bad "the fake records that open was invoked, so the absence checks below can bite" \
+      "a successful gate run did not write ${FAKE_STATE}/open-invoked, so every 'open was not invoked' assertion below passes unconditionally and proves nothing"
+  fi
+else
+  bad "the fake records that open was invoked, so the absence checks below can bite" \
+    "the baseline gate run failed, so the absence checks below would be reading a run that never reached the launch"
+fi
+
+# The refusal must not itself run anything. The diagnostic used to quote the word
+# `open` inside a double-quoted string, so bash executed `open` with no arguments
+# while assembling the message -- printing the real tool's usage dump into the CI log
+# right above the failure. Asserted by observing the fake rather than by grepping the
+# source, because a grep would have to be re-derived every time the message is
+# reworded, and would miss the same command substitution in any other message.
 #
 # There is deliberately NO `scenario_with` between the run above and this check.
-# `scenario_with` wipes the fake's state directory, so re-arming the scenario
-# first means inspecting an empty one -- an assertion that passes with the bug
-# present. It did exactly that and stayed green while the gate ran `open`: the
-# state file the gate created was deleted before anything looked at it, so the
-# check was reading an empty directory and proving nothing. The only way to see
-# the evidence is to read the state that the run above just wrote.
+# `scenario_with` wipes the fake's state directory, so re-arming the scenario first
+# means inspecting an empty one -- an assertion that passes with the bug present. It
+# did exactly that and stayed green while the gate ran `open`: the state file the
+# gate created was deleted before anything looked at it, so the check was reading an
+# empty directory and proving nothing. The only way to see the evidence is to read
+# the state that the run above just wrote.
+scenario_with "LSAPPINFO_ALREADY_RUNNING=1"
+expect_fail "a warm launch is refused because this gate requires a cold one" \
+  "requires a cold launch" run_gate
 if [[ -f "${FAKE_STATE}/open-invoked" ]]; then
   bad "the already-running refusal does not invoke open" \
     "the gate ran 'open' while building the failure message, so the message executed a command"
 else
   ok "the already-running refusal does not invoke open"
 fi
+
+# The same absence, for `pkill` -- see the fake's own comment. Without a `pkill` in
+# the farm this check could never fail, whatever the gate did.
+scenario_with
+if [[ -f "${FAKE_STATE}/pkill-invoked" ]]; then
+  bad "the gate never kills a process before the cold launch" \
+    "the gate invoked pkill before launching; a warm instance would be terminated and the launch would look cold without being cold"
+else
+  ok "the gate never kills a process before the cold launch"
+fi
+
+# And the window server must be positively answerable, not merely silent. An
+# lsappinfo that exits non-zero with nothing on stdout -- sandbox, TCC, no
+# window-server connection -- used to be read as "nothing is running", which made
+# the cold-launch check pass precisely when it had not been performed.
+scenario_with "LSAPPINFO_RC=3"
+expect_fail "an unanswerable window server fails rather than proving a cold launch" \
+  "could not ask the window server" run_gate
 scenario_with
 
 # `lsappinfo` writes some errors to stdout, so a query it rejects is
@@ -1721,9 +1796,15 @@ echo " lsappinfo reply parsing"
 # something that bites when it is deleted.
 {
   sed -n '/^lsappinfo_asn_raw()/,/^}/p' "${SCRIPT}"
+  # Both functions are needed: `lsappinfo_asn` delegates to `lsappinfo_query`, which
+  # owns the two globals the assertions below read. Extracting only `lsappinfo_asn`
+  # left the unit tests sourcing a function that called nothing, and they failed with
+  # empty output -- three assertions red for a reason that had nothing to do with the
+  # parsing they were written to check.
+  sed -n '/^lsappinfo_query()/,/^}/p' "${SCRIPT}"
   sed -n '/^lsappinfo_asn()/,/^}/p' "${SCRIPT}"
 } >"${WORK_DIR}/asn.sh"
-if [[ -s "${WORK_DIR}/asn.sh" ]] && grep -q 'lsappinfo_asn_raw' "${WORK_DIR}/asn.sh" &&
+if [[ -s "${WORK_DIR}/asn.sh" ]] && grep -q 'lsappinfo_query()' "${WORK_DIR}/asn.sh" &&
   grep -q 'lsappinfo_asn()' "${WORK_DIR}/asn.sh"; then
   ok "both lsappinfo reply functions are extractable for unit testing"
 else
@@ -1748,7 +1829,7 @@ asn_parse() {
   # harness before the reply can be inspected -- which is the property under test.
   FAKE_LSAPPINFO_REPLY="${1}" FAKE_LSAPPINFO_RC="${2:-0}" \
     LSAPPINFO_BIN="${asn_stub_dir}/lsappinfo" APP_BUNDLE_ID="com.example.app" \
-    bash -c "source '${WORK_DIR}/asn.sh'; lsappinfo_asn" 2>/dev/null
+    bash -c "source '${WORK_DIR}/asn.sh'; LSAPPINFO_RC=0; LSAPPINFO_RAW=''; lsappinfo_asn" 2>/dev/null
 }
 # The contract, which is deliberately narrower than "pass the reply through":
 # `lsappinfo_asn` returns a well-formed application serial number, or nothing.
