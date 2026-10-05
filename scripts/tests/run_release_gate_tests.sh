@@ -53,7 +53,7 @@ shards_for_suite() {
 
 failed=0
 degraded=0
-declare -a results=()
+declare -a results=() active_pids=()
 
 # Suite and shard logs are written under one job-scoped directory rather than as
 # anonymous `mktemp` files, and that directory is NOT deleted on exit.
@@ -80,10 +80,32 @@ printf 'release-gate logs: %s\n' "${LOG_DIR}"
 # A Ctrl-C mid-suite would otherwise leave the shards running. The signal handlers
 # exit, for the same reason the mutation harness's do: a handler that returns lets
 # the script resume, and a resumed driver re-reports work it never finished.
+stop_active_shards() {
+  local pid
+  for pid in "${active_pids[@]}"; do
+    [[ -n "${pid}" ]] || continue
+    kill -TERM -- "-${pid}" 2>/dev/null || true
+  done
+  # Mutation scripts may be waiting on a foreground tool that defers its own
+  # trap. Give cooperative children a moment, then kill the entire isolated
+  # process group so cancellation cannot leave work running in the background.
+  sleep 2
+  for pid in "${active_pids[@]}"; do
+    [[ -n "${pid}" ]] || continue
+    kill -KILL -- "-${pid}" 2>/dev/null || true
+  done
+  for pid in "${active_pids[@]}"; do
+    [[ -n "${pid}" ]] || continue
+    wait "${pid}" 2>/dev/null || true
+  done
+  active_pids=()
+}
+
 on_signal() {
   local name="$1" signo="$2"
   trap - INT TERM
-  printf '\nFATAL: received signal %s; the release-gate run did not finish.\n' "${name}" >&2
+  printf '\nFATAL: received signal %s; stopping the release-gate run.\n' "${name}" >&2
+  stop_active_shards
   printf '       Per-shard logs are kept in %s for diagnosis.\n' "${LOG_DIR}" >&2
   exit "$((128 + signo))"
 }
@@ -117,11 +139,18 @@ record_suite_result() {
 # the CI "--only-suite" path execute the identical code: a matrix leg cannot drift
 # from what a local full run does.
 run_suite() {
-  local suite="$1" shards shard log rc suite_log
+  local suite="$1" shards shard log rc suite_log status completed progressed shard_rc
   shards="$(shards_for_suite "${suite}")"
   if ((shards > 1)); then
     printf '\n==> %s (%s shards, run concurrently)\n' "${suite}" "${shards}"
-    declare -a pids=() shard_logs=()
+    declare -a pids=() shard_logs=() shard_reported=()
+    active_pids=()
+    if ! command -v setsid >/dev/null 2>&1; then
+      printf 'FATAL: setsid is required to isolate release-gate shard process groups\n' >&2
+      results+=("FAIL ${suite}${shards:+ (${shards} shards)}")
+      failed=1
+      return 1
+    fi
     shard=0
     while ((shard < shards)); do
       # Named, not `mktemp`: see LOG_DIR above. The name carries the suite and
@@ -130,24 +159,48 @@ run_suite() {
       log="${LOG_DIR}/${suite%.sh}.shard${shard}.log"
       : >"${log}"
       shard_logs+=("${log}")
-      MUTATION_SHARDS="${shards}" MUTATION_SHARD="${shard}" \
-        bash "${TESTS_DIR}/${suite}" >"${log}" 2>&1 &
+      status="${log}.exit"
+      rm -f "${status}"
+      # shellcheck disable=SC2016 # the wrapper script expands these at runtime
+      setsid bash -c '
+        MUTATION_SHARDS="$1" MUTATION_SHARD="$2" SHARD_WRAPPER_PID="$$" \
+          bash "$3" >"$4" 2>&1
+        suite_rc=$?
+        printf "%s\n" "$suite_rc" >"$5"
+      ' _ "${shards}" "${shard}" "${TESTS_DIR}/${suite}" "${log}" "${status}" &
       pids+=("$!")
+      active_pids+=("$!")
+      shard_reported+=(no)
       shard=$((shard + 1))
     done
     rc=0
-    shard=0
-    while ((shard < shards)); do
-      if ! wait "${pids[$shard]}"; then
-        rc=1
+    completed=0
+    while ((completed < shards)); do
+      progressed=no
+      shard=0
+      while ((shard < shards)); do
+        if [[ "${shard_reported[$shard]}" == no && -f "${shard_logs[$shard]}.exit" ]]; then
+          if ! IFS= read -r shard_rc <"${shard_logs[$shard]}.exit" || [[ ! "${shard_rc}" =~ ^[0-9]+$ ]]; then
+            shard_rc=1
+          fi
+          wait "${pids[$shard]}" 2>/dev/null || true
+          active_pids[shard]=""
+          if ((shard_rc != 0)); then
+            rc=1
+          fi
+          printf -- '--- shard %s/%s ---\n' "${shard}" "${shards}"
+          cat "${shard_logs[$shard]}"
+          shard_reported[shard]=yes
+          completed=$((completed + 1))
+          progressed=yes
+        fi
+        shard=$((shard + 1))
+      done
+      if [[ "${progressed}" == no ]]; then
+        sleep 1
       fi
-      # Tail each shard the moment it finishes instead of concatenating all eight
-      # at the end. A shard that never returns therefore cannot hide the ones that
-      # did: their progress is already in the job log while it is still running.
-      printf -- '--- shard %s/%s ---\n' "${shard}" "${shards}"
-      cat "${shard_logs[$shard]}"
-      shard=$((shard + 1))
     done
+    active_pids=()
     # Concatenated once more for the DEGRADED scan, so that check still covers
     # everything the pass produced. This is derived from the shard logs rather
     # than being the primary record of them, and it is not deleted on exit.
