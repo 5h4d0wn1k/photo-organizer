@@ -1327,6 +1327,62 @@ matrix_spec = matrix_jobs.get(matrix_name, {}) if matrix_name else {}
 # The cost is measured, not guessed: one shard alone took 772s for its 6 mutations
 # on #164, so ~130s per mutation and 45 mutations is ~97.5 CPU-minutes; sharded 8
 # ways over this job's 4 vCPU that is ~26 minutes. 60 is roughly 2x that.
+# A leg that is killed must still leave its per-shard logs somewhere that
+# survives, or the failure cannot be diagnosed at all. That is what the two #164
+# failures were: the runner is torn down mid-leg (~4 minutes in, reproducibly),
+# and the shard logs were anonymous `mktemp` files under /tmp -- on the very
+# machine being destroyed. The job log showed eight
+# `cat: /tmp/tmp.XXXX: No such file or directory` lines and nothing to read.
+#
+# Both halves are required and both are asserted: the driver must write under the
+# checkout (not TMPDIR, which dies with the runner), and the leg must upload it
+# with `if: always()`, because a cancelled step is exactly the case that needs it.
+_matrix_steps = matrix_spec.get("steps") or []
+_log_uploads = [step for step in _matrix_steps
+                if isinstance(step, dict) and "upload-artifact" in str(step.get("uses", ""))]
+emit(
+    len(_log_uploads) == 1,
+    "the suite leg uploads the release-gate logs exactly once, or a killed leg "
+    "yields nothing to read",
+    f"found {len(_log_uploads)} upload step(s) among {len(_matrix_steps)} step(s)",
+)
+if _log_uploads:
+    _up = _log_uploads[0]
+    _up_with = _up.get("with") or {}
+    emit(
+        str(_up.get("if", "")).strip() == "always()",
+        "the log upload runs even when the leg failed or was cancelled, or a killed "
+        "leg yields nothing",
+        f"if={_up.get('if')!r}",
+    )
+    emit(
+        "release-gate-logs" in str(_up_with.get("path", "")),
+        "the upload points at the driver's log directory",
+        f"path={_up_with.get('path')!r}",
+    )
+
+# Uploading is only useful if the logs outlive the runner. The driver's default
+# log directory therefore must not be under TMPDIR: on a CI runner /tmp is part of
+# the machine being torn down, which is precisely the event the logs exist to
+# record. Asserted on the driver's own source rather than on ci.yml, because this
+# is the driver's default and a leg that passes RELEASE_GATE_LOG_DIR cannot see it.
+# `[^}]*` cannot work here: the default itself contains `}`, so the group stops
+# at the first one and the pattern never matches a correct assignment.
+_log_default = re.search(r'^LOG_DIR="\$\{RELEASE_GATE_LOG_DIR:-(.+)\}"\s*$', driver_source, re.M)
+_log_default_value = _log_default.group(1) if _log_default else ""
+emit(
+    bool(_log_default_value) and "TMPDIR" not in _log_default_value,
+    "the driver's default log directory is not under TMPDIR, or the logs die with "
+    "the runner they exist to record",
+    f"LOG_DIR default={_log_default_value!r}",
+)
+emit(
+    "ROOT_DIR" in _log_default_value,
+    "the driver's default log directory is under the checkout, which is what "
+    "upload-artifact can reach after the job is killed",
+    f"LOG_DIR default={_log_default_value!r}",
+)
+
 _suite_timeout = matrix_spec.get("timeout-minutes") if matrix_name else None
 emit(
     isinstance(_suite_timeout, int) and _suite_timeout >= 60,
