@@ -150,6 +150,21 @@ jobs:
       # name is a hard error, so a typo cannot run nothing and report success.
       - name: Run the release gate suite
         run: bash scripts/tests/run_release_gate_tests.sh --only-suite "${{ matrix.suite }}"
+      # Always, and after the suite step, so a leg that is killed or cancelled
+      # still yields its per-shard logs. This is the step that makes the #164
+      # failure diagnosable at all: when the runner is torn down it SIGTERMs the
+      # job (~4 minutes in, reproducibly), and a log under /tmp dies with it --
+      # which is why two earlier failures contained only eight
+      # `cat: /tmp/tmp.XXXX: No such file or directory` lines and nothing to read.
+      # The driver therefore writes under the checkout, and this uploads it.
+      - name: Upload release-gate logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: release-gate-logs-${{ matrix.suite }}
+          path: release-gate-logs/
+          if-no-files-found: ignore
+          retention-days: 7
 
   # The aggregate. `needs:` alone is not enough: a job whose dependencies failed
   # is SKIPPED, and a skipped required check is not a red one. `if:
