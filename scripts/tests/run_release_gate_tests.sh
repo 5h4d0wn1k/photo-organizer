@@ -69,7 +69,11 @@ declare -a results=()
 # Keeping them costs a few hundred KB per job and makes the failure legible.
 # `RELEASE_GATE_LOG_DIR` lets CI point this at its artifact directory; the default
 # keeps local runs self-contained.
-LOG_DIR="${RELEASE_GATE_LOG_DIR:-${TMPDIR:-/tmp}/release-gate-logs}"
+# Default under the checkout, NOT under TMPDIR. On a CI runner /tmp is part of the
+# machine being torn down, so a log written there does not survive the very event
+# it exists to record -- claiming otherwise is worse than not keeping the log at
+# all. The checkout is what `upload-artifact` can actually reach after a job dies.
+LOG_DIR="${RELEASE_GATE_LOG_DIR:-${ROOT_DIR}/release-gate-logs}"
 mkdir -p "${LOG_DIR}"
 printf 'release-gate logs: %s\n' "${LOG_DIR}"
 
