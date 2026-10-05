@@ -12115,13 +12115,13 @@ mod tests {
         fs::write(&source, original_bytes).expect("write source");
 
         let service_a = GalleryService::new(AppConfig {
-            runtime_root: runtime_a.clone(),
+            runtime_root: runtime_a.to_path_buf(),
             network_policy: NetworkPolicy::OfflineOnly,
             ..AppConfig::default()
         })
         .expect("service a");
         let service_b = GalleryService::new(AppConfig {
-            runtime_root: runtime_b.clone(),
+            runtime_root: runtime_b.to_path_buf(),
             network_policy: NetworkPolicy::OfflineOnly,
             ..AppConfig::default()
         })

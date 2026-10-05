@@ -1,6 +1,6 @@
 use std::{
     ops::Deref,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -39,6 +39,12 @@ impl Deref for TestTempDir {
     type Target = PathBuf;
 
     fn deref(&self) -> &Self::Target {
+        &self.0.path
+    }
+}
+
+impl AsRef<Path> for TestTempDir {
+    fn as_ref(&self) -> &Path {
         &self.0.path
     }
 }
