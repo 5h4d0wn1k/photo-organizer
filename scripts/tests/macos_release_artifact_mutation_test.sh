@@ -88,7 +88,32 @@ WORK="$(mktemp -d)"
 # The trap only deletes the private tree: the run never mutates anything outside
 # it, so there is no worktree snapshot to restore even if the shard is killed.
 # (restore() still exists -- it resets the copy between mutations in one shard.)
-trap 'rm -rf "${WORK}"' EXIT INT TERM HUP
+#
+# The signal handlers MUST exit, and that is the whole point of splitting this
+# out. A single `trap 'rm -rf "${WORK}"' EXIT INT TERM HUP` is a trap that lies:
+# for EXIT that is the correct handler, but bash runs a signal handler and then
+# *resumes the script*. So a signalled shard deleted its own tree and carried on,
+# and every later mutation then reported itself as `COULD NOT APPLY -- ` with an
+# empty reason (the reason file lived in the tree that had just been removed),
+# followed by "restoring the originals did not return the suite to green". Read
+# naively that says four mutations do not bite; they were never tested. It also
+# meant a cancelled job could not honour the cancellation and left orphans behind.
+#
+# So: normal exit cleans up and reports; a signal cleans up, then exits 128+signo
+# WITHOUT printing a verdict. A shard that did not finish must never be able to
+# say anything that could be read as a result.
+on_signal() {
+  local name="$1" signo="$2"
+  trap - EXIT INT TERM HUP
+  rm -rf "${WORK}"
+  printf 'FATAL: received signal %s; this shard did not finish and reports no verdict\n' \
+    "${name}" >&2
+  exit "$((128 + signo))"
+}
+trap 'rm -rf "${WORK}"' EXIT
+trap 'on_signal INT 2' INT
+trap 'on_signal TERM 15' TERM
+trap 'on_signal HUP 1' HUP
 
 # The whole `scripts/` tree is COPIED and mutated in place.
 #
@@ -229,7 +254,23 @@ mutate() {
   MUTATIONS_RUN=$((MUTATIONS_RUN + 1))
 
   if ! apply "${target}" "${old}" "${new}" 2>"${WORK}/apply.err"; then
-    mismatches+=("${name}: COULD NOT APPLY -- $(tr '\n' ' ' <"${WORK}/apply.err")")
+    # An empty reason here is not cosmetic. apply() reports *why* it could not
+    # substitute the needle, and reading that reason is the only way to tell a
+    # genuine drift (the anchor moved, so this mutation needs re-anchoring) from
+    # a broken run (the tree this file lives in has been removed underneath us).
+    # The second case previously printed `COULD NOT APPLY -- ` with nothing after
+    # it and was indistinguishable from the first, which is how a killed shard
+    # managed to look like four mutations that do not bite. A reason we cannot
+    # read is therefore itself a hard error, not a per-mutation note.
+    local reason
+    reason="$(tr '\n' ' ' <"${WORK}/apply.err" 2>/dev/null || true)"
+    if [[ -z "${reason// /}" ]]; then
+      printf 'FATAL: %s could not be applied and apply.err is missing or empty.\n' "${name}" >&2
+      printf '       The private tree %s is gone, so this run cannot say which\n' "${WORK}"
+      printf '       mutations bit. Re-run the shard; do not read this as a result.\n' >&2
+      exit 3
+    fi
+    mismatches+=("${name}: COULD NOT APPLY -- ${reason}")
     restore
     return
   fi
