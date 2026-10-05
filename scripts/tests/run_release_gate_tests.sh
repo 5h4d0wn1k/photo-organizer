@@ -54,16 +54,37 @@ shards_for_suite() {
 failed=0
 degraded=0
 declare -a results=()
-declare -a suite_logs=()
 
-# A Ctrl-C mid-suite would otherwise leave the logs behind in /tmp.
-cleanup_logs() {
-  local log
-  for log in "${suite_logs[@]}"; do
-    rm -f "${log}"
-  done
+# Suite and shard logs are written under one job-scoped directory rather than as
+# anonymous `mktemp` files, and that directory is NOT deleted on exit.
+#
+# A shard's log is the only record of what that shard actually did, and reading it
+# was the only way to diagnose the macOS leg when it failed. The previous shape --
+# one `mktemp` per shard, concatenated into a second `mktemp` only after `wait`
+# returned, then `rm -f` -- meant that anything which interrupted the job destroyed
+# the evidence before it was read. That is exactly what happened: the job log
+# contained eight `cat: /tmp/tmp.XXXXXXXX: No such file or directory` lines, one
+# per shard, and no way to tell which mutations had run.
+#
+# Keeping them costs a few hundred KB per job and makes the failure legible.
+# `RELEASE_GATE_LOG_DIR` lets CI point this at its artifact directory; the default
+# keeps local runs self-contained.
+LOG_DIR="${RELEASE_GATE_LOG_DIR:-${TMPDIR:-/tmp}/release-gate-logs}"
+mkdir -p "${LOG_DIR}"
+printf 'release-gate logs: %s\n' "${LOG_DIR}"
+
+# A Ctrl-C mid-suite would otherwise leave the shards running. The signal handlers
+# exit, for the same reason the mutation harness's do: a handler that returns lets
+# the script resume, and a resumed driver re-reports work it never finished.
+on_signal() {
+  local name="$1" signo="$2"
+  trap - INT TERM
+  printf '\nFATAL: received signal %s; the release-gate run did not finish.\n' "${name}" >&2
+  printf '       Per-shard logs are kept in %s for diagnosis.\n' "${LOG_DIR}" >&2
+  exit "$((128 + signo))"
 }
-trap cleanup_logs EXIT INT TERM
+trap 'on_signal INT 2' INT
+trap 'on_signal TERM 15' TERM
 
 record_suite_result() {
   local suite="$1" rc="$2" log="$3" shards="$4" suffix=""
@@ -99,9 +120,12 @@ run_suite() {
     declare -a pids=() shard_logs=()
     shard=0
     while ((shard < shards)); do
-      log="$(mktemp)"
+      # Named, not `mktemp`: see LOG_DIR above. The name carries the suite and
+      # the shard index so a human opening the artifact can tell the eight files
+      # apart and see which shard died where.
+      log="${LOG_DIR}/${suite%.sh}.shard${shard}.log"
+      : >"${log}"
       shard_logs+=("${log}")
-      suite_logs+=("${log}")
       MUTATION_SHARDS="${shards}" MUTATION_SHARD="${shard}" \
         bash "${TESTS_DIR}/${suite}" >"${log}" 2>&1 &
       pids+=("$!")
@@ -113,32 +137,29 @@ run_suite() {
       if ! wait "${pids[$shard]}"; then
         rc=1
       fi
+      # Tail each shard the moment it finishes instead of concatenating all eight
+      # at the end. A shard that never returns therefore cannot hide the ones that
+      # did: their progress is already in the job log while it is still running.
+      printf -- '--- shard %s/%s ---\n' "${shard}" "${shards}"
+      cat "${shard_logs[$shard]}"
       shard=$((shard + 1))
     done
-    # Concatenate the shards into one log so the DEGRADED marker is checked over
-    # everything the pass produced, and so the CI log carries the same evidence a
-    # serial run would.
-    suite_log="$(mktemp)"
-    suite_logs+=("${suite_log}")
+    # Concatenated once more for the DEGRADED scan, so that check still covers
+    # everything the pass produced. This is derived from the shard logs rather
+    # than being the primary record of them, and it is not deleted on exit.
+    suite_log="${LOG_DIR}/${suite%.sh}.combined.log"
     cat "${shard_logs[@]}" >"${suite_log}"
-    for log in "${shard_logs[@]}"; do
-      rm -f "${log}"
-    done
-    cat "${suite_log}"
     record_suite_result "${suite}" "${rc}" "${suite_log}" "${shards}"
-    rm -f "${suite_log}"
     return
   fi
 
   printf '\n==> %s\n' "${suite}"
-  suite_log="$(mktemp)"
-  suite_logs+=("${suite_log}")
+  suite_log="${LOG_DIR}/${suite%.sh}.log"
   if bash "${TESTS_DIR}/${suite}" 2>&1 | tee "${suite_log}"; then
     record_suite_result "${suite}" 0 "${suite_log}" 1
   else
     record_suite_result "${suite}" 1 "${suite_log}" 1
   fi
-  rm -f "${suite_log}"
 }
 
 usage() {
