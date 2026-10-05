@@ -166,7 +166,9 @@ run_suite() {
         MUTATION_SHARDS="$1" MUTATION_SHARD="$2" SHARD_WRAPPER_PID="$$" \
           bash "$3" >"$4" 2>&1
         suite_rc=$?
-        printf "%s\n" "$suite_rc" >"$5"
+        status_tmp="$5.tmp.$$"
+        printf "%s\n" "$suite_rc" >"$status_tmp"
+        mv -- "$status_tmp" "$5"
       ' _ "${shards}" "${shard}" "${TESTS_DIR}/${suite}" "${log}" "${status}" &
       pids+=("$!")
       active_pids+=("$!")
