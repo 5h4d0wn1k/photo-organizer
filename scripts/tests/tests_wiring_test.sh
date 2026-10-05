@@ -478,15 +478,31 @@ for harness in "${TESTS_DIR}"/*_release_artifact_mutation_test.sh; do
   # ~97 minutes of work, so a harness that swallows the signal and limps on would
   # hang this test rather than fail it -- the probe has to stay cheap under the
   # very mutation it is designed to catch.
-  MUTATION_SHARDS=45 MUTATION_SHARD=0 bash "${harness}" >"${probe_out}" 2>&1 &
+  # The signal has to reach the harness's *process group*, not the harness's own
+  # pid. A harness spends the run blocked in `wait` on a foreground child (the
+  # suite, ~120s per mutation), and bash does not run a trap while it is waiting
+  # on a foreground child -- it defers it until the child returns. Signalling the
+  # parent alone therefore leaves it sitting there for the whole child, which is
+  # indistinguishable from a harness that cannot be signalled.
+  #
+  # This is not a subtle timing difference that happened to pass locally: it is
+  # exactly what CI reported, all three harnesses as `rc=still-running`.
+  #
+  # `setsid` puts the harness in its own process group so `kill -TERM -PID` hits
+  # the harness and everything it spawned. The child dies, the wait is interrupted,
+  # and the trap runs -- which is what a real cancellation does.
+  setsid env MUTATION_SHARDS=45 MUTATION_SHARD=0 \
+    bash "${harness}" >"${probe_out}" 2>&1 &
   probe_pid=$!
-  sleep 3
-  kill -TERM "${probe_pid}" 2>/dev/null || true
+  # Let it get as far as the first mutation, so the signal lands on a harness that
+  # is genuinely mid-run rather than one that has not started working yet.
+  sleep 5
+  kill -TERM -"${probe_pid}" 2>/dev/null || kill -TERM "${probe_pid}" 2>/dev/null || true
   # Bounded wait: a harness that cannot be signalled must fail here, not hang the
   # suite. SIGKILL afterwards so a runaway probe cannot outlive the check.
   probe_rc=""
   probe_ran_away=no
-  for _ in $(seq 1 30); do
+  for _ in $(seq 1 20); do
     if ! kill -0 "${probe_pid}" 2>/dev/null; then
       probe_ran_away=no
       break
@@ -496,7 +512,7 @@ for harness in "${TESTS_DIR}"/*_release_artifact_mutation_test.sh; do
   done
   if [[ "${probe_ran_away}" == "yes" ]]; then
     probe_rc="still-running"
-    kill -KILL "${probe_pid}" 2>/dev/null || true
+    kill -KILL -"${probe_pid}" 2>/dev/null || kill -KILL "${probe_pid}" 2>/dev/null || true
   fi
   if wait "${probe_pid}" 2>/dev/null; then
     probe_rc="${probe_rc:-0}"
