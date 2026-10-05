@@ -54,6 +54,9 @@ shards_for_suite() {
 failed=0
 degraded=0
 declare -a results=() active_pids=()
+launch_in_progress=no
+launch_baseline=""
+launch_candidate=""
 
 # Suite and shard logs are written under one job-scoped directory rather than as
 # anonymous `mktemp` files, and that directory is NOT deleted on exit.
@@ -74,14 +77,39 @@ declare -a results=() active_pids=()
 # it exists to record -- claiming otherwise is worse than not keeping the log at
 # all. The checkout is what `upload-artifact` can actually reach after a job dies.
 LOG_DIR="${RELEASE_GATE_LOG_DIR:-${ROOT_DIR}/release-gate-logs}"
-mkdir -p "${LOG_DIR}"
+if ! mkdir -p "${LOG_DIR}"; then
+  printf 'FATAL: cannot create release-gate log directory: %s\n' "${LOG_DIR}" >&2
+  exit 1
+fi
+log_probe="$(mktemp "${LOG_DIR}/.release-gate-write-XXXXXX")" || {
+  printf 'FATAL: release-gate log directory is not writable: %s\n' "${LOG_DIR}" >&2
+  exit 1
+}
+if ! rm -f "${log_probe}"; then
+  printf 'FATAL: cannot remove log-directory write probe: %s\n' "${log_probe}" >&2
+  exit 1
+fi
 printf 'release-gate logs: %s\n' "${LOG_DIR}"
 
 # A Ctrl-C mid-suite would otherwise leave the shards running. The signal handlers
 # exit, for the same reason the mutation harness's do: a handler that returns lets
 # the script resume, and a resumed driver re-reports work it never finished.
 stop_active_shards() {
-  local pid
+  local pid pending_candidate="" current_last_pid="${!:-}"
+  if [[ "${launch_in_progress}" == yes ]]; then
+    pending_candidate="${launch_candidate}"
+    # A trap can run after the background command has forked but before the
+    # following assignment captures $!. Compare with the last known async PID
+    # so an interrupt in that gap still tears down the unregistered group.
+    if [[ -z "${pending_candidate}" && -n "${current_last_pid}" \
+      && "${current_last_pid}" != "${launch_baseline}" ]]; then
+      pending_candidate="${current_last_pid}"
+    fi
+    if [[ -n "${pending_candidate}" ]]; then
+      kill -TERM "${pending_candidate}" 2>/dev/null || true
+      kill -TERM -- "-${pending_candidate}" 2>/dev/null || true
+    fi
+  fi
   for pid in "${active_pids[@]}"; do
     [[ -n "${pid}" ]] || continue
     kill -TERM -- "-${pid}" 2>/dev/null || true
@@ -90,10 +118,17 @@ stop_active_shards() {
   # trap. Give cooperative children a moment, then kill the entire isolated
   # process group so cancellation cannot leave work running in the background.
   sleep 2
+  if [[ -n "${pending_candidate}" ]]; then
+    kill -KILL "${pending_candidate}" 2>/dev/null || true
+    kill -KILL -- "-${pending_candidate}" 2>/dev/null || true
+  fi
   for pid in "${active_pids[@]}"; do
     [[ -n "${pid}" ]] || continue
     kill -KILL -- "-${pid}" 2>/dev/null || true
   done
+  if [[ -n "${pending_candidate}" ]]; then
+    wait "${pending_candidate}" 2>/dev/null || true
+  fi
   for pid in "${active_pids[@]}"; do
     [[ -n "${pid}" ]] || continue
     wait "${pid}" 2>/dev/null || true
@@ -103,7 +138,7 @@ stop_active_shards() {
 
 on_signal() {
   local name="$1" signo="$2"
-  trap - INT TERM
+  trap - INT TERM HUP
   printf '\nFATAL: received signal %s; stopping the release-gate run.\n' "${name}" >&2
   stop_active_shards
   printf '       Per-shard logs are kept in %s for diagnosis.\n' "${LOG_DIR}" >&2
@@ -111,6 +146,20 @@ on_signal() {
 }
 trap 'on_signal INT 2' INT
 trap 'on_signal TERM 15' TERM
+trap 'on_signal HUP 1' HUP
+
+stop_shard_group() {
+  local pid="$1"
+  kill -TERM -- "-${pid}" 2>/dev/null || true
+  # This is the fail-closed path for a dead/malformed worker; waiting here once
+  # per shard would serialize teardown and could multiply a broken run's delay.
+  kill -KILL -- "-${pid}" 2>/dev/null || true
+  wait "${pid}" 2>/dev/null || true
+}
+
+shard_process_state() {
+  ps -o stat= -p "$1" 2>/dev/null | tr -d '[:space:]'
+}
 
 record_suite_result() {
   local suite="$1" rc="$2" log="$3" shards="$4" suffix=""
@@ -145,8 +194,8 @@ run_suite() {
     printf '\n==> %s (%s shards, run concurrently)\n' "${suite}" "${shards}"
     declare -a pids=() shard_logs=() shard_reported=()
     active_pids=()
-    if ! command -v setsid >/dev/null 2>&1; then
-      printf 'FATAL: setsid is required to isolate release-gate shard process groups\n' >&2
+    if ! command -v python3 >/dev/null 2>&1; then
+      printf 'FATAL: python3 is required to isolate and stream release-gate shards\n' >&2
       results+=("FAIL ${suite}${shards:+ (${shards} shards)}")
       failed=1
       return 1
@@ -157,24 +206,32 @@ run_suite() {
       # the shard index so a human opening the artifact can tell the eight files
       # apart and see which shard died where.
       log="${LOG_DIR}/${suite%.sh}.shard${shard}.log"
-      : >"${log}"
+      if ! : >"${log}"; then
+        printf 'FATAL: cannot create shard log: %s\n' "${log}" >&2
+        stop_active_shards
+        results+=("FAIL ${suite} (shard log creation failed)")
+        failed=1
+        return 1
+      fi
       shard_logs+=("${log}")
       status="${log}.exit"
-      rm -f "${status}"
-      # shellcheck disable=SC2016 # the wrapper script expands these at runtime
-      setsid bash -c '
-        set -o pipefail
-        MUTATION_SHARDS="$1" MUTATION_SHARD="$2" SHARD_WRAPPER_PID="$$" \
-          bash "$3" 2>&1 \
-          | tee "$4" \
-          | sed -u "s/^/[shard $2] /"
-        suite_rc=$?
-        status_tmp="$5.tmp.$$"
-        printf "%s\n" "$suite_rc" >"$status_tmp"
-        mv -- "$status_tmp" "$5"
-      ' _ "${shards}" "${shard}" "${TESTS_DIR}/${suite}" "${log}" "${status}" &
-      pids+=("$!")
-      active_pids+=("$!")
+      if ! rm -f "${status}"; then
+        printf 'FATAL: cannot clear shard status marker: %s\n' "${status}" >&2
+        stop_active_shards
+        results+=("FAIL ${suite} (shard status cleanup failed)")
+        failed=1
+        return 1
+      fi
+      launch_baseline="${!:-}"
+      launch_candidate=""
+      launch_in_progress=yes
+      python3 "${TESTS_DIR}/run_in_process_group.py" bash \
+        "${TESTS_DIR}/run_release_gate_shard.sh" "${shards}" "${shard}" \
+        "${TESTS_DIR}/${suite}" "${log}" "${status}" &
+      launch_candidate="$!"
+      pids+=("${launch_candidate}")
+      active_pids+=("${launch_candidate}")
+      launch_in_progress=no
       shard_reported+=(no)
       shard=$((shard + 1))
     done
@@ -186,6 +243,8 @@ run_suite() {
       while ((shard < shards)); do
         if [[ "${shard_reported[$shard]}" == no && -f "${shard_logs[$shard]}.exit" ]]; then
           if ! IFS= read -r shard_rc <"${shard_logs[$shard]}.exit" || [[ ! "${shard_rc}" =~ ^[0-9]+$ ]]; then
+            printf 'FATAL: shard %s/%s published an invalid status marker\n' \
+              "${shard}" "${shards}" >&2
             shard_rc=1
           fi
           wait "${pids[$shard]}" 2>/dev/null || true
@@ -194,6 +253,19 @@ run_suite() {
             rc=1
           fi
           printf -- '--- shard %s/%s ---\n' "${shard}" "${shards}"
+          cat "${shard_logs[$shard]}"
+          shard_reported[shard]=yes
+          completed=$((completed + 1))
+          progressed=yes
+        elif [[ "${shard_reported[$shard]}" == no ]] \
+          && { [[ -z "$(shard_process_state "${pids[$shard]}")" ]] \
+            || [[ "$(shard_process_state "${pids[$shard]}")" == Z* ]]; }; then
+          printf 'FATAL: shard %s/%s exited without publishing a valid status marker\n' \
+            "${shard}" "${shards}" >&2
+          stop_shard_group "${pids[$shard]}"
+          active_pids[shard]=""
+          rc=1
+          printf -- '--- shard %s/%s (missing status marker) ---\n' "${shard}" "${shards}"
           cat "${shard_logs[$shard]}"
           shard_reported[shard]=yes
           completed=$((completed + 1))
