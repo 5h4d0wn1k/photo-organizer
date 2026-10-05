@@ -732,17 +732,10 @@ pub fn database_sha256(path: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-    fn test_config(name: &str) -> (AppConfig, PathBuf) {
-        let n = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
-        let root =
-            std::env::temp_dir().join(format!("pg-sec-test-{name}-{}-{n}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
+    fn test_config(name: &str) -> (AppConfig, crate::test_support::TestTempDir) {
+        let root = crate::test_support::TestTempDir::new(&format!("security-{name}"));
         let config = AppConfig {
-            runtime_root: root.clone(),
+            runtime_root: root.to_path_buf(),
             library_root: root.join("library"),
             ..AppConfig::default()
         };

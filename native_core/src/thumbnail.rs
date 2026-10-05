@@ -149,9 +149,7 @@ fn lookup_by_asset_id(config: &AppConfig, asset_id: Uuid) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::PathBuf};
-
-    use chrono::Utc;
+    use std::fs;
 
     use crate::{
         domain::{ImportAssetRequest, ImportMode, MediaKind},
@@ -164,13 +162,8 @@ mod tests {
     };
     use image::GenericImageView;
 
-    fn temp_root(name: &str) -> PathBuf {
-        let root = std::env::temp_dir().join(format!(
-            "private-gallery-thumbnail-{name}-{}",
-            Utc::now().timestamp_nanos_opt().unwrap_or_default()
-        ));
-        fs::create_dir_all(&root).expect("create temp root");
-        root
+    fn temp_root(name: &str) -> crate::test_support::TestTempDir {
+        crate::test_support::TestTempDir::new(&format!("thumbnail-{name}"))
     }
 
     fn write_ppm(path: &std::path::Path, width: u32, height: u32) {

@@ -475,11 +475,7 @@ mod tests {
 
     #[test]
     fn parses_takeout_timestamp_and_geo_sidecar() {
-        let root = std::env::temp_dir().join(format!(
-            "private-gallery-metadata-{}",
-            Utc::now().timestamp_nanos_opt().unwrap_or_default()
-        ));
-        fs::create_dir_all(&root).expect("temp dir");
+        let root = crate::test_support::TestTempDir::new("metadata");
         let media = root.join("a.jpg");
         let sidecar = root.join("a.jpg.json");
         fs::write(&media, b"not-real-jpeg").expect("media");
@@ -523,10 +519,7 @@ mod tests {
 
     #[test]
     fn derives_local_file_organization_hints_from_relative_path() {
-        let root = std::env::temp_dir().join(format!(
-            "private-gallery-org-hints-{}",
-            Utc::now().timestamp_nanos_opt().unwrap_or_default()
-        ));
+        let root = crate::test_support::TestTempDir::new("org-hints");
         let file = root
             .join("Office")
             .join("Client Acme")
@@ -554,10 +547,7 @@ mod tests {
 
     #[test]
     fn import_metadata_has_folder_hints_without_hosted_services() {
-        let root = std::env::temp_dir().join(format!(
-            "private-gallery-import-org-{}",
-            Utc::now().timestamp_nanos_opt().unwrap_or_default()
-        ));
+        let root = crate::test_support::TestTempDir::new("import-org");
         let file = root.join("project-renewal").join("notes.md");
         fs::create_dir_all(file.parent().expect("parent")).expect("folders");
         fs::write(&file, b"notes").expect("file");
