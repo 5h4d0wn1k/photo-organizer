@@ -163,8 +163,11 @@ run_suite() {
       rm -f "${status}"
       # shellcheck disable=SC2016 # the wrapper script expands these at runtime
       setsid bash -c '
+        set -o pipefail
         MUTATION_SHARDS="$1" MUTATION_SHARD="$2" SHARD_WRAPPER_PID="$$" \
-          bash "$3" >"$4" 2>&1
+          bash "$3" 2>&1 \
+          | tee "$4" \
+          | sed -u "s/^/[shard $2] /"
         suite_rc=$?
         status_tmp="$5.tmp.$$"
         printf "%s\n" "$suite_rc" >"$status_tmp"
