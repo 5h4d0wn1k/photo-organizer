@@ -1194,28 +1194,36 @@ SHARD_SUITE
         "the probe run failed, so the log assertions did not run"
     fi
 
-    # A cancelled driver must honour the cancellation and keep its logs. Before
-    # this, a single `trap cleanup_logs EXIT INT TERM` both deleted the logs and
-    # then *resumed*, so a cancelled run kept running and reported nothing usable.
+    # A cancelled driver must stop and reap every shard, then keep its logs.
+    # Separate sessions let the driver signal a whole shard, including a suite
+    # blocked in a foreground child, without signalling its own caller.
+    cancel_logs="${shard_root}/cancel-logs"
+    shard_pid_dir="${cancel_logs}/pids"
+    mkdir -p "${cancel_logs}" "${shard_pid_dir}"
     cat >"${shard_suite}" <<'SHARD_SUITE'
 #!/usr/bin/env bash
-sleep 30
-exit 0
+sleep 30 &
+sleep_pid=$!
+printf '%s %s\n' "${SHARD_WRAPPER_PID}" "${sleep_pid}" >"${SHARD_PID_DIR}/${MUTATION_SHARD}"
+wait "${sleep_pid}"
 SHARD_SUITE
-    cancel_logs="${shard_root}/cancel-logs"
-    mkdir -p "${cancel_logs}"
-    RELEASE_GATE_LOG_DIR="${cancel_logs}" bash "${shard_runner}" >"${shard_root}/cancel.out" 2>&1 &
+    RELEASE_GATE_LOG_DIR="${cancel_logs}" SHARD_PID_DIR="${shard_pid_dir}" \
+      bash "${shard_runner}" >"${shard_root}/cancel.out" 2>&1 &
     cancel_pid=$!
-    sleep 4
+    sleep 2
     kill -TERM "${cancel_pid}" 2>/dev/null || true
     cancel_gone=no
-    for _ in $(seq 1 20); do
+    for _ in $(seq 1 10); do
       if ! kill -0 "${cancel_pid}" 2>/dev/null; then
         cancel_gone=yes
         break
       fi
       sleep 1
     done
+    if [[ "${cancel_gone}" == no ]]; then
+      # Keep this regression bounded even when the handler it protects regresses.
+      kill -KILL "${cancel_pid}" 2>/dev/null || true
+    fi
     if wait "${cancel_pid}" 2>/dev/null; then
       cancel_rc=0
     else
@@ -1227,6 +1235,27 @@ SHARD_SUITE
       bad "a cancelled release-gate run exits 143 promptly instead of limping on" \
         "gone=${cancel_gone} rc=${cancel_rc} (expected gone=yes rc=143)"
     fi
+    live_groups=0
+    for pid_file in "${shard_pid_dir}"/*; do
+      [[ -f "${pid_file}" ]] || continue
+      read -r shard_group _sleep_pid <"${pid_file}"
+      if ps -eo pgid=,stat= | awk -v group="${shard_group}" '$1 == group && $2 !~ /^Z/ { live=1 } END { exit !live }'; then
+        live_groups=$((live_groups + 1))
+      fi
+    done
+    if [[ "${live_groups}" -eq 0 ]]; then
+      ok "cancelling the release-gate run stops every shard process group"
+    else
+      bad "cancelling the release-gate run stops every shard process group" \
+        "${live_groups} shard process group(s) remained live after driver exit"
+    fi
+    # If the assertion above detected a regression, clean up its isolated groups
+    # after recording the failure so the wiring test never leaves orphan work.
+    for pid_file in "${shard_pid_dir}"/*; do
+      [[ -f "${pid_file}" ]] || continue
+      read -r shard_group _sleep_pid <"${pid_file}"
+      kill -KILL -- "-${shard_group}" 2>/dev/null || true
+    done
     kept_logs=0
     for _f in "${cancel_logs}"/*.shard[0-9].log; do
       [[ -e "${_f}" ]] && kept_logs=$((kept_logs + 1))

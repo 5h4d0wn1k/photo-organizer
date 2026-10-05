@@ -665,6 +665,9 @@ set -uo pipefail
 # shellcheck source=/dev/null
 . "${FAKE_MACOS_BIN}/fake-lib"
 touch_state pkill-invoked
+if [[ ! -f "${FAKE_STATE}/open-invoked" ]]; then
+  touch_state pkill-before-open
+fi
 printf 'pkill %s\n' "$*"
 exit 0
 FAKE_PKILL
@@ -1315,10 +1318,10 @@ else
   ok "the already-running refusal does not invoke open"
 fi
 
-# The same absence, for `pkill` -- see the fake's own comment. Without a `pkill` in
-# the farm this check could never fail, whatever the gate did.
-scenario_with
-if [[ -f "${FAKE_STATE}/pkill-invoked" ]]; then
+# The fake also records whether pkill ran before open. Inspect the state from
+# the successful baseline launch above: resetting scenarios here would erase the
+# evidence and make this assertion pass unconditionally.
+if [[ -f "${FAKE_STATE}/pkill-before-open" ]]; then
   bad "the gate never kills a process before the cold launch" \
     "the gate invoked pkill before launching; a warm instance would be terminated and the launch would look cold without being cold"
 else

@@ -66,6 +66,7 @@ mismatches=()
 # apply <file> <old|||new>
 apply() {
   python3 - "$1" "$2" <<'PYTHON'
+import re
 import sys
 
 path, expr = sys.argv[1], sys.argv[2]
@@ -74,11 +75,39 @@ with open(path, encoding="utf-8") as handle:
 old, new = expr.split("|||")
 old = old.replace("\\n", "\n")
 new = new.replace("\\n", "\n")
-if old not in text:
-    print(f"MUTATION TARGET NOT FOUND: {old!r}", file=sys.stderr)
-    sys.exit(3)
+if old.startswith("@@uses-line@@"):
+    # Match an actual YAML `uses:` line. Literal replacement could rewrite a
+    # quoted copy in a comment before reaching the pin, and rejecting duplicate
+    # pin text made legitimate repeated uses impossible to mutate. Select the
+    # first active line deterministically and preserve its indentation/spacing.
+    old_line = old.removeprefix("@@uses-line@@")
+    new_line = new.removeprefix("@@uses-line@@")
+    prefix_re = re.compile(r"^([ \t]*(?:-[ \t]*)?uses:[ \t]+)(.*)$")
+    old_parts = prefix_re.fullmatch(old_line)
+    new_parts = prefix_re.fullmatch(new_line)
+    if not old_parts or not new_parts:
+        print("MUTATION TARGET NOT FOUND: malformed anchored uses line", file=sys.stderr)
+        sys.exit(3)
+    line_re = re.compile(
+        r"(?m)^([ \t]*(?:-[ \t]*)?uses:[ \t]+)"
+        + re.escape(old_parts.group(2))
+        + r"([ \t]*)(?=\r?$)"
+    )
+    match = line_re.search(text)
+    if not match:
+        print(f"MUTATION TARGET NOT FOUND: {old_line!r}", file=sys.stderr)
+        sys.exit(3)
+    replacement = match.group(1) + new_parts.group(2) + match.group(2)
+    text = text[:match.start()] + replacement + text[match.end():]
+else:
+    old = old.replace("\\n", "\n")
+    new = new.replace("\\n", "\n")
+    if old not in text:
+        print(f"MUTATION TARGET NOT FOUND: {old!r}", file=sys.stderr)
+        sys.exit(3)
+    text = text.replace(old, new, 1)
 with open(path, "w", encoding="utf-8") as handle:
-    handle.write(text.replace(old, new, 1))
+    handle.write(text)
 PYTHON
 }
 
@@ -135,14 +164,13 @@ others = [p for p in sys.argv[4:] if p != edit_file]
 # Anchored to a `uses:` line, because that is all the `pin-major` assertion
 # ever reads (`re.finditer(r"uses:\s*(\S+)", raw)`). Matching anywhere in the
 # file let a prose mention hijack the needle: quoting the pin verbatim in a
-# comment above the first real `uses:` line made `apply`'s `text.replace(old,
-# new, 1)` rewrite the COMMENT, leaving every real pin untouched -- and the
-# suite then passed, so the harness reported "SUITE STILL PASSED (assertion
-# does not bite)" for a mutation whose assertion bites perfectly well. Quoting
-# a pin in a comment is an established habit in this repo; `.github/dependabot.yml`
-# does it today. `anchor_only_one` below is the second line of defence.
+# comment above the first real `uses:` line made a text replacement rewrite the
+# COMMENT, leaving every real pin untouched. The suite then passed, so the harness
+# reported "SUITE STILL PASSED" for a mutation whose assertion bites perfectly
+# well. Since comments do quote pins in this repo, apply anchors to active YAML
+# `uses:` lines before changing anything.
 action_re = re.compile(
-    rf"^(?:\s*(?:-\s*)?)?uses:\s+{re.escape(repo)}"
+    rf"^(?:[ \t]*(?:-[ \t]*)?uses:[ \t]+){re.escape(repo)}"
     rf"(?:/[A-Za-z0-9_.-]+)*@[0-9a-f]{{40}} # v(\d+)",
     re.MULTILINE,
 )
@@ -194,7 +222,7 @@ if int(major) not in others_majors:
 
 old = first.group(0)
 new = old.rsplit("# v", 1)[0].rstrip() + f" # v{new_major}"
-print(f"{old}|||{new}")
+print(f"@@uses-line@@{old}|||@@uses-line@@{new}")
 PYTHON
 }
 
@@ -213,10 +241,8 @@ PYTHON
 #   set-comment <s>   replace the comment with an arbitrary string
 #   minor <v>         rewrite the declared major to a minor-version comment
 #
-# The returned literal is anchored to a `uses:` line and asserted to occur
-# EXACTLY ONCE in the file. `apply` rewrites the first textual occurrence, so a
-# needle that appears twice is a coin flip over which one it hit -- see the
-# `uses:`-anchoring note in pin_major_expr.
+# The returned expression is applied only to an active YAML `uses:` line.
+# Repeated action pins are valid, and prose copies cannot hijack the mutation.
 pin_expr() {
   python3 - "$1" "$2" "$3" "${4:-}" <<'PYTHON'
 import re
@@ -229,7 +255,7 @@ value = sys.argv[4] if len(sys.argv) > 4 else ""
 # indentation included -- so a replacement can be rebuilt without dropping the
 # prefix. group 2 is the SHA, group 3 the declared comment.
 action_re = re.compile(
-    rf"^((?:\s*(?:-\s*)?)?uses:\s+{re.escape(repo)}"
+    rf"^([ \t]*(?:-[ \t]*)?uses:[ \t]+{re.escape(repo)}"
     rf"(?:/[A-Za-z0-9_.-]+)*@)([0-9a-f]{{40}})( # v(\d+(?:\.\d+)*))?",
     re.MULTILINE,
 )
@@ -263,22 +289,10 @@ else:
     print(f"NEEDLE PRECONDITION FAILED: unknown edit-kind {kind!r}", file=sys.stderr)
     sys.exit(3)
 
-# `apply` uses `text.replace(old, new, 1)`, so an old that occurs more than once
-# makes the outcome depend on which occurrence comes first in the file -- and
-# here the first occurrence is the *real* pin, so the mutation would rewrite the
-# real pin and the second one would silently keep disagreeing (or not). Refuse
-# rather than guess. Quoting a pin in a comment is an established habit in this
-# repo, so this is not a hypothetical.
-if text.count(first.group(0)) != 1:
-    print(
-        f"NEEDLE PRECONDITION FAILED: the {repo} pin in {edit_file} occurs "
-        f"{text.count(first.group(0))} times as text, so rewriting the first "
-        f"occurrence is ambiguous. This pin must be unique in the file.",
-        file=sys.stderr,
-    )
-    sys.exit(3)
-
-print(f"{first.group(0)}|||{new}")
+# Multiple identical action pins are legitimate. `apply` matches only active
+# YAML `uses:` lines, so duplicate pins stay deterministic and prose copies stay
+# untouched.
+print(f"@@uses-line@@{first.group(0)}|||@@uses-line@@{new}")
 PYTHON
 }
 
