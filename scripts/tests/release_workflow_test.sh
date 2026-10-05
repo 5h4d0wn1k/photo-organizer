@@ -1076,6 +1076,9 @@ PYTHON
   shard_root="$(mktemp -d)"
   mkdir -p "${shard_root}/scripts/tests"
   cp "${runner}" "${shard_root}/scripts/tests/run_release_gate_tests.sh"
+  cp "${ROOT_DIR}/scripts/tests/run_in_process_group.py" \
+    "${ROOT_DIR}/scripts/tests/run_release_gate_shard.sh" \
+    "${ROOT_DIR}/scripts/tests/prefix_shard_output.py" "${shard_root}/scripts/tests/"
   if python3 - "${shard_root}/scripts/tests/run_release_gate_tests.sh" <<'PYTHON'
 import re
 import sys
@@ -1194,6 +1197,29 @@ SHARD_SUITE
         "the probe run failed, so the log assertions did not run"
     fi
 
+    # A path that is a file cannot be a log directory. The driver must reject it
+    # before any worker starts instead of waiting for status markers it cannot
+    # write.
+    bad_log_target="${shard_root}/not-a-directory"
+    bad_log_output="${shard_root}/bad-log-output"
+    started_marker="${shard_root}/worker-started-with-bad-log-path"
+    : >"${bad_log_target}"
+    cat >"${shard_suite}" <<SHARD_SUITE
+#!/usr/bin/env bash
+: >"${started_marker}"
+SHARD_SUITE
+    if RELEASE_GATE_LOG_DIR="${bad_log_target}" bash "${shard_runner}" \
+      >"${bad_log_output}" 2>&1; then
+      bad "an unusable log directory fails before workers start" \
+        "the runner returned success for a file used as the log directory"
+    elif grep -qF "cannot create release-gate log directory" "${bad_log_output}" \
+      && [[ ! -e "${started_marker}" ]]; then
+      ok "an unusable log directory fails before workers start"
+    else
+      bad "an unusable log directory fails before workers start" \
+        "failure lacked the expected diagnostic or a worker started"
+    fi
+
     # A cancelled driver must stop and reap every shard, and stream progress into
     # the live runner output before teardown. The observed job cancellation did
     # not reach the `if: always()` artifact step; the Actions job log preserves
@@ -1227,6 +1253,16 @@ SHARD_SUITE
     else
       bad "every running shard streams progress to the job output before cancellation" \
         "shard output was not visible for: ${missing_live_shards}"
+    fi
+    term_pid_markers=0
+    for pid_file in "${shard_pid_dir}"/*; do
+      [[ -f "${pid_file}" ]] && term_pid_markers=$((term_pid_markers + 1))
+    done
+    if [[ "${term_pid_markers}" -eq 8 ]]; then
+      ok "all eight shard groups are registered before TERM is sent"
+    else
+      bad "all eight shard groups are registered before TERM is sent" \
+        "found ${term_pid_markers} shard PID marker(s)"
     fi
     kill -TERM "${cancel_pid}" 2>/dev/null || true
     cancel_gone=no
@@ -1283,6 +1319,186 @@ SHARD_SUITE
       bad "a cancelled release-gate run keeps its shard logs for diagnosis" \
         "no shard logs left in ${cancel_logs}: $(ls -1 "${cancel_logs}" 2>/dev/null | tr '\n' ' ')"
     fi
+
+    # HUP must take the same cleanup path as TERM because isolated shard groups
+    # do not inherit a terminal/session signal sent only to the driver.
+    hup_logs="${shard_root}/hup-logs"
+    hup_pid_dir="${hup_logs}/pids"
+    mkdir -p "${hup_logs}" "${hup_pid_dir}"
+    cat >"${shard_suite}" <<'SHARD_SUITE'
+#!/usr/bin/env bash
+printf 'HUP_SHARD_STARTED %s\n' "${MUTATION_SHARD}"
+sleep 30 &
+sleep_pid=$!
+printf '%s %s\n' "${SHARD_WRAPPER_PID}" "${sleep_pid}" >"${SHARD_PID_DIR}/${MUTATION_SHARD}"
+wait "${sleep_pid}"
+SHARD_SUITE
+    RELEASE_GATE_LOG_DIR="${hup_logs}" SHARD_PID_DIR="${hup_pid_dir}" \
+      bash "${shard_runner}" >"${shard_root}/hup.out" 2>&1 &
+    hup_driver_pid=$!
+    hup_markers=0
+    for _ in $(seq 1 10); do
+      hup_markers=0
+      for pid_file in "${hup_pid_dir}"/*; do
+        [[ -f "${pid_file}" ]] && hup_markers=$((hup_markers + 1))
+      done
+      [[ "${hup_markers}" -eq 8 ]] && break
+      sleep 1
+    done
+    if [[ "${hup_markers}" -eq 8 ]]; then
+      ok "all eight shard groups are registered before HUP is sent"
+    else
+      bad "all eight shard groups are registered before HUP is sent" \
+        "found ${hup_markers} shard PID marker(s)"
+    fi
+    kill -HUP "${hup_driver_pid}" 2>/dev/null || true
+    hup_gone=no
+    for _ in $(seq 1 10); do
+      if ! kill -0 "${hup_driver_pid}" 2>/dev/null; then
+        hup_gone=yes
+        break
+      fi
+      sleep 1
+    done
+    if [[ "${hup_gone}" == no ]]; then
+      kill -KILL "${hup_driver_pid}" 2>/dev/null || true
+    fi
+    if wait "${hup_driver_pid}" 2>/dev/null; then
+      hup_rc=0
+    else
+      hup_rc=$?
+    fi
+    if [[ "${hup_gone}" == yes && "${hup_rc}" -eq 129 ]]; then
+      ok "a HUP-cancelled release-gate run exits 129 promptly"
+    else
+      bad "a HUP-cancelled release-gate run exits 129 promptly" \
+        "gone=${hup_gone} rc=${hup_rc} (expected gone=yes rc=129)"
+    fi
+    live_groups=0
+    for pid_file in "${hup_pid_dir}"/*; do
+      [[ -f "${pid_file}" ]] || continue
+      read -r shard_group _sleep_pid <"${pid_file}"
+      if ps -eo pgid=,stat= | awk -v group="${shard_group}" '$1 == group && $2 !~ /^Z/ { live=1 } END { exit !live }'; then
+        live_groups=$((live_groups + 1))
+      fi
+      kill -KILL -- "-${shard_group}" 2>/dev/null || true
+    done
+    if [[ "${live_groups}" -eq 0 ]]; then
+      ok "a HUP-cancelled release-gate run stops every shard process group"
+    else
+      bad "a HUP-cancelled release-gate run stops every shard process group" \
+        "${live_groups} shard process group(s) remained live after driver exit"
+    fi
+
+    # If a worker disappears before it can publish the atomic status marker, the
+    # driver must fail promptly and reap its remaining process group.
+    driver_is_running() {
+      local state
+      state="$(ps -o stat= -p "$1" 2>/dev/null | tr -d '[:space:]')"
+      [[ -n "${state}" && "${state}" != Z* ]]
+    }
+    missing_status_logs="${shard_root}/missing-status-logs"
+    missing_status_pids="${shard_root}/missing-status-pids"
+    missing_status_output="${shard_root}/missing-status.out"
+    mkdir -p "${missing_status_logs}" "${missing_status_pids}"
+    cat >"${shard_suite}" <<'SHARD_SUITE'
+#!/usr/bin/env bash
+printf '%s\n' "${SHARD_WRAPPER_PID}" >"${SHARD_PID_DIR}/${MUTATION_SHARD}"
+if [[ "${MUTATION_SHARD}" == 3 ]]; then
+  kill -KILL "${SHARD_WRAPPER_PID}"
+fi
+SHARD_SUITE
+    RELEASE_GATE_LOG_DIR="${missing_status_logs}" SHARD_PID_DIR="${missing_status_pids}" \
+      bash "${shard_runner}" >"${missing_status_output}" 2>&1 &
+    missing_status_driver_pid=$!
+    missing_status_gone=no
+    for _ in $(seq 1 15); do
+      if ! driver_is_running "${missing_status_driver_pid}"; then
+        missing_status_gone=yes
+        break
+      fi
+      sleep 1
+    done
+    if [[ "${missing_status_gone}" == no ]]; then
+      kill -TERM "${missing_status_driver_pid}" 2>/dev/null || true
+      sleep 2
+      kill -KILL "${missing_status_driver_pid}" 2>/dev/null || true
+    fi
+    if wait "${missing_status_driver_pid}" 2>/dev/null; then
+      missing_status_rc=0
+    else
+      missing_status_rc=$?
+    fi
+    if [[ "${missing_status_gone}" == yes && "${missing_status_rc}" -ne 124 \
+      ]] && grep -qF "exited without publishing a valid status marker" "${missing_status_output}"; then
+      ok "a worker exit without a status marker fails promptly"
+    elif [[ "${missing_status_gone}" == no ]]; then
+      bad "a worker exit without a status marker fails promptly" \
+        "the runner exceeded the 15-second bound and was terminated"
+    else
+      bad "a worker exit without a status marker fails promptly" \
+        "rc=${missing_status_rc}; failure lacked the expected diagnostic"
+    fi
+
+    # A failed atomic status publication must also propagate as a missing marker
+    # and a non-zero suite result. Shadow mv only for the shard helper so this
+    # is deterministic even when tests run with privileged file permissions.
+    failing_mv_dir="${shard_root}/failing-mv-bin"
+    mkdir -p "${failing_mv_dir}"
+    real_mv="$(command -v mv)"
+    cat >"${failing_mv_dir}/mv" <<'MV_SHIM'
+#!/usr/bin/env bash
+case "$*" in
+  *.log.exit.tmp.*) printf 'injected status publication failure\n' >&2; exit 1 ;;
+esac
+exec "${REAL_MV}" "$@"
+MV_SHIM
+    chmod +x "${failing_mv_dir}/mv"
+    publication_logs="${shard_root}/publication-failure-logs"
+    mkdir -p "${publication_logs}"
+    printf '#!/usr/bin/env bash\nexit 0\n' >"${shard_suite}"
+    PATH="${failing_mv_dir}:${PATH}" REAL_MV="${real_mv}" \
+      RELEASE_GATE_LOG_DIR="${publication_logs}" bash "${shard_runner}" \
+      >"${shard_root}/publication-failure.out" 2>&1 &
+    publication_driver_pid=$!
+    publication_gone=no
+    for _ in $(seq 1 15); do
+      if ! driver_is_running "${publication_driver_pid}"; then
+        publication_gone=yes
+        break
+      fi
+      sleep 1
+    done
+    if [[ "${publication_gone}" == no ]]; then
+      kill -TERM "${publication_driver_pid}" 2>/dev/null || true
+      sleep 2
+      kill -KILL "${publication_driver_pid}" 2>/dev/null || true
+    fi
+    if wait "${publication_driver_pid}" 2>/dev/null; then
+      publication_rc=0
+    else
+      publication_rc=$?
+    fi
+    if [[ "${publication_gone}" == yes && "${publication_rc}" -ne 0 ]] \
+      && grep -qF "exited without publishing a valid status marker" \
+        "${shard_root}/publication-failure.out" \
+      && grep -qF "injected status publication failure" \
+        "${shard_root}/publication-failure.out" \
+      && grep -qF "FATAL: cannot publish shard status marker" \
+        "${shard_root}/publication-failure.out"; then
+      ok "a failed status publication fails the release-gate suite"
+    elif [[ "${publication_gone}" == no ]]; then
+      bad "a failed status publication fails the release-gate suite" \
+        "the runner exceeded the 15-second bound and was terminated"
+    else
+      bad "a failed status publication fails the release-gate suite" \
+        "rc=${publication_rc}; helper failure did not reach the driver"
+    fi
+    for pid_file in "${missing_status_pids}"/*; do
+      [[ -f "${pid_file}" ]] || continue
+      read -r shard_group <"${pid_file}"
+      kill -KILL -- "-${shard_group}" 2>/dev/null || true
+    done
 
     rm -f "${shard_log}"
     rm -rf "${shard_root}"

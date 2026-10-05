@@ -488,10 +488,11 @@ for harness in "${TESTS_DIR}"/*_release_artifact_mutation_test.sh; do
   # This is not a subtle timing difference that happened to pass locally: it is
   # exactly what CI reported, all three harnesses as `rc=still-running`.
   #
-  # `setsid` puts the harness in its own process group so `kill -TERM -PID` hits
-  # the harness and everything it spawned. The child dies, the wait is interrupted,
-  # and the trap runs -- which is what a real cancellation does.
-  setsid env MUTATION_SHARDS=45 MUTATION_SHARD=0 \
+  # The Python helper starts a POSIX session so `kill -TERM -PID` hits the
+  # harness and everything it spawned on Linux and BSD/macOS. The child dies,
+  # the wait is interrupted, and the trap runs -- a real cancellation path.
+  python3 "${TESTS_DIR}/run_in_process_group.py" env \
+    MUTATION_SHARDS=45 MUTATION_SHARD=0 \
     bash "${harness}" >"${probe_out}" 2>&1 &
   probe_pid=$!
   # Let it get as far as the first mutation, so the signal lands on a harness that
