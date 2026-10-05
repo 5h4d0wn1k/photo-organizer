@@ -30,8 +30,21 @@ jobs:
         run: cargo fmt --check
       - name: Clippy
         run: cargo clippy --all-targets --all-features --locked -- -D warnings
-      - name: Test
-        run: cargo test --locked
+      - name: Test and verify temporary-root cleanup
+        env:
+          TMPDIR: ${{ runner.temp }}/photo-organizer-rust-test-tmp
+        run: |
+          mkdir -p "$TMPDIR"
+          for run in 1 2; do
+            echo "Rust test pass ${run}/2"
+            cargo test --locked
+            leaked="$(find "$TMPDIR" -mindepth 1 -maxdepth 1 -type d -name 'private-gallery-*' -print)"
+            if [[ -n "$leaked" ]]; then
+              echo "Rust tests left temporary directories after pass ${run}:" >&2
+              printf '%s\n' "$leaked" >&2
+              exit 1
+            fi
+          done
 
   flutter:
     name: Flutter app

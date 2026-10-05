@@ -1938,12 +1938,10 @@ mod tests {
         net::{IpAddr, Ipv4Addr, SocketAddr},
     };
 
-    use axum::http::{HeaderMap, HeaderValue};
-    use chrono::Utc;
-
     use super::{
         is_desktop_api_client, is_public_remote_route, local_web_file_path, local_web_relative_path,
     };
+    use axum::http::{HeaderMap, HeaderValue};
 
     #[test]
     fn loopback_without_tailnet_headers_is_desktop_api_client() {
@@ -2000,10 +1998,7 @@ mod tests {
 
     #[test]
     fn local_web_file_path_serves_assets_with_index_fallback() {
-        let root = std::env::temp_dir().join(format!(
-            "private-gallery-local-web-{}",
-            Utc::now().timestamp_nanos_opt().unwrap_or_default()
-        ));
+        let root = crate::test_support::TestTempDir::new("local-web");
         fs::create_dir_all(root.join("assets")).expect("create local web root");
         fs::write(root.join("index.html"), b"index").expect("write index");
         fs::write(root.join("assets/app.js"), b"app").expect("write asset");
@@ -2017,7 +2012,5 @@ mod tests {
             root.join("index.html")
         );
         assert!(local_web_file_path(&root, "../runtime/gallery.sqlite3").is_err());
-
-        fs::remove_dir_all(root).expect("remove local web root");
     }
 }

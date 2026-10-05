@@ -16,6 +16,9 @@ pub mod sync_transport;
 pub mod thumbnail;
 pub mod vault_store;
 
+#[cfg(test)]
+mod test_support;
+
 pub use api::{AppState, router};
 pub use config::AppConfig;
 pub use service::GalleryService;
