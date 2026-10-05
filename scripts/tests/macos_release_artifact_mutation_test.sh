@@ -177,7 +177,7 @@ pass_count() {
 # never read as a pass. DECLARED_MUTATIONS counts every declaration before any
 # shard filtering, so a shard that runs zero mutations and an unsharded run that
 # lost one are both caught.
-MIN_MUTATIONS=41
+MIN_MUTATIONS=45
 DECLARED_MUTATIONS=0
 
 MUTATIONS_RUN=0
@@ -465,22 +465,61 @@ mutate "an unparseable lsappinfo reply is claimed to be a serial number" \
 #    invisible. The needle is one of those unit assertions.
 mutate "lsappinfo_asn passes any reply through unfiltered" \
   'lsappinfo_asn drops a rejected query instead of passing it on' \
-  '  if [[ "${raw}" =~ ^ASN:0x[0-9a-fA-F]+:0x[0-9a-fA-F]+:$ ]]; then
-    printf '"'"'%s\n'"'"' "${raw}"' \
+  '  if [[ "${LSAPPINFO_RAW}" =~ ^ASN:0x[0-9a-fA-F]+:0x[0-9a-fA-F]+:$ ]]; then
+    printf '"'"'%s\n'"'"' "${LSAPPINFO_RAW}"' \
   '  if true; then
-    printf '"'"'%s\n'"'"' "${raw}"'
+    printf '"'"'%s\n'"'"' "${LSAPPINFO_RAW}"'
 
-# 4. Propagating the exit status. `lsappinfo` exits non-zero for a query it will
-#    not answer, and the reply -- not the status -- is what the callers need, so
-#    the status is discarded on purpose. Restoring the propagation makes the
-#    assignment at the call site fail, and under `set -e` the gate dies there
-#    with no ERROR line at all: the worst outcome of the three, because the run
-#    leaves no explanation. The needle is the assertion that reads the *message*,
-#    which a silent death cannot produce.
-mutate "the lsappinfo exit status is propagated instead of discarded" \
-  'that refusal quotes lsappinfo'"'"'s own reply so the failure is diagnosable' \
-  '{ "${LSAPPINFO_BIN}" find "bundleid=${APP_BUNDLE_ID}" 2>/dev/null || true; } |' \
-  '{ "${LSAPPINFO_BIN}" find "bundleid=${APP_BUNDLE_ID}" 2>/dev/null; } |'
+# 4. The exit status discarded again. `lsappinfo` exits non-zero for a query it will
+#    not answer, and `|| true` collapsed that into the same empty reply a genuinely
+#    not-running app produces -- so the cold-launch check passed precisely when it
+#    had not been performed. This is the fail-open the review found, and the needle
+#    is the assertion that a *silent* non-zero exit is refused rather than read as
+#    absence. Deliberately a different knob from the garbage-answer cases: the fake
+#    has `LSAPPINFO_ANSWER=garbage` for a refusal that prints text, and this
+#    mutation must be caught by the case that prints nothing at all.
+mutate "the lsappinfo exit status is discarded into an empty reply again" \
+  'an unanswerable window server fails rather than proving a cold launch' \
+  '  out="$("${LSAPPINFO_BIN}" find "bundleid=${APP_BUNDLE_ID}" 2>/dev/null)" || rc=$?' \
+  '  out="$("${LSAPPINFO_BIN}" find "bundleid=${APP_BUNDLE_ID}" 2>/dev/null || true)"'
+
+# 4b. The fail-closed branch itself removed. Mutation 4 alone is not enough coverage
+#     of it: that mutation still *computes* rc, it just stops consulting it. This
+#     one deletes the refusal, so a silent non-zero exit has no path to a red gate.
+mutate "the unanswerable-window-server refusal is deleted" \
+  'an unanswerable window server fails rather than proving a cold launch' \
+  '    if ((LSAPPINFO_RC != 0)); then
+      fail "could not ask the window server' \
+  '    if false; then
+      fail "could not ask the window server'
+
+# 4c. The refusal demoted to a warning: the same lost guarantee as 4b, reached a
+#     different way -- the gate carries on without having proven a cold launch.
+mutate "the unanswerable-window-server refusal is downgraded to a warning" \
+  'an unanswerable window server fails rather than proving a cold launch' \
+  '      fail "could not ask the window server' \
+  '      log "could not ask the window server'
+
+# 4d. The status-bearing call put back inside a command substitution. Not
+#     hypothetical: the first version of this fix did exactly that, the assignment
+#     died with the subshell, and the gate went red on every single run. If the
+#     globals stop surviving the call, no caller can read a status at all.
+mutate "the lsappinfo status is read inside a command substitution (subshell)" \
+  'an unanswerable window server fails rather than proving a cold launch' \
+  '  lsappinfo_query
+  raw="${LSAPPINFO_RAW}"' \
+  '  raw="$(lsappinfo_query)"
+  LSAPPINFO_RAW="${raw}"'
+
+# 4e. The gate kills a process before the cold launch. The gate'"'"'s own comments
+#     insist it never does -- terminating a stray instance would make the check pass
+#     without the launch being cold -- and before the pkill fake existed the suite
+#     could not have caught this at all, because nothing in the farm recorded it.
+mutate "the gate kills a process before the cold launch" \
+  'the gate never kills a process before the cold launch' \
+  'assert_nothing_already_running() {' \
+  'pkill -f "${APP_BUNDLE_ID}" || true
+assert_nothing_already_running() {'
 
 # 5. Backticks in the diagnostic. The refusal message quoted the `open` command
 #    inside a double-quoted string, so bash executed `open` with no arguments
