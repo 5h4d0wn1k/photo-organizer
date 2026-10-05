@@ -49,7 +49,7 @@ jobs:
   flutter:
     name: Flutter app
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 60
     defaults:
       run:
         working-directory: app
@@ -86,9 +86,23 @@ jobs:
     name: Release gate suite
     runs-on: ubuntu-24.04
     # Each leg runs exactly one suite. The mutation legs shard internally: the
-    # driver starts every shard concurrently, so a leg is bounded by one shard
-    # (~10 minutes), not by the whole pass. The bound only needs to catch a hang.
-    timeout-minutes: 30
+    # driver starts every shard concurrently, so a leg is bounded by the slowest
+    # shard, not by the whole pass.
+    #
+    # The bound still only needs to catch a hang, but 30 minutes was not actually
+    # above the slowest leg's real cost, so it was not catching hangs -- it was a
+    # deadline the macOS leg could legitimately miss. Measured on #164: one shard
+    # alone takes 772s for its 6 mutations, i.e. ~130s per mutation, so the 45
+    # mutations are ~97.5 CPU-minutes of work. Sharded 8 ways across this job's
+    # 4 vCPU that is ~26 minutes of wall clock, against a 30 minute limit: about
+    # four minutes of margin, on a runner whose throughput is not the local
+    # machine's. Its siblings passed only because their suites are cheaper (iOS
+    # 13m, Windows 9m on the same runner).
+    #
+    # 60 leaves roughly 2x headroom over the measured worst leg, which is what a
+    # hang-detector bound actually wants. release_workflow_test.sh asserts this
+    # value, so it cannot be lowered back under the measured cost unnoticed.
+    timeout-minutes: 60
     strategy:
       # One failed leg must not cancel the others: the whole set has to report,
       # so a single failure cannot hide a second, independent one.

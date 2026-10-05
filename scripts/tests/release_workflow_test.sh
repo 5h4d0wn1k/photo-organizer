@@ -559,6 +559,11 @@ expect(
     "the preflight must need no other job, or a missing secret stops being a fast fail",
 )
 
+# The suite job's timeout is asserted where matrix_name is computed, further
+# down: this block runs before the matrix fan-out has been parsed, so the job it
+# applies to cannot be named yet. See "the suite job's timeout must clear its
+# slowest measured leg" below.
+
 # --- least privilege --------------------------------------------------------
 expect(
     jobs["android"]["permissions"] == {"contents": "read"},
@@ -1145,6 +1150,94 @@ SHARD_SUITE
       ok "the committed runner degrades the pass when one shard is degraded"
     fi
 
+    # Each shard's log must be a named, readable file under the log directory
+    # rather than an anonymous `mktemp` that is concatenated at the end and
+    # deleted. A shard's log is the only record of what that shard did, and the
+    # #164 macOS leg failed with eight `cat: /tmp/tmp.XXXX: No such file or
+    # directory` lines and no readable evidence at all -- the logs were destroyed
+    # before anyone could read them.
+    shard_logs_dir="${shard_root}/logs"
+    mkdir -p "${shard_logs_dir}"
+    cat >"${shard_suite}" <<SHARD_SUITE
+#!/usr/bin/env bash
+printf 'shard %s ran\n' "\${MUTATION_SHARD}"
+exit 0
+SHARD_SUITE
+    if RELEASE_GATE_LOG_DIR="${shard_logs_dir}" bash "${shard_runner}" >/dev/null 2>&1; then
+      # Counted with a glob rather than `ls | grep`: the directory is ours, so
+      # there are no odd filenames to mangle, and shellcheck rejects the pipe.
+      shard_log_files=0
+      for _f in "${shard_logs_dir}"/*.shard[0-9].log; do
+        [[ -e "${_f}" ]] && shard_log_files=$((shard_log_files + 1))
+      done
+      if [[ "${shard_log_files}" == "8" ]]; then
+        ok "every shard writes its own named, readable log (a failure can be diagnosed)"
+      else
+        bad "every shard writes its own named, readable log (a failure can be diagnosed)" \
+          "found ${shard_log_files} per-shard log(s) in ${shard_logs_dir}: $(ls -1 "${shard_logs_dir}" 2>/dev/null | tr '\n' ' ')"
+      fi
+      # And the union must still be findable in the combined log, because the
+      # DEGRADED scan reads that rather than the shard files.
+      combined=0
+      for _f in "${shard_logs_dir}"/*.combined.log; do
+        [[ -e "${_f}" ]] && combined=$((combined + 1))
+      done
+      if [[ "${combined}" == "1" ]] \
+        && grep -q 'shard 7 ran' "${shard_logs_dir}"/*.combined.log 2>/dev/null; then
+        ok "the combined log still carries every shard, so the DEGRADED scan sees them all"
+      else
+        bad "the combined log still carries every shard, so the DEGRADED scan sees them all" \
+          "combined logs=${combined}"
+      fi
+    else
+      bad "every shard writes its own named, readable log (a failure can be diagnosed)" \
+        "the probe run failed, so the log assertions did not run"
+    fi
+
+    # A cancelled driver must honour the cancellation and keep its logs. Before
+    # this, a single `trap cleanup_logs EXIT INT TERM` both deleted the logs and
+    # then *resumed*, so a cancelled run kept running and reported nothing usable.
+    cat >"${shard_suite}" <<'SHARD_SUITE'
+#!/usr/bin/env bash
+sleep 30
+exit 0
+SHARD_SUITE
+    cancel_logs="${shard_root}/cancel-logs"
+    mkdir -p "${cancel_logs}"
+    RELEASE_GATE_LOG_DIR="${cancel_logs}" bash "${shard_runner}" >"${shard_root}/cancel.out" 2>&1 &
+    cancel_pid=$!
+    sleep 4
+    kill -TERM "${cancel_pid}" 2>/dev/null || true
+    cancel_gone=no
+    for _ in $(seq 1 20); do
+      if ! kill -0 "${cancel_pid}" 2>/dev/null; then
+        cancel_gone=yes
+        break
+      fi
+      sleep 1
+    done
+    if wait "${cancel_pid}" 2>/dev/null; then
+      cancel_rc=0
+    else
+      cancel_rc=$?
+    fi
+    if [[ "${cancel_gone}" == "yes" && "${cancel_rc}" -eq 143 ]]; then
+      ok "a cancelled release-gate run exits 143 promptly instead of limping on"
+    else
+      bad "a cancelled release-gate run exits 143 promptly instead of limping on" \
+        "gone=${cancel_gone} rc=${cancel_rc} (expected gone=yes rc=143)"
+    fi
+    kept_logs=0
+    for _f in "${cancel_logs}"/*.shard[0-9].log; do
+      [[ -e "${_f}" ]] && kept_logs=$((kept_logs + 1))
+    done
+    if ((kept_logs > 0)); then
+      ok "a cancelled release-gate run keeps its shard logs for diagnosis"
+    else
+      bad "a cancelled release-gate run keeps its shard logs for diagnosis" \
+        "no shard logs left in ${cancel_logs}: $(ls -1 "${cancel_logs}" 2>/dev/null | tr '\n' ' ')"
+    fi
+
     rm -f "${shard_log}"
     rm -rf "${shard_root}"
   else
@@ -1221,6 +1314,31 @@ emit(
 
 matrix_name = next(iter(matrix_jobs)) if len(matrix_jobs) == 1 else None
 matrix_spec = matrix_jobs.get(matrix_name, {}) if matrix_name else {}
+
+# The suite job's timeout must clear its slowest measured leg.
+#
+# The macOS mutation leg is the slowest and sat at ~26 minutes of measured work
+# against a 30 minute limit -- about four minutes of margin on a shared runner. A
+# bound that close is not a hang detector, it is a deadline the leg can
+# legitimately miss, and it had already done so. Asserted as a floor rather than
+# an exact value so the number cannot be quietly lowered back under the cost, and
+# capped so it cannot grow into "never times out" either.
+#
+# The cost is measured, not guessed: one shard alone took 772s for its 6 mutations
+# on #164, so ~130s per mutation and 45 mutations is ~97.5 CPU-minutes; sharded 8
+# ways over this job's 4 vCPU that is ~26 minutes. 60 is roughly 2x that.
+_suite_timeout = matrix_spec.get("timeout-minutes") if matrix_name else None
+emit(
+    isinstance(_suite_timeout, int) and _suite_timeout >= 60,
+    "the suite job needs timeout-minutes >= 60: its slowest measured leg is ~26 "
+    "minutes of work on this runner's 4 vCPU, and a 30 minute bound was under it",
+    f"timeout-minutes={_suite_timeout!r}",
+)
+emit(
+    isinstance(_suite_timeout, int) and _suite_timeout <= 120,
+    "the suite job's timeout must stay bounded, or a hang is no longer caught",
+    f"timeout-minutes={_suite_timeout!r}",
+)
 ci_suites = (((matrix_spec.get("strategy") or {}).get("matrix") or {}).get("suite")) or []
 
 emit(
