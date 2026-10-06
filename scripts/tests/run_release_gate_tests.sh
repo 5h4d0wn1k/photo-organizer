@@ -242,31 +242,54 @@ run_suite() {
       shard=0
       while ((shard < shards)); do
         if [[ "${shard_reported[$shard]}" == no && -f "${shard_logs[$shard]}.exit" ]]; then
+          wait "${pids[$shard]}" 2>/dev/null || true
           if ! IFS= read -r shard_rc <"${shard_logs[$shard]}.exit" || [[ ! "${shard_rc}" =~ ^[0-9]+$ ]]; then
             printf 'FATAL: shard %s/%s published an invalid status marker\n' \
               "${shard}" "${shards}" >&2
             shard_rc=1
+            stop_shard_group "${pids[$shard]}"
           fi
-          wait "${pids[$shard]}" 2>/dev/null || true
-          active_pids[shard]=""
           if ((shard_rc != 0)); then
             rc=1
           fi
           printf -- '--- shard %s/%s ---\n' "${shard}" "${shards}"
           cat "${shard_logs[$shard]}"
+          active_pids[shard]=""
           shard_reported[shard]=yes
           completed=$((completed + 1))
           progressed=yes
         elif [[ "${shard_reported[$shard]}" == no ]] \
           && { [[ -z "$(shard_process_state "${pids[$shard]}")" ]] \
             || [[ "$(shard_process_state "${pids[$shard]}")" == Z* ]]; }; then
-          printf 'FATAL: shard %s/%s exited without publishing a valid status marker\n' \
-            "${shard}" "${shards}" >&2
-          stop_shard_group "${pids[$shard]}"
+          # The worker can finish after the first status-file check and before
+          # this process-state check. Reap it, then check again before treating
+          # the missing marker as a broken worker. This also handles a transient
+          # process-table miss immediately after background launch without
+          # accepting a worker that truly exits before publishing status.
+          wait "${pids[$shard]}" 2>/dev/null || true
+          if [[ -f "${shard_logs[$shard]}.exit" ]]; then
+            if ! IFS= read -r shard_rc <"${shard_logs[$shard]}.exit" \
+              || [[ ! "${shard_rc}" =~ ^[0-9]+$ ]]; then
+              printf 'FATAL: shard %s/%s published an invalid status marker\n' \
+                "${shard}" "${shards}" >&2
+              shard_rc=1
+              stop_shard_group "${pids[$shard]}"
+            fi
+            if ((shard_rc != 0)); then
+              rc=1
+            fi
+            printf -- '--- shard %s/%s ---\n' "${shard}" "${shards}"
+            cat "${shard_logs[$shard]}"
+          else
+            printf 'FATAL: shard %s/%s exited without publishing a valid status marker\n' \
+              "${shard}" "${shards}" >&2
+            stop_shard_group "${pids[$shard]}"
+            rc=1
+            printf -- '--- shard %s/%s (missing status marker) ---\n' \
+              "${shard}" "${shards}"
+            cat "${shard_logs[$shard]}"
+          fi
           active_pids[shard]=""
-          rc=1
-          printf -- '--- shard %s/%s (missing status marker) ---\n' "${shard}" "${shards}"
-          cat "${shard_logs[$shard]}"
           shard_reported[shard]=yes
           completed=$((completed + 1))
           progressed=yes
