@@ -1063,6 +1063,110 @@ mutate "the staging step swallows its own refusal with continue-on-error" \
         run: |' \
   "no step in \`release\` may set \`continue-on-error\`"
 
+# `continue-on-error` is not a `release`-specific property. Anywhere in this
+# workflow it converts a failed step into a green job, and `needs` is what the
+# publisher reads -- so putting it on a gate means a red install/launch/crash
+# check still lets the release publish. That is the v0.1.7 partial-release shape,
+# reached through a key the suite had only ever scanned inside `release`. An
+# independent review tried it on six jobs/steps and every one stayed green.
+#
+# Each of these targets a DIFFERENT gate, on purpose: one assertion covering six
+# call sites proves the assertion works, and nothing more. If the assertion were
+# ever narrowed to a single job, the other five would go uncovered again.
+for gate_anchor_name in \
+  "Run Linux artifact smoke gate" \
+  "Run macOS artifact smoke gate" \
+  "Re-verify the artifact about to be published" \
+  "iOS simulator install/launch/render + backend gate"
+do
+  mutate "a gate step swallows its own failure: ${gate_anchor_name}" \
+    "      - name: ${gate_anchor_name}" \
+    "      - name: ${gate_anchor_name}
+        continue-on-error: true" \
+    "no job in release.yml may set \`continue-on-error\`"
+done
+
+# The job-level form is the coarser hole: one key marks the whole install/launch
+# job green no matter which of its steps failed.
+for gate_job_name in android-smoke linux-smoke
+do
+  mutate "a gate job hides every failed step behind a job-level continue-on-error: ${gate_job_name}" \
+    "  ${gate_job_name}:" \
+    "  ${gate_job_name}:
+    continue-on-error: true" \
+    "no job in release.yml may set \`continue-on-error\`"
+done
+
+# The evidence half of the AGENTS.md drop-gate, in two independent pieces.
+#
+# (1) `if: always()` -- the upload must still run when the gate above it failed,
+#     because a red install/launch is precisely the run whose evidence matters.
+# (2) `if-no-files-found: error` -- the action's default is `warn`, so an
+#     unconditional upload that finds nothing (the gate bailed before writing a
+#     screenshot) warns, the job goes green, and the release publishes with the
+#     evidence silently absent.
+#
+# (2) is only reachable *because* of (1): `warn` is harmless on a step that only
+# runs on success, and dangerous on one that runs regardless. An independent
+# review removed the line from an evidence upload and every other assertion
+# stayed green; the workflow's own comment states the requirement in prose.
+echo "== a gate's evidence cannot be lost to a swallowed failure =="
+
+# The whole step is derived rather than written out, because spelling it here
+# would mean spelling the action pin, and this harness refuses literal 40-hex
+# pins on purpose (a Dependabot bump must invalidate these mutations, not leave
+# them silently unapplicable).
+# SC2034 below is a false positive on both of these, not sloppiness: the loop
+# further down refers to them *by name* and reads them through
+# ${!lenient_mutation}, which shellcheck does not follow. Verified against both
+# 0.9.0 (the version CI installs from apt) and 0.11.0 -- each reports SC2034 for
+# both variables, so the suppression is needed and is not hiding anything else.
+derive "the whole [Upload Linux smoke evidence] step" \
+  step-block "${WORKFLOW}" 'Upload Linux smoke evidence'
+# shellcheck disable=SC2034 # read below by name, not by value
+LINUX_EVIDENCE_STEP="${DERIVED}"
+derive "the whole [Upload iOS smoke evidence] step" \
+  step-block "${WORKFLOW}" 'Upload iOS smoke evidence'
+# shellcheck disable=SC2034 # read below by name, not by value
+IOS_EVIDENCE_STEP="${DERIVED}"
+
+# `warn` is the action's own default, so this is the regression verbatim rather
+# than a deletion. Substituted on the derived bytes with bash pattern
+# substitution, so the anchor and its replacement keep identical whitespace and
+# line endings -- a mutation whose only difference from the file is the property
+# under test.
+for lenient_mutation in LINUX_EVIDENCE_STEP IOS_EVIDENCE_STEP
+do
+  lenient_before="${!lenient_mutation}"
+  if [[ "${lenient_before}" != *"if-no-files-found: error"* ]]; then
+    printf 'HARNESS REFUSAL: %s has no `if-no-files-found: error` line\n' \
+      "${lenient_mutation}" >&2
+    printf 'so the mutation below would be a no-op, and a no-op mutation reports\n' >&2
+    printf 'a green suite -- which reads as "the assertion does not bite".\n' >&2
+    exit 1
+  fi
+  lenient_after="${lenient_before//if-no-files-found: error/if-no-files-found: warn}"
+  mutate "an evidence upload goes lenient on a missing file (${lenient_mutation})" \
+    "${lenient_before}" "${lenient_after}" \
+    "every upload that runs regardless of prior failure must set"
+done
+
+# And (1): an evidence upload that only runs on success means a red gate leaves
+# no evidence at all, which is the exact hole AGENTS.md forbids. `android-verify`
+# is deliberately absent -- it verifies a checksum and signature rather than
+# launching anything, so it has no evidence to preserve.
+mutate "a gate's evidence upload stops running when the gate fails (linux-smoke)" \
+  '      - name: Upload Linux smoke evidence
+        if: always()' \
+  '      - name: Upload Linux smoke evidence' \
+  "must keep an unconditional evidence upload"
+
+mutate "a gate's evidence upload stops running when the gate fails (macos-smoke)" \
+  '      - name: Upload macOS smoke evidence
+        if: always()' \
+  '      - name: Upload macOS smoke evidence' \
+  "must keep an unconditional evidence upload"
+
 # The action's default creates a release with zero assets when the glob matches
 # nothing, which is a live public release missing every platform.
 mutate "the publish step loses fail_on_unmatched_files and can create an empty release" \
