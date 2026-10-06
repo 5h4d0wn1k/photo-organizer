@@ -51,12 +51,40 @@ for f in "${PINNED_FILES[@]}"; do
 done
 cp "${DEPENDABOT}" "${WORK}/dependabot.yml.orig"
 
+# The CodeQL-suppression assertions read four files outside .github/workflows:
+# the config that holds the exclusions, the justification table, and two Rust
+# files whose centralization is what makes the one exclusion sound. `restore`
+# must cover them too, or a mutation below leaks a plaintext `Connection::open`
+# or a stale query id straight into the working tree.
+GUARDED_FILES=(
+  "${ROOT_DIR}/.github/codeql/codeql-config.yml"
+  "${ROOT_DIR}/.github/codeql/suppressed-queries.txt"
+  "${ROOT_DIR}/native_core/src/security.rs"
+  "${ROOT_DIR}/native_core/src/storage.rs"
+  # The suite itself, because one mutation below renames a label inside it to
+  # prove the ledger catches an emitter drifting away from the list of labels
+  # that must report. Without this the edit would outlive the harness.
+  "${ROOT_DIR}/scripts/tests/workflow_hygiene_test.sh"
+)
+mkdir -p "${WORK}/guarded"
+for f in "${GUARDED_FILES[@]}"; do
+  if [[ -f "$f" ]]; then
+    cp "$f" "${WORK}/guarded/$(basename "$f").orig"
+  else
+    echo "ERROR: guarded file missing: ${f}" >&2
+    exit 2
+  fi
+done
+
 restore() {
   for f in "${PINNED_FILES[@]}"; do
     base="$(basename "$f")"
     [[ -f "${WORK}/${base}.orig" ]] && cp "${WORK}/${base}.orig" "$f"
   done
   cp "${WORK}/dependabot.yml.orig" "${DEPENDABOT}"
+  for f in "${GUARDED_FILES[@]}"; do
+    cp "${WORK}/guarded/$(basename "$f").orig" "$f"
+  done
 }
 
 MUTATIONS_RUN=0
@@ -324,7 +352,38 @@ mutate() {
   restore
 }
 
-# A matcher that accepted every needle would report every mutation as biting
+# Two of the assertions guarded here are about a file being *readable*, not about
+# its contents: "the config file is present" and "the justification file is
+# present". A content-rewriting mutator cannot make a file absent, so those two
+# would ship untested -- an assertion that cannot be made to fail is a comment.
+# This is `mutate` with the removal instead of the rewrite, and it judges the
+# result with the same `needle_matches` so the two runners cannot drift apart in
+# what they accept.
+mutate_missing() {
+  local name="$1" file="$2" needle="$3"
+  MUTATIONS_RUN=$((MUTATIONS_RUN + 1))
+  restore
+  local stashed
+  stashed="${WORK}/removed.$(basename "$file")"
+  if ! mv "$file" "$stashed"; then
+    mismatches+=("${name}: could not remove ${file}")
+    restore
+    return
+  fi
+  local out rc
+  out="$(bash "${SUITE}" 2>&1)"
+  rc=$?
+  if [[ ${rc} -eq 0 ]]; then
+    mismatches+=("${name}: SUITE STILL PASSED (assertion does not bite)")
+  elif ! needle_matches "${out}" "${needle}"; then
+    mismatches+=("${name}: went red but not on '${needle}'")
+    mismatches+=("        saw: $(grep -E '^  FAIL ' <<<"${out}" | head -3 | tr '\n' ' ')")
+  else
+    MUTATIONS_BITING=$((MUTATIONS_BITING + 1))
+    printf '  bites  %s\n' "${name}"
+  fi
+  restore
+}
 # while proving nothing, and no amount of green output would reveal it. So the
 # harness checks its own discrimination, on a real mutation, using needle_matches
 # itself:
@@ -754,6 +813,111 @@ else
   MUTATIONS_BITING=$((MUTATIONS_BITING + 1))
   printf '  bites  the install moves after the suites that need it\n'
 fi
+CODEQL_CONFIG="${ROOT_DIR}/.github/codeql/codeql-config.yml"
+CODEQL_JUSTIFY="${ROOT_DIR}/.github/codeql/suppressed-queries.txt"
+SECURITY_RS="${ROOT_DIR}/native_core/src/security.rs"
+STORAGE_RS="${ROOT_DIR}/native_core/src/storage.rs"
+QUERY_ID='rust/cleartext-storage-database'
+QUERY_URL='https://codeql.github.com/codeql-query-help/rust/rust-cleartext-storage-database/'
+
+# The CodeQL-suppression assertions. The drift these exist to catch is not
+# hypothetical: the config excluded
+# `rust/database/cleartext-storage-sensitive-data`, which is not a CodeQL query
+# id at all, so the exclusion matched nothing, the query ran anyway, and it
+# reported the SQLCipher `PRAGMA key` call in `security.rs` as a high-severity
+# alert on every analysis while four inline `// codeql[...]` comments in the same
+# file pretended to suppress it. Nothing caught either. So the first mutation
+# below reproduces exactly that shipped state and requires the suite to notice.
+echo "== CodeQL suppressions are real, justified, and structurally load-bearing =="
+
+mutate_missing "the CodeQL config file is removed entirely" \
+  "${CODEQL_CONFIG}" "codeql: config file is present"
+
+mutate_missing "the justification file is removed entirely" \
+  "${CODEQL_JUSTIFY}" "codeql: justification file is present"
+
+mutate "the config stops declaring query-filters" \
+  "${CODEQL_CONFIG}" \
+  "query-filters:\n  - exclude:\n      id: ${QUERY_ID}|||" \
+  "codeql: config declares query-filters"
+
+mutate "a query-filter uses a shape this suite cannot justify" \
+  "${CODEQL_CONFIG}" \
+  "  - exclude:\n      id: ${QUERY_ID}|||  - include:\n      id: ${QUERY_ID}" \
+  "every query-filter is an exclusion this suite can justify"
+
+mutate "the excluded query id drifts off the real one again" \
+  "${CODEQL_CONFIG}" \
+  "      id: ${QUERY_ID}|||      id: rust/database/cleartext-storage-sensitive-data" \
+  "every excluded query has a justification"
+
+mutate "the same exclusion is listed twice" \
+  "${CODEQL_CONFIG}" \
+  "query-filters:\n  - exclude:\n      id: ${QUERY_ID}|||query-filters:\n  - exclude:\n      id: ${QUERY_ID}\n  - exclude:\n      id: ${QUERY_ID}" \
+  "codeql: no duplicate exclusions"
+
+# The anchor below is the bare URL, not "| <url>". Anchoring on the separator
+# too meant the replacement swallowed it, leaving the real row one field short --
+# the suite then failed "row is complete" and never reached the assertion the
+# mutation was aimed at. A mutation must only break what it claims to.
+mutate "the justification table grows a row nothing excludes" \
+  "${CODEQL_JUSTIFY}" \
+  "${QUERY_URL}|||${QUERY_URL}\njs/hardcoded-credentials | Hard-coded credentials | 8.8 | not excluded anywhere | https://example.invalid/" \
+  "codeql: no stale justification rows"
+
+mutate "the same query is justified twice" \
+  "${CODEQL_JUSTIFY}" \
+  "${QUERY_URL}|||${QUERY_URL}\n${QUERY_ID} | Cleartext storage of sensitive information in a database | 7.5 | duplicate row | https://example.invalid/" \
+  "codeql: no duplicate justification rows"
+
+mutate "a justification row loses its verification URL" \
+  "${CODEQL_JUSTIFY}" \
+  "| ${QUERY_URL}|||" \
+  "codeql: every justification row is complete"
+
+# Anchored on the text after the severity, not on the severity alone: `| 7.5 |`
+# opens and closes with the separator, and `split("|||")` cannot tell that
+# boundary from the one it is given -- the four-pipe run reads as an earlier
+# match and the mutation lands somewhere else entirely.
+mutate "a justification severity stops being a number" \
+  "${CODEQL_JUSTIFY}" \
+  "7.5 | Every database|||high | Every database" \
+  "codeql: every justification records a numeric severity"
+
+mutate "a justification URL is downgraded to http" \
+  "${CODEQL_JUSTIFY}" \
+  "${QUERY_URL}|||${QUERY_URL/https:/http:}" \
+  "codeql: every justification records an https verification URL"
+
+mutate "an inline codeql[] directive is reintroduced into security.rs" \
+  "${SECURITY_RS}" \
+  "fn key_connection(connection: &Connection, key_hex: &str) -> Result<(), SecurityError> {|||// codeql[rust/cleartext-storage-database]\nfn key_connection(connection: &Connection, key_hex: &str) -> Result<(), SecurityError> {" \
+  'no inline `codeql[...]` suppression directives in source'
+
+mutate "storage.rs opens its own database outside a test module" \
+  "${STORAGE_RS}" \
+  "fn open_connection(path: &Path) -> Result<Connection, rusqlite::Error> {|||fn plaintext_database(path: &Path) {\n    let _ = Connection::open(path).map_err(|_| ());\n}\n\nfn open_connection(path: &Path) -> Result<Connection, rusqlite::Error> {" \
+  "codeql: every database is opened through the encrypted path"
+
+mutate "open_database stops being the thing that opens the connection" \
+  "${SECURITY_RS}" \
+  "let connection = Connection::open(path).map_err(database_error)?;|||let connection = open_unencrypted(path).map_err(database_error)?;" \
+  "codeql: the encrypted-path invariant still has a subject"
+
+mutate "the function the suppression depends on is renamed away" \
+  "${SECURITY_RS}" \
+  "pub fn open_database|||pub fn open_database_REMOVED" \
+  "codeql: the encrypted-path invariant still has a subject"
+
+# The non-vacuity of the guard above it. Every check in that block is required to
+# report under a name the block below pins, precisely because a python crash once
+# deleted eleven of twelve and the suite stayed green. So: rename one emitter and
+# the ledger must name it, rather than the count quietly disagreeing.
+mutate "a check reports under a name the ledger does not expect" \
+  "${SUITE}" \
+  'emit("codeql: justification file is present", justify_ok,|||emit("codeql: justification file presence (folded elsewhere)", justify_ok,' \
+  "codeql: every suppression check reported a verdict"
+
 restore
 
 # The needle matcher decides whether the numbers above mean anything, so it is

@@ -3,6 +3,23 @@ name: Photo Organizer CodeQL Config
 queries:
   - uses: security-and-quality
 
+# Suppressions belong HERE and nowhere else.
+#
+# Every id below must have a row in `suppressed-queries.txt` recording the query
+# name, its security severity, why the suppression is sound for this repository,
+# and the URL the id was verified against. `scripts/tests/workflow_hygiene_test.sh`
+# asserts that correspondence in BOTH directions, and asserts that no source file
+# carries its own inline `codeql[...]` directive -- so the mechanism cannot drift
+# back into comments that look like suppressions and suppress nothing.
+#
+# This file used to exclude `rust/database/cleartext-storage-sensitive-data`.
+# That is not a CodeQL query id: the real one is `rust/cleartext-storage-database`.
+# The stale id matched no query, so the exclusion was a no-op, the query ran
+# anyway, and it reported `security.rs:564` -- a SQLCipher `PRAGMA key` call -- as
+# a high-severity alert. No assertion covered this file, so nothing noticed.
+#
+# An exclusion that names no query is worse than no exclusion: it reads as
+# coverage while providing none.
 query-filters:
   - exclude:
-      id: rust/database/cleartext-storage-sensitive-data
+      id: rust/cleartext-storage-database
