@@ -119,7 +119,7 @@ jobs:
       # Pinning 3.13 -- the newest minor with a wheel for this pin -- makes that
       # impossible, and makes a future runner image change unable to alter what
       # these suites run against.
-      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.13"
       - name: Install hash-pinned test dependencies
@@ -151,7 +151,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       # See the release-gate-suites job above for why the interpreter is pinned
       # and why the install is hash-verified.
-      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.13"
       - name: Install hash-pinned test dependencies
@@ -204,7 +204,7 @@ jobs:
           fetch-depth: 0
       # See the identical step in the release-gate job for why the interpreter
       # is pinned and why the install is hash-verified.
-      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.13"
       - name: Install hash-pinned test dependencies
