@@ -1108,11 +1108,13 @@ PYTHON
 printf '%s\n' "\${MUTATION_SHARD}" >>"${shard_log}"
 exit 0
 SHARD_SUITE
-    if bash "${shard_runner}" >/dev/null 2>&1; then
+    shard_probe_output="${shard_root}/shard-probe.out"
+    if bash "${shard_runner}" >"${shard_probe_output}" 2>&1; then
       ok "the committed runner exits 0 when every shard of a sharded suite passes"
     else
+      shard_probe_rc=$?
       bad "the committed runner exits 0 when every shard of a sharded suite passes" \
-        "the sharded path failed on a clean probe"
+        "the sharded path exited ${shard_probe_rc}: $(cat "${shard_probe_output}")"
     fi
     shards_seen="$(sort -n -u "${shard_log}" | tr '\n' ' ')"
     if [[ "${shards_seen}" == "0 1 2 3 4 5 6 7 " ]]; then
@@ -1120,6 +1122,72 @@ SHARD_SUITE
     else
       bad "every shard of the sharded suite runs (the union is the full set)" \
         "shards seen: ${shards_seen:-<none>}"
+    fi
+
+    # Force the monitor's first process-state lookup to land after shard 0 has
+    # published its status marker. This recreates the boundary between the
+    # driver's initial marker check and process-state check without relying on
+    # scheduler timing: shard 0 waits for the ps shim, and the shim waits for
+    # shard 0's atomic marker publication before reporting a transient miss.
+    race_ps_dir="${shard_root}/race-ps-bin"
+    race_logs_dir="${shard_root}/race-logs"
+    race_state_seen="${shard_root}/race-state-seen"
+    race_output="${shard_root}/race-probe.out"
+    mkdir -p "${race_ps_dir}" "${race_logs_dir}"
+    real_ps="$(command -v ps)"
+    cat >"${race_ps_dir}/ps" <<'PS_SHIM'
+#!/usr/bin/env bash
+if [[ "$*" == "-o stat= -p "* && ! -e "${RACE_STATE_SEEN}" ]]; then
+  : >"${RACE_STATE_SEEN}"
+  while [[ ! -f "${RACE_STATUS}" ]]; do
+    sleep 0.01
+  done
+  printf '\n'
+  exit 0
+fi
+exec "${REAL_PS}" "$@"
+PS_SHIM
+    chmod +x "${race_ps_dir}/ps"
+    cat >"${shard_suite}" <<'SHARD_SUITE'
+#!/usr/bin/env bash
+if [[ "${MUTATION_SHARD}" == 0 ]]; then
+  while [[ ! -e "${RACE_STATE_SEEN}" ]]; do
+    sleep 0.01
+  done
+fi
+printf '%s\n' "${MUTATION_SHARD}"
+SHARD_SUITE
+    race_status="${race_logs_dir}/ios_release_artifact_mutation_test.shard0.log.exit"
+    PATH="${race_ps_dir}:${PATH}" REAL_PS="${real_ps}" \
+      RACE_STATE_SEEN="${race_state_seen}" RACE_STATUS="${race_status}" \
+      RELEASE_GATE_LOG_DIR="${race_logs_dir}" bash "${shard_runner}" \
+      >"${race_output}" 2>&1 &
+    race_driver_pid=$!
+    race_driver_gone=no
+    for _ in $(seq 1 15); do
+      race_driver_state="$("${real_ps}" -o stat= -p "${race_driver_pid}" 2>/dev/null \
+        | tr -d '[:space:]')"
+      if [[ -z "${race_driver_state}" || "${race_driver_state}" == Z* ]]; then
+        race_driver_gone=yes
+        break
+      fi
+      sleep 1
+    done
+    if [[ "${race_driver_gone}" == no ]]; then
+      kill -TERM "${race_driver_pid}" 2>/dev/null || true
+      sleep 2
+      kill -KILL "${race_driver_pid}" 2>/dev/null || true
+    fi
+    if wait "${race_driver_pid}" 2>/dev/null; then
+      race_rc=0
+    else
+      race_rc=$?
+    fi
+    if [[ "${race_driver_gone}" == yes && "${race_rc}" -eq 0 ]]; then
+      ok "a status marker published during the process-state check is accepted"
+    else
+      bad "a status marker published during the process-state check is accepted" \
+        "runner gone=${race_driver_gone} rc=${race_rc}: $(cat "${race_output}")"
     fi
 
     # A failure in any one shard must fail the whole pass, not be averaged away.
@@ -1166,7 +1234,9 @@ SHARD_SUITE
 printf 'shard %s ran\n' "\${MUTATION_SHARD}"
 exit 0
 SHARD_SUITE
-    if RELEASE_GATE_LOG_DIR="${shard_logs_dir}" bash "${shard_runner}" >/dev/null 2>&1; then
+    shard_logs_probe_output="${shard_root}/shard-logs-probe.out"
+    if RELEASE_GATE_LOG_DIR="${shard_logs_dir}" bash "${shard_runner}" \
+      >"${shard_logs_probe_output}" 2>&1; then
       # Counted with a glob rather than `ls | grep`: the directory is ours, so
       # there are no odd filenames to mangle, and shellcheck rejects the pipe.
       shard_log_files=0
@@ -1193,8 +1263,9 @@ SHARD_SUITE
           "combined logs=${combined}"
       fi
     else
+      shard_logs_probe_rc=$?
       bad "every shard writes its own named, readable log (a failure can be diagnosed)" \
-        "the probe run failed, so the log assertions did not run"
+        "the probe runner exited ${shard_logs_probe_rc}: $(cat "${shard_logs_probe_output}")"
     fi
 
     # A path that is a file cannot be a log directory. The driver must reject it
