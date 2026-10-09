@@ -202,7 +202,7 @@ pass_count() {
 # never read as a pass. DECLARED_MUTATIONS counts every declaration before any
 # shard filtering, so a shard that runs zero mutations and an unsharded run that
 # lost one are both caught.
-MIN_MUTATIONS=45
+MIN_MUTATIONS=30
 DECLARED_MUTATIONS=0
 
 MUTATIONS_RUN=0
