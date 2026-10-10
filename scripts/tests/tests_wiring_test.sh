@@ -434,6 +434,20 @@ else
   ok "every release-artifact mutation harness declares a MIN_MUTATIONS floor"
 fi
 
+# The macOS gate's 45 declarations are each an independent protection the
+# release workflow relies on. The floor must cover the complete declared set:
+# lowering it must not turn future deletion of declarations into a green check.
+macos_mutation_harness="${TESTS_DIR}/macos_release_artifact_mutation_test.sh"
+macos_floor="$(sed -n 's/^MIN_MUTATIONS=//p' "${macos_mutation_harness}" | head -1)"
+macos_declared="$(grep -c '^mutate ' "${macos_mutation_harness}" || true)"
+if [[ "${macos_floor}" =~ ^[0-9]+$ && "${macos_declared}" =~ ^[0-9]+$ ]] \
+  && ((macos_floor >= macos_declared)); then
+  ok "the macOS mutation floor covers every declared mutation (${macos_floor} >= ${macos_declared})"
+else
+  no "the macOS mutation floor covers every declared mutation" \
+    "floor=${macos_floor:-<missing>} declared=${macos_declared:-<unknown>}"
+fi
+
 # --- mutation harnesses must be able to be signalled -------------------------
 # Every release-artifact mutation harness traps INT/TERM/HUP so its private tree is
 # not abandoned. Those handlers must EXIT, and that distinction is the whole point:
