@@ -23,3 +23,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["serde", "v4"] }
 zeroize = "1"
 image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "webp", "gif", "pnm"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
+
+[target.'cfg(target_vendor = "apple")'.dependencies]
+libc = "0.2"

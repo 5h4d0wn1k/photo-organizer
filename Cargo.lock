@@ -2436,6 +2436,7 @@ dependencies = [
  "image",
  "iroh",
  "keyring",
+ "libc",
  "nom-exif",
  "reqwest 0.12.28",
  "rusqlite",
@@ -2448,6 +2449,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "windows-sys 0.61.2",
  "zeroize",
 ]
 

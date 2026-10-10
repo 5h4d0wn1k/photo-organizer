@@ -43,22 +43,83 @@ struct EncryptionStateFile {
     backup_path: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct EncryptionRecoveryManifest {
+    transaction_id: String,
+    database_file: String,
+    key_id: String,
+    key_storage: String,
+    database_sha256: String,
+    user_version: i64,
+    row_counts: BTreeMap<String, i64>,
+}
+
 pub fn open_database(path: &Path) -> Result<Connection, SecurityError> {
-    let connection = Connection::open(path).map_err(database_error)?;
     match read_state_for_database_path(path) {
         Ok(Some(state)) => {
+            if !path.exists() && !recover_missing_database(path, Some(&state))? {
+                return Err(SecurityError::Database(format!(
+                    "encrypted database {} is missing and no verified activation file is available for recovery",
+                    path.display()
+                )));
+            }
+            // The state file may reach storage before the database rename on
+            // filesystems that do not promise persistence ordering for
+            // directory entries. Never trust state alone: if the database is
+            // still plaintext, finish the verified encryption transaction
+            // before returning a connection to callers.
+            if !database_file_is_encrypted(path) {
+                if !database_file_is_plaintext(path) {
+                    return Err(SecurityError::Database(format!(
+                        "encryption state exists but the database at {} is neither a valid plaintext SQLite file nor an encrypted database",
+                        path.display()
+                    )));
+                }
+                recover_plaintext_database(path, &state)?;
+            }
+            let connection = Connection::open(path).map_err(database_error)?;
             let key_hex = load_key_for_state(path, &state)?;
             // codeql[database/cleartext-storage-sensitive-data]
             key_connection(&connection, &key_hex)?;
+            if !key_unlocks_database(path, &key_hex) {
+                return Err(SecurityError::KeyStorage(
+                    "stored key does not unlock the encrypted database".to_string(),
+                ));
+            }
+            remove_recovery_artifacts(path, Some(&key_hex))?;
+            Ok(connection)
         }
         // No state file at all. Either a library that has not activated
         // encryption (nothing to do) or the #109 crash window, where the
         // database was swapped to SQLCipher but the state never landed. The
         // database header decides which, and it is read exactly once here.
         Ok(None) => {
+            if !path.exists() && recover_missing_database(path, None)? {
+                let state = read_state_for_database_path(path)?
+                    .ok_or_else(|| SecurityError::Invalid("recovered state is missing".into()))?;
+                let connection = Connection::open(path).map_err(database_error)?;
+                let key_hex = load_key_for_state(path, &state)?;
+                // codeql[database/cleartext-storage-sensitive-data]
+                key_connection(&connection, &key_hex)?;
+                return Ok(connection);
+            }
+            let connection = Connection::open(path).map_err(database_error)?;
             if database_file_is_encrypted(path) {
                 recover_interrupted_activation(path, &connection)?;
+            } else if database_file_is_plaintext(path)
+                && connection
+                    .query_row("SELECT count(*) FROM sqlite_master", [], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                    .is_ok()
+            {
+                // A verified live plaintext database is newer than any staged
+                // encryption candidate left by a failed activation. Discard
+                // those candidates rather than allowing a later missing-file
+                // recovery to roll back writes made since staging.
+                remove_recovery_artifacts(path, None)?;
             }
+            Ok(connection)
         }
         // A torn or otherwise unreadable state file is fatal -- unless the
         // database file itself proves it is encrypted, in which case this is
@@ -67,13 +128,41 @@ pub fn open_database(path: &Path) -> Result<Connection, SecurityError> {
         // corruption we cannot explain would disguise a disk failure as a
         // clean open.
         Err(error) => {
-            if !database_file_is_encrypted(path) {
-                return Err(error);
+            if database_file_is_encrypted(path) {
+                let connection = Connection::open(path).map_err(database_error)?;
+                recover_interrupted_activation(path, &connection)?;
+                Ok(connection)
+            } else if !path.exists() && recover_missing_database(path, None)? {
+                let state = read_state_for_database_path(path)?
+                    .ok_or_else(|| SecurityError::Invalid("recovered state is missing".into()))?;
+                let connection = Connection::open(path).map_err(database_error)?;
+                let key_hex = load_key_for_state(path, &state)?;
+                // codeql[database/cleartext-storage-sensitive-data]
+                key_connection(&connection, &key_hex)?;
+                Ok(connection)
+            } else if path.exists() && database_file_is_plaintext(path) {
+                // A crash may persist a torn state file before the database
+                // replacement. Recover only when a stored key successfully
+                // creates and verifies an encrypted copy; never ignore the
+                // state error and return a plaintext connection.
+                recover_plaintext_database_without_state(path).map_err(|recovery_error| {
+                    match recovery_error {
+                        SecurityError::KeyStorage(_) => error,
+                        other => other,
+                    }
+                })?;
+                let state = read_state_for_database_path(path)?
+                    .ok_or_else(|| SecurityError::Invalid("recovered state is missing".into()))?;
+                let connection = Connection::open(path).map_err(database_error)?;
+                let key_hex = load_key_for_state(path, &state)?;
+                // codeql[database/cleartext-storage-sensitive-data]
+                key_connection(&connection, &key_hex)?;
+                Ok(connection)
+            } else {
+                Err(error)
             }
-            recover_interrupted_activation(path, &connection)?;
         }
     }
-    Ok(connection)
 }
 
 /// Whether the database file at `path` is SQLCipher-encrypted, judged from
@@ -107,6 +196,391 @@ fn database_file_is_encrypted(path: &Path) -> bool {
     }
 }
 
+fn database_file_is_plaintext(path: &Path) -> bool {
+    const SQLITE_MAGIC: &[u8] = b"SQLite format 3\0";
+    let mut header = [0_u8; SQLITE_MAGIC.len()];
+    fs::File::open(path)
+        .and_then(|mut file| file.read_exact(&mut header))
+        .is_ok_and(|()| header.as_slice() == SQLITE_MAGIC)
+}
+
+fn promote_verified_candidate(
+    database_path: &Path,
+    source_path: &Path,
+    partial_path: &Path,
+    state: &EncryptionStateFile,
+    key_hex: &str,
+) -> Result<(PathBuf, PathBuf), SecurityError> {
+    let parent = database_path.parent().ok_or_else(|| {
+        SecurityError::Invalid("database path has no parent directory".to_string())
+    })?;
+    let database_name = database_path
+        .file_name()
+        .ok_or_else(|| SecurityError::Invalid("database path has no file name".to_string()))?
+        .to_string_lossy();
+    let source = Connection::open(source_path).map_err(database_error)?;
+    let source_counts = user_table_row_counts(&source)?;
+    let source_user_version = source
+        .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+        .map_err(database_error)?;
+    drop(source);
+    let metadata = encrypted_candidate_metadata(partial_path, key_hex)?;
+    if metadata.row_counts != source_counts || metadata.user_version != source_user_version {
+        return Err(SecurityError::Database(
+            "encrypted staging database does not match the source schema version and row counts"
+                .to_string(),
+        ));
+    }
+
+    sync_file_contents(partial_path)?;
+    let transaction_id = Uuid::new_v4().to_string();
+    let committed_database = parent.join(format!("{database_name}.ready-{transaction_id}.db"));
+    let manifest_path = parent.join(format!("{database_name}.ready-{transaction_id}.json"));
+    atomic_rename_file(partial_path, &committed_database)?;
+    sync_directory(parent)?;
+    let manifest = EncryptionRecoveryManifest {
+        transaction_id,
+        database_file: database_name.to_string(),
+        key_id: state.key_id.clone(),
+        key_storage: state.key_storage.clone(),
+        database_sha256: metadata.sha256,
+        user_version: metadata.user_version,
+        row_counts: metadata.row_counts,
+    };
+    let manifest_bytes =
+        serde_json::to_vec(&manifest).map_err(|error| SecurityError::Invalid(error.to_string()))?;
+    atomic_write_file(&manifest_path, &manifest_bytes)?;
+    Ok((committed_database, manifest_path))
+}
+
+struct EncryptedCandidateMetadata {
+    sha256: String,
+    user_version: i64,
+    row_counts: BTreeMap<String, i64>,
+}
+
+fn encrypted_candidate_metadata(
+    path: &Path,
+    key_hex: &str,
+) -> Result<EncryptedCandidateMetadata, SecurityError> {
+    use rusqlite::OpenFlags;
+
+    let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)
+        .map_err(database_error)?;
+    key_connection(&connection, key_hex)?;
+    let integrity = connection
+        .query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))
+        .map_err(database_error)?;
+    if integrity != "ok" {
+        return Err(SecurityError::Database(format!(
+            "encrypted staging database integrity check failed: {integrity}"
+        )));
+    }
+    let row_counts = user_table_row_counts(&connection)?;
+    let user_version = connection
+        .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+        .map_err(database_error)?;
+    drop(connection);
+    let sha256 = database_sha256(path).ok_or_else(|| {
+        SecurityError::Io("could not hash verified encrypted staging database".to_string())
+    })?;
+    Ok(EncryptedCandidateMetadata {
+        sha256,
+        user_version,
+        row_counts,
+    })
+}
+
+fn recover_missing_database(
+    database_path: &Path,
+    recorded_state: Option<&EncryptionStateFile>,
+) -> Result<bool, SecurityError> {
+    let parent = database_path.parent().ok_or_else(|| {
+        SecurityError::Invalid("database path has no parent directory".to_string())
+    })?;
+    let database_name = database_path
+        .file_name()
+        .ok_or_else(|| SecurityError::Invalid("database path has no file name".to_string()))?
+        .to_string_lossy();
+    let manifest_prefix = format!("{database_name}.ready-");
+    let ready_suffix = ".db";
+    let manifest_suffix = ".json";
+    let mut manifests = Vec::new();
+    let mut orphan_ready_files = Vec::new();
+    let mut unverified_partials = Vec::new();
+    for entry in fs::read_dir(parent).map_err(io_error)? {
+        let entry = entry.map_err(io_error)?;
+        if !entry.file_type().map_err(io_error)?.is_file() {
+            continue;
+        }
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with(&manifest_prefix) && name.ends_with(manifest_suffix) {
+            manifests.push(entry.path());
+        } else if name.starts_with(&manifest_prefix) && name.ends_with(ready_suffix) {
+            orphan_ready_files.push(entry.path());
+        } else if name.starts_with(database_name.as_ref())
+            && (name.ends_with(".partial") || name.ends_with(".tmp"))
+        {
+            unverified_partials.push(entry.path());
+        }
+    }
+    if manifests.is_empty() {
+        if orphan_ready_files.is_empty() {
+            if !database_path.exists() && !unverified_partials.is_empty() {
+                return Err(SecurityError::Database(format!(
+                    "database {} is missing and only unverified partial encryption files remain",
+                    database_path.display()
+                )));
+            }
+            return Ok(false);
+        }
+        return Err(SecurityError::Database(format!(
+            "database {} has a staged recovery file without its verification manifest",
+            database_path.display()
+        )));
+    }
+    if manifests.len() != 1 {
+        return Err(SecurityError::Database(format!(
+            "database {} has multiple staged recovery manifests; refusing an ambiguous restore",
+            database_path.display()
+        )));
+    }
+    let manifest_path = &manifests[0];
+    let manifest: EncryptionRecoveryManifest =
+        serde_json::from_slice(&fs::read(manifest_path).map_err(io_error)?).map_err(|error| {
+            SecurityError::Invalid(format!("invalid recovery manifest: {error}"))
+        })?;
+    if manifest.database_file != database_name
+        || manifest.key_id != key_id_for_path(database_path)
+        || manifest.transaction_id.is_empty()
+        || !manifest
+            .transaction_id
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() || byte == b'-')
+    {
+        return Err(SecurityError::Database(
+            "recovery manifest does not match this database".to_string(),
+        ));
+    }
+    let expected_manifest_name = format!("{database_name}.ready-{}.json", manifest.transaction_id);
+    if manifest_path.file_name().and_then(|name| name.to_str()) != Some(&expected_manifest_name) {
+        return Err(SecurityError::Database(
+            "recovery manifest transaction identifier does not match its file name".to_string(),
+        ));
+    }
+    let committed_database = parent.join(format!(
+        "{database_name}.ready-{}.db",
+        manifest.transaction_id
+    ));
+    if orphan_ready_files.len() != 1
+        || orphan_ready_files[0].file_name() != committed_database.file_name()
+    {
+        return Err(SecurityError::Database(format!(
+            "database {} has ambiguous staged recovery files",
+            database_path.display()
+        )));
+    }
+    if !committed_database.is_file() {
+        return Err(SecurityError::Database(
+            "verified recovery manifest has no staged database file".to_string(),
+        ));
+    }
+
+    let state = if let Some(state) = recorded_state {
+        if state.key_id != manifest.key_id || state.key_storage != manifest.key_storage {
+            return Err(SecurityError::Database(
+                "recovery manifest key identity does not match encryption state".to_string(),
+            ));
+        }
+        state.clone()
+    } else {
+        if !CANDIDATE_KEY_STORES.contains(&manifest.key_storage.as_str()) {
+            return Err(SecurityError::KeyStorage(
+                "recovery manifest names an unavailable key store".to_string(),
+            ));
+        }
+        EncryptionStateFile {
+            database_encrypted: true,
+            derived_data_encrypted: true,
+            key_id: manifest.key_id.clone(),
+            key_storage: manifest.key_storage.clone(),
+            activated_at: Utc::now(),
+            backup_path: String::new(),
+        }
+    };
+    let key_hex = load_key_for_state(database_path, &state)?;
+    let metadata = encrypted_candidate_metadata(&committed_database, &key_hex)?;
+    if metadata.sha256 != manifest.database_sha256
+        || metadata.user_version != manifest.user_version
+        || metadata.row_counts != manifest.row_counts
+    {
+        return Err(SecurityError::Database(
+            "staged recovery database does not match its verified manifest".to_string(),
+        ));
+    }
+
+    replace_file_then(
+        &committed_database,
+        database_path,
+        sync_file_contents,
+        || {
+            remove_sidecar(database_path, "wal")?;
+            remove_sidecar(database_path, "shm")
+        },
+        atomic_rename_file,
+        sync_directory,
+        || {
+            persist_state_for_database_path(database_path, &state)?;
+            fs::remove_file(manifest_path).map_err(io_error)?;
+            sync_directory(parent)
+        },
+    )?;
+    remove_recovery_artifacts(database_path, Some(&key_hex))?;
+    Ok(true)
+}
+
+/// Remove staged files only after the live database has been verified and the
+/// matching state has been persisted. Keeping an old, valid encrypted stage
+/// beside an actively writable database could otherwise roll back later
+/// writes if the live database name disappeared in a future failure.
+fn remove_recovery_artifacts(
+    database_path: &Path,
+    key_hex: Option<&str>,
+) -> Result<(), SecurityError> {
+    let parent = database_path.parent().ok_or_else(|| {
+        SecurityError::Invalid("database path has no parent directory".to_string())
+    })?;
+    let database_name = database_path
+        .file_name()
+        .ok_or_else(|| SecurityError::Invalid("database path has no file name".to_string()))?
+        .to_string_lossy();
+    let ready_prefix = format!("{database_name}.ready-");
+    let partial_prefix = format!("{database_name}.");
+    let mut artifacts = Vec::new();
+    let mut has_ready_artifact = false;
+    for entry in fs::read_dir(parent).map_err(io_error)? {
+        let entry = entry.map_err(io_error)?;
+        if !entry.file_type().map_err(io_error)?.is_file() {
+            continue;
+        }
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let ready_artifact =
+            name.starts_with(&ready_prefix) && (name.ends_with(".db") || name.ends_with(".json"));
+        let partial_artifact = name.starts_with(partial_prefix.as_str())
+            && (name.ends_with(".partial") || name.ends_with(".tmp"));
+        if ready_artifact || partial_artifact {
+            has_ready_artifact |= ready_artifact;
+            artifacts.push(entry.path());
+        }
+    }
+    if has_ready_artifact {
+        use rusqlite::OpenFlags;
+
+        let connection =
+            Connection::open_with_flags(database_path, OpenFlags::SQLITE_OPEN_READ_WRITE)
+                .map_err(database_error)?;
+        if let Some(key_hex) = key_hex {
+            key_connection(&connection, key_hex)?;
+        }
+        let integrity = connection
+            .query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))
+            .map_err(database_error)?;
+        if integrity != "ok" {
+            return Err(SecurityError::Database(format!(
+                "live database integrity check failed; retaining staged recovery files: {integrity}"
+            )));
+        }
+    }
+    for artifact in &artifacts {
+        fs::remove_file(artifact).map_err(io_error)?;
+    }
+    if !artifacts.is_empty() {
+        sync_directory(parent)?;
+    }
+    Ok(())
+}
+
+/// Recover the state-ahead-of-database observation by exporting the intact
+/// plaintext database again with the already-persisted key. State is
+/// rewritten only after the verified encrypted replacement and its platform
+/// durability barriers complete. If a barrier fails, the next startup can
+/// retry from the still-plaintext database or recognize the encrypted one.
+fn recover_plaintext_database(
+    database_path: &Path,
+    state: &EncryptionStateFile,
+) -> Result<(), SecurityError> {
+    let key_hex = load_key_for_state(database_path, state)?;
+    recover_plaintext_database_with_key(database_path, state, &key_hex)
+}
+
+fn recover_plaintext_database_without_state(database_path: &Path) -> Result<(), SecurityError> {
+    let key_id = key_id_for_path(database_path);
+    let mut candidate_error = None;
+    for key_storage in CANDIDATE_KEY_STORES {
+        let candidate = load_key_candidate(database_path, &key_id, key_storage);
+        let Some(key_hex) = candidate else {
+            continue;
+        };
+        let state = EncryptionStateFile {
+            database_encrypted: true,
+            derived_data_encrypted: true,
+            key_id: key_id.clone(),
+            key_storage: key_storage.to_string(),
+            activated_at: Utc::now(),
+            backup_path: String::new(),
+        };
+        match recover_plaintext_database_with_key(database_path, &state, &key_hex) {
+            Ok(()) => return Ok(()),
+            Err(error) => candidate_error = Some(error),
+        }
+    }
+    Err(candidate_error.unwrap_or_else(|| {
+        SecurityError::KeyStorage(format!(
+            "state is unreadable and no stored encryption key is available to recover database {key_id}"
+        ))
+    }))
+}
+
+fn recover_plaintext_database_with_key(
+    database_path: &Path,
+    state: &EncryptionStateFile,
+    key_hex: &str,
+) -> Result<(), SecurityError> {
+    let parent = database_path.parent().ok_or_else(|| {
+        SecurityError::Invalid("database path has no parent directory".to_string())
+    })?;
+    let file_name = database_path
+        .file_name()
+        .ok_or_else(|| SecurityError::Invalid("database path has no file name".to_string()))?
+        .to_string_lossy();
+    let temp = parent.join(format!("{file_name}.recovery-{}.partial", Uuid::new_v4()));
+    let verification = (|| {
+        export_plaintext_to_encrypted(database_path, &temp, key_hex)?;
+        verify_encrypted_database(database_path, &temp, key_hex)
+    })();
+    let (rows_match, integrity) = match verification {
+        Ok(result) => result,
+        Err(error) => {
+            let _ = fs::remove_file(&temp);
+            return Err(error);
+        }
+    };
+    if !rows_match || integrity != "ok" {
+        let _ = fs::remove_file(&temp);
+        return Err(SecurityError::Database(format!(
+            "plaintext database recovery verification failed: rows={rows_match}, integrity={integrity}"
+        )));
+    }
+    let (ready_database, _manifest_path) =
+        promote_verified_candidate(database_path, database_path, &temp, state, key_hex)?;
+    replace_database_with_encrypted_then(database_path, &ready_database, || {
+        persist_state_for_database_path(database_path, state)?;
+        remove_recovery_artifacts(database_path, Some(key_hex))
+    })
+}
+
 /// Rebuild the state file after a crash between the database swap and the
 /// state write (#109).
 ///
@@ -137,12 +611,7 @@ fn recover_interrupted_activation(
     // file store -- which may hold the key that works -- was ever tried.
     let mut stores_holding_a_candidate: Vec<&str> = Vec::new();
     for key_storage in CANDIDATE_KEY_STORES {
-        let candidate = match key_storage {
-            "os_keychain" => keyring::Entry::new(KEYRING_SERVICE, &key_id)
-                .ok()
-                .and_then(|entry| entry.get_password().ok()),
-            _ => load_key_from_file(database_path, &key_id).ok(),
-        };
+        let candidate = load_key_candidate(database_path, &key_id, key_storage);
         let Some(key_hex) = candidate else {
             continue;
         };
@@ -181,7 +650,22 @@ fn recover_interrupted_activation(
 /// tried. That walk-past cannot be exercised on a host without a keyring
 /// daemon; the verification step it depends on is covered by
 /// `recovery_reports_a_wrong_key_and_persists_nothing`.
+#[cfg(test)]
 const CANDIDATE_KEY_STORES: [&str; 2] = ["os_keychain", "test_file_key_store"];
+#[cfg(not(test))]
+const CANDIDATE_KEY_STORES: [&str; 1] = ["os_keychain"];
+
+fn load_key_candidate(_database_path: &Path, key_id: &str, key_storage: &str) -> Option<String> {
+    match key_storage {
+        "os_keychain" => keyring::Entry::new(KEYRING_SERVICE, key_id)
+            .ok()
+            .and_then(|entry| entry.get_password().ok())
+            .filter(|key| validate_key_hex(key).is_ok()),
+        #[cfg(test)]
+        "test_file_key_store" => load_key_from_file(_database_path, key_id).ok(),
+        _ => None,
+    }
+}
 
 /// Whether `key_hex` actually unlocks the database at `path`.
 ///
@@ -219,26 +703,35 @@ fn persist_recovered_state(
     key_id: String,
     key_storage: &str,
 ) -> Result<(), SecurityError> {
-    let raw = serde_json::to_string_pretty(&EncryptionStateFile {
+    let state = EncryptionStateFile {
         database_encrypted: true,
         derived_data_encrypted: true,
         key_id,
         key_storage: key_storage.to_string(),
         activated_at: Utc::now(),
         backup_path: String::new(),
-    })
-    .map_err(|error| SecurityError::Invalid(error.to_string()))?;
-    atomic_write_file(
-        &state_path_for_database_path(database_path)?,
-        raw.as_bytes(),
-    )
+    };
+    persist_state_for_database_path(database_path, &state)?;
+    let key_hex = load_key_for_state(database_path, &state)?;
+    remove_recovery_artifacts(database_path, Some(&key_hex))
 }
 
-/// Durably write bytes: temp file in the same directory, fsync the file,
-/// atomic rename over the destination, fsync the directory. A crash at any
-/// point leaves either the old file or the new file, never a torn one --
-/// which is exactly what a bare `fs::write` cannot promise and what bricked
-/// the daemon in #109 variant B (a 40-byte prefix of a 219-byte state file).
+fn persist_state_for_database_path(
+    database_path: &Path,
+    state: &EncryptionStateFile,
+) -> Result<(), SecurityError> {
+    let raw = serde_json::to_vec_pretty(state)
+        .map_err(|error| SecurityError::Invalid(error.to_string()))?;
+    atomic_write_file(&state_path_for_database_path(database_path)?, &raw)
+}
+
+/// Write through a same-directory temp file, synchronize its contents, rename
+/// it over the destination, and synchronize the parent directory where the
+/// platform supports that operation. Rename prevents readers from seeing a
+/// partially written destination; startup reconciliation handles platform
+/// differences in which side of the rename survives a sudden shutdown. This
+/// replaces the bare `fs::write` that bricked the daemon in #109 variant B (a
+/// 40-byte prefix of a 219-byte state file).
 fn atomic_write_file(path: &Path, bytes: &[u8]) -> Result<(), SecurityError> {
     let parent = path
         .parent()
@@ -254,19 +747,22 @@ fn atomic_write_file(path: &Path, bytes: &[u8]) -> Result<(), SecurityError> {
     // an operator who had tightened the state file to 0600 silently got the
     // looser mode back on the very next write.
     let mut file = open_temp_for_write(&temp, existing_mode(path))?;
-    let written = file.write_all(bytes).and_then(|()| file.sync_all());
+    let written = file
+        .write_all(bytes)
+        .map_err(io_error)
+        .and_then(|()| sync_file(&file));
     // Every failure past this point must remove the temp file. It is named
     // like the destination and sits in the same security directory, so leaving
     // one behind means leaving a stray copy of the state next to the state --
     // and the old code did exactly that on both the write and the rename path.
-    if let Err(error) = written.map_err(io_error) {
+    if let Err(error) = written {
         let _ = fs::remove_file(&temp);
         return Err(error);
     }
     // Closed before the rename: on Windows a rename cannot replace a file that
     // is still open.
     drop(file);
-    if let Err(error) = fs::rename(&temp, path).map_err(io_error) {
+    if let Err(error) = atomic_rename_file(&temp, path) {
         let _ = fs::remove_file(&temp);
         return Err(error);
     }
@@ -306,27 +802,6 @@ fn open_temp_for_write(temp: &Path, _existing: Option<u32>) -> Result<fs::File, 
         .create_new(true)
         .open(temp)
         .map_err(io_error)
-}
-
-/// Make a rename into `parent` durable.
-///
-/// On Unix this means fsyncing the directory, which is what actually commits
-/// the new name. Windows has no equivalent for a directory handle, and asking
-/// for one can fail there -- so calling it unconditionally meant `write_state`
-/// could fail *after* the database swap had already renamed the SQLCipher file
-/// over the live database, turning the recovery path into the very brick #109
-/// describes. The call is therefore compiled out where it cannot be honoured,
-/// rather than attempted and hoped for.
-#[cfg(unix)]
-fn sync_directory(parent: &Path) -> Result<(), SecurityError> {
-    fs::File::open(parent)
-        .and_then(|dir| dir.sync_all())
-        .map_err(io_error)
-}
-
-#[cfg(not(unix))]
-fn sync_directory(_parent: &Path) -> Result<(), SecurityError> {
-    Ok(())
 }
 
 pub fn encryption_status(config: &AppConfig) -> EncryptionStatus {
@@ -420,7 +895,11 @@ pub fn activate_encryption(
     let db_dir = database_path.parent().ok_or_else(|| {
         SecurityError::Invalid("database path has no parent directory".to_string())
     })?;
-    let temp_name = format!("gallery.sqlite3.sqlcipher-{}.tmp", Uuid::new_v4());
+    let file_name = database_path
+        .file_name()
+        .ok_or_else(|| SecurityError::Invalid("database path has no file name".to_string()))?
+        .to_string_lossy();
+    let temp_name = format!("{file_name}.sqlcipher-{}.partial", Uuid::new_v4());
     let encrypted_temp = db_dir.join(temp_name);
 
     export_plaintext_to_encrypted(&database_path, &encrypted_temp, &key_hex)?;
@@ -433,19 +912,26 @@ pub fn activate_encryption(
         )));
     }
 
-    replace_database_with_encrypted(&database_path, &encrypted_temp)?;
     let activated_at = Utc::now();
-    write_state(
-        config,
-        &EncryptionStateFile {
-            database_encrypted: true,
-            derived_data_encrypted: true,
-            key_id,
-            key_storage,
-            activated_at,
-            backup_path: String::new(),
-        },
+    let state = EncryptionStateFile {
+        database_encrypted: true,
+        derived_data_encrypted: true,
+        key_id,
+        key_storage,
+        activated_at,
+        backup_path: String::new(),
+    };
+    let (ready_database, _manifest_path) = promote_verified_candidate(
+        &database_path,
+        &database_path,
+        &encrypted_temp,
+        &state,
+        &key_hex,
     )?;
+    replace_database_with_encrypted_then(&database_path, &ready_database, || {
+        write_state(config, &state)?;
+        remove_recovery_artifacts(&database_path, Some(&key_hex))
+    })?;
     write_encryption_settings_row(config)?;
 
     Ok(EncryptionActivationResult {
@@ -484,10 +970,14 @@ fn export_plaintext_to_encrypted(
     encrypted_temp: &Path,
     key_hex: &str,
 ) -> Result<(), SecurityError> {
+    validate_key_hex(key_hex)?;
     let connection = Connection::open(database_path).map_err(database_error)?;
+    let user_version = connection
+        .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+        .map_err(database_error)?;
     connection
         .execute_batch(&format!(
-            "ATTACH DATABASE '{}' AS encrypted KEY \"x'{}'\";\nSELECT sqlcipher_export('encrypted');\nDETACH DATABASE encrypted;",
+            "ATTACH DATABASE '{}' AS encrypted KEY \"x'{}'\";\nSELECT sqlcipher_export('encrypted');\nPRAGMA encrypted.user_version = {user_version};\nDETACH DATABASE encrypted;",
             quote_sql_path(encrypted_temp),
             key_hex
         ))
@@ -512,14 +1002,153 @@ fn verify_encrypted_database(
     Ok((source_counts == encrypted_counts, integrity_check))
 }
 
-fn replace_database_with_encrypted(
+fn replace_database_with_encrypted_then(
     database_path: &Path,
     encrypted_temp: &Path,
+    publish_state: impl FnOnce() -> Result<(), SecurityError>,
 ) -> Result<(), SecurityError> {
-    remove_sidecar(database_path, "wal")?;
-    remove_sidecar(database_path, "shm")?;
-    fs::rename(encrypted_temp, database_path).map_err(io_error)?;
+    replace_file_then(
+        encrypted_temp,
+        database_path,
+        sync_file_contents,
+        || {
+            remove_sidecar(database_path, "wal")?;
+            remove_sidecar(database_path, "shm")
+        },
+        atomic_rename_file,
+        sync_directory,
+        publish_state,
+    )
+}
+
+/// Perform a file replacement in a fixed order: sync the candidate contents,
+/// prepare the live path, rename the candidate, request a parent-directory
+/// sync where available, and only then publish encryption state. Startup
+/// reconciliation handles platform-specific outcomes if a sudden shutdown
+/// exposes the state and database replacement in a different order.
+fn replace_file_then(
+    source: &Path,
+    destination: &Path,
+    sync_source: impl FnOnce(&Path) -> Result<(), SecurityError>,
+    prepare: impl FnOnce() -> Result<(), SecurityError>,
+    rename: impl FnOnce(&Path, &Path) -> Result<(), SecurityError>,
+    sync_parent: impl FnOnce(&Path) -> Result<(), SecurityError>,
+    publish: impl FnOnce() -> Result<(), SecurityError>,
+) -> Result<(), SecurityError> {
+    let parent = destination.parent().ok_or_else(|| {
+        SecurityError::Invalid("replacement destination has no parent directory".to_string())
+    })?;
+    sync_source(source)?;
+    prepare()?;
+    rename(source, destination)?;
+    sync_parent(parent)?;
+    publish()
+}
+
+fn sync_file_contents(path: &Path) -> Result<(), SecurityError> {
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(io_error)?;
+    sync_file(&file)
+}
+
+#[cfg(target_vendor = "apple")]
+fn sync_file(file: &fs::File) -> Result<(), SecurityError> {
+    use std::os::fd::AsRawFd;
+
+    // Apple documents that fsync alone may leave writes in volatile device
+    // cache and reorder them across a power loss. F_FULLFSYNC also asks the
+    // device to flush those buffers. Treat unsupported filesystems/devices as
+    // an activation failure rather than silently weakening the guarantee.
+    let result = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_FULLFSYNC) };
+    if result == -1 {
+        Err(io_error(std::io::Error::last_os_error()))
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(target_vendor = "apple"))]
+fn sync_file(file: &fs::File) -> Result<(), SecurityError> {
+    file.sync_all().map_err(io_error)
+}
+
+#[cfg(unix)]
+fn atomic_rename_file(source: &Path, destination: &Path) -> Result<(), SecurityError> {
+    fs::rename(source, destination).map_err(io_error)
+}
+
+#[cfg(windows)]
+fn atomic_rename_file(source: &Path, destination: &Path) -> Result<(), SecurityError> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    };
+
+    let source: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
+    let destination: Vec<u16> = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    // The temp and destination are in the same directory. WRITE_THROUGH
+    // requests write-through handling for this same-volume replacement;
+    // REPLACE_EXISTING is required because activation replaces the live
+    // plaintext database. Startup reconciliation still verifies the actual
+    // database and key before trusting the published state.
+    let moved = unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if moved == 0 {
+        Err(io_error(std::io::Error::last_os_error()))
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn atomic_rename_file(_source: &Path, _destination: &Path) -> Result<(), SecurityError> {
+    Err(SecurityError::Io(
+        "durable database replacement is unsupported on this platform".to_string(),
+    ))
+}
+
+#[cfg(all(unix, not(target_vendor = "apple")))]
+fn sync_directory(parent: &Path) -> Result<(), SecurityError> {
+    fs::File::open(parent)
+        .and_then(|dir| dir.sync_all())
+        .map_err(io_error)
+}
+
+#[cfg(target_vendor = "apple")]
+fn sync_directory(parent: &Path) -> Result<(), SecurityError> {
+    let directory = fs::File::open(parent).map_err(io_error)?;
+    // Apple documents F_FULLFSYNC for file contents, but does not promise that
+    // it commits directory-entry changes. Use the available directory fsync;
+    // startup reconciliation treats the actual database header as authority
+    // if a power loss exposes the state and replacement in a different order.
+    directory.sync_all().map_err(io_error)
+}
+
+#[cfg(windows)]
+fn sync_directory(_parent: &Path) -> Result<(), SecurityError> {
+    // atomic_rename_file requests MOVEFILE_WRITE_THROUGH. Windows exposes no
+    // portable directory-handle flush here; startup reconciliation verifies
+    // the database contents against the stored key and state.
     Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn sync_directory(_parent: &Path) -> Result<(), SecurityError> {
+    Err(SecurityError::Io(
+        "durable directory synchronization is unsupported on this platform".to_string(),
+    ))
 }
 
 fn checkpoint_plaintext_database(database_path: &Path) -> Result<(), SecurityError> {
@@ -560,6 +1189,7 @@ fn user_table_row_counts(connection: &Connection) -> Result<BTreeMap<String, i64
 // (OS keychain; test file store only in tests). Key is applied to encrypted
 // database connection only, never persisted in plaintext.
 fn key_connection(connection: &Connection, key_hex: &str) -> Result<(), SecurityError> {
+    validate_key_hex(key_hex)?;
     connection
         .execute_batch(&format!("PRAGMA key = \"x'{key_hex}'\";"))
         .map_err(database_error)
@@ -620,33 +1250,57 @@ fn state_path_for_database_path(database_path: &Path) -> Result<PathBuf, Securit
 }
 
 fn store_key(config: &AppConfig, key_id: &str, key_hex: &str) -> Result<String, SecurityError> {
-    if cfg!(test) {
-        return store_key_in_file(config, key_id, key_hex);
+    validate_key_hex(key_hex)?;
+    #[cfg(test)]
+    {
+        store_key_in_file(config, key_id, key_hex)
     }
-
-    let entry = keyring::Entry::new(KEYRING_SERVICE, key_id)
-        .map_err(|error| SecurityError::KeyStorage(error.to_string()))?;
-    entry
-        .set_password(key_hex)
-        .map_err(|error| SecurityError::KeyStorage(error.to_string()))?;
-    Ok("os_keychain".to_string())
+    #[cfg(not(test))]
+    {
+        let _ = config;
+        let entry = keyring::Entry::new(KEYRING_SERVICE, key_id)
+            .map_err(|error| SecurityError::KeyStorage(error.to_string()))?;
+        entry
+            .set_password(key_hex)
+            .map_err(|error| SecurityError::KeyStorage(error.to_string()))?;
+        Ok("os_keychain".to_string())
+    }
 }
 
 fn load_key_for_state(
-    database_path: &Path,
+    _database_path: &Path,
     state: &EncryptionStateFile,
 ) -> Result<String, SecurityError> {
     if state.key_storage == "test_file_key_store" {
-        return load_key_from_file(database_path, &state.key_id);
+        #[cfg(test)]
+        return load_key_from_file(_database_path, &state.key_id);
+        #[cfg(not(test))]
+        return Err(SecurityError::KeyStorage(
+            "test-only key storage is unavailable in production builds".to_string(),
+        ));
     }
 
     let entry = keyring::Entry::new(KEYRING_SERVICE, &state.key_id)
         .map_err(|error| SecurityError::KeyStorage(error.to_string()))?;
-    entry
+    let key = entry
         .get_password()
-        .map_err(|error| SecurityError::KeyStorage(error.to_string()))
+        .map_err(|error| SecurityError::KeyStorage(error.to_string()))?;
+    validate_key_hex(&key)?;
+    Ok(key)
 }
 
+fn validate_key_hex(key_hex: &str) -> Result<(), SecurityError> {
+    if key_hex.len() == 64 && key_hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        Ok(())
+    } else {
+        Err(SecurityError::KeyStorage(
+            "SQLCipher key must be exactly 32 bytes encoded as 64 hexadecimal characters"
+                .to_string(),
+        ))
+    }
+}
+
+#[cfg(test)]
 fn store_key_in_file(
     config: &AppConfig,
     key_id: &str,
@@ -660,6 +1314,7 @@ fn store_key_in_file(
     Ok("test_file_key_store".to_string())
 }
 
+#[cfg(test)]
 fn load_key_from_file(database_path: &Path, key_id: &str) -> Result<String, SecurityError> {
     let runtime_root = database_path
         .parent()
@@ -669,13 +1324,12 @@ fn load_key_from_file(database_path: &Path, key_id: &str) -> Result<String, Secu
         .map_err(io_error)
         .and_then(|value| {
             let trimmed = value.trim();
-            if trimmed.is_empty() || !trimmed.chars().all(|c| c.is_ascii_hexdigit()) {
-                return Err(SecurityError::Invalid("invalid key format".to_string()));
-            }
+            validate_key_hex(trimmed)?;
             Ok(trimmed.to_string())
         })
 }
 
+#[cfg(test)]
 fn key_file_path(runtime_root: &Path, key_id: &str) -> PathBuf {
     runtime_root
         .join("security")
@@ -751,6 +1405,28 @@ mod tests {
                  INSERT INTO recovery_canary (note) VALUES ('before-activation');",
             )
             .expect("canary row must insert");
+    }
+
+    fn stage_verified_copy_for_test(database_path: &Path, state: &EncryptionStateFile, key: &str) {
+        let metadata = encrypted_candidate_metadata(database_path, key)
+            .expect("source encrypted database must validate");
+        let parent = database_path.parent().unwrap();
+        let database_name = database_path.file_name().unwrap().to_string_lossy();
+        let transaction_id = Uuid::new_v4().to_string();
+        let staged_database = parent.join(format!("{database_name}.ready-{transaction_id}.db"));
+        let manifest_path = parent.join(format!("{database_name}.ready-{transaction_id}.json"));
+        fs::copy(database_path, &staged_database).expect("copy encrypted database");
+        let manifest = EncryptionRecoveryManifest {
+            transaction_id,
+            database_file: database_name.to_string(),
+            key_id: state.key_id.clone(),
+            key_storage: state.key_storage.clone(),
+            database_sha256: metadata.sha256,
+            user_version: metadata.user_version,
+            row_counts: metadata.row_counts,
+        };
+        let raw = serde_json::to_vec(&manifest).expect("serialize recovery manifest");
+        atomic_write_file(&manifest_path, &raw).expect("persist recovery manifest");
     }
 
     fn cleanup(root: &Path) {
@@ -1050,6 +1726,374 @@ mod tests {
         cleanup(&root);
     }
 
+    #[test]
+    fn database_replacement_publishes_state_only_after_both_durability_barriers() {
+        use std::cell::RefCell;
+
+        let expected = [
+            "sync_source",
+            "prepare",
+            "rename",
+            "sync_parent",
+            "publish_state",
+        ];
+        for (failure, expected_events) in [
+            (Some("sync_source"), &expected[..1]),
+            (Some("prepare"), &expected[..2]),
+            (Some("rename"), &expected[..3]),
+            (Some("sync_parent"), &expected[..4]),
+            (None, &expected[..]),
+        ] {
+            let events = RefCell::new(Vec::new());
+            let record = |name: &'static str| {
+                events.borrow_mut().push(name);
+                if failure == Some(name) {
+                    Err(SecurityError::Io(format!("injected {name} failure")))
+                } else {
+                    Ok(())
+                }
+            };
+            let result = replace_file_then(
+                Path::new("db/encrypted.tmp"),
+                Path::new("db/library.sqlite3"),
+                |_| record("sync_source"),
+                || record("prepare"),
+                |_, _| record("rename"),
+                |_| record("sync_parent"),
+                || {
+                    events.borrow_mut().push("publish_state");
+                    Ok(())
+                },
+            );
+
+            assert_eq!(
+                events.borrow().as_slice(),
+                expected_events,
+                "failure at {failure:?} must not publish state before durable database replacement"
+            );
+            assert_eq!(
+                result.is_ok(),
+                failure.is_none(),
+                "the sequence should fail closed at injected barrier {failure:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn failed_database_barrier_or_state_write_recovers_through_startup() {
+        use std::cell::Cell;
+
+        for failure in ["sync_parent", "publish_state"] {
+            let (config, root) = test_config(&format!("replace-failure-{failure}"));
+            seed_db(&config);
+            activate_encryption(&config).expect("initial activation must succeed");
+            let database_path = config.database_path();
+            let state = read_state(&config)
+                .expect("state must be readable")
+                .expect("state must exist");
+            let candidate = root.join("encrypted-replacement.tmp");
+            fs::copy(&database_path, &candidate).expect("make encrypted replacement fixture");
+            fs::remove_file(state_path(&config)).expect("simulate missing state after crash");
+            let published = Cell::new(false);
+
+            let result = replace_file_then(
+                &candidate,
+                &database_path,
+                sync_file_contents,
+                || {
+                    remove_sidecar(&database_path, "wal")?;
+                    remove_sidecar(&database_path, "shm")
+                },
+                atomic_rename_file,
+                |parent| {
+                    if failure == "sync_parent" {
+                        Err(SecurityError::Io(
+                            "injected parent sync failure".to_string(),
+                        ))
+                    } else {
+                        sync_directory(parent)
+                    }
+                },
+                || {
+                    published.set(true);
+                    if failure == "publish_state" {
+                        Err(SecurityError::Io(
+                            "injected state write failure".to_string(),
+                        ))
+                    } else {
+                        persist_state_for_database_path(&database_path, &state)
+                    }
+                },
+            );
+
+            assert!(result.is_err(), "injected {failure} must fail activation");
+            assert_eq!(
+                published.get(),
+                failure == "publish_state",
+                "state publication must not run before the database barrier"
+            );
+            assert!(
+                !state_path(&config).exists(),
+                "failed activation must leave startup recovery authoritative"
+            );
+
+            let connection = open_database(&database_path)
+                .expect("startup must recover the actual replacement after injected failure");
+            let note: String = connection
+                .query_row("SELECT note FROM recovery_canary", [], |row| row.get(0))
+                .expect("recovered database must retain the original data");
+            assert_eq!(note, "before-activation");
+            assert!(state_path(&config).exists(), "startup must rebuild state");
+            drop(connection);
+            cleanup(&root);
+        }
+    }
+
+    #[test]
+    fn missing_database_recovers_from_verified_staging_file() {
+        for keep_state in [true, false] {
+            let (config, root) = test_config(if keep_state {
+                "missing-db-with-state"
+            } else {
+                "missing-db-without-state"
+            });
+            seed_db(&config);
+            let database_path = config.database_path();
+            activate_encryption(&config).expect("initial activation must succeed");
+            let state_path = state_path(&config);
+            let state = read_state(&config)
+                .expect("state must be readable")
+                .expect("state must exist");
+            let key_hex = load_key_for_state(&database_path, &state).expect("key must load");
+            stage_verified_copy_for_test(&database_path, &state, &key_hex);
+            let stale_partial = database_path.parent().unwrap().join(format!(
+                "{}.stale.partial",
+                database_path.file_name().unwrap().to_string_lossy()
+            ));
+            fs::write(&stale_partial, b"incomplete previous export")
+                .expect("create unrelated stale partial");
+            fs::remove_file(&database_path).expect("simulate a missing destination name");
+            if !keep_state {
+                fs::remove_file(&state_path).expect("simulate missing state");
+            }
+
+            let connection = open_database(&database_path)
+                .expect("startup must install a verified staged encrypted database");
+            let note: String = connection
+                .query_row("SELECT note FROM recovery_canary", [], |row| row.get(0))
+                .expect("recovered database must retain its data");
+            assert_eq!(note, "before-activation");
+            assert!(database_file_is_encrypted(&database_path));
+            assert!(
+                !stale_partial.exists(),
+                "stale partial should be cleaned after verified restore"
+            );
+            if !keep_state {
+                let recovered = read_state(&config)
+                    .expect("recovered state must parse")
+                    .expect("recovered state must exist");
+                assert_eq!(recovered.key_id, state.key_id);
+            }
+            drop(connection);
+            cleanup(&root);
+        }
+    }
+
+    #[test]
+    fn existing_plaintext_database_wins_over_an_older_verified_stage() {
+        let (config, root) = test_config("stale-stage-does-not-roll-back");
+        seed_db(&config);
+        let database_path = config.database_path();
+        let plaintext_source = database_path.with_extension("plaintext-fixture");
+        fs::copy(&database_path, &plaintext_source).expect("preserve initial plaintext database");
+        activate_encryption(&config).expect("initial activation must succeed");
+
+        let state = read_state(&config)
+            .expect("state must be readable")
+            .expect("state must exist");
+        let key_hex = load_key_for_state(&database_path, &state).expect("key must load");
+        stage_verified_copy_for_test(&database_path, &state, &key_hex);
+
+        fs::copy(&plaintext_source, &database_path).expect("simulate state-ahead plaintext");
+        let newer = Connection::open(&database_path).expect("plaintext database must open");
+        newer
+            .execute(
+                "INSERT INTO recovery_canary (note) VALUES (?1)",
+                ["written-after-the-stage"],
+            )
+            .expect("write newer row");
+        drop(newer);
+
+        let recovered = open_database(&database_path)
+            .expect("startup must encrypt the current plaintext database");
+        let row_count: i64 = recovered
+            .query_row(
+                "SELECT count(*) FROM recovery_canary WHERE note = 'written-after-the-stage'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("newer row must survive encryption recovery");
+        assert_eq!(row_count, 1, "recovery must not install the older stage");
+        assert!(database_file_is_encrypted(&database_path));
+        assert!(
+            !fs::read_dir(database_path.parent().unwrap())
+                .unwrap()
+                .any(|entry| entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .contains(".ready-")),
+            "stale stages must be removed after the live database is recovered"
+        );
+        drop(recovered);
+        cleanup(&root);
+    }
+
+    #[test]
+    fn missing_database_refuses_unverified_partial_instead_of_creating_empty_database() {
+        let (config, root) = test_config("missing-db-partial");
+        seed_db(&config);
+        let database_path = config.database_path();
+        let partial = database_path.parent().unwrap().join(format!(
+            "{}.crash.partial",
+            database_path.file_name().unwrap().to_string_lossy()
+        ));
+        fs::write(&partial, b"incomplete SQLCipher export").expect("write partial fixture");
+        fs::remove_file(&database_path).expect("simulate lost database name");
+
+        assert!(open_database(&database_path).is_err());
+        assert!(
+            !database_path.exists(),
+            "recovery must not create an empty replacement"
+        );
+        cleanup(&root);
+    }
+
+    #[test]
+    fn verified_but_empty_encrypted_candidate_cannot_replace_populated_database() {
+        let (config, root) = test_config("empty-encrypted-candidate");
+        seed_db(&config);
+        let database_path = config.database_path();
+        let key_hex = "ab".repeat(32);
+        let key_id = key_id_for_path(&database_path);
+        let state = EncryptionStateFile {
+            database_encrypted: true,
+            derived_data_encrypted: true,
+            key_id,
+            key_storage: "test_file_key_store".to_string(),
+            activated_at: Utc::now(),
+            backup_path: String::new(),
+        };
+        let partial = database_path.with_extension("empty-candidate.partial");
+        let empty = Connection::open(&partial).expect("create empty candidate");
+        key_connection(&empty, &key_hex).expect("apply candidate encryption key");
+        empty
+            .execute_batch("CREATE TABLE empty_canary (id INTEGER PRIMARY KEY);")
+            .expect("write a valid encrypted but empty database");
+        drop(empty);
+
+        assert!(
+            promote_verified_candidate(&database_path, &database_path, &partial, &state, &key_hex)
+                .is_err()
+        );
+        assert!(
+            !fs::read_dir(database_path.parent().unwrap())
+                .unwrap()
+                .any(|entry| entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .contains(".ready-")),
+            "a candidate that omits live rows must never become recoverable"
+        );
+        cleanup(&root);
+    }
+
+    #[test]
+    fn corrupt_live_database_keeps_verified_recovery_copy() {
+        use std::io::{Seek, SeekFrom};
+
+        let (config, root) = test_config("corrupt-live-retains-stage");
+        seed_db(&config);
+        activate_encryption(&config).expect("activation must succeed");
+        let database_path = config.database_path();
+        let state = read_state(&config)
+            .expect("state must be readable")
+            .expect("state must exist");
+        let key_hex = load_key_for_state(&database_path, &state).expect("key must load");
+        stage_verified_copy_for_test(&database_path, &state, &key_hex);
+
+        let connection = Connection::open(&database_path).expect("encrypted file opens");
+        key_connection(&connection, &key_hex).expect("key applies");
+        let page_size = connection
+            .query_row("PRAGMA cipher_page_size", [], |row| row.get::<_, String>(0))
+            .expect("read database page size")
+            .parse::<u64>()
+            .expect("page size must be numeric");
+        drop(connection);
+        let mut file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&database_path)
+            .expect("open live database for corruption fixture");
+        let offset = page_size + 64;
+        file.seek(SeekFrom::Start(offset))
+            .expect("seek into data page");
+        let mut byte = [0_u8; 1];
+        std::io::Read::read_exact(&mut file, &mut byte).expect("read data page byte");
+        byte[0] ^= 0x80;
+        file.seek(SeekFrom::Start(offset))
+            .expect("seek back into data page");
+        std::io::Write::write_all(&mut file, &byte).expect("corrupt data page");
+        file.sync_all().expect("persist corruption fixture");
+        drop(file);
+
+        assert!(open_database(&database_path).is_err());
+        assert!(
+            fs::read_dir(database_path.parent().unwrap())
+                .unwrap()
+                .any(|entry| entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .contains(".ready-")),
+            "integrity failure must retain the verified recovery copy"
+        );
+        cleanup(&root);
+    }
+
+    #[test]
+    fn missing_database_rejects_ambiguous_verified_manifests() {
+        let (config, root) = test_config("missing-db-ambiguous");
+        seed_db(&config);
+        let database_path = config.database_path();
+        activate_encryption(&config).expect("activation must succeed");
+        let state = read_state(&config)
+            .expect("state must be readable")
+            .unwrap();
+        let key_hex = load_key_for_state(&database_path, &state).expect("key must load");
+        for _ in 0..2 {
+            stage_verified_copy_for_test(&database_path, &state, &key_hex);
+        }
+        fs::remove_file(&database_path).expect("simulate missing database");
+
+        assert!(open_database(&database_path).is_err());
+        assert!(
+            !database_path.exists(),
+            "ambiguous candidates must not be selected"
+        );
+        cleanup(&root);
+    }
+
+    #[test]
+    fn sqlcipher_key_input_requires_exact_hex_encoding() {
+        assert!(validate_key_hex(&"ab".repeat(32)).is_ok());
+        assert!(validate_key_hex(&"a".repeat(63)).is_err());
+        assert!(validate_key_hex(&"a".repeat(65)).is_err());
+        assert!(validate_key_hex(&format!("{}' OR 1=1 --", "a".repeat(56))).is_err());
+        assert!(validate_key_hex(&format!("{}é", "a".repeat(62))).is_err());
+    }
+
     /// The recovery path has to work through the real startup entry point, not
     /// only through `open_database` called directly, or a fix here proves
     /// nothing about the daemon actually starting. `bootstrap_storage` is what
@@ -1096,6 +2140,60 @@ mod tests {
             state_path(&config).exists(),
             "recovery must rebuild the state file"
         );
+        cleanup(&root);
+    }
+
+    /// Filesystems can expose the state-file rename before the database
+    /// rename survives a sudden shutdown. Startup must compare the database
+    /// header with the state and complete encryption before returning it.
+    #[test]
+    fn state_ahead_of_plaintext_database_reencrypts_before_open() {
+        let (config, root) = test_config("state-ahead-of-database");
+        seed_db(&config);
+        let plaintext = root.join("plaintext-before-activation.sqlite3");
+        fs::copy(config.database_path(), &plaintext).expect("save plaintext recovery fixture");
+        activate_encryption(&config).expect("activation must succeed");
+
+        // Model a power-loss outcome where the encryption state is present but
+        // the database directory entry reverted to the old plaintext file.
+        fs::copy(&plaintext, config.database_path()).expect("restore plaintext observation");
+        let connection = open_database(&config.database_path())
+            .expect("startup must finish encryption before opening the library");
+        let note: String = connection
+            .query_row("SELECT note FROM recovery_canary", [], |row| row.get(0))
+            .expect("the verified encrypted database must retain its data");
+        assert_eq!(note, "before-activation");
+        assert!(
+            database_file_is_encrypted(&config.database_path()),
+            "startup must not return while the library remains plaintext"
+        );
+        drop(connection);
+        cleanup(&root);
+    }
+
+    #[test]
+    fn torn_state_with_plaintext_database_recovers_from_verified_key() {
+        let (config, root) = test_config("torn-state-plaintext-database");
+        seed_db(&config);
+        let plaintext = root.join("plaintext-before-activation.sqlite3");
+        fs::copy(config.database_path(), &plaintext).expect("save plaintext recovery fixture");
+        activate_encryption(&config).expect("activation must succeed");
+
+        fs::copy(&plaintext, config.database_path()).expect("restore plaintext observation");
+        fs::write(state_path(&config), "{\"database_encrypted\": tru")
+            .expect("model a torn state rename");
+        let connection = open_database(&config.database_path())
+            .expect("startup must recover a torn state using a verified stored key");
+        let note: String = connection
+            .query_row("SELECT note FROM recovery_canary", [], |row| row.get(0))
+            .expect("recovered database must retain its data");
+        assert_eq!(note, "before-activation");
+        let recovered_state = read_state(&config)
+            .expect("recovered state must parse")
+            .expect("recovered state must exist");
+        assert!(recovered_state.database_encrypted);
+        assert!(database_file_is_encrypted(&config.database_path()));
+        drop(connection);
         cleanup(&root);
     }
 
