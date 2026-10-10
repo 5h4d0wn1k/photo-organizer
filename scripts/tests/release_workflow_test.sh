@@ -1967,6 +1967,178 @@ else
   ok 'no multi-line inline emulator script: block may reappear'
 fi
 
+echo " the desktop build inputs a release depends on are asserted, not assumed"
+# Both of these were silent until a release run died on them. Neither is a workflow
+# construct, so neither is visible to a YAML parser: every assertion in this file up
+# to this point stayed green through both failures.
+LINUX_CMAKE="${ROOT_DIR}/app/linux/CMakeLists.txt"
+if [[ ! -f "${LINUX_CMAKE}" ]]; then
+  bad 'the Linux CMakeLists exists for the compiler-cache assertions to read' \
+    "not found at ${LINUX_CMAKE}"
+else
+  ok 'the Linux CMakeLists exists for the compiler-cache assertions to read'
+
+  # Structural, and comment-aware. `project()` reads the compiler out of the cache,
+  # so a plain `set(...)` before `project()` is a directory-scope variable that
+  # never reaches CMakeCache.txt, and Flutter's build then aborts with "Expected
+  # .../CMakeCache.txt to contain an entry for CMAKE_CXX_COMPILER" -- how release
+  # run 37184543519 lost the Linux leg.
+  #
+  # Comments are stripped first because this file's own comments discuss
+  # `set(CMAKE_CXX_COMPILER ...)` in prose; a check over raw text would be satisfied
+  # by the explanation of the bug. Line comments, bracket comments and quoted
+  # arguments that contain a '#' are all handled, because getting that wrong makes
+  # the assertions below read positions from a file they did not read.
+  cmake_code_only() {
+    python3 - "$1" <<'PYTHON'
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    lines = handle.read().splitlines()
+out = []
+in_bracket = False
+for number, line in enumerate(lines, 1):
+    text = line
+    if in_bracket:
+        rest = text
+        while True:
+            close_at = rest.find("]]")
+            if close_at == -1:
+                break
+            rest = rest[close_at + 2:]
+            if rest.find("[[") == -1:
+                in_bracket = False
+                break
+        continue
+    while True:
+        stripped = text.lstrip()
+        if stripped.startswith("#"):
+            if stripped.startswith("#[["):
+                rest = stripped[3:]
+                while True:
+                    close_at = rest.find("]]")
+                    if close_at == -1:
+                        in_bracket = True
+                        break
+                    rest = rest[close_at + 2:]
+                    if rest.find("[[") == -1:
+                        break
+            break
+        if stripped.startswith('"'):
+            end = 1
+            while end < len(stripped):
+                if stripped[end] == "\\":
+                    end += 2
+                    continue
+                if stripped[end] == '"':
+                    break
+                end += 1
+            start = text.index('"')
+            text = text[: start + end + 1]
+            break
+        hash_at = text.find("#")
+        if hash_at != -1:
+            text = text[:hash_at]
+        break
+    out.append(f"{number}\t{text}")
+print("\n".join(out))
+PYTHON
+  }
+
+  cmake_code_only "${LINUX_CMAKE}" >"${WORK_DIR}/cmake_code.tsv"
+  # Every original line must still be addressable, or the assertions below would be
+  # reporting positions into a file that no longer exists.
+  cmake_rows="$(wc -l <"${WORK_DIR}/cmake_code.tsv")"
+  cmake_real="$(wc -l <"${LINUX_CMAKE}")"
+  if [[ "${cmake_rows}" == "${cmake_real}" ]]; then
+    ok "the Linux CMakeLists comment stripper keeps every line addressable (${cmake_rows})"
+  else
+    bad "the Linux CMakeLists comment stripper keeps every line addressable" \
+      "emitted ${cmake_rows} rows for ${cmake_real} lines; the assertions below would read the wrong positions"
+  fi
+
+  project_line="$(awk -F'\t' '$2 ~ /^[[:space:]]*project[[:space:]]*\(/ {print $1; exit}' "${WORK_DIR}/cmake_code.tsv")"
+  if [[ -z "${project_line}" ]]; then
+    bad 'the Linux CMakeLists calls project() on a line of its own' \
+      'not found, so there is nothing for the ordering assertion to compare against'
+  else
+    ok "the Linux CMakeLists calls project() on a line of its own (line ${project_line})"
+    for var in CMAKE_C_COMPILER CMAKE_CXX_COMPILER; do
+      set_lines="$(awk -F'\t' -v want="${var}" \
+        '$2 ~ ("^[[:space:]]*set[[:space:]]*\\([[:space:]]*" want "[[:space:]]") {print $1}' \
+        "${WORK_DIR}/cmake_code.tsv")"
+      if [[ -z "${set_lines}" ]]; then
+        bad "${var} is written as a CMake cache entry" \
+          "no set(${var} ...) appears in code; a mention in a comment is not a fix"
+        continue
+      fi
+      missing_cache=""
+      late=""
+      while IFS= read -r line; do
+        [[ -n "${line}" ]] || continue
+        row="$(awk -F'\t' -v want_line="${line}" '$1 == want_line {print $2}' "${WORK_DIR}/cmake_code.tsv")"
+        if [[ "${row}" != *"CACHE "* ]]; then
+          missing_cache+="${line} "
+        fi
+        if ((line > project_line)); then
+          late+="${line} "
+        fi
+      done <<<"${set_lines}"
+      if [[ -n "${missing_cache}" ]]; then
+        bad "${var} is written as a CMake cache entry" \
+          "set(${var} ...) at line(s) ${missing_cache}carries no CACHE keyword; a directory-scope set before project() never reaches CMakeCache.txt"
+      else
+        ok "${var} is written as a CMake cache entry (line(s) ${set_lines% })"
+      fi
+      if [[ -n "${late}" ]]; then
+        bad "${var} is cached before project() consumes it" \
+          "set(${var} ...) at line(s) ${late} runs after project() at line ${project_line}"
+      else
+        ok "${var} is cached before project() consumes it"
+      fi
+    done
+
+    # Behavioural, not textual: configure the file's own prefix with real cmake and
+    # read the cache it actually wrote. A structural check can be satisfied by a
+    # set() on a branch that never runs; this cannot.
+    if ! command -v cmake >/dev/null 2>&1; then
+      bad 'cmake is available to prove the compiler cache entry behaviourally' \
+        'cmake not found: the structural assertions above ran, but nothing proved that configuring this file really produces a cache entry'
+    else
+      ok 'cmake is available to prove the compiler cache entry behaviourally'
+      cmake_prefix="${WORK_DIR}/cmake-prefix"
+      mkdir -p "${cmake_prefix}"
+      # Everything up to and including project(). Everything below it adds Flutter
+      # plugin subdirectories that need the engine, and a required check must not
+      # need a Flutter engine in order to test a two-line property.
+      awk -F'\t' -v stop="${project_line}" '$1 <= stop {sub(/^[^\t]*\t/, ""); print}' \
+        "${WORK_DIR}/cmake_code.tsv" >"${cmake_prefix}/CMakeLists.txt"
+      if ! cmake -S "${cmake_prefix}" -B "${WORK_DIR}/cmake-build" >"${WORK_DIR}/cmake.log" 2>&1; then
+        bad 'the Linux CMakeLists prefix configures' \
+          "cmake exited non-zero: $(tail -3 "${WORK_DIR}/cmake.log" | tr '\n' ' ')"
+      else
+        ok 'the Linux CMakeLists prefix configures'
+        cache="${WORK_DIR}/cmake-build/CMakeCache.txt"
+        if [[ ! -f "${cache}" ]]; then
+          bad 'configuring the Linux CMakeLists writes a CMakeCache.txt' \
+            "cmake reported success but no cache file appeared at ${cache}"
+        else
+          ok 'configuring the Linux CMakeLists writes a CMakeCache.txt'
+          # The exact condition Flutter's build_linux.dart checks for.
+          for var in CMAKE_C_COMPILER CMAKE_CXX_COMPILER; do
+            if grep -qE "^${var}:" "${cache}"; then
+              ok "CMakeCache.txt contains an entry for ${var}, which is what flutter build linux requires"
+            else
+              bad "CMakeCache.txt contains an entry for ${var}, which is what flutter build linux requires" \
+                "no such entry in the cache cmake actually wrote; flutter build linux aborts with 'Expected .../CMakeCache.txt to contain an entry for ${var}'"
+            fi
+          done
+        fi
+      fi
+    fi
+  fi
+fi
+
 printf '\n%s passed, %s failed\n' "${PASS_COUNT}" "${FAIL_COUNT}"
 if ((FAIL_COUNT > 0)); then
   exit 1
