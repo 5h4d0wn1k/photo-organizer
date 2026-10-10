@@ -957,24 +957,45 @@ fn export_plaintext_to_encrypted(
     key_hex: &str,
 ) -> Result<(), SecurityError> {
     validate_key_hex(key_hex)?;
-    let connection = Connection::open(database_path).map_err(database_error)?;
-    let user_version = connection
-        .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
-        .map_err(database_error)?;
-    let encrypted_path = encrypted_temp.to_string_lossy();
-    connection
-        .execute("ATTACH DATABASE ?1 AS encrypted", [encrypted_path.as_ref()])
-        .map_err(database_error)?;
-    key_database_connection(&connection, b"encrypted\0", key_hex)?;
-    connection
-        .execute_batch("SELECT sqlcipher_export('encrypted');")
-        .map_err(database_error)?;
-    connection
-        .execute_batch(&format!("PRAGMA encrypted.user_version = {user_version};"))
-        .map_err(database_error)?;
-    connection
-        .execute_batch("DETACH DATABASE encrypted;")
-        .map_err(database_error)
+    // Reserve a genuinely new, empty destination. SQLCipher initializes an
+    // attached schema before a later key_v2 call, so keying after ATTACH is
+    // safe here only because this is a fresh staging database. create_new
+    // turns that invariant into an enforced precondition and prevents a UUID
+    // collision or stale path from being treated as an existing database.
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let reservation = options.open(encrypted_temp).map_err(io_error)?;
+    drop(reservation);
+
+    let export_result = (|| {
+        let connection = Connection::open(database_path).map_err(database_error)?;
+        let user_version = connection
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .map_err(database_error)?;
+        let encrypted_path = encrypted_temp.to_string_lossy();
+        connection
+            .execute("ATTACH DATABASE ?1 AS encrypted", [encrypted_path.as_ref()])
+            .map_err(database_error)?;
+        key_database_connection(&connection, b"encrypted\0", key_hex)?;
+        connection
+            .execute_batch("SELECT sqlcipher_export('encrypted');")
+            .map_err(database_error)?;
+        connection
+            .execute_batch(&format!("PRAGMA encrypted.user_version = {user_version};"))
+            .map_err(database_error)?;
+        connection
+            .execute_batch("DETACH DATABASE encrypted;")
+            .map_err(database_error)
+    })();
+    match export_result {
+        Ok(()) => Ok(()),
+        Err(error) => Err(cleanup_candidate_after_error(encrypted_temp, error)),
+    }
 }
 
 fn verify_encrypted_database(
@@ -2326,6 +2347,15 @@ mod tests {
             .expect("exported integrity check must run");
         assert_eq!(integrity, "ok");
         drop(exported);
+
+        let existing_path = root.join("existing-target.db");
+        fs::write(&existing_path, b"preserve existing target")
+            .expect("existing target fixture must be created");
+        assert!(export_plaintext_to_encrypted(&plaintext_path, &existing_path, &key_hex).is_err());
+        assert_eq!(
+            fs::read(&existing_path).expect("existing target must remain"),
+            b"preserve existing target"
+        );
         cleanup(&root);
     }
 
