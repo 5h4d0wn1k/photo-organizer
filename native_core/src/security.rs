@@ -1,16 +1,18 @@
 use std::{
     collections::BTreeMap,
+    ffi::CStr,
     fs,
     io::{Read, Write},
     path::{Path, PathBuf},
 };
 
 use chrono::{DateTime, Utc};
-use rusqlite::Connection;
+use rusqlite::{Connection, ffi};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 use crate::{
     config::AppConfig,
@@ -962,12 +964,19 @@ fn export_plaintext_to_encrypted(
     let user_version = connection
         .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
         .map_err(database_error)?;
+    let encrypted_path = encrypted_temp.to_string_lossy();
     connection
-        .execute_batch(&format!(
-            "ATTACH DATABASE '{}' AS encrypted KEY \"x'{}'\";\nSELECT sqlcipher_export('encrypted');\nPRAGMA encrypted.user_version = {user_version};\nDETACH DATABASE encrypted;",
-            quote_sql_path(encrypted_temp),
-            key_hex
-        ))
+        .execute("ATTACH DATABASE ?1 AS encrypted", [encrypted_path.as_ref()])
+        .map_err(database_error)?;
+    key_database_connection(&connection, b"encrypted\0", key_hex)?;
+    connection
+        .execute_batch("SELECT sqlcipher_export('encrypted');")
+        .map_err(database_error)?;
+    connection
+        .execute_batch(&format!("PRAGMA encrypted.user_version = {user_version};"))
+        .map_err(database_error)?;
+    connection
+        .execute_batch("DETACH DATABASE encrypted;")
         .map_err(database_error)
 }
 
@@ -1198,10 +1207,60 @@ fn user_table_row_counts(connection: &Connection) -> Result<BTreeMap<String, i64
 // (OS keychain; test file store only in tests). Key is applied to encrypted
 // database connection only, never persisted in plaintext.
 fn key_connection(connection: &Connection, key_hex: &str) -> Result<(), SecurityError> {
+    key_database_connection(connection, b"main\0", key_hex)
+}
+
+fn key_database_connection(
+    connection: &Connection,
+    database_name: &'static [u8],
+    key_hex: &str,
+) -> Result<(), SecurityError> {
     validate_key_hex(key_hex)?;
-    connection
-        .execute_batch(&format!("PRAGMA key = \"x'{key_hex}'\";"))
-        .map_err(database_error)
+    let database_name = CStr::from_bytes_with_nul(database_name).map_err(|error| {
+        SecurityError::Invalid(format!("invalid SQLCipher database name: {error}"))
+    })?;
+    let key = decode_key_hex(key_hex)?;
+    // SQLCipher's C key API is equivalent to PRAGMA key, but avoids copying
+    // key material into SQL source text, trace output, or SQL error context.
+    // The pointer is used only for this call; SQLCipher retains its internal
+    // codec key for the lifetime of the connection.
+    let result = unsafe {
+        ffi::sqlite3_key_v2(
+            connection.handle(),
+            database_name.as_ptr(),
+            key.as_ptr().cast(),
+            key.len() as i32,
+        )
+    };
+    if result == ffi::SQLITE_OK {
+        Ok(())
+    } else {
+        Err(database_error(rusqlite::Error::SqliteFailure(
+            ffi::Error::new(result),
+            None,
+        )))
+    }
+}
+
+fn decode_key_hex(key_hex: &str) -> Result<Zeroizing<[u8; 32]>, SecurityError> {
+    validate_key_hex(key_hex)?;
+    let mut key = Zeroizing::new([0_u8; 32]);
+    for (index, pair) in key_hex.as_bytes().chunks_exact(2).enumerate() {
+        key[index] = (decode_hex_nibble(pair[0])? << 4) | decode_hex_nibble(pair[1])?;
+    }
+    Ok(key)
+}
+
+fn decode_hex_nibble(value: u8) -> Result<u8, SecurityError> {
+    match value {
+        b'0'..=b'9' => Ok(value - b'0'),
+        b'a'..=b'f' => Ok(value - b'a' + 10),
+        b'A'..=b'F' => Ok(value - b'A' + 10),
+        _ => Err(SecurityError::KeyStorage(
+            "SQLCipher key must be exactly 32 bytes encoded as 64 hexadecimal characters"
+                .to_string(),
+        )),
+    }
 }
 
 fn sqlcipher_available(database_path: &Path) -> bool {
@@ -1366,10 +1425,6 @@ fn hex_string(bytes: impl AsRef<[u8]>) -> String {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
-}
-
-fn quote_sql_path(path: &Path) -> String {
-    path.to_string_lossy().replace('\'', "''")
 }
 
 fn remove_sidecar(database_path: &Path, suffix: &str) -> Result<(), SecurityError> {
@@ -2165,8 +2220,17 @@ mod tests {
     #[test]
     fn sqlcipher_key_input_requires_exact_hex_encoding() {
         assert!(validate_key_hex(&"ab".repeat(32)).is_ok());
+        let expected = (0_u8..32).collect::<Vec<_>>();
+        let encoded = hex_string(&expected);
+        let decoded = decode_key_hex(&encoded).expect("valid SQLCipher key must decode");
+        assert_eq!(&decoded[..], expected.as_slice());
+        assert_eq!(
+            &decode_key_hex(&encoded.to_uppercase()).unwrap()[..],
+            expected
+        );
         assert!(validate_key_hex(&"a".repeat(63)).is_err());
         assert!(validate_key_hex(&"a".repeat(65)).is_err());
+        assert!(decode_key_hex(&"a".repeat(63)).is_err());
         assert!(validate_key_hex(&format!("{}' OR 1=1 --", "a".repeat(56))).is_err());
         assert!(validate_key_hex(&format!("{}é", "a".repeat(62))).is_err());
     }
