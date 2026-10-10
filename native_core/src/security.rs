@@ -420,22 +420,9 @@ fn recover_missing_database(
         ));
     }
 
-    replace_file_then(
-        &committed_database,
-        database_path,
-        sync_file_contents,
-        || {
-            remove_sidecar(database_path, "wal")?;
-            remove_sidecar(database_path, "shm")
-        },
-        atomic_rename_file,
-        sync_directory,
-        || {
-            persist_state_for_database_path(database_path, &state)?;
-            fs::remove_file(manifest_path).map_err(io_error)?;
-            sync_directory(parent)
-        },
-    )?;
+    replace_database_with_encrypted_then(database_path, &committed_database, || {
+        persist_state_for_database_path(database_path, &state)
+    })?;
     remove_recovery_artifacts(database_path, Some(&key_hex))?;
     Ok(true)
 }
@@ -1007,8 +994,24 @@ fn replace_database_with_encrypted_then(
     encrypted_temp: &Path,
     publish_state: impl FnOnce() -> Result<(), SecurityError>,
 ) -> Result<(), SecurityError> {
-    replace_file_then(
-        encrypted_temp,
+    let parent = database_path.parent().ok_or_else(|| {
+        SecurityError::Invalid("database path has no parent directory".to_string())
+    })?;
+    let file_name = database_path
+        .file_name()
+        .ok_or_else(|| SecurityError::Invalid("database path has no file name".to_string()))?
+        .to_string_lossy();
+    // Never consume the verified recovery candidate during the live swap. On
+    // filesystems that can lose the destination directory entry after a power
+    // failure, the separate manifest-backed copy is what lets startup restore
+    // the database name. The replacement copy is disposable until published.
+    let replacement = parent.join(format!(
+        "{file_name}.replacement-{}.partial",
+        Uuid::new_v4()
+    ));
+    fs::copy(encrypted_temp, &replacement).map_err(io_error)?;
+    let result = replace_file_then(
+        &replacement,
         database_path,
         sync_file_contents,
         || {
@@ -1018,7 +1021,11 @@ fn replace_database_with_encrypted_then(
         atomic_rename_file,
         sync_directory,
         publish_state,
-    )
+    );
+    if replacement.exists() {
+        fs::remove_file(&replacement).map_err(io_error)?;
+    }
+    result
 }
 
 /// Perform a file replacement in a fixed order: sync the candidate contents,
@@ -1434,6 +1441,7 @@ mod tests {
     }
 
     /// Peak resident set size of this process, in bytes, from the kernel.
+    #[cfg(target_os = "linux")]
     fn peak_rss_bytes() -> u64 {
         let status = fs::read_to_string("/proc/self/status").expect("procfs must be readable");
         status
@@ -1462,6 +1470,9 @@ mod tests {
     /// in this binary run on parallel threads, so a tight bound would be flaky.
     /// 64 MiB against a 512 MiB file still leaves 8x of headroom -- the
     /// regression this guards is a 512 MiB allocation, not a marginal one.
+    /// This measurement uses Linux procfs; the behavior is also exercised by
+    /// the portable header-classification tests on every target.
+    #[cfg(target_os = "linux")]
     #[test]
     fn header_probe_does_not_read_the_whole_database() {
         let (_config, root) = test_config("header-probe-rss");
@@ -1897,6 +1908,70 @@ mod tests {
             drop(connection);
             cleanup(&root);
         }
+    }
+
+    #[test]
+    fn missing_live_name_after_replacement_restores_from_preserved_candidate() {
+        let (config, root) = test_config("missing-live-name-after-replacement");
+        seed_db(&config);
+        let database_path = config.database_path();
+        activate_encryption(&config).expect("initial activation must succeed");
+        let state = read_state(&config)
+            .expect("state must be readable")
+            .expect("state must exist");
+        let key_hex = load_key_for_state(&database_path, &state).expect("key must load");
+        stage_verified_copy_for_test(&database_path, &state, &key_hex);
+        let ready_prefix = format!(
+            "{}.ready-",
+            database_path.file_name().unwrap().to_string_lossy()
+        );
+        let ready_database = fs::read_dir(database_path.parent().unwrap())
+            .expect("database directory must be readable")
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(&ready_prefix) && name.ends_with(".db"))
+            })
+            .expect("verified recovery candidate must exist");
+
+        let interrupted =
+            replace_database_with_encrypted_then(&database_path, &ready_database, || {
+                // Model a platform power-loss observation where the target
+                // name is absent after the replacement rename, before state
+                // publication completes.
+                fs::remove_file(&database_path).map_err(io_error)?;
+                Err(SecurityError::Io(
+                    "injected lost destination name".to_string(),
+                ))
+            });
+        assert!(
+            interrupted.is_err(),
+            "injected interruption must fail closed"
+        );
+        assert!(
+            !database_path.exists(),
+            "fixture must model a missing live name"
+        );
+        assert!(
+            ready_database.exists(),
+            "replacement must preserve the verified recovery candidate"
+        );
+
+        assert!(
+            recover_missing_database(&database_path, Some(&state))
+                .expect("startup must restore from the retained candidate"),
+            "a missing live name must be recovered"
+        );
+        let connection =
+            open_database(&database_path).expect("restored encrypted database must open");
+        let note: String = connection
+            .query_row("SELECT note FROM recovery_canary", [], |row| row.get(0))
+            .expect("restored database must preserve the canary row");
+        assert_eq!(note, "before-activation");
+        drop(connection);
+        cleanup(&root);
     }
 
     #[test]
