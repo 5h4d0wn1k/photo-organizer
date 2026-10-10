@@ -63,11 +63,29 @@ WORK="$(mktemp -d)"
 cleanup() {
   rm -rf "${WORK}"
 }
-# EXIT alone does not run for an untrapped SIGTERM/SIGINT, so a timeout or Ctrl-C
-# would abandon the private tree. Trap the signals too. The tree is private, so this
-# is about not leaking a large temp tree rather than about protecting the worktree;
-# the macOS/Windows siblings trap the same set.
-trap cleanup EXIT INT TERM HUP
+# The signals must be trapped so the private tree is not abandoned, and the
+# handlers must EXIT. `trap cleanup EXIT INT TERM HUP` looks equivalent and is
+# not: bash runs an EXIT trap when the script ends, but for a signal it runs the
+# handler and then *resumes the script*. So a signalled shard deleted its own
+# tree and carried on, and every later mutation then operated on files that no
+# longer existed. Proven on the macOS sibling (issue #172), where the residue
+# read as four mutations that "do not bite" when they had never been tested.
+#
+# So: normal exit cleans up and reports; a signal cleans up, then exits 128+signo
+# without printing a verdict. A shard that did not finish must not be able to say
+# anything that could be read as a result.
+on_signal() {
+  local name="$1" signo="$2"
+  trap - EXIT INT TERM HUP
+  cleanup
+  printf 'FATAL: received signal %s; this shard did not finish and reports no verdict\n' \
+    "${name}" >&2
+  exit "$((128 + signo))"
+}
+trap cleanup EXIT
+trap 'on_signal INT 2' INT
+trap 'on_signal TERM 15' TERM
+trap 'on_signal HUP 1' HUP
 
 # The whole `scripts/` tree is COPIED and mutated in place.
 #

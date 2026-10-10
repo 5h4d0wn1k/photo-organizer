@@ -559,6 +559,11 @@ expect(
     "the preflight must need no other job, or a missing secret stops being a fast fail",
 )
 
+# The suite job's timeout is asserted where matrix_name is computed, further
+# down: this block runs before the matrix fan-out has been parsed, so the job it
+# applies to cannot be named yet. See "the suite job's timeout must clear its
+# slowest measured leg" below.
+
 # --- least privilege --------------------------------------------------------
 expect(
     jobs["android"]["permissions"] == {"contents": "read"},
@@ -1071,6 +1076,9 @@ PYTHON
   shard_root="$(mktemp -d)"
   mkdir -p "${shard_root}/scripts/tests"
   cp "${runner}" "${shard_root}/scripts/tests/run_release_gate_tests.sh"
+  cp "${ROOT_DIR}/scripts/tests/run_in_process_group.py" \
+    "${ROOT_DIR}/scripts/tests/run_release_gate_shard.sh" \
+    "${ROOT_DIR}/scripts/tests/prefix_shard_output.py" "${shard_root}/scripts/tests/"
   if python3 - "${shard_root}/scripts/tests/run_release_gate_tests.sh" <<'PYTHON'
 import re
 import sys
@@ -1100,11 +1108,13 @@ PYTHON
 printf '%s\n' "\${MUTATION_SHARD}" >>"${shard_log}"
 exit 0
 SHARD_SUITE
-    if bash "${shard_runner}" >/dev/null 2>&1; then
+    shard_probe_output="${shard_root}/shard-probe.out"
+    if bash "${shard_runner}" >"${shard_probe_output}" 2>&1; then
       ok "the committed runner exits 0 when every shard of a sharded suite passes"
     else
+      shard_probe_rc=$?
       bad "the committed runner exits 0 when every shard of a sharded suite passes" \
-        "the sharded path failed on a clean probe"
+        "the sharded path exited ${shard_probe_rc}: $(cat "${shard_probe_output}")"
     fi
     shards_seen="$(sort -n -u "${shard_log}" | tr '\n' ' ')"
     if [[ "${shards_seen}" == "0 1 2 3 4 5 6 7 " ]]; then
@@ -1112,6 +1122,72 @@ SHARD_SUITE
     else
       bad "every shard of the sharded suite runs (the union is the full set)" \
         "shards seen: ${shards_seen:-<none>}"
+    fi
+
+    # Force the monitor's first process-state lookup to land after shard 0 has
+    # published its status marker. This recreates the boundary between the
+    # driver's initial marker check and process-state check without relying on
+    # scheduler timing: shard 0 waits for the ps shim, and the shim waits for
+    # shard 0's atomic marker publication before reporting a transient miss.
+    race_ps_dir="${shard_root}/race-ps-bin"
+    race_logs_dir="${shard_root}/race-logs"
+    race_state_seen="${shard_root}/race-state-seen"
+    race_output="${shard_root}/race-probe.out"
+    mkdir -p "${race_ps_dir}" "${race_logs_dir}"
+    real_ps="$(command -v ps)"
+    cat >"${race_ps_dir}/ps" <<'PS_SHIM'
+#!/usr/bin/env bash
+if [[ "$*" == "-o stat= -p "* && ! -e "${RACE_STATE_SEEN}" ]]; then
+  : >"${RACE_STATE_SEEN}"
+  while [[ ! -f "${RACE_STATUS}" ]]; do
+    sleep 0.01
+  done
+  printf '\n'
+  exit 0
+fi
+exec "${REAL_PS}" "$@"
+PS_SHIM
+    chmod +x "${race_ps_dir}/ps"
+    cat >"${shard_suite}" <<'SHARD_SUITE'
+#!/usr/bin/env bash
+if [[ "${MUTATION_SHARD}" == 0 ]]; then
+  while [[ ! -e "${RACE_STATE_SEEN}" ]]; do
+    sleep 0.01
+  done
+fi
+printf '%s\n' "${MUTATION_SHARD}"
+SHARD_SUITE
+    race_status="${race_logs_dir}/ios_release_artifact_mutation_test.shard0.log.exit"
+    PATH="${race_ps_dir}:${PATH}" REAL_PS="${real_ps}" \
+      RACE_STATE_SEEN="${race_state_seen}" RACE_STATUS="${race_status}" \
+      RELEASE_GATE_LOG_DIR="${race_logs_dir}" bash "${shard_runner}" \
+      >"${race_output}" 2>&1 &
+    race_driver_pid=$!
+    race_driver_gone=no
+    for _ in $(seq 1 15); do
+      race_driver_state="$("${real_ps}" -o stat= -p "${race_driver_pid}" 2>/dev/null \
+        | tr -d '[:space:]')"
+      if [[ -z "${race_driver_state}" || "${race_driver_state}" == Z* ]]; then
+        race_driver_gone=yes
+        break
+      fi
+      sleep 1
+    done
+    if [[ "${race_driver_gone}" == no ]]; then
+      kill -TERM "${race_driver_pid}" 2>/dev/null || true
+      sleep 2
+      kill -KILL "${race_driver_pid}" 2>/dev/null || true
+    fi
+    if wait "${race_driver_pid}" 2>/dev/null; then
+      race_rc=0
+    else
+      race_rc=$?
+    fi
+    if [[ "${race_driver_gone}" == yes && "${race_rc}" -eq 0 ]]; then
+      ok "a status marker published during the process-state check is accepted"
+    else
+      bad "a status marker published during the process-state check is accepted" \
+        "runner gone=${race_driver_gone} rc=${race_rc}: $(cat "${race_output}")"
     fi
 
     # A failure in any one shard must fail the whole pass, not be averaged away.
@@ -1144,6 +1220,356 @@ SHARD_SUITE
     else
       ok "the committed runner degrades the pass when one shard is degraded"
     fi
+
+    # Each shard's log must be a named, readable file under the log directory
+    # rather than an anonymous `mktemp` that is concatenated at the end and
+    # deleted. A shard's log is the only record of what that shard did, and the
+    # #164 macOS leg failed with eight `cat: /tmp/tmp.XXXX: No such file or
+    # directory` lines and no readable evidence at all -- the logs were destroyed
+    # before anyone could read them.
+    shard_logs_dir="${shard_root}/logs"
+    mkdir -p "${shard_logs_dir}"
+    cat >"${shard_suite}" <<SHARD_SUITE
+#!/usr/bin/env bash
+printf 'shard %s ran\n' "\${MUTATION_SHARD}"
+exit 0
+SHARD_SUITE
+    shard_logs_probe_output="${shard_root}/shard-logs-probe.out"
+    if RELEASE_GATE_LOG_DIR="${shard_logs_dir}" bash "${shard_runner}" \
+      >"${shard_logs_probe_output}" 2>&1; then
+      # Counted with a glob rather than `ls | grep`: the directory is ours, so
+      # there are no odd filenames to mangle, and shellcheck rejects the pipe.
+      shard_log_files=0
+      for _f in "${shard_logs_dir}"/*.shard[0-9].log; do
+        [[ -e "${_f}" ]] && shard_log_files=$((shard_log_files + 1))
+      done
+      if [[ "${shard_log_files}" == "8" ]]; then
+        ok "every shard writes its own named, readable log (a failure can be diagnosed)"
+      else
+        bad "every shard writes its own named, readable log (a failure can be diagnosed)" \
+          "found ${shard_log_files} per-shard log(s) in ${shard_logs_dir}: $(ls -1 "${shard_logs_dir}" 2>/dev/null | tr '\n' ' ')"
+      fi
+      # And the union must still be findable in the combined log, because the
+      # DEGRADED scan reads that rather than the shard files.
+      combined=0
+      for _f in "${shard_logs_dir}"/*.combined.log; do
+        [[ -e "${_f}" ]] && combined=$((combined + 1))
+      done
+      if [[ "${combined}" == "1" ]] \
+        && grep -q 'shard 7 ran' "${shard_logs_dir}"/*.combined.log 2>/dev/null; then
+        ok "the combined log still carries every shard, so the DEGRADED scan sees them all"
+      else
+        bad "the combined log still carries every shard, so the DEGRADED scan sees them all" \
+          "combined logs=${combined}"
+      fi
+    else
+      shard_logs_probe_rc=$?
+      bad "every shard writes its own named, readable log (a failure can be diagnosed)" \
+        "the probe runner exited ${shard_logs_probe_rc}: $(cat "${shard_logs_probe_output}")"
+    fi
+
+    # A path that is a file cannot be a log directory. The driver must reject it
+    # before any worker starts instead of waiting for status markers it cannot
+    # write.
+    bad_log_target="${shard_root}/not-a-directory"
+    bad_log_output="${shard_root}/bad-log-output"
+    started_marker="${shard_root}/worker-started-with-bad-log-path"
+    : >"${bad_log_target}"
+    cat >"${shard_suite}" <<SHARD_SUITE
+#!/usr/bin/env bash
+: >"${started_marker}"
+SHARD_SUITE
+    if RELEASE_GATE_LOG_DIR="${bad_log_target}" bash "${shard_runner}" \
+      >"${bad_log_output}" 2>&1; then
+      bad "an unusable log directory fails before workers start" \
+        "the runner returned success for a file used as the log directory"
+    elif grep -qF "cannot create release-gate log directory" "${bad_log_output}" \
+      && [[ ! -e "${started_marker}" ]]; then
+      ok "an unusable log directory fails before workers start"
+    else
+      bad "an unusable log directory fails before workers start" \
+        "failure lacked the expected diagnostic or a worker started"
+    fi
+
+    # A cancelled driver must stop and reap every shard, and stream progress into
+    # the live runner output before teardown. The observed job cancellation did
+    # not reach the `if: always()` artifact step; the Actions job log preserves
+    # output that was already streamed before cancellation.
+    # Separate sessions let the driver signal a whole shard, including a suite
+    # blocked in a foreground child, without signalling its own caller.
+    cancel_logs="${shard_root}/cancel-logs"
+    shard_pid_dir="${cancel_logs}/pids"
+    mkdir -p "${cancel_logs}" "${shard_pid_dir}"
+    cat >"${shard_suite}" <<'SHARD_SUITE'
+#!/usr/bin/env bash
+printf 'SHARD_STARTED %s\n' "${MUTATION_SHARD}"
+sleep 30 &
+sleep_pid=$!
+printf '%s %s\n' "${SHARD_WRAPPER_PID}" "${sleep_pid}" >"${SHARD_PID_DIR}/${MUTATION_SHARD}"
+wait "${sleep_pid}"
+SHARD_SUITE
+    RELEASE_GATE_LOG_DIR="${cancel_logs}" SHARD_PID_DIR="${shard_pid_dir}" \
+      bash "${shard_runner}" >"${shard_root}/cancel.out" 2>&1 &
+    cancel_pid=$!
+    sleep 2
+    missing_live_shards=""
+    for shard_index in $(seq 0 7); do
+      if ! grep -qF "[shard ${shard_index}] SHARD_STARTED ${shard_index}" \
+        "${shard_root}/cancel.out"; then
+        missing_live_shards+="${shard_index} "
+      fi
+    done
+    if [[ -z "${missing_live_shards}" ]]; then
+      ok "every running shard streams progress to the job output before cancellation"
+    else
+      bad "every running shard streams progress to the job output before cancellation" \
+        "shard output was not visible for: ${missing_live_shards}"
+    fi
+    term_pid_markers=0
+    for pid_file in "${shard_pid_dir}"/*; do
+      [[ -f "${pid_file}" ]] && term_pid_markers=$((term_pid_markers + 1))
+    done
+    if [[ "${term_pid_markers}" -eq 8 ]]; then
+      ok "all eight shard groups are registered before TERM is sent"
+    else
+      bad "all eight shard groups are registered before TERM is sent" \
+        "found ${term_pid_markers} shard PID marker(s)"
+    fi
+    kill -TERM "${cancel_pid}" 2>/dev/null || true
+    cancel_gone=no
+    for _ in $(seq 1 10); do
+      if ! kill -0 "${cancel_pid}" 2>/dev/null; then
+        cancel_gone=yes
+        break
+      fi
+      sleep 1
+    done
+    if [[ "${cancel_gone}" == no ]]; then
+      # Keep this regression bounded even when the handler it protects regresses.
+      kill -KILL "${cancel_pid}" 2>/dev/null || true
+    fi
+    if wait "${cancel_pid}" 2>/dev/null; then
+      cancel_rc=0
+    else
+      cancel_rc=$?
+    fi
+    if [[ "${cancel_gone}" == "yes" && "${cancel_rc}" -eq 143 ]]; then
+      ok "a cancelled release-gate run exits 143 promptly instead of limping on"
+    else
+      bad "a cancelled release-gate run exits 143 promptly instead of limping on" \
+        "gone=${cancel_gone} rc=${cancel_rc} (expected gone=yes rc=143)"
+    fi
+    live_groups=0
+    for pid_file in "${shard_pid_dir}"/*; do
+      [[ -f "${pid_file}" ]] || continue
+      read -r shard_group _sleep_pid <"${pid_file}"
+      if ps -eo pgid=,stat= | awk -v group="${shard_group}" '$1 == group && $2 !~ /^Z/ { live=1 } END { exit !live }'; then
+        live_groups=$((live_groups + 1))
+      fi
+    done
+    if [[ "${live_groups}" -eq 0 ]]; then
+      ok "cancelling the release-gate run stops every shard process group"
+    else
+      bad "cancelling the release-gate run stops every shard process group" \
+        "${live_groups} shard process group(s) remained live after driver exit"
+    fi
+    # If the assertion above detected a regression, clean up its isolated groups
+    # after recording the failure so the wiring test never leaves orphan work.
+    for pid_file in "${shard_pid_dir}"/*; do
+      [[ -f "${pid_file}" ]] || continue
+      read -r shard_group _sleep_pid <"${pid_file}"
+      kill -KILL -- "-${shard_group}" 2>/dev/null || true
+    done
+    kept_logs=0
+    for _f in "${cancel_logs}"/*.shard[0-9].log; do
+      [[ -e "${_f}" ]] && kept_logs=$((kept_logs + 1))
+    done
+    if ((kept_logs > 0)); then
+      ok "a cancelled release-gate run keeps its shard logs for diagnosis"
+    else
+      bad "a cancelled release-gate run keeps its shard logs for diagnosis" \
+        "no shard logs left in ${cancel_logs}: $(ls -1 "${cancel_logs}" 2>/dev/null | tr '\n' ' ')"
+    fi
+
+    # HUP must take the same cleanup path as TERM because isolated shard groups
+    # do not inherit a terminal/session signal sent only to the driver.
+    hup_logs="${shard_root}/hup-logs"
+    hup_pid_dir="${hup_logs}/pids"
+    mkdir -p "${hup_logs}" "${hup_pid_dir}"
+    cat >"${shard_suite}" <<'SHARD_SUITE'
+#!/usr/bin/env bash
+printf 'HUP_SHARD_STARTED %s\n' "${MUTATION_SHARD}"
+sleep 30 &
+sleep_pid=$!
+printf '%s %s\n' "${SHARD_WRAPPER_PID}" "${sleep_pid}" >"${SHARD_PID_DIR}/${MUTATION_SHARD}"
+wait "${sleep_pid}"
+SHARD_SUITE
+    RELEASE_GATE_LOG_DIR="${hup_logs}" SHARD_PID_DIR="${hup_pid_dir}" \
+      bash "${shard_runner}" >"${shard_root}/hup.out" 2>&1 &
+    hup_driver_pid=$!
+    hup_markers=0
+    for _ in $(seq 1 10); do
+      hup_markers=0
+      for pid_file in "${hup_pid_dir}"/*; do
+        [[ -f "${pid_file}" ]] && hup_markers=$((hup_markers + 1))
+      done
+      [[ "${hup_markers}" -eq 8 ]] && break
+      sleep 1
+    done
+    if [[ "${hup_markers}" -eq 8 ]]; then
+      ok "all eight shard groups are registered before HUP is sent"
+    else
+      bad "all eight shard groups are registered before HUP is sent" \
+        "found ${hup_markers} shard PID marker(s)"
+    fi
+    kill -HUP "${hup_driver_pid}" 2>/dev/null || true
+    hup_gone=no
+    for _ in $(seq 1 10); do
+      if ! kill -0 "${hup_driver_pid}" 2>/dev/null; then
+        hup_gone=yes
+        break
+      fi
+      sleep 1
+    done
+    if [[ "${hup_gone}" == no ]]; then
+      kill -KILL "${hup_driver_pid}" 2>/dev/null || true
+    fi
+    if wait "${hup_driver_pid}" 2>/dev/null; then
+      hup_rc=0
+    else
+      hup_rc=$?
+    fi
+    if [[ "${hup_gone}" == yes && "${hup_rc}" -eq 129 ]]; then
+      ok "a HUP-cancelled release-gate run exits 129 promptly"
+    else
+      bad "a HUP-cancelled release-gate run exits 129 promptly" \
+        "gone=${hup_gone} rc=${hup_rc} (expected gone=yes rc=129)"
+    fi
+    live_groups=0
+    for pid_file in "${hup_pid_dir}"/*; do
+      [[ -f "${pid_file}" ]] || continue
+      read -r shard_group _sleep_pid <"${pid_file}"
+      if ps -eo pgid=,stat= | awk -v group="${shard_group}" '$1 == group && $2 !~ /^Z/ { live=1 } END { exit !live }'; then
+        live_groups=$((live_groups + 1))
+      fi
+      kill -KILL -- "-${shard_group}" 2>/dev/null || true
+    done
+    if [[ "${live_groups}" -eq 0 ]]; then
+      ok "a HUP-cancelled release-gate run stops every shard process group"
+    else
+      bad "a HUP-cancelled release-gate run stops every shard process group" \
+        "${live_groups} shard process group(s) remained live after driver exit"
+    fi
+
+    # If a worker disappears before it can publish the atomic status marker, the
+    # driver must fail promptly and reap its remaining process group.
+    driver_is_running() {
+      local state
+      state="$(ps -o stat= -p "$1" 2>/dev/null | tr -d '[:space:]')"
+      [[ -n "${state}" && "${state}" != Z* ]]
+    }
+    missing_status_logs="${shard_root}/missing-status-logs"
+    missing_status_pids="${shard_root}/missing-status-pids"
+    missing_status_output="${shard_root}/missing-status.out"
+    mkdir -p "${missing_status_logs}" "${missing_status_pids}"
+    cat >"${shard_suite}" <<'SHARD_SUITE'
+#!/usr/bin/env bash
+printf '%s\n' "${SHARD_WRAPPER_PID}" >"${SHARD_PID_DIR}/${MUTATION_SHARD}"
+if [[ "${MUTATION_SHARD}" == 3 ]]; then
+  kill -KILL "${SHARD_WRAPPER_PID}"
+fi
+SHARD_SUITE
+    RELEASE_GATE_LOG_DIR="${missing_status_logs}" SHARD_PID_DIR="${missing_status_pids}" \
+      bash "${shard_runner}" >"${missing_status_output}" 2>&1 &
+    missing_status_driver_pid=$!
+    missing_status_gone=no
+    for _ in $(seq 1 15); do
+      if ! driver_is_running "${missing_status_driver_pid}"; then
+        missing_status_gone=yes
+        break
+      fi
+      sleep 1
+    done
+    if [[ "${missing_status_gone}" == no ]]; then
+      kill -TERM "${missing_status_driver_pid}" 2>/dev/null || true
+      sleep 2
+      kill -KILL "${missing_status_driver_pid}" 2>/dev/null || true
+    fi
+    if wait "${missing_status_driver_pid}" 2>/dev/null; then
+      missing_status_rc=0
+    else
+      missing_status_rc=$?
+    fi
+    if [[ "${missing_status_gone}" == yes && "${missing_status_rc}" -ne 124 \
+      ]] && grep -qF "exited without publishing a valid status marker" "${missing_status_output}"; then
+      ok "a worker exit without a status marker fails promptly"
+    elif [[ "${missing_status_gone}" == no ]]; then
+      bad "a worker exit without a status marker fails promptly" \
+        "the runner exceeded the 15-second bound and was terminated"
+    else
+      bad "a worker exit without a status marker fails promptly" \
+        "rc=${missing_status_rc}; failure lacked the expected diagnostic"
+    fi
+
+    # A failed atomic status publication must also propagate as a missing marker
+    # and a non-zero suite result. Shadow mv only for the shard helper so this
+    # is deterministic even when tests run with privileged file permissions.
+    failing_mv_dir="${shard_root}/failing-mv-bin"
+    mkdir -p "${failing_mv_dir}"
+    real_mv="$(command -v mv)"
+    cat >"${failing_mv_dir}/mv" <<'MV_SHIM'
+#!/usr/bin/env bash
+case "$*" in
+  *.log.exit.tmp.*) printf 'injected status publication failure\n' >&2; exit 1 ;;
+esac
+exec "${REAL_MV}" "$@"
+MV_SHIM
+    chmod +x "${failing_mv_dir}/mv"
+    publication_logs="${shard_root}/publication-failure-logs"
+    mkdir -p "${publication_logs}"
+    printf '#!/usr/bin/env bash\nexit 0\n' >"${shard_suite}"
+    PATH="${failing_mv_dir}:${PATH}" REAL_MV="${real_mv}" \
+      RELEASE_GATE_LOG_DIR="${publication_logs}" bash "${shard_runner}" \
+      >"${shard_root}/publication-failure.out" 2>&1 &
+    publication_driver_pid=$!
+    publication_gone=no
+    for _ in $(seq 1 15); do
+      if ! driver_is_running "${publication_driver_pid}"; then
+        publication_gone=yes
+        break
+      fi
+      sleep 1
+    done
+    if [[ "${publication_gone}" == no ]]; then
+      kill -TERM "${publication_driver_pid}" 2>/dev/null || true
+      sleep 2
+      kill -KILL "${publication_driver_pid}" 2>/dev/null || true
+    fi
+    if wait "${publication_driver_pid}" 2>/dev/null; then
+      publication_rc=0
+    else
+      publication_rc=$?
+    fi
+    if [[ "${publication_gone}" == yes && "${publication_rc}" -ne 0 ]] \
+      && grep -qF "exited without publishing a valid status marker" \
+        "${shard_root}/publication-failure.out" \
+      && grep -qF "injected status publication failure" \
+        "${shard_root}/publication-failure.out" \
+      && grep -qF "FATAL: cannot publish shard status marker" \
+        "${shard_root}/publication-failure.out"; then
+      ok "a failed status publication fails the release-gate suite"
+    elif [[ "${publication_gone}" == no ]]; then
+      bad "a failed status publication fails the release-gate suite" \
+        "the runner exceeded the 15-second bound and was terminated"
+    else
+      bad "a failed status publication fails the release-gate suite" \
+        "rc=${publication_rc}; helper failure did not reach the driver"
+    fi
+    for pid_file in "${missing_status_pids}"/*; do
+      [[ -f "${pid_file}" ]] || continue
+      read -r shard_group <"${pid_file}"
+      kill -KILL -- "-${shard_group}" 2>/dev/null || true
+    done
 
     rm -f "${shard_log}"
     rm -rf "${shard_root}"
@@ -1221,6 +1647,77 @@ emit(
 
 matrix_name = next(iter(matrix_jobs)) if len(matrix_jobs) == 1 else None
 matrix_spec = matrix_jobs.get(matrix_name, {}) if matrix_name else {}
+
+# The suite job's timeout must clear its slowest measured leg.
+#
+# The macOS mutation leg is the slowest and sat at ~26 minutes of measured work
+# against a 30 minute limit -- about four minutes of margin on a shared runner. A
+# bound that close is not a hang detector, it is a deadline the leg can
+# legitimately miss, and it had already done so. Asserted as a floor rather than
+# an exact value so the number cannot be quietly lowered back under the cost, and
+# capped so it cannot grow into "never times out" either.
+#
+# The cost is measured, not guessed: one shard alone took 772s for its 6 mutations
+# on #164, so ~130s per mutation and 45 mutations is ~97.5 CPU-minutes; sharded 8
+# ways over this job's 4 vCPU that is ~26 minutes. 60 is roughly 2x that.
+# An interrupted leg must expose shard progress in the job log as it runs. The
+# observed job cancellation skipped the `if: always()` upload step. Artifacts
+# remain useful when the job reaches that step, but cannot be the only evidence
+# when cancellation stops later steps.
+_matrix_steps = matrix_spec.get("steps") or []
+_log_uploads = [step for step in _matrix_steps
+                if isinstance(step, dict) and "upload-artifact" in str(step.get("uses", ""))]
+emit(
+    len(_log_uploads) == 1,
+    "the suite leg uploads release-gate logs exactly once when the runner reaches "
+    "the upload step",
+    f"found {len(_log_uploads)} upload step(s) among {len(_matrix_steps)} step(s)",
+)
+if _log_uploads:
+    _up = _log_uploads[0]
+    _up_with = _up.get("with") or {}
+    emit(
+        str(_up.get("if", "")).strip() == "always()",
+        "the log upload runs after failure or cooperative cancellation",
+        f"if={_up.get('if')!r}",
+    )
+    emit(
+        "release-gate-logs" in str(_up_with.get("path", "")),
+        "the upload points at the driver's log directory",
+        f"path={_up_with.get('path')!r}",
+    )
+
+# Uploading is only useful if logs remain in the checkout until the action runs.
+# The driver's default directory therefore must not be under TMPDIR. Asserted on
+# the driver's source rather than on ci.yml, because a leg that passes
+# RELEASE_GATE_LOG_DIR cannot see the default.
+# `[^}]*` cannot work here: the default itself contains `}`, so the group stops
+# at the first one and the pattern never matches a correct assignment.
+_log_default = re.search(r'^LOG_DIR="\$\{RELEASE_GATE_LOG_DIR:-(.+)\}"\s*$', driver_source, re.M)
+_log_default_value = _log_default.group(1) if _log_default else ""
+emit(
+    bool(_log_default_value) and "TMPDIR" not in _log_default_value,
+    "the driver's default log directory is not under TMPDIR before artifact upload",
+    f"LOG_DIR default={_log_default_value!r}",
+)
+emit(
+    "ROOT_DIR" in _log_default_value,
+    "the driver's default log directory is under the checkout for artifact upload",
+    f"LOG_DIR default={_log_default_value!r}",
+)
+
+_suite_timeout = matrix_spec.get("timeout-minutes") if matrix_name else None
+emit(
+    isinstance(_suite_timeout, int) and _suite_timeout >= 60,
+    "the suite job needs timeout-minutes >= 60: its slowest measured leg is ~26 "
+    "minutes of work on this runner's 4 vCPU, and a 30 minute bound was under it",
+    f"timeout-minutes={_suite_timeout!r}",
+)
+emit(
+    isinstance(_suite_timeout, int) and _suite_timeout <= 120,
+    "the suite job's timeout must stay bounded, or a hang is no longer caught",
+    f"timeout-minutes={_suite_timeout!r}",
+)
 ci_suites = (((matrix_spec.get("strategy") or {}).get("matrix") or {}).get("suite")) or []
 
 emit(
