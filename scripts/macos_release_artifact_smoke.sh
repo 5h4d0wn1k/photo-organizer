@@ -680,8 +680,57 @@ lsappinfo_output() {
   "${LSAPPINFO_BIN}" info "${asn}" 2>/dev/null
 }
 
+# The raw reply to "which application serial number owns this bundle id", with
+# whitespace squeezed out.
+#
+# `find bundleid=<id>` is the documented spelling. The `findLSApplication` verb
+# that used to be here is not: on the macOS 26.6.2 runner it answers
+# `Unrecognized command: findLSApplication` on *stdout*, so `2>/dev/null` cannot
+# suppress it and the caller read the error text as a serial number. That is how
+# release run 37184543519 aborted at the "already registered with the window
+# server" check with nothing running and nothing launched.
+#
+# Sets two globals rather than printing the reply.
+#
+# This cannot be a command substitution. `raw="$(lsappinfo_asn_raw)"` runs the
+# function in a subshell, so an assignment to the status inside it dies with the
+# subshell and the caller sees the variable unset -- which under a `${VAR:-1}`
+# default reads as "the tool failed". Measured, not assumed: the first version of
+# this fix did exactly that and turned the entire gate red, reporting an
+# unanswerable window server on runs where lsappinfo answered perfectly well.
+#
+# The status is captured rather than discarded because `|| true` collapses two
+# different facts into one empty reply:
+#   * "the app is not running" -- exit 0, nothing on stdout
+#   * "the window server would not answer" -- non-zero, nothing on stdout, which a
+#     sandbox, TCC, or a missing window-server connection all produce
+# Reading the second as the first makes the cold-launch check pass precisely when
+# it was not performed at all. The reply is still what the parsing cares about;
+# only the pre-launch caller acts on the status.
+LSAPPINFO_RC=0
+LSAPPINFO_RAW=''
+lsappinfo_query() {
+  local out rc=0
+  out="$("${LSAPPINFO_BIN}" find "bundleid=${APP_BUNDLE_ID}" 2>/dev/null)" || rc=$?
+  LSAPPINFO_RC="${rc}"
+  LSAPPINFO_RAW="$(printf '%s' "${out}" | tr -d '[:space:]')"
+}
+
+# The reply as a well-formed ASN, or nothing.
+#
+# "Nothing" is a real answer -- the app is not running -- and `refresh_window_state`
+# treats it as "no window yet", which is correct for an app that is still launching.
+# An unparseable reply is filtered out here rather than being passed along as an ASN,
+# so the two callers cannot end up disagreeing about what the tool actually said.
+#
+# That holds for reply *content*, not for the exit status: an unanswerable window
+# server and an empty reply both arrive as "". `LSAPPINFO_RC` is what keeps them
+# apart, and only the pre-launch caller reads it.
 lsappinfo_asn() {
-  "${LSAPPINFO_BIN}" findLSApplication "=${APP_BUNDLE_ID}" 2>/dev/null | tr -d '[:space:]'
+  lsappinfo_query
+  if [[ "${LSAPPINFO_RAW}" =~ ^ASN:0x[0-9a-fA-F]+:0x[0-9a-fA-F]+:$ ]]; then
+    printf '%s\n' "${LSAPPINFO_RAW}"
+  fi
 }
 
 # Refreshes the cached window-server state for the app.
@@ -795,13 +844,49 @@ window_extent() {
 # activate it and every subsequent observation would describe a warm process,
 # which is the exact thing the Android gate's `am start -W ... LaunchState: COLD`
 # is there to guarantee.
+# Refuse to continue unless the window server positively says nothing is running.
+#
+# Three answers are possible and only two of them are usable. Before this was
+# shape-checked, any non-empty reply counted as "already running", and because
+# `lsappinfo` reports some errors on stdout, a rejected query was reported as a
+# phantom instance -- a red gate for an app that was never started.
+#
+# There is deliberately no `pkill` before the launch. Terminating a stray
+# instance would make this check pass without ever proving the launch is cold,
+# which is the entire reason it exists (the Android gate pins the same property
+# with `am start -W ... LaunchState: COLD`). A red gate naming the real cause is
+# the correct outcome here.
 assert_nothing_already_running() {
-  local asn
-  asn="$(lsappinfo_asn)"
-  if [[ -n "${asn}" ]]; then
-    fail "${APP_BUNDLE_ID} is already registered with the window server (application serial number ${asn}); this gate requires a cold launch, so something is already running and `open` would only activate it. Kill it and re-run."
+  local raw
+  lsappinfo_query
+  raw="${LSAPPINFO_RAW}"
+
+  if [[ "${raw}" =~ ^ASN:0x[0-9a-fA-F]+:0x[0-9a-fA-F]+:$ ]]; then
+    fail "${APP_BUNDLE_ID} is already registered with the window server (application serial number ${raw}); this gate requires a cold launch, so something is already running and 'open' would only activate it. Kill it and re-run."
   fi
-  log "no existing instance of ${APP_BUNDLE_ID} is registered"
+
+  # An empty reply is the only ambiguous case, and the exit status is what resolves
+  # it: "nothing is running" and "the window server would not answer" both print
+  # nothing, so taking the empty string as proof of absence makes this check pass
+  # exactly when it was never performed. The cold launch is then unproven and the
+  # gate reports success it did not earn.
+  #
+  # Checked last, after the two branches above, because a tool that answered with
+  # unusable *text* has given us something to work with and should be reported as
+  # the parse failure it is, quoting its own reply. Only a tool that said nothing at
+  # all has left the question open.
+  if [[ -z "${raw}" ]]; then
+    if ((LSAPPINFO_RC != 0)); then
+      fail "could not ask the window server whether ${APP_BUNDLE_ID} is running (lsappinfo find exited ${LSAPPINFO_RC} with no usable reply). This gate requires a positively cold launch, and 'no reply' is not proof that nothing is running -- a sandbox, TCC, or a missing window-server connection produces exactly this. Re-run on a session with a working window server; do not work around it by killing processes, which would void the cold-launch proof."
+    fi
+    log "no existing instance of ${APP_BUNDLE_ID} is registered"
+    return 0
+  fi
+  # Not an ASN. That is a question the gate could not get answered, not a
+  # statement about what is running, and the difference matters: reporting it as
+  # "already running" sends the operator to kill a process that may not exist.
+  # Quoting the reply verbatim is what makes the failure diagnosable.
+  fail "cannot tell whether ${APP_BUNDLE_ID} is already running: lsappinfo answered with something that is not an application serial number: '${raw}'. Refusing to continue, because a cold launch cannot be proven while the window server will not answer. This is a fault in the gate's environment, not a claim that the app is running."
 }
 
 cold_launch() {
