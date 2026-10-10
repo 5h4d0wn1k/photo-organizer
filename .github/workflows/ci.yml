@@ -149,14 +149,7 @@ jobs:
       # same dispatcher a local full run uses, for exactly one suite. An unknown
       # name is a hard error, so a typo cannot run nothing and report success.
       - name: Run the release gate suite
-        env:
-          MUTATION_SHARDS: ${{ matrix.suite == 'macos_release_artifact_mutation_test.sh' && '4' || '' }}
-        run: |
-          if [ "${{ matrix.suite }}" = "macos_release_artifact_mutation_test.sh" ] && [ -n "${MUTATION_SHARDS}" ]; then
-            MUTATION_SHARDS="${MUTATION_SHARDS}" bash scripts/tests/run_release_gate_tests.sh --only-suite "${{ matrix.suite }}"
-          else
-            bash scripts/tests/run_release_gate_tests.sh --only-suite "${{ matrix.suite }}"
-          fi
+        run: bash scripts/tests/run_release_gate_tests.sh --only-suite "${{ matrix.suite }}"
       # Upload the per-shard files after the suite completes, fails, or is
       # cooperatively cancelled. A job cancellation can skip later steps, so the
       # driver also streams shard output into the live Actions log while each
