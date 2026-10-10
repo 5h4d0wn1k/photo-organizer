@@ -58,12 +58,14 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Prepare native dependencies for Windows durability tests
+        if: matrix.os == 'windows-2022'
+        run: cargo check --locked --profile test --tests -p native_core
+      - name: Stage OpenSSL symbols beside the Rust test link inputs
+        if: matrix.os == 'windows-2022'
+        shell: pwsh
+        run: ./scripts/windows_stage_openssl_pdb.ps1
       - name: Test encryption activation and crash recovery on the native filesystem
-        # OpenSSL's MSVC target adds /Zi and references ossl_static.pdb. Use
-        # compiler-embedded debug records instead so LNK4099 remains a real
-        # denied warning rather than hiding it with a linker suppression.
-        env:
-          CFLAGS: ${{ matrix.os == 'windows-2022' && '/Z7' || '' }}
         run: cargo test --locked -p native_core security::tests
 
   encryption-durability-gate:
