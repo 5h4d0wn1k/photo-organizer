@@ -1031,8 +1031,10 @@ fn replace_database_with_encrypted_then(
 /// Perform a file replacement in a fixed order: sync the candidate contents,
 /// prepare the live path, rename the candidate, request a parent-directory
 /// sync where available, and only then publish encryption state. Startup
-/// reconciliation handles platform-specific outcomes if a sudden shutdown
-/// exposes the state and database replacement in a different order.
+/// reconciliation handles interrupted-process outcomes if the state and
+/// database replacement are observed in a different order. These APIs cannot
+/// promise against physical storage failure or power loss beyond each OS's
+/// documented sync semantics.
 fn replace_file_then(
     source: &Path,
     destination: &Path,
@@ -1067,8 +1069,8 @@ fn sync_file(file: &fs::File) -> Result<(), SecurityError> {
 
     // Apple documents that fsync alone may leave writes in volatile device
     // cache and reorder them across a power loss. F_FULLFSYNC also asks the
-    // device to flush those buffers. Treat unsupported filesystems/devices as
-    // an activation failure rather than silently weakening the guarantee.
+    // device to flush those buffers. Require it rather than silently falling
+    // back to fsync; Apple still documents this as best effort.
     let result = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_FULLFSYNC) };
     if result == -1 {
         Err(io_error(std::io::Error::last_os_error()))
@@ -2219,7 +2221,7 @@ mod tests {
     }
 
     /// Filesystems can expose the state-file rename before the database
-    /// rename survives a sudden shutdown. Startup must compare the database
+    /// rename survives interruption. Startup must compare the database
     /// header with the state and complete encryption before returning it.
     #[test]
     fn state_ahead_of_plaintext_database_reencrypts_before_open() {
@@ -2229,8 +2231,8 @@ mod tests {
         fs::copy(config.database_path(), &plaintext).expect("save plaintext recovery fixture");
         activate_encryption(&config).expect("activation must succeed");
 
-        // Model a power-loss outcome where the encryption state is present but
-        // the database directory entry reverted to the old plaintext file.
+        // Model a possible filesystem outcome where encryption state is
+        // present but the database directory entry reverted to plaintext.
         fs::copy(&plaintext, config.database_path()).expect("restore plaintext observation");
         let connection = open_database(&config.database_path())
             .expect("startup must finish encryption before opening the library");
