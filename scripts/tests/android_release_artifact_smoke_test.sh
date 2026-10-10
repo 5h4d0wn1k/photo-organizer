@@ -638,8 +638,47 @@ EOF
 # exercises. An empty file is NOT a valid stand-in for this: on a device whose API
 # level supports exit-info, an empty reply is a failed read, and the gate now says
 # so rather than treating it as a clean device.
-printf 'ACTIVITY MANAGER LRU PROCESSES (dumpsys activity exit-info)\n' \
-  >"${WORK_DIR}/header-only-exit-info.txt"
+#
+# Verbatim from the API 35 leg of release run 37184543519, which failed here on
+# 2026-10-04 with "ApplicationExitInfo returned output that is not a dumpsys
+# exit-info reply" -- after the app had installed, launched, rendered a stable
+# 33-colour frame and left a clean crash buffer. This is the whole bug in one
+# fixture: it used to read `ACTIVITY MANAGER LRU PROCESSES`, the spelling the gate
+# already knew, so the suite and the gate agreed with each other and both
+# disagreed with every real device in the matrix. Two more lines than the old
+# fixture had, and both of them matter.
+# A heredoc, not `printf`. Written as a `printf` whose format had no conversion,
+# this fixture needed its second line passed as an *argument* -- which printf
+# neither converts nor newline-terminates, so the fixture silently ended without a
+# trailing newline (SC2182), and the trailing newline is what real dumpsys output
+# has. The heredoc says the same two lines, terminates them the way the device
+# does, and cannot be misread by shellcheck as an ignored argument.
+cat >"${WORK_DIR}/header-only-exit-info.txt" <<'EOF'
+ACTIVITY MANAGER PROCESS EXIT INFO (dumpsys activity exit-info)
+Last Timestamp of Persistence Into Persistent Storage: 1970-01-01 00:00:00.000
+EOF
+
+# The two older header spellings, kept as separate fixtures rather than folded
+# into one. They are real output from other API levels, so a fix that taught the
+# gate the API 35 spelling by replacing its knowledge -- instead of adding to it
+# -- would have been invisible here and would have broken those levels.
+cat >"${WORK_DIR}/header-only-exit-info-lru.txt" <<'EOF'
+ACTIVITY MANAGER LRU PROCESSES (dumpsys activity exit-info)
+EOF
+cat >"${WORK_DIR}/header-only-exit-info-historical.txt" <<'EOF'
+  Historical Process Exit for com.privategallery.app
+EOF
+
+# A header that is real but quoted *mid-line* rather than standing at the start of
+# a line, and which contains no `ApplicationExitInfo` block and no `reason=` field.
+# So the only thing that could make this dump look like a dumpsys reply is the
+# header substring itself. Without this fixture, anchoring the header match to the
+# start of a line would be untested and could be dropped without the suite
+# noticing -- and dropping it is what would let a service complaint quoted inside a
+# record pass as a section header.
+cat >"${WORK_DIR}/header-inside-record.txt" <<'EOF'
+  description=ACTIVITY MANAGER PROCESS EXIT INFO (dumpsys activity exit-info)
+EOF
 
 cat >"${WORK_DIR}/crash-java.txt" <<'EOF'
 09-26 00:00:01.000  1000  1000 E AndroidRuntime: FATAL EXCEPTION: main
@@ -1036,6 +1075,25 @@ scenario_with "EXIT_INFO_AFTER=${WORK_DIR}/header-only-exit-info.txt"
 #      app, so clean. Every ordinary passing case above already asserts this; it is
 #      repeated here so cases (1) and (2) cannot drift apart.
 expect_pass "the dumpsys header with no records is a real clean reply" run_smoke
+#   2a. All three header spellings that real API levels print. This is the case
+#        that failed on 2026-10-04: the gate knew two of the three and rejected the
+#        third, on every device in the matrix, after a fully successful launch.
+#        Pinning each separately is what stops the next one from being "fixed" by
+#        deleting the others.
+scenario_with "EXIT_INFO_AFTER=${WORK_DIR}/header-only-exit-info-lru.txt"
+expect_pass "the older ACTIVITY MANAGER LRU PROCESSES header is still a real clean reply" \
+  run_smoke
+scenario_with "EXIT_INFO_AFTER=${WORK_DIR}/header-only-exit-info-historical.txt"
+expect_pass "the older 'Historical Process Exit' header is still a real clean reply" \
+  run_smoke
+#   2b. The header must be recognised as a header, not merely as text. A complaint
+#        that happens to contain the header string, quoted inside a record, is not
+#        a dumpsys section header -- and this dump has an adverse reason in it, so
+#        accepting it as a header would also mean counting it as clean.
+scenario_with "EXIT_INFO_AFTER=${WORK_DIR}/header-inside-record.txt"
+expect_fail "a header string quoted inside a record does not make the dump a header" \
+  "refusing to report a crash check that never ran" run_smoke
+scenario_with "EXIT_INFO_AFTER=${WORK_DIR}/header-only-exit-info.txt"
 #   3. an unrecognised non-blank reply -> refused, because zero adverse entries
 #      counted in something that was never a dump is not evidence of anything.
 printf 'something went wrong and this is not a dump\n' >"${WORK_DIR}/garbage-exit-info.txt"
