@@ -81,7 +81,6 @@ pub fn open_database(path: &Path) -> Result<Connection, SecurityError> {
             }
             let connection = Connection::open(path).map_err(database_error)?;
             let key_hex = load_key_for_state(path, &state)?;
-            // codeql[database/cleartext-storage-sensitive-data]
             key_connection(&connection, &key_hex)?;
             if !key_unlocks_database(path, &key_hex) {
                 return Err(SecurityError::KeyStorage(
@@ -101,7 +100,6 @@ pub fn open_database(path: &Path) -> Result<Connection, SecurityError> {
                     .ok_or_else(|| SecurityError::Invalid("recovered state is missing".into()))?;
                 let connection = Connection::open(path).map_err(database_error)?;
                 let key_hex = load_key_for_state(path, &state)?;
-                // codeql[database/cleartext-storage-sensitive-data]
                 key_connection(&connection, &key_hex)?;
                 return Ok(connection);
             }
@@ -139,7 +137,6 @@ pub fn open_database(path: &Path) -> Result<Connection, SecurityError> {
                     .ok_or_else(|| SecurityError::Invalid("recovered state is missing".into()))?;
                 let connection = Connection::open(path).map_err(database_error)?;
                 let key_hex = load_key_for_state(path, &state)?;
-                // codeql[database/cleartext-storage-sensitive-data]
                 key_connection(&connection, &key_hex)?;
                 Ok(connection)
             } else if path.exists() && database_file_is_plaintext(path) {
@@ -157,7 +154,6 @@ pub fn open_database(path: &Path) -> Result<Connection, SecurityError> {
                     .ok_or_else(|| SecurityError::Invalid("recovered state is missing".into()))?;
                 let connection = Connection::open(path).map_err(database_error)?;
                 let key_hex = load_key_for_state(path, &state)?;
-                // codeql[database/cleartext-storage-sensitive-data]
                 key_connection(&connection, &key_hex)?;
                 Ok(connection)
             } else {
@@ -551,16 +547,13 @@ fn recover_plaintext_database_with_key(
     })();
     let (rows_match, integrity) = match verification {
         Ok(result) => result,
-        Err(error) => {
-            let _ = fs::remove_file(&temp);
-            return Err(error);
-        }
+        Err(error) => return Err(cleanup_candidate_after_error(&temp, error)),
     };
     if !rows_match || integrity != "ok" {
-        let _ = fs::remove_file(&temp);
-        return Err(SecurityError::Database(format!(
+        let error = SecurityError::Database(format!(
             "plaintext database recovery verification failed: rows={rows_match}, integrity={integrity}"
-        )));
+        ));
+        return Err(cleanup_candidate_after_error(&temp, error));
     }
     let (ready_database, _manifest_path) =
         promote_verified_candidate(database_path, database_path, &temp, state, key_hex)?;
@@ -658,7 +651,7 @@ fn load_key_candidate(_database_path: &Path, key_id: &str, key_storage: &str) ->
 
 /// Whether `key_hex` actually unlocks the database at `path`.
 ///
-/// This has to run on its own connection. `PRAGMA key` cannot be undone, so a
+/// This has to run on its own connection. A SQLCipher key cannot be unset, so a
 /// wrong key applied to a shared connection poisons every later candidate --
 /// which is exactly why verification has to happen on a throwaway connection
 /// *before* the winner is applied to the real one, rather than after.
@@ -676,7 +669,6 @@ fn key_unlocks_database(path: &Path, key_hex: &str) -> bool {
     else {
         return false;
     };
-    // codeql[database/cleartext-storage-sensitive-data]
     key_connection(&connection, key_hex).is_ok()
         && connection
             .query_row("SELECT count(*) FROM sqlite_master", [], |row| {
@@ -891,14 +883,19 @@ pub fn activate_encryption(
     let temp_name = format!("{file_name}.sqlcipher-{}.partial", Uuid::new_v4());
     let encrypted_temp = db_dir.join(temp_name);
 
-    export_plaintext_to_encrypted(&database_path, &encrypted_temp, &key_hex)?;
-    let (row_counts_verified, integrity_check) =
-        verify_encrypted_database(&database_path, &encrypted_temp, &key_hex)?;
+    let verification = (|| {
+        export_plaintext_to_encrypted(&database_path, &encrypted_temp, &key_hex)?;
+        verify_encrypted_database(&database_path, &encrypted_temp, &key_hex)
+    })();
+    let (row_counts_verified, integrity_check) = match verification {
+        Ok(result) => result,
+        Err(error) => return Err(cleanup_candidate_after_error(&encrypted_temp, error)),
+    };
     if !row_counts_verified || integrity_check != "ok" {
-        let _ = fs::remove_file(&encrypted_temp);
-        return Err(SecurityError::Database(format!(
+        let error = SecurityError::Database(format!(
             "encrypted migration verification failed: rows={row_counts_verified}, integrity={integrity_check}"
-        )));
+        ));
+        return Err(cleanup_candidate_after_error(&encrypted_temp, error));
     }
 
     let activated_at = Utc::now();
@@ -987,7 +984,6 @@ fn verify_encrypted_database(
 ) -> Result<(bool, String), SecurityError> {
     let source = Connection::open(source_path).map_err(database_error)?;
     let encrypted = Connection::open(encrypted_path).map_err(database_error)?;
-    // codeql[database/cleartext-storage-sensitive-data]
     key_connection(&encrypted, key_hex)?;
 
     let source_counts = user_table_row_counts(&source)?;
@@ -1202,10 +1198,9 @@ fn user_table_row_counts(connection: &Connection) -> Result<BTreeMap<String, i64
     Ok(counts)
 }
 
-// codeql[database/cleartext-storage-sensitive-data]
-// SQLCipher key material applied via PRAGMA key using hex from secure storage
-// (OS keychain; test file store only in tests). Key is applied to encrypted
-// database connection only, never persisted in plaintext.
+// Apply SQLCipher key material from secure storage (test file store only in
+// tests). The validated raw-key specification is passed to SQLCipher's C API,
+// never embedded in SQL text or persisted by this function.
 fn key_connection(connection: &Connection, key_hex: &str) -> Result<(), SecurityError> {
     key_database_connection(connection, b"main\0", key_hex)
 }
@@ -1219,7 +1214,7 @@ fn key_database_connection(
     let database_name = CStr::from_bytes_with_nul(database_name).map_err(|error| {
         SecurityError::Invalid(format!("invalid SQLCipher database name: {error}"))
     })?;
-    let key = decode_key_hex(key_hex)?;
+    let key = sqlcipher_key_spec(key_hex)?;
     // SQLCipher's C key API is equivalent to PRAGMA key, but avoids copying
     // key material into SQL source text, trace output, or SQL error context.
     // The pointer is used only for this call; SQLCipher retains its internal
@@ -1242,25 +1237,18 @@ fn key_database_connection(
     }
 }
 
-fn decode_key_hex(key_hex: &str) -> Result<Zeroizing<[u8; 32]>, SecurityError> {
+fn sqlcipher_key_spec(key_hex: &str) -> Result<Zeroizing<Vec<u8>>, SecurityError> {
     validate_key_hex(key_hex)?;
-    let mut key = Zeroizing::new([0_u8; 32]);
-    for (index, pair) in key_hex.as_bytes().chunks_exact(2).enumerate() {
-        key[index] = (decode_hex_nibble(pair[0])? << 4) | decode_hex_nibble(pair[1])?;
-    }
+    // Preserve the exact raw-key syntax previously passed through `PRAGMA
+    // key = "x'…'"`. SQLCipher's C API treats arbitrary bytes as a passphrase,
+    // so passing only the decoded 32-byte value would derive a different key.
+    // Keeping this validated keyspec in zeroizing memory preserves existing
+    // vault compatibility without embedding secret material in SQL text.
+    let mut key = Zeroizing::new(Vec::with_capacity(key_hex.len() + 3));
+    key.extend_from_slice(b"x'");
+    key.extend_from_slice(key_hex.as_bytes());
+    key.push(b'\'');
     Ok(key)
-}
-
-fn decode_hex_nibble(value: u8) -> Result<u8, SecurityError> {
-    match value {
-        b'0'..=b'9' => Ok(value - b'0'),
-        b'a'..=b'f' => Ok(value - b'a' + 10),
-        b'A'..=b'F' => Ok(value - b'A' + 10),
-        _ => Err(SecurityError::KeyStorage(
-            "SQLCipher key must be exactly 32 bytes encoded as 64 hexadecimal characters"
-                .to_string(),
-        )),
-    }
 }
 
 fn sqlcipher_available(database_path: &Path) -> bool {
@@ -1441,6 +1429,17 @@ fn database_error(error: rusqlite::Error) -> SecurityError {
 
 fn io_error(error: std::io::Error) -> SecurityError {
     SecurityError::Io(error.to_string())
+}
+
+fn cleanup_candidate_after_error(path: &Path, primary_error: SecurityError) -> SecurityError {
+    match fs::remove_file(path) {
+        Ok(()) => primary_error,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => primary_error,
+        Err(cleanup_error) => SecurityError::Io(format!(
+            "{primary_error}; failed to remove temporary candidate {}: {cleanup_error}",
+            path.display()
+        )),
+    }
 }
 
 pub fn database_sha256(path: &Path) -> Option<String> {
@@ -2222,17 +2221,112 @@ mod tests {
         assert!(validate_key_hex(&"ab".repeat(32)).is_ok());
         let expected = (0_u8..32).collect::<Vec<_>>();
         let encoded = hex_string(&expected);
-        let decoded = decode_key_hex(&encoded).expect("valid SQLCipher key must decode");
-        assert_eq!(&decoded[..], expected.as_slice());
         assert_eq!(
-            &decode_key_hex(&encoded.to_uppercase()).unwrap()[..],
-            expected
+            sqlcipher_key_spec(&encoded).unwrap().as_slice(),
+            format!("x'{encoded}'").as_bytes()
+        );
+        let uppercase = encoded.to_uppercase();
+        assert_eq!(
+            sqlcipher_key_spec(&uppercase).unwrap().as_slice(),
+            format!("x'{uppercase}'").as_bytes()
         );
         assert!(validate_key_hex(&"a".repeat(63)).is_err());
         assert!(validate_key_hex(&"a".repeat(65)).is_err());
-        assert!(decode_key_hex(&"a".repeat(63)).is_err());
+        assert!(sqlcipher_key_spec(&"a".repeat(63)).is_err());
         assert!(validate_key_hex(&format!("{}' OR 1=1 --", "a".repeat(56))).is_err());
         assert!(validate_key_hex(&format!("{}é", "a".repeat(62))).is_err());
+    }
+
+    #[test]
+    fn failed_candidate_cleanup_preserves_the_cause_and_reports_cleanup_failure() {
+        let (_config, root) = test_config("candidate-cleanup-errors");
+        let candidate = root.join("candidate.partial");
+        fs::write(&candidate, b"partial candidate").expect("candidate fixture must exist");
+
+        let error = cleanup_candidate_after_error(
+            &candidate,
+            SecurityError::Database("verification failed".to_string()),
+        );
+        assert_eq!(
+            error.to_string(),
+            "encrypted database operation failed: verification failed"
+        );
+        assert!(!candidate.exists(), "failed candidate must be removed");
+
+        let directory = root.join("not-a-file");
+        fs::create_dir(&directory).expect("directory fixture must exist");
+        let error = cleanup_candidate_after_error(
+            &directory,
+            SecurityError::Database("export failed".to_string()),
+        );
+        let message = error.to_string();
+        assert!(message.contains("export failed"));
+        assert!(message.contains("failed to remove temporary candidate"));
+        cleanup(&root);
+    }
+
+    #[test]
+    fn key_api_remains_compatible_with_legacy_pragma_and_attached_export() {
+        let (_config, root) = test_config("legacy-key-api-compatibility");
+        let source_path = root.join("legacy.db");
+        let plaintext_path = root.join("plaintext.db");
+        let encrypted_path = root.join("exported.db");
+        let key_hex = "ab".repeat(32);
+
+        let legacy = Connection::open(&source_path).expect("legacy fixture must open");
+        legacy
+            .execute_batch(&format!(
+                "PRAGMA key = \"x'{key_hex}'\"; \
+                 CREATE TABLE secret(value TEXT NOT NULL); \
+                 INSERT INTO secret VALUES ('legacy-ciphertext');"
+            ))
+            .expect("legacy PRAGMA format must create encrypted data");
+        drop(legacy);
+
+        let migrated = Connection::open(&source_path).expect("legacy db handle must open");
+        key_connection(&migrated, &key_hex)
+            .expect("C key API must open databases written with the old PRAGMA format");
+        let value: String = migrated
+            .query_row("SELECT value FROM secret", [], |row| row.get(0))
+            .expect("legacy rows must remain readable");
+        assert_eq!(value, "legacy-ciphertext");
+        let integrity: String = migrated
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .expect("legacy integrity check must run");
+        assert_eq!(integrity, "ok");
+        drop(migrated);
+
+        let plaintext = Connection::open(&plaintext_path).expect("plaintext fixture must open");
+        plaintext
+            .execute_batch(
+                "CREATE TABLE secret(value TEXT NOT NULL); \
+                 INSERT INTO secret VALUES ('legacy-ciphertext');",
+            )
+            .expect("plaintext fixture data must be created");
+        drop(plaintext);
+
+        export_plaintext_to_encrypted(&plaintext_path, &encrypted_path, &key_hex)
+            .expect("attach then key then export must succeed");
+        assert!(database_file_is_encrypted(&encrypted_path));
+        assert_ne!(
+            &fs::read(&encrypted_path).expect("exported database must exist")[..16],
+            b"SQLite format 3\0"
+        );
+
+        let exported = Connection::open(&encrypted_path).expect("exported db handle must open");
+        exported
+            .execute_batch(&format!("PRAGMA key = \"x'{key_hex}'\";"))
+            .expect("old PRAGMA key format must reopen exported database");
+        let value: String = exported
+            .query_row("SELECT value FROM secret", [], |row| row.get(0))
+            .expect("exported row must be readable with the old key format");
+        assert_eq!(value, "legacy-ciphertext");
+        let integrity: String = exported
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .expect("exported integrity check must run");
+        assert_eq!(integrity, "ok");
+        drop(exported);
+        cleanup(&root);
     }
 
     /// The recovery path has to work through the real startup entry point, not
