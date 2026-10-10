@@ -18,6 +18,17 @@ class ImportScreen extends StatefulWidget {
   State<ImportScreen> createState() => _ImportScreenState();
 }
 
+/// What the import screen hands back: the committed session, plus whether
+/// the user asked to review its skipped duplicates (P2: one-click review).
+/// The caller switches to the Files tab, which hosts the duplicate review
+/// panel, instead of the default gallery landing.
+class ImportOutcome {
+  const ImportOutcome({required this.session, this.reviewDuplicates = false});
+
+  final ImportSession session;
+  final bool reviewDuplicates;
+}
+
 class _ImportScreenState extends State<ImportScreen> {
   static const String _recommendedSourceRoot =
       '/mnt/windows/transfer/Ok/Photos/Unfiltered';
@@ -413,7 +424,17 @@ class _ImportScreenState extends State<ImportScreen> {
             ],
             if (_committedSession != null) ...[
               const SizedBox(height: 16),
-              _CommitResultPanel(session: _committedSession!),
+              _CommitResultPanel(
+                session: _committedSession!,
+                onReviewDuplicates: _committedSession!.skippedDuplicateIds.isNotEmpty
+                    ? () => Navigator.of(context).pop(
+                          ImportOutcome(
+                            session: _committedSession!,
+                            reviewDuplicates: true,
+                          ),
+                        )
+                    : null,
+              ),
             ],
             const SizedBox(height: 24),
             _ImportSessionResults(
@@ -453,7 +474,9 @@ class _ImportScreenState extends State<ImportScreen> {
                 if (_committedSession != null)
                   FilledButton.tonalIcon(
                     onPressed: () {
-                      Navigator.of(context).pop(_committedSession);
+                      Navigator.of(context).pop(
+                        ImportOutcome(session: _committedSession!),
+                      );
                     },
                     icon: const Icon(Icons.check_circle_outline),
                     label: const Text('Done and refresh library'),
@@ -717,14 +740,19 @@ class _PreflightChip extends StatelessWidget {
 }
 
 class _CommitResultPanel extends StatelessWidget {
-  const _CommitResultPanel({required this.session});
+  const _CommitResultPanel({required this.session, this.onReviewDuplicates});
 
   final ImportSession session;
+
+  /// Shown only when the session skipped duplicates; navigates to the Files
+  /// tab's duplicate review panel. Null hides the button.
+  final VoidCallback? onReviewDuplicates;
 
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final failedCount = session.failedCandidateIds.length;
+    final duplicateCount = session.skippedDuplicateIds.length;
 
     return Card(
       color: failedCount == 0
@@ -738,8 +766,18 @@ class _CommitResultPanel extends StatelessWidget {
             Text('Import result', style: theme.textTheme.titleLarge),
             const SizedBox(height: 8),
             Text(
-              '${session.importedAssetIds.length} imported • ${session.movedAssetIds.length} moved • ${session.skippedDuplicateIds.length} duplicates skipped • $failedCount failed • ${session.sidecarsMoved} sidecars moved',
+              '${session.importedAssetIds.length} imported • ${session.movedAssetIds.length} moved • $duplicateCount duplicates skipped • $failedCount failed • ${session.sidecarsMoved} sidecars moved',
             ),
+            if (onReviewDuplicates != null) ...[
+              const SizedBox(height: 12),
+              OutlinedButton.icon(
+                onPressed: onReviewDuplicates,
+                icon: const Icon(Icons.content_copy_outlined),
+                label: Text(
+                  'Review $duplicateCount skipped duplicate${duplicateCount == 1 ? '' : 's'}',
+                ),
+              ),
+            ],
             if (failedCount > 0) ...[
               const SizedBox(height: 8),
               const Text(

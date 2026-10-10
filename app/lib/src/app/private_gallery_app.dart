@@ -330,7 +330,7 @@ class _GalleryBootstrapPageState extends State<GalleryBootstrapPage> {
       return;
     }
 
-    final result = await Navigator.of(context).push<ImportSession>(
+    final result = await Navigator.of(context).push<ImportOutcome>(
       MaterialPageRoute(
         builder: (_) => ImportScreen(
           repository: _repository,
@@ -347,9 +347,12 @@ class _GalleryBootstrapPageState extends State<GalleryBootstrapPage> {
     if (!mounted) {
       return;
     }
-    setState(() => _selectedIndex = 0);
+    final session = result.session;
+    // A duplicate-review request lands on the Files tab, which hosts the
+    // duplicate review panel; anything else lands on the gallery as before.
+    setState(() => _selectedIndex = result.reviewDuplicates ? 1 : 0);
     _showMessage(
-      'Imported ${result.importedAssetIds.length} assets, moved ${result.movedAssetIds.length}, moved ${result.sidecarsMoved} sidecars, skipped ${result.skippedDuplicateIds.length} duplicates.',
+      'Imported ${session.importedAssetIds.length} assets, moved ${session.movedAssetIds.length}, moved ${session.sidecarsMoved} sidecars, skipped ${session.skippedDuplicateIds.length} duplicates.',
     );
   }
 
