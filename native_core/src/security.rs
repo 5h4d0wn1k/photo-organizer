@@ -48,7 +48,8 @@ pub fn open_database(path: &Path) -> Result<Connection, SecurityError> {
     match read_state_for_database_path(path) {
         Ok(Some(state)) => {
             let key_hex = load_key_for_state(path, &state)?;
-            // codeql[database/cleartext-storage-sensitive-data]
+            // Key application; see `key_connection` for why the CodeQL
+            // cleartext-storage query does not apply to this line.
             key_connection(&connection, &key_hex)?;
         }
         // No state file at all. Either a library that has not activated
@@ -203,7 +204,7 @@ fn key_unlocks_database(path: &Path, key_hex: &str) -> bool {
     else {
         return false;
     };
-    // codeql[database/cleartext-storage-sensitive-data]
+    // Key application; see `key_connection`.
     key_connection(&connection, key_hex).is_ok()
         && connection
             .query_row("SELECT count(*) FROM sqlite_master", [], |row| {
@@ -501,7 +502,7 @@ fn verify_encrypted_database(
 ) -> Result<(bool, String), SecurityError> {
     let source = Connection::open(source_path).map_err(database_error)?;
     let encrypted = Connection::open(encrypted_path).map_err(database_error)?;
-    // codeql[database/cleartext-storage-sensitive-data]
+    // Key application; see `key_connection`.
     key_connection(&encrypted, key_hex)?;
 
     let source_counts = user_table_row_counts(&source)?;
@@ -555,10 +556,21 @@ fn user_table_row_counts(connection: &Connection) -> Result<BTreeMap<String, i64
     Ok(counts)
 }
 
-// codeql[database/cleartext-storage-sensitive-data]
 // SQLCipher key material applied via PRAGMA key using hex from secure storage
 // (OS keychain; test file store only in tests). Key is applied to encrypted
 // database connection only, never persisted in plaintext.
+//
+// This is the sink where key material reaches a database operation, and it is
+// why `rust/cleartext-storage-database` is excluded repository-wide in
+// `.github/codeql/codeql-config.yml` and justified in
+// `.github/codeql/suppressed-queries.txt`. The query reports this key as
+// sensitive data being stored without encryption, when the key is what
+// *encrypts* the database: nothing here leaves anything readable in the clear,
+// because SQLCipher encrypts the whole file. That exclusion is only sound while
+// every database is opened through `open_database`, so the hygiene suite
+// asserts that centralization structurally rather than trusting this comment --
+// and treats this `PRAGMA key` line as the one place the query legitimately
+// fires, which is exactly why it is suppressed centrally instead of inline.
 fn key_connection(connection: &Connection, key_hex: &str) -> Result<(), SecurityError> {
     connection
         .execute_batch(&format!("PRAGMA key = \"x'{key_hex}'\";"))
