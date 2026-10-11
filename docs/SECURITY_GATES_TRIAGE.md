@@ -35,12 +35,10 @@ rationale.
   merged). Query: "Which asset is optional" — used only by `textmarker` in the
   optional OCR feature path.
 - `hickory-proto` GHSA-q2qq-hmj6-3wpp and `hickory-net` GHSA-3v94-mw7p-v465 —
-  dismissed as `tolerable_risk`. `iroh = "0.98.2"` (latest release) pins
-  `hickory-resolver =0.26.0-beta.4`; there is no patched release to bump to.
-  The affected `DnssecDnsHandle` path is never compiled because iroh builds
-  hickory-resolver without `dnssec-ring`/`dnssec-aws-lc-rs`. Mirror of the
-  ignore entry in `.cargo/audit.toml` (RUSTSEC-2026-0120/-0119);
-  re-audit on every iroh bump.
+  the prior `tolerable_risk` dismissals and matching `.cargo/audit.toml`
+  suppressions were removed with issue #175's Iroh 1.3.0 update. The current
+  locked dependency graph contains no Hickory packages, so these advisories no
+  longer apply to this repository. `cargo audit` reports no vulnerabilities.
 
 ### Merged this session
 
@@ -56,8 +54,9 @@ rationale.
 - `chacha20poly1305` 0.10 -> 0.11 — API breakage in the vault crypto path
   (`aead::OsRng`/`RngCore` renamed, `Array::from_slice` deprecated); deliberately
   deferred, it is security-sensitive code.
-- `sha2` 0.10 -> 0.11 — unresolvable while iroh pins `sha2 ==0.11.0-rc.5`;
-  blocked upstream, re-open on iroh bump.
+- `sha2` 0.10 -> 0.11 — the prior upstream resolution blocker is gone: Iroh
+  1.3.0 resolves stable `sha2 0.11.0`. The application still directly uses
+  `sha2 0.10`; evaluate its API and behavior in a separately tested update.
 - `keyring` 3 -> 4 — API break; `apple-native` feature dropped upstream.
 - `reqwest` 0.12 -> 0.13 — API break; `rustls-tls` feature renamed upstream.
 
@@ -117,11 +116,12 @@ channel, not the filesystem layering.
    revisit when a second human reviewer is added.
 2. CodeQL checks not required on PRs (neutral on dependabot PRs) — revisit if
    GitHub closes that gap.
-3. Rust `cargo-audit` runs under CI `Security gates`; the four iroh-pinned
-   ignores re-audit on every iroh bump.
+3. Rust `cargo-audit` runs under CI `Security gates`; `.cargo/audit.toml` has
+   no active advisory suppressions. Re-audit dependency findings whenever the
+   Iroh dependency changes.
 
 ## Re-audit triggers
 
-- iroh bump (hickory/quick-xml ignores re-evaluate).
+- Iroh bump (re-audit the resolved dependency graph and any new advisories).
 - New remote-peer write path touching library root (re-filed path-injection).
 - Adoption of a second approving reviewer (raise required review count).
