@@ -33,8 +33,9 @@ void main() {
     expect(savedTitle, 'event-1:Birthday dinner');
   });
 
-  testWidgets('places screen can save a manual place correction',
-      (tester) async {
+  testWidgets('places screen can save a manual place correction', (
+    tester,
+  ) async {
     String? saved;
 
     await tester.pumpWidget(
@@ -43,17 +44,19 @@ void main() {
           body: PlacesScreen(
             places: [_place()],
             libraryRoot: '/tmp/library',
+            databaseEncrypted: false,
             onFetchPlaceAssets: (_) async => [_asset()],
             onRebuildPlaces: () async {},
-            onCorrectPlace: (
-              id, {
-              required label,
-              latitude,
-              longitude,
-              hideExactGps,
-            }) async {
-              saved = '$id:$label:$hideExactGps';
-            },
+            onCorrectPlace:
+                (
+                  id, {
+                  required label,
+                  latitude,
+                  longitude,
+                  hideExactGps,
+                }) async {
+                  saved = '$id:$label:$hideExactGps';
+                },
           ),
         ),
       ),
@@ -61,6 +64,8 @@ void main() {
 
     await tester.tap(find.byTooltip('Correct place'));
     await tester.pumpAndSettle();
+    expect(find.textContaining('Database encryption is off'), findsOneWidget);
+    expect(find.textContaining('encrypted local catalog'), findsNothing);
     await tester.enterText(find.widgetWithText(TextField, 'Home'), 'Goa trip');
     await tester.tap(find.text('Save correction'));
     await tester.pumpAndSettle();
@@ -104,18 +109,20 @@ void main() {
           body: PlacesScreen(
             places: [_place()],
             libraryRoot: '/tmp/library',
+            databaseEncrypted: true,
             onFetchPlaceAssets: (_) async {
               fetchCalls += 1;
               return [_asset()];
             },
             onRebuildPlaces: () async {},
-            onCorrectPlace: (
-              id, {
-              required label,
-              latitude,
-              longitude,
-              hideExactGps,
-            }) async {},
+            onCorrectPlace:
+                (
+                  id, {
+                  required label,
+                  latitude,
+                  longitude,
+                  hideExactGps,
+                }) async {},
           ),
         ),
       ),
@@ -126,6 +133,74 @@ void main() {
 
     expect(fetchCalls, 1);
     expect(find.text('a.jpg'), findsOneWidget);
+  });
+
+  testWidgets('places correction copy reflects encrypted catalog state', (
+    tester,
+  ) async {
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: PlacesScreen(
+            places: [_place()],
+            libraryRoot: '/tmp/library',
+            databaseEncrypted: true,
+            onFetchPlaceAssets: (_) async => [_asset()],
+            onRebuildPlaces: () async {},
+            onCorrectPlace:
+                (
+                  id, {
+                  required label,
+                  latitude,
+                  longitude,
+                  hideExactGps,
+                }) async {},
+          ),
+        ),
+      ),
+    );
+
+    await tester.tap(find.byTooltip('Correct place'));
+    await tester.pumpAndSettle();
+
+    expect(find.textContaining('encrypted local catalog'), findsOneWidget);
+    expect(find.textContaining('Database encryption is off'), findsNothing);
+  });
+
+  testWidgets('places correction copy preserves unavailable encryption state', (
+    tester,
+  ) async {
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: PlacesScreen(
+            places: [_place()],
+            libraryRoot: '/tmp/library',
+            databaseEncrypted: null,
+            onFetchPlaceAssets: (_) async => [_asset()],
+            onRebuildPlaces: () async {},
+            onCorrectPlace:
+                (
+                  id, {
+                  required label,
+                  latitude,
+                  longitude,
+                  hideExactGps,
+                }) async {},
+          ),
+        ),
+      ),
+    );
+
+    await tester.tap(find.byTooltip('Correct place'));
+    await tester.pumpAndSettle();
+
+    expect(
+      find.textContaining('Encryption status is unavailable'),
+      findsOneWidget,
+    );
+    expect(find.textContaining('Database encryption is off'), findsNothing);
+    expect(find.textContaining('encrypted local catalog'), findsNothing);
   });
 }
 
