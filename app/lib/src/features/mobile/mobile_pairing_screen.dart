@@ -1303,7 +1303,8 @@ class _MobilePairingScreenState extends State<MobilePairingScreen> {
       }
       setState(() {
         _status = switch (result.status) {
-          FileExportStatus.shared => 'Shared ${entry.name}.',
+          FileExportStatus.shareActionSelected =>
+            'Share action selected for ${entry.name}. Check the selected app to confirm delivery.',
           FileExportStatus.unavailable =>
             'Sharing is unavailable on this device.',
           FileExportStatus.saved => 'Saved ${entry.name}.',

@@ -53,6 +53,27 @@ Future<bool> localApiFileExists(LocalApiFile file) {
   return file.exists();
 }
 
+Future<void> localApiRecoverDownloadedFile(LocalApiFile destination) async {
+  if (await destination.exists()) {
+    return;
+  }
+  final parent = destination.parent;
+  if (!await parent.exists()) {
+    return;
+  }
+  final prefix = '${destination.path}.previous.';
+  final backups = <File>[];
+  await for (final entity in parent.list(followLinks: false)) {
+    if (entity is File && entity.path.startsWith(prefix)) {
+      backups.add(entity);
+    }
+  }
+  backups.sort((left, right) => left.path.compareTo(right.path));
+  if (backups.isNotEmpty) {
+    await backups.last.rename(destination.path);
+  }
+}
+
 Future<void> localApiDeleteFile(LocalApiFile file) {
   return file.delete();
 }
@@ -95,12 +116,18 @@ Future<int> localApiWriteStreamToFile(
   LocalApiFile file, {
   required bool append,
   int? expectedBytes,
+  int? maxBytes,
   required Duration timeout,
 }) async {
   var received = 0;
   final sink = file.openWrite(mode: append ? FileMode.append : FileMode.write);
   try {
     await for (final chunk in stream.timeout(timeout)) {
+      if (maxBytes != null && chunk.length > maxBytes - received) {
+        throw localApiTransferException(
+          'Download exceeded the allowed $maxBytes bytes',
+        );
+      }
       received += chunk.length;
       sink.add(chunk);
     }

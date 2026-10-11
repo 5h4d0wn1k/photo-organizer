@@ -157,7 +157,7 @@ class _FilesScreenState extends State<FilesScreen> {
           _showMessage('Saved ${entry.name} to ${result.path}.');
         case FileExportStatus.cancelled:
           break;
-        case FileExportStatus.shared:
+        case FileExportStatus.shareActionSelected:
         case FileExportStatus.unavailable:
           _showMessage('Could not save ${entry.name}.');
       }

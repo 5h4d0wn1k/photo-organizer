@@ -1516,6 +1516,7 @@ class LocalApiClient {
     void Function(int received, int total)? onProgress,
     bool resumeIncomplete = false,
   }) async {
+    await localApiRecoverDownloadedFile(destination);
     await localApiCreateParent(destination);
     final temp = localApiPartFile(destination);
     if (!resumeIncomplete && await localApiFileExists(temp)) {
@@ -1541,11 +1542,19 @@ class LocalApiClient {
         }
 
         if (response.statusCode == localHttpStatusOk && offset == 0) {
+          final maxBytes = expectedBytes ?? response.contentLength;
+          if (maxBytes == null) {
+            await response.stream.drain<List<int>>();
+            throw localApiTransferException(
+              'Cannot safely stream $path because its size is unknown',
+            );
+          }
           await localApiWriteStreamToFile(
             response.stream,
             temp,
             append: false,
             expectedBytes: response.contentLength,
+            maxBytes: maxBytes,
             timeout: _heavyReadTimeout,
           );
           expectedTotal = await localApiFileLength(temp);
@@ -1602,6 +1611,7 @@ class LocalApiClient {
           temp,
           append: offset != 0,
           expectedBytes: response.contentLength,
+          maxBytes: contentRange.end - contentRange.start + 1,
           timeout: _heavyReadTimeout,
         );
         final expectedRangeBytes = contentRange.end - contentRange.start + 1;

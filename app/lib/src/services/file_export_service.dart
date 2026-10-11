@@ -3,7 +3,7 @@ import 'dart:io';
 import 'package:file_selector/file_selector.dart';
 import 'package:share_plus/share_plus.dart';
 
-enum FileExportStatus { saved, shared, cancelled, unavailable }
+enum FileExportStatus { saved, shareActionSelected, cancelled, unavailable }
 
 class FileExportResult {
   const FileExportResult(this.status, {this.path});
@@ -13,13 +13,16 @@ class FileExportResult {
 }
 
 class FileExportService {
-  const FileExportService();
+  const FileExportService({this.saveLocation, this.shareFile});
+
+  final Future<FileSaveLocation?> Function(String suggestedName)? saveLocation;
+  final Future<ShareResult> Function(ShareParams params)? shareFile;
 
   Future<FileExportResult> saveDesktop({
     required String suggestedName,
     required Future<File> Function(File destination) download,
   }) async {
-    final location = await getSaveLocation(suggestedName: suggestedName);
+    final location = await (saveLocation ?? _getSaveLocation)(suggestedName);
     if (location == null) {
       return const FileExportResult(FileExportStatus.cancelled);
     }
@@ -36,7 +39,7 @@ class FileExportService {
     final file = File('${directory.path}/$filename');
     try {
       final downloaded = await download(file);
-      final result = await SharePlus.instance.share(
+      final result = await (shareFile ?? _shareFile)(
         ShareParams(
           files: [XFile(downloaded.path, mimeType: mimeType)],
           subject: filename,
@@ -45,7 +48,7 @@ class FileExportService {
       );
       switch (result.status) {
         case ShareResultStatus.success:
-          return const FileExportResult(FileExportStatus.shared);
+          return const FileExportResult(FileExportStatus.shareActionSelected);
         case ShareResultStatus.dismissed:
           return const FileExportResult(FileExportStatus.cancelled);
         case ShareResultStatus.unavailable:
@@ -57,4 +60,12 @@ class FileExportService {
       }
     }
   }
+}
+
+Future<FileSaveLocation?> _getSaveLocation(String suggestedName) {
+  return getSaveLocation(suggestedName: suggestedName);
+}
+
+Future<ShareResult> _shareFile(ShareParams params) {
+  return SharePlus.instance.share(params);
 }

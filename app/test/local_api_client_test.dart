@@ -565,6 +565,55 @@ void main() {
     },
   );
 
+  test('bounds a non-range response before writing excess bytes', () async {
+    final client = LocalApiClient(
+      httpClient: _OversizedOriginalClient(const [1, 2, 3, 4, 5, 6]),
+      baseUri: Uri.parse('http://127.0.0.1:4821'),
+    );
+    final tempDir = await Directory.systemTemp.createTemp('pg-file-export-');
+    addTearDown(() => tempDir.delete(recursive: true));
+    final destination = File('${tempDir.path}/original.pdf');
+
+    await expectLater(
+      client.downloadFileOriginalToFile(
+        entryId: 'entry-1',
+        destination: destination,
+        expectedBytes: 3,
+        expectedHash: null,
+      ),
+      throwsA(isA<SocketException>()),
+    );
+
+    expect(await destination.exists(), isFalse);
+    expect(await File('${destination.path}.part').exists(), isFalse);
+  });
+
+  test(
+    'recovers a previous destination after an interrupted replacement',
+    () async {
+      final client = LocalApiClient(
+        httpClient: _OversizedOriginalClient(const [1, 2, 3]),
+        baseUri: Uri.parse('http://127.0.0.1:4821'),
+      );
+      final tempDir = await Directory.systemTemp.createTemp('pg-file-export-');
+      addTearDown(() => tempDir.delete(recursive: true));
+      final destination = File('${tempDir.path}/original.pdf');
+      await File('${destination.path}.previous.123').writeAsString('old copy');
+
+      await expectLater(
+        client.downloadFileOriginalToFile(
+          entryId: 'entry-1',
+          destination: destination,
+          expectedBytes: 2,
+          expectedHash: null,
+        ),
+        throwsA(isA<SocketException>()),
+      );
+
+      expect(await destination.readAsString(), 'old copy');
+    },
+  );
+
   test('cancels resumable mobile file uploads between chunks', () async {
     final httpClient = _CancelUploadClient();
     final client = LocalApiClient(
@@ -1201,6 +1250,22 @@ class _FileOriginalClient extends http.BaseClient {
       206,
       contentLength: body.length,
       headers: {'content-range': 'bytes 0-${body.length - 1}/${body.length}'},
+    );
+  }
+}
+
+class _OversizedOriginalClient extends http.BaseClient {
+  _OversizedOriginalClient(this.body);
+
+  final List<int> body;
+
+  @override
+  Future<http.StreamedResponse> send(http.BaseRequest request) async {
+    expect(request.url.path, '/files/entry-1/original');
+    return http.StreamedResponse(
+      Stream<List<int>>.value(body),
+      HttpStatus.ok,
+      contentLength: body.length,
     );
   }
 }
