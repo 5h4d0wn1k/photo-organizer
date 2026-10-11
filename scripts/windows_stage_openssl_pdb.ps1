@@ -22,6 +22,7 @@ $candidatePdbs = @(
         }
     }
 ) | Sort-Object -Unique
+$candidatePdbs = @($candidatePdbs)
 
 if ($candidatePdbs.Count -ne 1) {
     throw "Expected one built OpenSSL symbol file, found $($candidatePdbs.Count). Refusing to stage an ambiguous or missing PDB."
