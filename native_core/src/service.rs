@@ -3666,12 +3666,34 @@ impl GalleryService {
         let library_root = PathBuf::from(library_root);
         for asset in &mut state.assets {
             let source_path = asset_file_path(asset, &library_root);
+            let previously_hidden_geo = asset
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.geo.as_ref())
+                .filter(|geo| geo.exact_hidden)
+                .cloned();
             let extracted = metadata::extract_media_metadata(&source_path, &[], asset.captured_at);
             asset.captured_at = extracted.captured_at;
-            if asset.place_hint.is_none() {
+            if let Some(previously_hidden_geo) = &previously_hidden_geo {
+                if asset.place_hint.as_deref()
+                    == Some(&gps_place_hint(
+                        previously_hidden_geo.latitude,
+                        previously_hidden_geo.longitude,
+                    ))
+                {
+                    asset.place_hint = None;
+                }
+            } else if asset.place_hint.is_none() {
                 asset.place_hint = metadata::coarse_place_label(&extracted);
             }
-            asset.metadata = Some(extracted.into_asset_metadata(asset.id));
+            let mut rebuilt_metadata = extracted.into_asset_metadata(asset.id);
+            if let Some(previously_hidden_geo) = previously_hidden_geo {
+                match rebuilt_metadata.geo.as_mut() {
+                    Some(geo) => geo.exact_hidden = true,
+                    None => rebuilt_metadata.geo = Some(previously_hidden_geo),
+                }
+            }
+            asset.metadata = Some(rebuilt_metadata);
         }
         refresh_derived_views(&mut state);
         let job = completed_job(
@@ -9527,18 +9549,21 @@ fn refresh_derived_views(state: &mut LibraryState) {
             .as_ref()
             .and_then(|metadata| metadata.geo.as_ref())
             && geo.exact_hidden
-            && asset.place_hint.as_deref()
-                == Some(&format!(
-                    "GPS {:.2}, {:.2}",
-                    (geo.latitude * 100.0).round() / 100.0,
-                    (geo.longitude * 100.0).round() / 100.0,
-                ))
+            && asset.place_hint.as_deref() == Some(&gps_place_hint(geo.latitude, geo.longitude))
         {
             asset.place_hint = None;
         }
     }
     state.places = derive_places(&state.assets, &state.places);
     state.events = derive_events(&state.assets, &state.places, &state.events);
+}
+
+fn gps_place_hint(latitude: f64, longitude: f64) -> String {
+    format!(
+        "GPS {:.2}, {:.2}",
+        (latitude * 100.0).round() / 100.0,
+        (longitude * 100.0).round() / 100.0,
+    )
 }
 
 fn refresh_missing_derived_views(state: &mut LibraryState) {
@@ -14551,6 +14576,25 @@ mod tests {
             .expect("hidden-place assets");
         assert_eq!(
             serde_json::to_value(&assets[0]).expect("serialize asset")["metadata"]["geo"],
+            serde_json::Value::Null
+        );
+
+        service.rebuild_metadata().await.expect("rebuild metadata");
+        let place_after_rebuild = service
+            .places()
+            .await
+            .into_iter()
+            .find(|place| place.label == "Home")
+            .expect("place after metadata rebuild");
+        assert_eq!(place_after_rebuild.centroid_latitude, None);
+        assert_eq!(place_after_rebuild.centroid_longitude, None);
+        let assets_after_rebuild = service
+            .place_assets(place_after_rebuild.id)
+            .await
+            .expect("assets after metadata rebuild");
+        assert_eq!(
+            serde_json::to_value(&assets_after_rebuild[0]).expect("serialize rebuilt asset")["metadata"]
+                ["geo"],
             serde_json::Value::Null
         );
 
