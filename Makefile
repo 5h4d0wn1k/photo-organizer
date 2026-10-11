@@ -1,12 +1,13 @@
 SHELL := /bin/bash
 
-.PHONY: help setup deps fmt lint test check audit flutter-analyze flutter-test release-linux-local release-gate workflow-hygiene workflow-hygiene-mutations canary canary-mutations
+.PHONY: help setup deps fmt lint test check audit flutter-analyze flutter-test release-linux-local release-gate workflow-hygiene workflow-hygiene-mutations canary canary-mutations iroh-interop-test
 
 help:
 	@echo "Photo Organizer dev targets:"
 	@echo "  fmt                cargo fmt --check"
 	@echo "  lint               cargo clippy -D warnings"
 	@echo "  test               cargo test (Rust workspace)"
+	@echo "  iroh-interop-test  mixed-version Iroh 0.98.2/1.x verified sync transfer test"
 	@echo "  check              scripts/dev-check.sh (Rust + Flutter + release gate when available)"
 	@echo "  deps               install the hash-pinned test dependencies (scripts/requirements-test.txt)"
 	@echo "  audit              cargo audit"
@@ -107,6 +108,9 @@ lint:
 
 test:
 	cargo test --locked
+
+iroh-interop-test:
+	bash scripts/tests/iroh_mixed_version_sync_test.sh
 
 check:
 	./scripts/dev-check.sh

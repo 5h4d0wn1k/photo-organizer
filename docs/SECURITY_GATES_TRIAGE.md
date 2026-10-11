@@ -29,7 +29,7 @@ rationale.
 
 ## Dependency vulnerabilities
 
-### Closed this session
+### Resolved in the dependency graph (protocol gate still open)
 
 - `cmov` CVE GHSA-3rjw-m598-pq24 — fixed by dependabot bump to 0.5.4 (PR #17,
   merged). Query: "Which asset is optional" — used only by `textmarker` in the
@@ -38,7 +38,17 @@ rationale.
   the prior `tolerable_risk` dismissals and matching `.cargo/audit.toml`
   suppressions were removed with issue #175's Iroh 1.3.0 update. The current
   locked dependency graph contains no Hickory packages, so these advisories no
-  longer apply to this repository. `cargo audit` reports no vulnerabilities.
+  longer apply to this repository. The Iroh 1.3.0 graph also removes the old
+  `atomic-polyfill` warning and upgrades `lru` to 0.18.5, above the patched
+  minimum. `cargo audit --json` reports zero vulnerabilities and one visible
+  informational warning: `paste` 1.0.15 is an unmaintained compile-time macro
+  dependency in Iroh's `netwatch` netlink stack; it is not suppressed. The
+  yanked `yoke-derive` 0.8.3 lock entry was advanced to 0.8.4. Issue #122 now
+  has a regression test for the existing persisted identity format and a
+  hermetic four-path Iroh 0.98.2 peer/current 1.x production transfer-contract
+  test. The legacy-side peer is an independent fixture, not the historical
+  Photo Organizer 0.98.2 implementation. Old-app/new-app compatibility is
+  still unproven, so issue #122 remains open.
 
 ### Merged this session
 
