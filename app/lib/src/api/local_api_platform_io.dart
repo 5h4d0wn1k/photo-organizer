@@ -62,9 +62,7 @@ Future<void> localApiRecoverDownloadedFile(LocalApiFile destination) async {
   if (!await parent.exists()) {
     return;
   }
-  final backupPattern = RegExp(
-    '^${RegExp.escape(destination.path)}\\.previous\\.[0-9a-f]{32}\$',
-  );
+  final backupPattern = _backupPattern(destination);
   final backups = <File>[];
   await for (final entity in parent.list(followLinks: false)) {
     if (entity is File && backupPattern.hasMatch(entity.path)) {
@@ -95,11 +93,28 @@ Future<void> localApiCommitDownloadedFile(
   LocalApiFile destination,
 ) async {
   final random = Random.secure();
+  var newestTimestamp = 0;
+  final parent = destination.parent;
+  if (await parent.exists()) {
+    final backupPattern = _backupPattern(destination);
+    await for (final entity in parent.list(followLinks: false)) {
+      if (entity is File) {
+        final match = backupPattern.firstMatch(entity.path);
+        if (match != null) {
+          newestTimestamp = max(newestTimestamp, int.parse(match.group(1)!));
+        }
+      }
+    }
+  }
+  final timestamp = max(
+    DateTime.now().microsecondsSinceEpoch,
+    newestTimestamp + 1,
+  ).toString().padLeft(16, '0');
   final backupId = List<String>.generate(
     16,
     (_) => random.nextInt(256).toRadixString(16).padLeft(2, '0'),
   ).join();
-  final backup = File('${destination.path}.previous.$backupId');
+  final backup = File('${destination.path}.previous.$timestamp.$backupId');
   final hadDestination = await destination.exists();
   if (hadDestination) {
     await destination.rename(backup.path);
@@ -115,6 +130,12 @@ Future<void> localApiCommitDownloadedFile(
   if (hadDestination && await backup.exists()) {
     await backup.delete();
   }
+}
+
+RegExp _backupPattern(LocalApiFile destination) {
+  return RegExp(
+    '^${RegExp.escape(destination.path)}\\.previous\\.([0-9]{16})\\.[0-9a-f]{32}\$',
+  );
 }
 
 Future<int> localApiWriteStreamToFile(

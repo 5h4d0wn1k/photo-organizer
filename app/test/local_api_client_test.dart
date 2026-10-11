@@ -621,8 +621,11 @@ void main() {
       addTearDown(() => tempDir.delete(recursive: true));
       final destination = File('${tempDir.path}/original.pdf');
       await File(
-        '${destination.path}.previous.0123456789abcdef0123456789abcdef',
-      ).writeAsString('old copy');
+        '${destination.path}.previous.0000000000000001.0123456789abcdef0123456789abcdef',
+      ).writeAsString('older copy');
+      await File(
+        '${destination.path}.previous.0000000000000002.1123456789abcdef0123456789abcdef',
+      ).writeAsString('newer copy');
 
       await expectLater(
         client.downloadFileOriginalToFile(
@@ -634,7 +637,7 @@ void main() {
         throwsA(isA<SocketException>()),
       );
 
-      expect(await destination.readAsString(), 'old copy');
+      expect(await destination.readAsString(), 'newer copy');
     },
   );
 
