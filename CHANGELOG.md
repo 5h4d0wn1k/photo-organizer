@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Update the Iroh transport from 0.98.2 to 1.3.0. Existing persisted endpoint
+  identities and the Photo Organizer sync ALPN are unchanged. A local direct
+  loopback transport probe passed in both mixed-version directions, but it did
+  not test the app's Push/Pull chunk-transfer protocol. Mixed-version
+  public-relay interoperability was not tested; Iroh ended public-relay support
+  for 0.9x clients on September 30, 2026. Upgrade all paired devices to Iroh
+  1.x for public-relay sync; older peers may still connect directly, but relay
+  interoperability is unverified. See the
+  [Iroh 1.0 compatibility announcement](https://www.iroh.computer/blog/v1).
+
 ### Added
 
 - Android release artifact gate: the exact APK that will be published is now
