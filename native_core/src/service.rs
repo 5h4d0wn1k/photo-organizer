@@ -10163,6 +10163,39 @@ mod tests {
             .await
             .expect("entitlement");
 
+        let source = runtime_root.join("hidden-location.jpg");
+        fs::write(&source, b"photo with hidden exact location").expect("write source");
+        let imported = service
+            .import_asset(ImportAssetRequest {
+                source_path: source.to_string_lossy().to_string(),
+                original_filename: "hidden-location.jpg".to_string(),
+                media_kind: MediaKind::Photo,
+                mime_type: "image/jpeg".to_string(),
+                bytes: 32,
+                content_hash: None,
+                captured_at: Some(Utc::now()),
+                place_hint: None,
+                import_mode: Some(ImportMode::Copy),
+            })
+            .await
+            .expect("import location asset");
+        {
+            let mut state = service.state.write().await;
+            let metadata = state
+                .assets
+                .iter_mut()
+                .find(|asset| asset.id == imported.asset.id)
+                .and_then(|asset| asset.metadata.as_mut())
+                .expect("imported asset metadata");
+            metadata.geo = Some(crate::domain::GeoTag {
+                latitude: 43.1234567,
+                longitude: -79.7654321,
+                altitude_meters: None,
+                source: MetadataSource::Embedded,
+                exact_hidden: true,
+            });
+        }
+
         let result = service
             .export_support_bundle(SupportBundleExportRequest {
                 export_root: support_root.to_string_lossy().to_string(),
@@ -10185,6 +10218,8 @@ mod tests {
         assert!(!bundle_text.contains(sensitive_library_root.to_string_lossy().as_ref()));
         assert!(!bundle_text.contains("library-alex-private-tax-photos"));
         assert!(!bundle_text.contains("\"database_path\":"));
+        assert!(!bundle_text.contains("43.1234567"));
+        assert!(!bundle_text.contains("-79.7654321"));
         assert!(bundle_text.contains("private_data_excluded"));
         assert!(bundle_text.contains("account_identifier_redacted"));
         assert!(bundle_text.contains("release_readiness"));
@@ -10371,6 +10406,31 @@ mod tests {
             .expect("receive duplicate");
         assert_eq!(duplicate.asset_id, Some(asset_id));
 
+        {
+            let mut state = service.state.write().await;
+            let metadata = state
+                .assets
+                .iter_mut()
+                .find(|asset| asset.id == asset_id)
+                .and_then(|asset| asset.metadata.as_mut())
+                .expect("uploaded asset metadata");
+            metadata.geo = Some(crate::domain::GeoTag {
+                latitude: 43.1234567,
+                longitude: -79.7654321,
+                altitude_meters: None,
+                source: MetadataSource::Embedded,
+                exact_hidden: true,
+            });
+        }
+        let metadata = service
+            .asset_metadata(asset_id)
+            .await
+            .expect("hidden asset metadata");
+        assert_eq!(
+            serde_json::to_value(metadata).expect("serialize asset metadata")["geo"],
+            serde_json::Value::Null
+        );
+
         let mobile_tree = service
             .mobile_file_tree(&paired.bearer_token, false)
             .await
@@ -10409,6 +10469,11 @@ mod tests {
         assert!(workspace.capabilities.can_upload_camera_roll);
         assert!(workspace.capabilities.can_download_originals);
         assert!(!workspace.capabilities.can_manage_storage);
+        let workspace_json = serde_json::to_value(&workspace).expect("serialize workspace");
+        assert_eq!(
+            workspace_json["timeline"]["buckets"][0]["assets"][0]["metadata"]["geo"],
+            serde_json::Value::Null
+        );
 
         let search = service
             .mobile_search(
@@ -10437,6 +10502,11 @@ mod tests {
             .expect("mobile search");
         assert_eq!(search.assets.len(), 1);
         assert_eq!(search.assets[0].id, asset_id);
+        assert_eq!(
+            serde_json::to_value(&search).expect("serialize mobile search")["assets"][0]["metadata"]
+                ["geo"],
+            serde_json::Value::Null
+        );
 
         let device_search = service
             .mobile_search(
