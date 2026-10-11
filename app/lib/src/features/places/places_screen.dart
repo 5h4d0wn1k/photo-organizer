@@ -239,24 +239,26 @@ class PlacesScreen extends StatelessWidget {
                         true =>
                           'Keeps your place label and hides coordinates '
                               'from app features. Coordinates remain in the '
-                              'encrypted local catalog and original files; '
-                              'exporting or sharing originals may reveal GPS '
-                              'metadata.',
+                              'encrypted local catalog. Restorable backup '
+                              'exports preserve these exact coordinates; '
+                              'original files may also contain GPS metadata.',
                         false =>
                           'Keeps your place label and hides coordinates '
                               'from app features. Coordinates remain in the '
                               'local catalog and original files. Database '
                               'encryption is off, so catalog coordinates are '
                               'not protected at rest; activate it in Settings. '
-                              'Exporting or sharing originals may also reveal '
+                              'Restorable backup exports preserve these exact '
+                              'coordinates, and original files may also contain '
                               'GPS metadata.',
                         null =>
                           'Keeps your place label and hides coordinates '
                               'from app features. Coordinates remain in the '
                               'local catalog and original files. Encryption '
                               'status is unavailable; check Settings before '
-                              'relying on at-rest protection. Exporting or '
-                              'sharing originals may reveal GPS metadata.',
+                              'relying on at-rest protection. Restorable backup '
+                              'exports preserve these exact coordinates, and '
+                              'original files may also contain GPS metadata.',
                       }),
                       onChanged: (value) {
                         setDialogState(() => hideExactGps = value ?? true);

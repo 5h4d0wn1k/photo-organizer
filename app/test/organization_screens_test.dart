@@ -165,6 +165,12 @@ void main() {
 
     expect(find.textContaining('encrypted local catalog'), findsOneWidget);
     expect(find.textContaining('Database encryption is off'), findsNothing);
+    expect(
+      find.textContaining(
+        'Restorable backup exports preserve these exact coordinates',
+      ),
+      findsOneWidget,
+    );
   });
 
   testWidgets('places correction copy preserves unavailable encryption state', (
@@ -201,6 +207,12 @@ void main() {
     );
     expect(find.textContaining('Database encryption is off'), findsNothing);
     expect(find.textContaining('encrypted local catalog'), findsNothing);
+    expect(
+      find.textContaining(
+        'Restorable backup exports preserve these exact coordinates',
+      ),
+      findsOneWidget,
+    );
   });
 }
 
