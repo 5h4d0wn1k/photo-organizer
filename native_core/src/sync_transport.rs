@@ -2304,7 +2304,7 @@ mod tests {
             let legacy_endpoint = fixture_descriptor(&legacy.next_json(), source_id);
             assert_eq!(legacy_endpoint.node_id, legacy_node);
 
-            let (mut envelope, ciphertexts) = aead_encrypted_envelope();
+            let (key, mut envelope, ciphertexts) = aead_encrypted_envelope();
             envelope.from_device_id = receiver_id;
             envelope.to_device_id = source_id;
             let root_library = root.0.join("library");
@@ -2349,7 +2349,7 @@ mod tests {
                 assert_eq!(bytes, ciphertexts[chunk.chunk_index as usize]);
                 assert_eq!(sha256_hex(&bytes), chunk.encrypted_hash);
             }
-            assert_aead_chunks_match_manifest(&chunks, &ciphertexts);
+            assert_aead_chunks_match_manifest(&key, &chunks, &ciphertexts);
             let persisted = storage::load_state(&report).expect("reload sender app state");
             assert!(persisted.blob_records.is_empty());
             assert!(persisted.blob_chunks.is_empty());
@@ -2361,7 +2361,7 @@ mod tests {
             eprintln!("interop case: 0.98.2 sender to 1.x receiver");
             let root = TestRoot::new();
             let legacy_key = write_legacy_key(&root.0, &LEGACY_KEY);
-            let (envelope, ciphertexts) = aead_encrypted_envelope();
+            let (key, envelope, ciphertexts) = aead_encrypted_envelope();
             let manifest = write_manifest(&root.0, &envelope);
             let fixture_chunks = write_fixture_ciphertexts(&root.0, &envelope.chunks, &ciphertexts);
             let (runtime, _, report, library_root) = runtime_for_fixture(RuntimeFixtureSpec {
@@ -2409,7 +2409,7 @@ mod tests {
                 assert_eq!(&bytes, ciphertext);
                 assert_eq!(sha256_hex(&bytes), chunk.encrypted_hash);
             }
-            assert_aead_chunks_match_manifest(&persisted.blob_chunks, &ciphertexts);
+            assert_aead_chunks_match_manifest(&key, &persisted.blob_chunks, &ciphertexts);
             stop_fixture_runtime(&runtime).await;
         }
 
@@ -2418,7 +2418,7 @@ mod tests {
             eprintln!("interop case: 1.x Pull client from 0.98.2 server");
             let root = TestRoot::new();
             let legacy_key = write_legacy_key(&root.0, &LEGACY_KEY);
-            let (envelope, ciphertexts) = aead_encrypted_envelope();
+            let (key, envelope, ciphertexts) = aead_encrypted_envelope();
             let manifest = write_manifest(&root.0, &envelope);
             let fixture_chunks = write_fixture_ciphertexts(&root.0, &envelope.chunks, &ciphertexts);
             let server_args = fixture_arguments(
@@ -2479,7 +2479,7 @@ mod tests {
                 assert_eq!(&bytes, ciphertext);
                 assert_eq!(sha256_hex(&bytes), chunk.encrypted_hash);
             }
-            assert_aead_chunks_match_manifest(&persisted.blob_chunks, &ciphertexts);
+            assert_aead_chunks_match_manifest(&key, &persisted.blob_chunks, &ciphertexts);
             assert_eq!(local.descriptor.node_id, current_node);
         }
 
@@ -2488,7 +2488,7 @@ mod tests {
             eprintln!("interop case: 0.98.2 Pull client from 1.x server");
             let root = TestRoot::new();
             let legacy_key = write_legacy_key(&root.0, &LEGACY_KEY);
-            let (envelope, ciphertexts) = aead_encrypted_envelope();
+            let (key, envelope, ciphertexts) = aead_encrypted_envelope();
             let request = super::PullRequest {
                 protocol_version: super::PROTOCOL_VERSION,
                 transfer_id: envelope.transfer_id,
@@ -2539,7 +2539,7 @@ mod tests {
                 assert_eq!(&bytes, ciphertext);
                 assert_eq!(sha256_hex(&bytes), chunk.encrypted_hash);
             }
-            assert_aead_chunks_match_manifest(&envelope.chunks, &ciphertexts);
+            assert_aead_chunks_match_manifest(&key, &envelope.chunks, &ciphertexts);
             let source_paths_exist = server_chunks.iter().all(|chunk| {
                 chunk
                     .local_path
@@ -2703,14 +2703,14 @@ mod tests {
         (envelope, ciphertexts)
     }
 
-    fn aead_encrypted_envelope() -> (TransferEnvelope, Vec<Vec<u8>>) {
+    fn aead_encrypted_envelope() -> (chacha20poly1305::Key, TransferEnvelope, Vec<Vec<u8>>) {
         use chacha20poly1305::{
             XChaCha20Poly1305, XNonce,
-            aead::{Aead, KeyInit, Payload},
+            aead::{Aead, KeyInit, OsRng, Payload},
         };
 
-        let key = [42_u8; 32];
-        let cipher = XChaCha20Poly1305::new((&key).into());
+        let key = XChaCha20Poly1305::generate_key(&mut OsRng);
+        let cipher = XChaCha20Poly1305::new(&key);
         let plaintexts = [
             b"first verified original".as_slice(),
             b"second verified original".as_slice(),
@@ -2745,16 +2745,20 @@ mod tests {
             hash_input.extend_from_slice(chunk.encrypted_hash.as_bytes());
         }
         envelope.blob.encrypted_hash = sha256_hex(&hash_input);
-        (envelope, ciphertexts)
+        (key, envelope, ciphertexts)
     }
 
-    fn assert_aead_chunks_match_manifest(chunks: &[BlobChunk], ciphertexts: &[Vec<u8>]) {
+    fn assert_aead_chunks_match_manifest(
+        key: &chacha20poly1305::Key,
+        chunks: &[BlobChunk],
+        ciphertexts: &[Vec<u8>],
+    ) {
         use chacha20poly1305::{
             XChaCha20Poly1305, XNonce,
             aead::{Aead, KeyInit, Payload},
         };
 
-        let cipher = XChaCha20Poly1305::new((&[42_u8; 32]).into());
+        let cipher = XChaCha20Poly1305::new(key);
         assert_eq!(chunks.len(), ciphertexts.len());
         for (chunk, ciphertext) in chunks.iter().zip(ciphertexts) {
             assert_eq!(sha256_hex(ciphertext), chunk.encrypted_hash);
