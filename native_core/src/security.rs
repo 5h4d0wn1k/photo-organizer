@@ -1188,9 +1188,23 @@ fn sync_directory(_parent: &Path) -> Result<(), SecurityError> {
 
 fn checkpoint_plaintext_database(database_path: &Path) -> Result<(), SecurityError> {
     let connection = Connection::open(database_path).map_err(database_error)?;
-    connection
-        .execute_batch("PRAGMA wal_checkpoint(FULL);")
-        .map_err(database_error)
+    let (busy, log_frames, checkpointed_frames) = connection
+        .query_row("PRAGMA wal_checkpoint(FULL)", [], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })
+        .map_err(database_error)?;
+    let checkpoint_complete = (log_frames == -1 && checkpointed_frames == -1)
+        || (log_frames >= 0 && checkpointed_frames == log_frames);
+    if busy != 0 || !checkpoint_complete {
+        return Err(SecurityError::Database(format!(
+            "plaintext database WAL checkpoint did not complete (busy={busy}, log_frames={log_frames}, checkpointed_frames={checkpointed_frames}); retry after database readers release their snapshots"
+        )));
+    }
+    Ok(())
 }
 
 fn user_table_row_counts(connection: &Connection) -> Result<BTreeMap<String, i64>, SecurityError> {
@@ -1817,6 +1831,122 @@ mod tests {
             leftovers.is_empty(),
             "a failed write must not leave temp files behind: {leftovers:?}"
         );
+        cleanup(&root);
+    }
+
+    #[test]
+    fn activation_preserves_committed_wal_frames_when_a_reader_blocks_checkpoint() {
+        let (config, root) = test_config("blocked-wal-checkpoint");
+        seed_db(&config);
+        let database_path = config.database_path();
+
+        let writer = Connection::open(&database_path).expect("writer must open");
+        writer
+            .pragma_update(None, "wal_autocheckpoint", 0_i64)
+            .expect("automatic checkpoint must be disabled for this fixture");
+        let reader = Connection::open(&database_path).expect("reader must open");
+        reader
+            .execute_batch("BEGIN DEFERRED;")
+            .expect("reader transaction must begin");
+        let initial_rows: i64 = reader
+            .query_row("SELECT COUNT(*) FROM recovery_canary", [], |row| row.get(0))
+            .expect("reader must establish a WAL snapshot");
+        assert_eq!(initial_rows, 1);
+
+        writer
+            .execute(
+                "INSERT INTO recovery_canary (note) VALUES ('committed-in-wal')",
+                [],
+            )
+            .expect("new row must commit to the WAL");
+        let mut wal_path = database_path.as_os_str().to_os_string();
+        wal_path.push("-wal");
+        let wal_path = PathBuf::from(wal_path);
+        assert!(wal_path.exists(), "committed row must remain in the WAL");
+
+        let error = activate_encryption(&config)
+            .expect_err("activation must stop before staging if FULL checkpoint is blocked");
+        assert!(
+            error
+                .to_string()
+                .contains("WAL checkpoint did not complete"),
+            "the failure must identify the incomplete checkpoint: {error}"
+        );
+        assert!(
+            !state_path(&config).exists(),
+            "activation must not persist a key state before checkpoint completion"
+        );
+        assert!(wal_path.exists(), "activation must preserve the live WAL");
+
+        let live = Connection::open(&database_path).expect("live database must still open");
+        let committed_rows: i64 = live
+            .query_row("SELECT COUNT(*) FROM recovery_canary", [], |row| row.get(0))
+            .expect("committed WAL data must remain readable");
+        assert_eq!(committed_rows, 2);
+        drop(live);
+
+        reader
+            .execute_batch("ROLLBACK;")
+            .expect("reader snapshot must be released");
+        drop(reader);
+        drop(writer);
+
+        checkpoint_plaintext_database(&database_path)
+            .expect("checkpoint must complete after the reader releases its snapshot");
+        let replacement = root.join("injected-replacement.partial");
+        fs::write(&replacement, b"replacement candidate")
+            .expect("replacement fixture must be written");
+        let publish_called = std::cell::Cell::new(false);
+        let prepare_called = std::cell::Cell::new(false);
+        let failed_replacement = replace_file_then(
+            &replacement,
+            &database_path,
+            sync_file_contents,
+            || {
+                prepare_called.set(true);
+                remove_sidecar(&database_path, "wal")?;
+                remove_sidecar(&database_path, "shm")
+            },
+            |_, _| {
+                Err(SecurityError::Io(
+                    "injected database replacement rename failure".to_string(),
+                ))
+            },
+            sync_directory,
+            || {
+                publish_called.set(true);
+                Ok(())
+            },
+        );
+        assert!(
+            failed_replacement.is_err(),
+            "injected replacement failure must stop activation"
+        );
+        assert!(
+            prepare_called.get(),
+            "replacement failure must occur after the production sidecar preparation step"
+        );
+        assert!(
+            !publish_called.get(),
+            "state must not publish after the injected replacement failure"
+        );
+        fs::remove_file(&replacement).expect("failed replacement fixture must be removed");
+        let after_rename_failure =
+            Connection::open(&database_path).expect("checkpointed plaintext database must open");
+        let rows_after_rename_failure: i64 = after_rename_failure
+            .query_row("SELECT COUNT(*) FROM recovery_canary", [], |row| row.get(0))
+            .expect("all committed rows must survive a failed replacement");
+        assert_eq!(rows_after_rename_failure, 2);
+        drop(after_rename_failure);
+
+        activate_encryption(&config)
+            .expect("activation must converge after the reader releases its snapshot");
+        let encrypted = open_database(&database_path).expect("encrypted database must reopen");
+        let recovered_rows: i64 = encrypted
+            .query_row("SELECT COUNT(*) FROM recovery_canary", [], |row| row.get(0))
+            .expect("encrypted database must retain the WAL-committed row");
+        assert_eq!(recovered_rows, 2);
+        drop(encrypted);
         cleanup(&root);
     }
 
