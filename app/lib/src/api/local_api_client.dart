@@ -542,11 +542,15 @@ class LocalApiClient {
     required String bearerToken,
     required String assetId,
     required T destination,
+    int? expectedBytes,
+    String? expectedHash,
   }) async {
     final downloaded = await _downloadPathToFile(
       path: '/mobile/assets/$assetId/original',
       headers: _mobileHeaders(bearerToken),
       destination: localApiFileFromObject(destination),
+      expectedBytes: expectedBytes,
+      expectedHash: expectedHash,
       resumeIncomplete: true,
     );
     return downloaded as T;
@@ -1532,8 +1536,10 @@ class LocalApiClient {
       while (expectedTotal == null || offset < expectedTotal) {
         final rangeEnd = offset + _mobileDownloadChunkBytes - 1;
         final request = http.Request('GET', _resolve(path))
-          ..headers.addAll(headers)
-          ..headers['range'] = 'bytes=$offset-$rangeEnd';
+          ..headers.addAll(headers);
+        if (expectedBytes != 0) {
+          request.headers['range'] = 'bytes=$offset-$rangeEnd';
+        }
         late final http.StreamedResponse response;
         try {
           response = await _httpClient.send(request).timeout(_heavyReadTimeout);

@@ -1273,6 +1273,8 @@ class _MobilePairingScreenState extends State<MobilePairingScreen> {
       bearerToken: token,
       assetId: asset.assetId,
       destination: file,
+      expectedBytes: asset.bytes,
+      expectedHash: asset.contentHash,
     );
   }
 

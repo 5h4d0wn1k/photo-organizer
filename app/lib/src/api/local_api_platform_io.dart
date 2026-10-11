@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:math';
 
 typedef LocalApiFile = File;
 
@@ -61,10 +62,12 @@ Future<void> localApiRecoverDownloadedFile(LocalApiFile destination) async {
   if (!await parent.exists()) {
     return;
   }
-  final prefix = '${destination.path}.previous.';
+  final backupPattern = RegExp(
+    '^${RegExp.escape(destination.path)}\\.previous\\.[0-9a-f]{32}\$',
+  );
   final backups = <File>[];
   await for (final entity in parent.list(followLinks: false)) {
-    if (entity is File && entity.path.startsWith(prefix)) {
+    if (entity is File && backupPattern.hasMatch(entity.path)) {
       backups.add(entity);
     }
   }
@@ -91,9 +94,12 @@ Future<void> localApiCommitDownloadedFile(
   LocalApiFile temporary,
   LocalApiFile destination,
 ) async {
-  final backup = File(
-    '${destination.path}.previous.${DateTime.now().microsecondsSinceEpoch}',
-  );
+  final random = Random.secure();
+  final backupId = List<String>.generate(
+    16,
+    (_) => random.nextInt(256).toRadixString(16).padLeft(2, '0'),
+  ).join();
+  final backup = File('${destination.path}.previous.$backupId');
   final hadDestination = await destination.exists();
   if (hadDestination) {
     await destination.rename(backup.path);

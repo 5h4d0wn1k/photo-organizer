@@ -539,6 +539,28 @@ void main() {
   );
 
   test(
+    'exports an empty original without issuing an invalid byte range',
+    () async {
+      final client = LocalApiClient(
+        httpClient: _EmptyOriginalClient(),
+        baseUri: Uri.parse('http://127.0.0.1:4821'),
+      );
+      final tempDir = await Directory.systemTemp.createTemp('pg-file-export-');
+      addTearDown(() => tempDir.delete(recursive: true));
+      final destination = File('${tempDir.path}/empty.txt');
+
+      final saved = await client.downloadFileOriginalToFile(
+        entryId: 'entry-1',
+        destination: destination,
+        expectedBytes: 0,
+        expectedHash: sha256.convert(const <int>[]).toString(),
+      );
+
+      expect(await saved.length(), 0);
+    },
+  );
+
+  test(
     'preserves destination when streamed file hash does not match',
     () async {
       final client = LocalApiClient(
@@ -598,7 +620,9 @@ void main() {
       final tempDir = await Directory.systemTemp.createTemp('pg-file-export-');
       addTearDown(() => tempDir.delete(recursive: true));
       final destination = File('${tempDir.path}/original.pdf');
-      await File('${destination.path}.previous.123').writeAsString('old copy');
+      await File(
+        '${destination.path}.previous.0123456789abcdef0123456789abcdef',
+      ).writeAsString('old copy');
 
       await expectLater(
         client.downloadFileOriginalToFile(
@@ -613,6 +637,31 @@ void main() {
       expect(await destination.readAsString(), 'old copy');
     },
   );
+
+  test('does not treat a user file as an interrupted-save backup', () async {
+    final client = LocalApiClient(
+      httpClient: _OversizedOriginalClient(const [1, 2, 3]),
+      baseUri: Uri.parse('http://127.0.0.1:4821'),
+    );
+    final tempDir = await Directory.systemTemp.createTemp('pg-file-export-');
+    addTearDown(() => tempDir.delete(recursive: true));
+    final destination = File('${tempDir.path}/original.pdf');
+    final userFile = File('${destination.path}.previous.123');
+    await userFile.writeAsString('user file');
+
+    await expectLater(
+      client.downloadFileOriginalToFile(
+        entryId: 'entry-1',
+        destination: destination,
+        expectedBytes: 2,
+        expectedHash: null,
+      ),
+      throwsA(isA<SocketException>()),
+    );
+
+    expect(await destination.exists(), isFalse);
+    expect(await userFile.readAsString(), 'user file');
+  });
 
   test('cancels resumable mobile file uploads between chunks', () async {
     final httpClient = _CancelUploadClient();
@@ -1266,6 +1315,19 @@ class _OversizedOriginalClient extends http.BaseClient {
       Stream<List<int>>.value(body),
       HttpStatus.ok,
       contentLength: body.length,
+    );
+  }
+}
+
+class _EmptyOriginalClient extends http.BaseClient {
+  @override
+  Future<http.StreamedResponse> send(http.BaseRequest request) async {
+    expect(request.url.path, '/files/entry-1/original');
+    expect(request.headers.containsKey('range'), isFalse);
+    return http.StreamedResponse(
+      const Stream<List<int>>.empty(),
+      HttpStatus.ok,
+      contentLength: 0,
     );
   }
 }
