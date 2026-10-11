@@ -14,8 +14,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   loopback test passed in both mixed-version directions (old and new peers as
   client and server). Mixed-version public-relay interoperability was not
   tested; Iroh ended public-relay support for 0.9x clients on September 30,
-  2026. Devices that relied on that retired route need a supported transport
-  path. See the [Iroh 1.0 compatibility announcement](https://www.iroh.computer/blog/v1).
+  2026. Upgrade all paired devices to Iroh 1.x for public-relay sync; older
+  peers may still connect directly, but relay interoperability is unverified.
+  See the [Iroh 1.0 compatibility announcement](https://www.iroh.computer/blog/v1).
 
 ### Added
 
