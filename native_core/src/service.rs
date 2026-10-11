@@ -4598,6 +4598,7 @@ impl GalleryService {
         }
 
         let mut state = self.state.write().await;
+        let hide_coordinates_in_history = request.hide_exact_gps.unwrap_or(true);
         let (asset_ids, correction) = {
             let place = state
                 .places
@@ -4606,8 +4607,16 @@ impl GalleryService {
                 .ok_or_else(|| ServiceError::NotFound(format!("place {place_id}")))?;
             let previous = json!({
                 "label": place.label,
-                "centroid_latitude": place.centroid_latitude,
-                "centroid_longitude": place.centroid_longitude,
+                "centroid_latitude": if hide_coordinates_in_history {
+                    None
+                } else {
+                    place.centroid_latitude
+                },
+                "centroid_longitude": if hide_coordinates_in_history {
+                    None
+                } else {
+                    place.centroid_longitude
+                },
             });
             place.label = request.label.trim().to_string();
             place.centroid_latitude = request.latitude.or(place.centroid_latitude);
@@ -4621,8 +4630,8 @@ impl GalleryService {
                 previous_json: previous,
                 applied_json: json!({
                     "label": request.label.trim(),
-                    "latitude": request.latitude,
-                    "longitude": request.longitude,
+                    "latitude": if hide_coordinates_in_history { None } else { request.latitude },
+                    "longitude": if hide_coordinates_in_history { None } else { request.longitude },
                     "hide_exact_gps": request.hide_exact_gps,
                     "reason": request.reason,
                 }),
@@ -4630,6 +4639,30 @@ impl GalleryService {
             };
             (place.asset_ids.clone(), correction)
         };
+        if hide_coordinates_in_history {
+            for entry in state.corrections.iter_mut().filter(|entry| {
+                entry.kind == CorrectionKind::CorrectPlace && entry.place_id == Some(place_id)
+            }) {
+                redact_json_coordinate_fields(
+                    &mut entry.previous_json,
+                    &[
+                        "latitude",
+                        "longitude",
+                        "centroid_latitude",
+                        "centroid_longitude",
+                    ],
+                );
+                redact_json_coordinate_fields(
+                    &mut entry.applied_json,
+                    &[
+                        "latitude",
+                        "longitude",
+                        "centroid_latitude",
+                        "centroid_longitude",
+                    ],
+                );
+            }
+        }
         state.corrections.push(correction);
 
         for asset in &mut state.assets {
@@ -9556,6 +9589,17 @@ fn gps_place_hint(latitude: f64, longitude: f64) -> String {
     )
 }
 
+fn redact_json_coordinate_fields(value: &mut serde_json::Value, fields: &[&str]) {
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+    for field in fields {
+        if object.contains_key(*field) {
+            object.insert((*field).to_string(), serde_json::Value::Null);
+        }
+    }
+}
+
 fn preserve_hidden_geo(
     previously_hidden_geo: Option<crate::domain::GeoTag>,
     place_hint: &mut Option<String>,
@@ -9768,7 +9812,7 @@ mod tests {
         config::AppConfig,
         domain::{
             AssetAvailabilityState, BlobReplica, CorrectDateRequest, CorrectPlaceRequest,
-            CreateAlbumRequest, CreateDeviceRequest, CreateFileFolderRequest,
+            CorrectionKind, CreateAlbumRequest, CreateDeviceRequest, CreateFileFolderRequest,
             CreateManualPersonRequest, CreatePairingSessionRequest, CreateSmartFolderRequest,
             CreateVaultRequest, DeviceRole, DeviceStorageProfile, DeviceTrustLevel,
             EncryptionActivationRequest, EnrollDeviceRequest, EntitlementCacheStatus,
@@ -14573,9 +14617,24 @@ mod tests {
         );
 
         let place_id = service.places().await[0].id;
-        let place = service
+        let visible_place = service
             .correct_place(
                 place_id,
+                CorrectPlaceRequest {
+                    label: "Old place".to_string(),
+                    latitude: Some(12.34),
+                    longitude: Some(56.78),
+                    hide_exact_gps: Some(false),
+                    reason: None,
+                },
+            )
+            .await
+            .expect("set visible place coordinates");
+        assert_eq!(visible_place.centroid_latitude, Some(12.34));
+        assert_eq!(visible_place.centroid_longitude, Some(56.78));
+        let place = service
+            .correct_place(
+                visible_place.id,
                 CorrectPlaceRequest {
                     label: "Home".to_string(),
                     latitude: Some(12.34),
@@ -14590,6 +14649,20 @@ mod tests {
         assert_eq!(place.asset_ids.len(), 2);
         assert_eq!(place.centroid_latitude, None);
         assert_eq!(place.centroid_longitude, None);
+        let correction_history = service.state.read().await.corrections.clone();
+        let place_corrections = correction_history
+            .iter()
+            .filter(|entry| {
+                entry.kind == CorrectionKind::CorrectPlace && entry.place_id == Some(place.id)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(place_corrections.len(), 2);
+        for correction in place_corrections {
+            assert!(correction.applied_json["latitude"].is_null());
+            assert!(correction.applied_json["longitude"].is_null());
+            assert!(correction.previous_json["centroid_latitude"].is_null());
+            assert!(correction.previous_json["centroid_longitude"].is_null());
+        }
         assert_eq!(service.places().await[0].label, "Home");
         let assets = service
             .place_assets(place.id)
