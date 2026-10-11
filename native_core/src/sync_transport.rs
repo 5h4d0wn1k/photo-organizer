@@ -1469,7 +1469,7 @@ fn open_or_create_directory(
 }
 
 #[cfg(windows)]
-fn create_storage_directory(parent: &Dir, name: &str, path: &Path) -> std::io::Result<()> {
+fn create_storage_directory(parent: &Dir, _name: &str, path: &Path) -> std::io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_WRITE_THROUGH, MoveFileExW};
 
