@@ -2061,7 +2061,9 @@ mod tests {
     fn decode_hex_array<const N: usize>(encoded: &str) -> [u8; N] {
         assert_eq!(encoded.len(), N * 2, "hex value has the expected length");
         let mut decoded = [0_u8; N];
-        for (index, pair) in encoded.as_bytes().chunks_exact(2).enumerate() {
+        let (pairs, remainder) = encoded.as_bytes().as_chunks::<2>();
+        assert!(remainder.is_empty(), "hex input has complete byte pairs");
+        for (index, pair) in pairs.iter().enumerate() {
             decoded[index] =
                 u8::from_str_radix(std::str::from_utf8(pair).expect("hex is ASCII"), 16)
                     .expect("valid hex");
