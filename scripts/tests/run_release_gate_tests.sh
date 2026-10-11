@@ -162,24 +162,38 @@ shard_process_state() {
 }
 
 record_suite_result() {
-  local suite="$1" rc="$2" log="$3" shards="$4" suffix=""
+  local suite="$1" rc="$2" log="$3" shards="$4" suffix="" scan_rc
   if ((shards > 1)); then
     suffix=" (${shards} shards)"
   fi
   if ((rc != 0)); then
     results+=("FAIL ${suite}${suffix}")
     failed=1
-  elif grep -qF "${DEGRADED_MARKER}" "${log}"; then
-    # A suite that could not run its assertions still exits 0 (an unavailable
-    # emulator SDK is not a code defect). Reporting that as a plain PASS would
-    # let a real gap hide behind a green build, so degrade it loudly instead.
-    # Anchored to a marker the suites emit, not the bare word: the log also
-    # contains human prose, including assertion names, and prose that happens to
-    # say "DEGRADED" must not be read as a skipped suite.
-    results+=("DEGRADED ${suite}${suffix} (see the SKIP output above -- assertions did NOT run)")
-    degraded=1
+  elif [[ ! -f "${log}" || ! -r "${log}" ]]; then
+    printf 'FATAL: cannot read the %s result log: %s\n' "${suite}" "${log}" >&2
+    results+=("FAIL ${suite}${suffix}")
+    failed=1
   else
-    results+=("PASS ${suite}${suffix}")
+    if grep -qF "${DEGRADED_MARKER}" "${log}"; then
+      # A suite that could not run its assertions still exits 0 (an unavailable
+      # emulator SDK is not a code defect). Reporting that as a plain PASS would
+      # let a real gap hide behind a green build, so degrade it loudly instead.
+      # Anchored to a marker the suites emit, not the bare word: the log also
+      # contains human prose, including assertion names, and prose that happens to
+      # say "DEGRADED" must not be read as a skipped suite.
+      results+=("DEGRADED ${suite}${suffix} (see the SKIP output above -- assertions did NOT run)")
+      degraded=1
+    else
+      scan_rc=$?
+      if ((scan_rc == 1)); then
+        results+=("PASS ${suite}${suffix}")
+      else
+        printf 'FATAL: cannot scan the %s result log (grep exited %s): %s\n' \
+          "${suite}" "${scan_rc}" "${log}" >&2
+        results+=("FAIL ${suite}${suffix}")
+        failed=1
+      fi
+    fi
   fi
 }
 
@@ -305,7 +319,11 @@ run_suite() {
     # everything the pass produced. This is derived from the shard logs rather
     # than being the primary record of them, and it is not deleted on exit.
     suite_log="${LOG_DIR}/${suite%.sh}.combined.log"
-    cat "${shard_logs[@]}" >"${suite_log}"
+    if ! cat "${shard_logs[@]}" >"${suite_log}"; then
+      printf 'FATAL: cannot combine the %s shard logs into %s\n' \
+        "${suite}" "${suite_log}" >&2
+      rc=1
+    fi
     record_suite_result "${suite}" "${rc}" "${suite_log}" "${shards}"
     return
   fi
