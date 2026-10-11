@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:crypto/crypto.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:http/http.dart' as http;
 import 'package:private_gallery_app/src/api/local_api_client.dart';
@@ -508,6 +509,58 @@ void main() {
 
       expect(await file.readAsBytes(), [1, 2, 3, 4]);
       expect(httpClient.ranges, ['bytes=2-4194305']);
+      expect(await File('${destination.path}.part').exists(), isFalse);
+    },
+  );
+
+  test(
+    'streams file originals and verifies hash before replacing destination',
+    () async {
+      final body = const <int>[1, 2, 3, 4];
+      final client = LocalApiClient(
+        httpClient: _FileOriginalClient(body),
+        baseUri: Uri.parse('http://127.0.0.1:4821'),
+      );
+      final tempDir = await Directory.systemTemp.createTemp('pg-file-export-');
+      addTearDown(() => tempDir.delete(recursive: true));
+      final destination = File('${tempDir.path}/original.pdf');
+      await destination.writeAsString('old copy');
+
+      final saved = await client.downloadFileOriginalToFile(
+        entryId: 'entry-1',
+        destination: destination,
+        expectedBytes: body.length,
+        expectedHash: sha256.convert(body).toString(),
+      );
+
+      expect(await saved.readAsBytes(), body);
+      expect(await File('${destination.path}.part').exists(), isFalse);
+    },
+  );
+
+  test(
+    'preserves destination when streamed file hash does not match',
+    () async {
+      final client = LocalApiClient(
+        httpClient: _FileOriginalClient(const [1, 2, 3, 4]),
+        baseUri: Uri.parse('http://127.0.0.1:4821'),
+      );
+      final tempDir = await Directory.systemTemp.createTemp('pg-file-export-');
+      addTearDown(() => tempDir.delete(recursive: true));
+      final destination = File('${tempDir.path}/original.pdf');
+      await destination.writeAsString('known good copy');
+
+      await expectLater(
+        client.downloadFileOriginalToFile(
+          entryId: 'entry-1',
+          destination: destination,
+          expectedBytes: 4,
+          expectedHash: 'wrong-hash',
+        ),
+        throwsA(isA<SocketException>()),
+      );
+
+      expect(await destination.readAsString(), 'known good copy');
       expect(await File('${destination.path}.part').exists(), isFalse);
     },
   );
@@ -1130,6 +1183,24 @@ class _MobileSyncJsonClient extends http.BaseClient {
       Stream<List<int>>.value(utf8.encode(jsonEncode(body))),
       HttpStatus.ok,
       headers: const {'content-type': 'application/json'},
+    );
+  }
+}
+
+class _FileOriginalClient extends http.BaseClient {
+  _FileOriginalClient(this.body);
+
+  final List<int> body;
+
+  @override
+  Future<http.StreamedResponse> send(http.BaseRequest request) async {
+    expect(request.url.path, '/files/entry-1/original');
+    expect(request.headers['range'], 'bytes=0-4194303');
+    return http.StreamedResponse(
+      Stream<List<int>>.value(body),
+      206,
+      contentLength: body.length,
+      headers: {'content-range': 'bytes 0-${body.length - 1}/${body.length}'},
     );
   }
 }

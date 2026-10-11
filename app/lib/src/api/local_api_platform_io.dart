@@ -64,6 +64,32 @@ Future<LocalApiFile> localApiRenameFile(
   return file.rename(destination.path);
 }
 
+Stream<List<int>> localApiOpenRead(LocalApiFile file) => file.openRead();
+
+Future<void> localApiCommitDownloadedFile(
+  LocalApiFile temporary,
+  LocalApiFile destination,
+) async {
+  final backup = File(
+    '${destination.path}.previous.${DateTime.now().microsecondsSinceEpoch}',
+  );
+  final hadDestination = await destination.exists();
+  if (hadDestination) {
+    await destination.rename(backup.path);
+  }
+  try {
+    await temporary.rename(destination.path);
+  } catch (_) {
+    if (hadDestination && await backup.exists()) {
+      await backup.rename(destination.path);
+    }
+    rethrow;
+  }
+  if (hadDestination && await backup.exists()) {
+    await backup.delete();
+  }
+}
+
 Future<int> localApiWriteStreamToFile(
   Stream<List<int>> stream,
   LocalApiFile file, {

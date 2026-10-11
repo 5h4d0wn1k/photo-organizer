@@ -61,6 +61,17 @@ Future<LocalApiFile> localApiRenameFile(
   throw _unsupportedFileStreaming();
 }
 
+Stream<List<int>> localApiOpenRead(LocalApiFile file) {
+  throw _unsupportedFileStreaming();
+}
+
+Future<void> localApiCommitDownloadedFile(
+  LocalApiFile temporary,
+  LocalApiFile destination,
+) {
+  throw _unsupportedFileStreaming();
+}
+
 Future<int> localApiWriteStreamToFile(
   Stream<List<int>> stream,
   LocalApiFile file, {
