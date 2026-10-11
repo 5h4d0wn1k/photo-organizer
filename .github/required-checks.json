@@ -17,6 +17,11 @@
       "why": "Secret scan, dependency audit, SBOM. Security defects get highest priority by repo principle."
     },
     {
+      "context": "Encryption durability",
+      "source": "ci.yml job 'encryption-durability-gate'",
+      "why": "Requires native crash-recovery tests on both macOS and Windows before encrypted database durability changes merge."
+    },
+    {
       "context": "Release gate (artifact + signing policy)",
       "source": "ci.yml job 'release-gate', required by PR #100",
       "why": "The gate that decides what ships must never be advisory: this one context fans out over every platform artifact leg and the signing policy, and fails unless all of them pass."
@@ -28,6 +33,10 @@
     }
   ],
   "advisory": [
+    {
+      "context": "Encryption durability (${{ matrix.os }})",
+      "reason": "Platform matrix legs are collected by the required Encryption durability aggregate, which fails unless every native filesystem leg succeeds."
+    },
     {
       "context": "Release gate suite",
       "reason": "The release-gate matrix legs (one suite per runner). Not required individually: the aggregate `Release gate (artifact + signing policy)` is the single required context and fails unless every leg succeeds, so adding a suite never needs a ruleset change."

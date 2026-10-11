@@ -46,6 +46,46 @@ jobs:
             fi
           done
 
+  encryption-durability:
+    name: Encryption durability (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 50
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, windows-2022]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Prepare native dependencies for Windows durability tests
+        if: matrix.os == 'windows-2022'
+        run: cargo check --locked --profile test --tests -p native_core
+      - name: Stage OpenSSL symbols beside the Rust test link inputs
+        if: matrix.os == 'windows-2022'
+        shell: pwsh
+        run: ./scripts/windows_stage_openssl_pdb.ps1
+      - name: Test encryption activation and crash recovery on the native filesystem
+        run: cargo test --locked -p native_core security::tests
+
+  encryption-durability-gate:
+    name: Encryption durability
+    if: ${{ always() }}
+    needs: encryption-durability
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require every native durability test leg
+        env:
+          DURABILITY_RESULT: ${{ needs.encryption-durability.result }}
+        run: |
+          set -euo pipefail
+          if [[ "${DURABILITY_RESULT}" != "success" ]]; then
+            printf '::error::native encryption durability checks did not all pass (result: %s)\n' "${DURABILITY_RESULT}" >&2
+            exit 1
+          fi
+          printf 'all native encryption durability checks passed\n'
+
   flutter:
     name: Flutter app
     runs-on: ubuntu-24.04

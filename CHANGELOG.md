@@ -197,6 +197,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Encrypted database activation now stages and verifies recovery copies before
+  publishing encryption state, and startup fails closed when the database and
+  state disagree. Recovery candidates are integrity-checked before use or
+  cleanup, so interrupted activation cannot silently replace current plaintext
+  data with stale contents or discard the only valid recovery copy.
 - The documentation claimed configuration prefixes (`PG_*`) that no longer
   exist anywhere in the tree, described the application-menu entry as still
   using the legacy *Private Gallery* name, and listed roughly a third of the
