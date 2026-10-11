@@ -12243,6 +12243,13 @@ mod tests {
 
         {
             let mut state_b = service_b.state.write().await;
+            state_b
+                .vaults
+                .iter_mut()
+                .find(|vault| vault.id == source_vault.id)
+                .expect("mirrored source vault")
+                .storage_policy
+                .min_free_space_bytes = 0;
             let local_b = local_device_id(&state_b).expect("local b before endpoint");
             let device = state_b
                 .devices
@@ -12251,6 +12258,7 @@ mod tests {
                 .expect("local b device");
             device.trust_level = DeviceTrustLevel::StorageOnly;
             device.storage_profile.accepts_storage = true;
+            device.storage_profile.reserved_bytes = 0;
             for member in state_b
                 .vault_members
                 .iter_mut()
@@ -12373,6 +12381,17 @@ mod tests {
             )
             .await
             .expect("single remote replica policy");
+        {
+            let mut state_a = service_a.state.write().await;
+            let local_a = local_device_id(&state_a).expect("local a");
+            state_a
+                .devices
+                .iter_mut()
+                .find(|device| device.id == local_a)
+                .expect("local a device")
+                .storage_profile
+                .reserved_bytes = 0;
+        }
         let evicted = service_a
             .evict_local_asset(imported.asset.id)
             .await
