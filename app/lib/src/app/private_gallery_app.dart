@@ -584,6 +584,8 @@ class _GalleryWorkspaceShell extends StatelessWidget {
       PlacesScreen(
         places: workspace.dashboard.places,
         libraryRoot: workspace.settings.libraryRoot,
+        databaseEncrypted:
+            workspace.privacyStatus?.encryption.databaseEncryptionState,
         onFetchPlaceAssets: repository.fetchPlaceAssets,
         onRebuildPlaces: onRebuildPlaces,
         onCorrectPlace: onCorrectPlace,

@@ -9,6 +9,7 @@ class PlacesScreen extends StatelessWidget {
     super.key,
     required this.places,
     required this.libraryRoot,
+    required this.databaseEncrypted,
     required this.onFetchPlaceAssets,
     required this.onRebuildPlaces,
     required this.onCorrectPlace,
@@ -16,6 +17,7 @@ class PlacesScreen extends StatelessWidget {
 
   final List<PlaceCluster> places;
   final String libraryRoot;
+  final bool? databaseEncrypted;
   final Future<List<Asset>> Function(String id) onFetchPlaceAssets;
   final Future<void> Function() onRebuildPlaces;
   final Future<void> Function(
@@ -24,7 +26,8 @@ class PlacesScreen extends StatelessWidget {
     double? latitude,
     double? longitude,
     bool? hideExactGps,
-  }) onCorrectPlace;
+  })
+  onCorrectPlace;
 
   @override
   Widget build(BuildContext context) {
@@ -150,10 +153,7 @@ class PlacesScreen extends StatelessWidget {
                         '${assets.length} local asset(s). Places are coarse/private by default and do not use online geocoding.',
                       ),
                       const SizedBox(height: 16),
-                      AssetGrid(
-                        assets: assets,
-                        libraryRoot: libraryRoot,
-                      ),
+                      AssetGrid(assets: assets, libraryRoot: libraryRoot),
                     ],
                   ),
                 );
@@ -235,12 +235,29 @@ class PlacesScreen extends StatelessWidget {
                       contentPadding: EdgeInsets.zero,
                       value: hideExactGps,
                       title: const Text('Hide exact GPS from app features'),
-                      subtitle: const Text(
-                        'Keeps your place label and hides coordinates from app '
-                        'features. Coordinates remain in the encrypted catalog '
-                        'and original files; exporting or sharing originals may '
-                        'reveal GPS metadata.',
-                      ),
+                      subtitle: Text(switch (databaseEncrypted) {
+                        true =>
+                          'Keeps your place label and hides coordinates '
+                              'from app features. Coordinates remain in the '
+                              'encrypted local catalog and original files; '
+                              'exporting or sharing originals may reveal GPS '
+                              'metadata.',
+                        false =>
+                          'Keeps your place label and hides coordinates '
+                              'from app features. Coordinates remain in the '
+                              'local catalog and original files. Database '
+                              'encryption is off, so catalog coordinates are '
+                              'not protected at rest; activate it in Settings. '
+                              'Exporting or sharing originals may also reveal '
+                              'GPS metadata.',
+                        null =>
+                          'Keeps your place label and hides coordinates '
+                              'from app features. Coordinates remain in the '
+                              'local catalog and original files. Encryption '
+                              'status is unavailable; check Settings before '
+                              'relying on at-rest protection. Exporting or '
+                              'sharing originals may reveal GPS metadata.',
+                      }),
                       onChanged: (value) {
                         setDialogState(() => hideExactGps = value ?? true);
                       },
