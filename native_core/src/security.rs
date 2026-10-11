@@ -1740,12 +1740,12 @@ mod tests {
         cleanup(&root);
     }
 
-    /// Permissions on the state file are a security property, so the atomic
-    /// write must not quietly widen them. Two directions: a file an operator
-    /// has tightened keeps its mode, and a brand-new file is created 0600
-    /// rather than inheriting the process umask.
+    /// Replacing existing state must work on every supported platform.
+    /// On Unix, permissions are also a security property: a file an operator
+    /// has tightened keeps its mode, and a new file is created 0600 rather
+    /// than inheriting the process umask.
     #[test]
-    fn atomic_write_preserves_tight_permissions_and_creates_private_ones() {
+    fn atomic_write_replaces_existing_state_and_preserves_unix_mode() {
         let (_config, root) = test_config("state-permissions");
         fs::create_dir_all(&root).expect("root must be creatable");
         let target = root.join("state.json");
@@ -1766,7 +1766,13 @@ mod tests {
 
             fs::set_permissions(&target, fs::Permissions::from_mode(0o600))
                 .expect("tighten must work");
-            atomic_write_file(&target, b"{\"second\":true}").expect("rewrite must succeed");
+        }
+
+        atomic_write_file(&target, b"{\"second\":true}").expect("rewrite must succeed");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
             let mode = fs::metadata(&target)
                 .expect("metadata")
                 .permissions()
