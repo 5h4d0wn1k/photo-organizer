@@ -14515,6 +14515,7 @@ mod tests {
         let source_root = runtime_root.join("source");
         fs::create_dir_all(&source_root).expect("source dir");
         fs::write(source_root.join("a.jpg"), b"image-a").expect("write file");
+        fs::write(source_root.join("b.jpg"), b"image-b").expect("write second file");
         let corrected_at = chrono::DateTime::parse_from_rfc3339("2024-02-03T04:05:06Z")
             .expect("date")
             .with_timezone(&Utc);
@@ -14536,7 +14537,7 @@ mod tests {
             .scan_import_source(ScanImportSourceRequest {
                 source_path: source_root.to_string_lossy().to_string(),
                 source_kind: ImportSourceKind::Folder,
-                recursive: false,
+                recursive: true,
                 import_mode: Some(ImportMode::Reference),
                 add_as_watch_folder: false,
                 place_hint: Some("Old place".to_string()),
@@ -14561,9 +14562,14 @@ mod tests {
             .await
             .expect("correct date");
         assert_eq!(metadata.captured_at_source, MetadataSource::Manual);
-        assert_eq!(
-            service.timeline().await.buckets[0].assets[0].captured_at,
-            corrected_at
+        assert!(
+            service
+                .timeline()
+                .await
+                .buckets
+                .iter()
+                .flat_map(|bucket| &bucket.assets)
+                .any(|asset| asset.id == asset_id && asset.captured_at == corrected_at)
         );
 
         let place_id = service.places().await[0].id;
@@ -14581,6 +14587,7 @@ mod tests {
             .await
             .expect("correct place");
         assert_eq!(place.label, "Home");
+        assert_eq!(place.asset_ids.len(), 2);
         assert_eq!(place.centroid_latitude, None);
         assert_eq!(place.centroid_longitude, None);
         assert_eq!(service.places().await[0].label, "Home");
@@ -14588,9 +14595,51 @@ mod tests {
             .place_assets(place.id)
             .await
             .expect("hidden-place assets");
-        assert_eq!(
-            serde_json::to_value(&assets[0]).expect("serialize asset")["metadata"]["geo"],
-            serde_json::Value::Null
+        assert_eq!(assets.len(), 2);
+        for asset in &assets {
+            assert_eq!(
+                serde_json::to_value(asset).expect("serialize asset")["metadata"]["geo"],
+                serde_json::Value::Null
+            );
+        }
+
+        let hidden_search = service
+            .search(SearchQuery {
+                text: None,
+                people: None,
+                places: Some("Home".to_string()),
+                events: None,
+                workspace: None,
+                client: None,
+                project: None,
+                topic: None,
+                source_folder: None,
+                device: None,
+                media_kind: None,
+                tags: None,
+                favorite: None,
+                from_date: None,
+                to_date: None,
+                include_archived: false,
+                limit: None,
+            })
+            .await;
+        assert_eq!(hidden_search.assets.len(), 2);
+        for asset in &hidden_search.assets {
+            assert_eq!(
+                serde_json::to_value(asset).expect("serialize search asset")["metadata"]["geo"],
+                serde_json::Value::Null
+            );
+        }
+        let serialized_timeline =
+            serde_json::to_value(service.timeline().await).expect("serialize timeline projection");
+        assert!(
+            serialized_timeline["buckets"]
+                .as_array()
+                .expect("timeline buckets")
+                .iter()
+                .flat_map(|bucket| bucket["assets"].as_array().expect("bucket assets"))
+                .all(|asset| asset["metadata"]["geo"].is_null())
         );
 
         let previous_hidden_geo = assets[0]
@@ -14629,11 +14678,13 @@ mod tests {
             .place_assets(place_after_rebuild.id)
             .await
             .expect("assets after metadata rebuild");
-        assert_eq!(
-            serde_json::to_value(&assets_after_rebuild[0]).expect("serialize rebuilt asset")["metadata"]
-                ["geo"],
-            serde_json::Value::Null
-        );
+        assert_eq!(assets_after_rebuild.len(), 2);
+        for asset in &assets_after_rebuild {
+            assert_eq!(
+                serde_json::to_value(asset).expect("serialize rebuilt asset")["metadata"]["geo"],
+                serde_json::Value::Null
+            );
+        }
 
         let restarted = GalleryService::new(config).expect("restart service");
         let place_after_restart = restarted
@@ -14648,11 +14699,51 @@ mod tests {
             .place_assets(place_after_restart.id)
             .await
             .expect("persisted hidden-place assets");
-        assert_eq!(
-            serde_json::to_value(&assets_after_restart[0]).expect("serialize persisted asset")["metadata"]
-                ["geo"],
-            serde_json::Value::Null
-        );
+        assert_eq!(assets_after_restart.len(), 2);
+        for asset in &assets_after_restart {
+            assert_eq!(
+                serde_json::to_value(asset).expect("serialize persisted asset")["metadata"]["geo"],
+                serde_json::Value::Null
+            );
+        }
+
+        restarted
+            .rebuild_metadata()
+            .await
+            .expect("rebuild after restart");
+        let place_after_restart_rebuild = restarted
+            .places()
+            .await
+            .into_iter()
+            .find(|place| place.label == "Home")
+            .expect("hidden place after post-restart rebuild");
+        assert_eq!(place_after_restart_rebuild.centroid_latitude, None);
+        assert_eq!(place_after_restart_rebuild.centroid_longitude, None);
+
+        let visible_place = restarted
+            .correct_place(
+                place_after_restart_rebuild.id,
+                CorrectPlaceRequest {
+                    label: "Home".to_string(),
+                    latitude: None,
+                    longitude: None,
+                    hide_exact_gps: Some(false),
+                    reason: Some("show exact GPS again".to_string()),
+                },
+            )
+            .await
+            .expect("unhide exact GPS");
+        assert!(visible_place.centroid_latitude.is_some());
+        assert!(visible_place.centroid_longitude.is_some());
+        let visible_assets = restarted
+            .place_assets(visible_place.id)
+            .await
+            .expect("assets after unhide");
+        for asset in &visible_assets {
+            let serialized = serde_json::to_value(asset).expect("serialize visible asset");
+            assert!(serialized["metadata"]["geo"]["latitude"].is_number());
+            assert!(serialized["metadata"]["geo"]["longitude"].is_number());
+        }
     }
 
     #[tokio::test]
