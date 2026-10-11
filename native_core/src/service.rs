@@ -3674,25 +3674,15 @@ impl GalleryService {
                 .cloned();
             let extracted = metadata::extract_media_metadata(&source_path, &[], asset.captured_at);
             asset.captured_at = extracted.captured_at;
-            if let Some(previously_hidden_geo) = &previously_hidden_geo {
-                if asset.place_hint.as_deref()
-                    == Some(&gps_place_hint(
-                        previously_hidden_geo.latitude,
-                        previously_hidden_geo.longitude,
-                    ))
-                {
-                    asset.place_hint = None;
-                }
-            } else if asset.place_hint.is_none() {
+            if previously_hidden_geo.is_none() && asset.place_hint.is_none() {
                 asset.place_hint = metadata::coarse_place_label(&extracted);
             }
             let mut rebuilt_metadata = extracted.into_asset_metadata(asset.id);
-            if let Some(previously_hidden_geo) = previously_hidden_geo {
-                match rebuilt_metadata.geo.as_mut() {
-                    Some(geo) => geo.exact_hidden = true,
-                    None => rebuilt_metadata.geo = Some(previously_hidden_geo),
-                }
-            }
+            preserve_hidden_geo(
+                previously_hidden_geo,
+                &mut asset.place_hint,
+                &mut rebuilt_metadata.geo,
+            );
             asset.metadata = Some(rebuilt_metadata);
         }
         refresh_derived_views(&mut state);
@@ -9566,6 +9556,30 @@ fn gps_place_hint(latitude: f64, longitude: f64) -> String {
     )
 }
 
+fn preserve_hidden_geo(
+    previously_hidden_geo: Option<crate::domain::GeoTag>,
+    place_hint: &mut Option<String>,
+    rebuilt_geo: &mut Option<crate::domain::GeoTag>,
+) {
+    let Some(previously_hidden_geo) = previously_hidden_geo else {
+        return;
+    };
+
+    if place_hint.as_deref()
+        == Some(&gps_place_hint(
+            previously_hidden_geo.latitude,
+            previously_hidden_geo.longitude,
+        ))
+    {
+        *place_hint = None;
+    }
+
+    match rebuilt_geo {
+        Some(geo) => geo.exact_hidden = true,
+        None => *rebuilt_geo = Some(previously_hidden_geo),
+    }
+}
+
 fn refresh_missing_derived_views(state: &mut LibraryState) {
     if state.assets.is_empty() {
         return;
@@ -14559,6 +14573,29 @@ mod tests {
             serde_json::to_value(&assets[0]).expect("serialize asset")["metadata"]["geo"],
             serde_json::Value::Null
         );
+
+        let previous_hidden_geo = assets[0]
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.geo.as_ref())
+            .expect("hidden local geo remains in memory")
+            .clone();
+        let mut newly_extracted_geo = previous_hidden_geo.clone();
+        newly_extracted_geo.latitude = 13.34;
+        newly_extracted_geo.exact_hidden = false;
+        let mut stale_gps_label = Some(super::gps_place_hint(
+            previous_hidden_geo.latitude,
+            previous_hidden_geo.longitude,
+        ));
+        let mut rebuilt_geo = Some(newly_extracted_geo);
+        super::preserve_hidden_geo(
+            Some(previous_hidden_geo),
+            &mut stale_gps_label,
+            &mut rebuilt_geo,
+        );
+        assert_eq!(stale_gps_label, None);
+        assert_eq!(rebuilt_geo.as_ref().map(|geo| geo.latitude), Some(13.34));
+        assert!(rebuilt_geo.is_some_and(|geo| geo.exact_hidden));
 
         service.rebuild_metadata().await.expect("rebuild metadata");
         let place_after_rebuild = service
