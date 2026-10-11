@@ -45,6 +45,8 @@ jobs:
               exit 1
             fi
           done
+      - name: Iroh 0.98.2 endpoint and 1.x transfer contract test
+        run: bash scripts/tests/iroh_mixed_version_sync_test.sh
 
   encryption-durability:
     name: Encryption durability (${{ matrix.os }})

@@ -5,8 +5,7 @@
 [advisories]
 ignore = []
 
-# cargo-audit still reports non-security supply-chain warnings:
-# - paste 1.0.15 is unmaintained and used as a compile-time macro dependency.
-# - yoke-derive 0.8.3 is yanked; it was already present in the base lockfile.
-# Neither is suppressed here. Revisit them when an upstream-compatible update
-# is available.
+# cargo-audit still reports a non-security supply-chain warning: paste 1.0.15
+# is unmaintained and used as a compile-time macro dependency by netwatch's
+# netlink stack. This remains visible and is not suppressed. The Iroh update
+# also advanced yoke-derive from yanked 0.8.3 to 0.8.4.
