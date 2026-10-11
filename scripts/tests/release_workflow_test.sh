@@ -1268,6 +1268,71 @@ SHARD_SUITE
         "the probe runner exited ${shard_logs_probe_rc}: $(cat "${shard_logs_probe_output}")"
     fi
 
+    # The combined evidence file is derived after every shard completes. If it
+    # cannot be written, a shard's degraded marker must not turn into a green
+    # result just because grep could not read the absent output.
+    combine_failure_logs="${shard_root}/combine-failure-logs"
+    combine_failure_output="${shard_root}/combine-failure-output"
+    mkdir -p "${combine_failure_logs}/ios_release_artifact_mutation_test.combined.log"
+    cat >"${shard_suite}" <<'SHARD_SUITE'
+#!/usr/bin/env bash
+if [[ "${MUTATION_SHARD}" == "5" ]]; then
+  printf 'RELEASE_GATE_SUITE_DEGRADED: probe shard\n'
+fi
+exit 0
+SHARD_SUITE
+    if RELEASE_GATE_LOG_DIR="${combine_failure_logs}" bash "${shard_runner}" \
+      >"${combine_failure_output}" 2>&1; then
+      bad "a failed combined-log write fails the sharded suite" \
+        "the runner reported PASS without combined evidence"
+    elif grep -qF "cannot combine the ios_release_artifact_mutation_test.sh shard logs" \
+      "${combine_failure_output}" \
+      && grep -qF "FAIL ios_release_artifact_mutation_test.sh (8 shards)" \
+      "${combine_failure_output}"; then
+      ok "a failed combined-log write fails the sharded suite"
+    else
+      bad "a failed combined-log write fails the sharded suite" \
+        "the runner failed without a clear combined-log diagnostic"
+    fi
+
+    # A successful write can still fail its evidence scan. Simulate grep's read
+    # error only for the combined log and require the driver to report failure,
+    # not confuse an I/O error with the clean no-marker result (grep exit 1).
+    scan_failure_logs="${shard_root}/scan-failure-logs"
+    scan_failure_bin="${shard_root}/scan-failure-bin"
+    scan_failure_output="${shard_root}/scan-failure-output"
+    mkdir -p "${scan_failure_logs}" "${scan_failure_bin}"
+    real_grep="$(command -v grep)"
+    cat >"${scan_failure_bin}/grep" <<'GREP_SHIM'
+#!/usr/bin/env bash
+for argument in "$@"; do
+  if [[ "${argument}" == *.combined.log ]]; then
+    exit 2
+  fi
+done
+exec "${REAL_GREP}" "$@"
+GREP_SHIM
+    chmod +x "${scan_failure_bin}/grep"
+    cat >"${shard_suite}" <<'SHARD_SUITE'
+#!/usr/bin/env bash
+printf 'clean shard %s ran\n' "${MUTATION_SHARD}"
+exit 0
+SHARD_SUITE
+    if PATH="${scan_failure_bin}:${PATH}" REAL_GREP="${real_grep}" \
+      RELEASE_GATE_LOG_DIR="${scan_failure_logs}" bash "${shard_runner}" \
+      >"${scan_failure_output}" 2>&1; then
+      bad "a failed combined-log scan fails the sharded suite" \
+        "the runner reported PASS after grep failed to scan its evidence"
+    elif grep -qF "cannot scan the ios_release_artifact_mutation_test.sh result log" \
+      "${scan_failure_output}" \
+      && grep -qF "FAIL ios_release_artifact_mutation_test.sh (8 shards)" \
+      "${scan_failure_output}"; then
+      ok "a failed combined-log scan fails the sharded suite"
+    else
+      bad "a failed combined-log scan fails the sharded suite" \
+        "the runner failed without a clear scan diagnostic"
+    fi
+
     # A path that is a file cannot be a log directory. The driver must reject it
     # before any worker starts instead of waiting for status markers it cannot
     # write.
