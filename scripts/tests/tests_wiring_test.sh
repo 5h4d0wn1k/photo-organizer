@@ -434,5 +434,122 @@ else
   ok "every release-artifact mutation harness declares a MIN_MUTATIONS floor"
 fi
 
+# The macOS gate's 45 declarations are each an independent protection the
+# release workflow relies on. The floor must cover the complete declared set:
+# lowering it must not turn future deletion of declarations into a green check.
+macos_mutation_harness="${TESTS_DIR}/macos_release_artifact_mutation_test.sh"
+macos_floor="$(sed -n 's/^MIN_MUTATIONS=//p' "${macos_mutation_harness}" | head -1)"
+macos_declared="$(grep -c '^mutate ' "${macos_mutation_harness}" || true)"
+if [[ "${macos_floor}" =~ ^[0-9]+$ && "${macos_declared}" =~ ^[0-9]+$ ]] \
+  && ((macos_floor >= macos_declared)); then
+  ok "the macOS mutation floor covers every declared mutation (${macos_floor} >= ${macos_declared})"
+else
+  no "the macOS mutation floor covers every declared mutation" \
+    "floor=${macos_floor:-<missing>} declared=${macos_declared:-<unknown>}"
+fi
+
+# --- mutation harnesses must be able to be signalled -------------------------
+# Every release-artifact mutation harness traps INT/TERM/HUP so its private tree is
+# not abandoned. Those handlers must EXIT, and that distinction is the whole point:
+# bash runs a signal handler and then *resumes the script*. So the shape
+# `trap cleanup EXIT INT TERM HUP` deletes the harness's own tree and then keeps
+# going, and every later mutation operates on files that no longer exist.
+#
+# The residue is a verdict the harness never established. On the macOS sibling
+# (issue #172) a signalled shard reported four mutations as `COULD NOT APPLY -- `
+# with an empty reason and ended with "restoring the originals did not return the
+# suite to green" -- read naively, four mutations that do not bite. It also meant a
+# cancelled job could not honour the cancellation and left orphans behind, which is
+# exactly what the failed #164 CI runs showed.
+#
+# Asserted structurally across all three harnesses so the next one to be written
+# cannot reintroduce it. A combined `trap ... EXIT INT TERM HUP` line is the exact
+# shape being rejected, so it is what is matched.
+non_exiting=""
+for harness in "${TESTS_DIR}"/*_release_artifact_mutation_test.sh; do
+  [[ -e "${harness}" ]] || continue
+  if grep -qE "^trap .*EXIT INT TERM HUP" "${harness}"; then
+    non_exiting+="$(basename "${harness}") "
+  fi
+done
+if [[ -n "${non_exiting// /}" ]]; then
+  no "every mutation harness's signal handler exits instead of resuming the script" \
+    "combined EXIT+INT+TERM+HUP trap (a signalled shard deletes its own tree and then keeps going): ${non_exiting}"
+else
+  ok "every mutation harness's signal handler exits instead of resuming the script"
+fi
+
+# And each must actually reach an exit on a signal, asserted by running them.
+# `--list` exits before the tree is built, so the harness is started the way CI
+# starts it and then signalled; the point is the exit status and the absence of a
+# verdict, not the mutations.
+unstoppable=""
+for harness in "${TESTS_DIR}"/*_release_artifact_mutation_test.sh; do
+  [[ -e "${harness}" ]] || continue
+  name="$(basename "${harness}")"
+  probe_out="$(mktemp)"
+  # Shard so the harness has exactly one mutation to get through. A full pass is
+  # ~97 minutes of work, so a harness that swallows the signal and limps on would
+  # hang this test rather than fail it -- the probe has to stay cheap under the
+  # very mutation it is designed to catch.
+  # The signal has to reach the harness's *process group*, not the harness's own
+  # pid. A harness spends the run blocked in `wait` on a foreground child (the
+  # suite, ~120s per mutation), and bash does not run a trap while it is waiting
+  # on a foreground child -- it defers it until the child returns. Signalling the
+  # parent alone therefore leaves it sitting there for the whole child, which is
+  # indistinguishable from a harness that cannot be signalled.
+  #
+  # This is not a subtle timing difference that happened to pass locally: it is
+  # exactly what CI reported, all three harnesses as `rc=still-running`.
+  #
+  # The Python helper starts a POSIX session so `kill -TERM -PID` hits the
+  # harness and everything it spawned on Linux and BSD/macOS. The child dies,
+  # the wait is interrupted, and the trap runs -- a real cancellation path.
+  python3 "${TESTS_DIR}/run_in_process_group.py" env \
+    MUTATION_SHARDS=45 MUTATION_SHARD=0 \
+    bash "${harness}" >"${probe_out}" 2>&1 &
+  probe_pid=$!
+  # Let it get as far as the first mutation, so the signal lands on a harness that
+  # is genuinely mid-run rather than one that has not started working yet.
+  sleep 5
+  kill -TERM -"${probe_pid}" 2>/dev/null || kill -TERM "${probe_pid}" 2>/dev/null || true
+  # Bounded wait: a harness that cannot be signalled must fail here, not hang the
+  # suite. SIGKILL afterwards so a runaway probe cannot outlive the check.
+  probe_rc=""
+  probe_ran_away=no
+  for _ in $(seq 1 20); do
+    if ! kill -0 "${probe_pid}" 2>/dev/null; then
+      probe_ran_away=no
+      break
+    fi
+    probe_ran_away=yes
+    sleep 1
+  done
+  if [[ "${probe_ran_away}" == "yes" ]]; then
+    probe_rc="still-running"
+    kill -KILL -"${probe_pid}" 2>/dev/null || kill -KILL "${probe_pid}" 2>/dev/null || true
+  fi
+  if wait "${probe_pid}" 2>/dev/null; then
+    probe_rc="${probe_rc:-0}"
+  else
+    probe_rc="${probe_rc:-$?}"
+  fi
+  # 143 = 128 + SIGTERM. Anything else means the signal was swallowed (the old
+  # single-trap shape resumed and carried on), or the harness died another way.
+  if [[ "${probe_rc}" != "143" ]]; then
+    unstoppable+="${name}(rc=${probe_rc}) "
+  fi
+  if grep -aqE 'COULD NOT APPLY|NON-BITING|mutations: [0-9]+ run' "${probe_out}"; then
+    unstoppable+="${name}(printed a verdict after a signal) "
+  fi
+  rm -f "${probe_out}"
+done
+if [[ -n "${unstoppable// /}" ]]; then
+  no "every mutation harness exits 143 on SIGTERM without printing a verdict" \
+    "${unstoppable}"
+else
+  ok "every mutation harness exits 143 on SIGTERM without printing a verdict"
+fi
+
 printf '  %d passed, %d failed\n' "${PASS_COUNT}" "${FAIL_COUNT}"
 [[ ${FAIL_COUNT} -eq 0 ]]

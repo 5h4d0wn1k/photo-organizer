@@ -88,7 +88,32 @@ WORK="$(mktemp -d)"
 # The trap only deletes the private tree: the run never mutates anything outside
 # it, so there is no worktree snapshot to restore even if the shard is killed.
 # (restore() still exists -- it resets the copy between mutations in one shard.)
-trap 'rm -rf "${WORK}"' EXIT INT TERM HUP
+#
+# The signal handlers MUST exit, and that is the whole point of splitting this
+# out. A single `trap 'rm -rf "${WORK}"' EXIT INT TERM HUP` is a trap that lies:
+# for EXIT that is the correct handler, but bash runs a signal handler and then
+# *resumes the script*. So a signalled shard deleted its own tree and carried on,
+# and every later mutation then reported itself as `COULD NOT APPLY -- ` with an
+# empty reason (the reason file lived in the tree that had just been removed),
+# followed by "restoring the originals did not return the suite to green". Read
+# naively that says four mutations do not bite; they were never tested. It also
+# meant a cancelled job could not honour the cancellation and left orphans behind.
+#
+# So: normal exit cleans up and reports; a signal cleans up, then exits 128+signo
+# WITHOUT printing a verdict. A shard that did not finish must never be able to
+# say anything that could be read as a result.
+on_signal() {
+  local name="$1" signo="$2"
+  trap - EXIT INT TERM HUP
+  rm -rf "${WORK}"
+  printf 'FATAL: received signal %s; this shard did not finish and reports no verdict\n' \
+    "${name}" >&2
+  exit "$((128 + signo))"
+}
+trap 'rm -rf "${WORK}"' EXIT
+trap 'on_signal INT 2' INT
+trap 'on_signal TERM 15' TERM
+trap 'on_signal HUP 1' HUP
 
 # The whole `scripts/` tree is COPIED and mutated in place.
 #
@@ -177,7 +202,7 @@ pass_count() {
 # never read as a pass. DECLARED_MUTATIONS counts every declaration before any
 # shard filtering, so a shard that runs zero mutations and an unsharded run that
 # lost one are both caught.
-MIN_MUTATIONS=36
+MIN_MUTATIONS=45
 DECLARED_MUTATIONS=0
 
 MUTATIONS_RUN=0
@@ -229,7 +254,23 @@ mutate() {
   MUTATIONS_RUN=$((MUTATIONS_RUN + 1))
 
   if ! apply "${target}" "${old}" "${new}" 2>"${WORK}/apply.err"; then
-    mismatches+=("${name}: COULD NOT APPLY -- $(tr '\n' ' ' <"${WORK}/apply.err")")
+    # An empty reason here is not cosmetic. apply() reports *why* it could not
+    # substitute the needle, and reading that reason is the only way to tell a
+    # genuine drift (the anchor moved, so this mutation needs re-anchoring) from
+    # a broken run (the tree this file lives in has been removed underneath us).
+    # The second case previously printed `COULD NOT APPLY -- ` with nothing after
+    # it and was indistinguishable from the first, which is how a killed shard
+    # managed to look like four mutations that do not bite. A reason we cannot
+    # read is therefore itself a hard error, not a per-mutation note.
+    local reason
+    reason="$(tr '\n' ' ' <"${WORK}/apply.err" 2>/dev/null || true)"
+    if [[ -z "${reason// /}" ]]; then
+      printf 'FATAL: %s could not be applied and apply.err is missing or empty.\n' "${name}" >&2
+      printf '       The private tree %s is gone, so this run cannot say which\n' "${WORK}"
+      printf '       mutations bit. Re-run the shard; do not read this as a result.\n' >&2
+      exit 3
+    fi
+    mismatches+=("${name}: COULD NOT APPLY -- ${reason}")
     restore
     return
   fi
@@ -401,10 +442,138 @@ mutate "an OS-level refusal to launch is tolerated" \
 
 # Without the cold-launch assertion, `open` would merely activate an existing
 # copy and every later observation would describe a warm process.
+#
+# Repointed when the lsappinfo fix landed: the guard used to be a single
+# `if [[ -n "${asn}" ]]`, which no longer exists. This now stops the guard firing
+# at all. The other direction -- the guard firing on a reply that is not a serial
+# number -- is mutation 2 further down; a guard can be wrong in each direction and
+# one mutation cannot cover both.
 mutate "a warm launch is accepted as a cold one" \
   'a warm launch is refused because this gate requires a cold one' \
-  'if [[ -n "${asn}" ]]; then' \
-  'if false; then'
+  '  if [[ "${raw}" =~ ^ASN:0x[0-9a-fA-F]+:0x[0-9a-fA-F]+:$ ]]; then
+    fail "${APP_BUNDLE_ID} is already registered' \
+  '  if false; then
+    fail "${APP_BUNDLE_ID} is already registered'
+
+# ---------------------------------------------------------------------------
+# The `lsappinfo` query itself. These four mutations are the record of how the
+# macOS smoke gate failed in release run 37184543519: the gate aborted at the
+# "already registered with the window server" check, on an app it had just
+# installed, reporting a phantom instance. Three separate defects stacked:
+# an undocumented verb, no shape-check on the reply, and an exit status that
+# killed the gate silently. Each is listed here so none of them can come back
+# unnoticed -- an assertion nobody has seen fail is a comment.
+# ---------------------------------------------------------------------------
+
+# 1. The verb. `findLSApplication` is not a thing `lsappinfo` answers; on the
+#    26.6.2 runner it replies `Unrecognized command: findLSApplication` on
+#    *stdout*. The gate read that error text as a serial number and refused to
+#    launch an app that was not running.
+#
+#    The needle is a plain `expect_pass`, because that is what this mutation
+#    breaks: with the verb reverted, the reply is unparseable on the *healthy*
+#    path too, so the gate fails before it ever launches and every scenario that
+#    expects a pass reports a failure instead.
+mutate "the lsappinfo query reverts to the undocumented verb" \
+  'mounts the published .dmg, cold-launches, renders and passes' \
+  '"${LSAPPINFO_BIN}" find "bundleid=${APP_BUNDLE_ID}" 2>/dev/null' \
+  '"${LSAPPINFO_BIN}" findLSApplication "=${APP_BUNDLE_ID}" 2>/dev/null'
+
+# 2. No shape-check. Even with the right verb, `lsappinfo` writes some errors to
+#    stdout, so a query it declines is indistinguishable from an ASN unless the
+#    reply is matched. Without the match, an unanswerable window server is
+#    reported as "already running" -- the exact failure mode of the release run,
+#    and the one that sends an operator to kill a process that does not exist.
+#
+#    The regex is weakened to `.`, not the branch deleted, and that distinction is
+#    the whole point. Deleting the branch does NOT reproduce the defect: an
+#    unparseable reply would then fall through to the "cannot tell whether" failure,
+#    which still refuses and still tells the operator the truth. The defect only
+#    exists when something *claims* the reply is a serial number, so the mutation
+#    has to make it claim that. A mutation that passes here would have looked like
+#    coverage of this assertion while testing nothing.
+mutate "an unparseable lsappinfo reply is claimed to be a serial number" \
+  'an unanswerable window server is not reported as a warm app' \
+  '  if [[ "${raw}" =~ ^ASN:0x[0-9a-fA-F]+:0x[0-9a-fA-F]+:$ ]]; then
+    fail "${APP_BUNDLE_ID} is already registered' \
+  '  if [[ "${raw}" =~ . ]]; then
+    fail "${APP_BUNDLE_ID} is already registered'
+
+# 3. `lsappinfo_asn`'s own filter. Unreachable from the scenarios, because
+#    `assert_nothing_already_running` refuses the gate before `lsappinfo_asn` is
+#    ever called -- which is exactly why it needed its own unit assertions, and
+#    why this mutation is here: without them, deleting the filter would be
+#    invisible. The needle is one of those unit assertions.
+mutate "lsappinfo_asn passes any reply through unfiltered" \
+  'lsappinfo_asn drops a rejected query instead of passing it on' \
+  '  if [[ "${LSAPPINFO_RAW}" =~ ^ASN:0x[0-9a-fA-F]+:0x[0-9a-fA-F]+:$ ]]; then
+    printf '"'"'%s\n'"'"' "${LSAPPINFO_RAW}"' \
+  '  if true; then
+    printf '"'"'%s\n'"'"' "${LSAPPINFO_RAW}"'
+
+# 4. The exit status discarded again. `lsappinfo` exits non-zero for a query it will
+#    not answer, and `|| true` collapsed that into the same empty reply a genuinely
+#    not-running app produces -- so the cold-launch check passed precisely when it
+#    had not been performed. This is the fail-open the review found, and the needle
+#    is the assertion that a *silent* non-zero exit is refused rather than read as
+#    absence. Deliberately a different knob from the garbage-answer cases: the fake
+#    has `LSAPPINFO_ANSWER=garbage` for a refusal that prints text, and this
+#    mutation must be caught by the case that prints nothing at all.
+mutate "the lsappinfo exit status is discarded into an empty reply again" \
+  'an unanswerable window server fails rather than proving a cold launch' \
+  '  out="$("${LSAPPINFO_BIN}" find "bundleid=${APP_BUNDLE_ID}" 2>/dev/null)" || rc=$?' \
+  '  out="$("${LSAPPINFO_BIN}" find "bundleid=${APP_BUNDLE_ID}" 2>/dev/null || true)"'
+
+# 4b. The fail-closed branch itself removed. Mutation 4 alone is not enough coverage
+#     of it: that mutation still *computes* rc, it just stops consulting it. This
+#     one deletes the refusal, so a silent non-zero exit has no path to a red gate.
+mutate "the unanswerable-window-server refusal is deleted" \
+  'an unanswerable window server fails rather than proving a cold launch' \
+  '    if ((LSAPPINFO_RC != 0)); then
+      fail "could not ask the window server' \
+  '    if false; then
+      fail "could not ask the window server'
+
+# 4c. The refusal demoted to a warning: the same lost guarantee as 4b, reached a
+#     different way -- the gate carries on without having proven a cold launch.
+mutate "the unanswerable-window-server refusal is downgraded to a warning" \
+  'an unanswerable window server fails rather than proving a cold launch' \
+  '      fail "could not ask the window server' \
+  '      log "could not ask the window server'
+
+# 4d. The status-bearing call put back inside a command substitution. Not
+#     hypothetical: the first version of this fix did exactly that, the assignment
+#     died with the subshell, and the gate went red on every single run. If the
+#     globals stop surviving the call, no caller can read a status at all.
+mutate "the lsappinfo status is read inside a command substitution (subshell)" \
+  'an unanswerable window server fails rather than proving a cold launch' \
+  '  lsappinfo_query
+  raw="${LSAPPINFO_RAW}"' \
+  '  raw="$(lsappinfo_query)"
+  LSAPPINFO_RAW="${raw}"'
+
+# 4e. The gate kills a process before the cold launch. The gate'"'"'s own comments
+#     insist it never does -- terminating a stray instance would make the check pass
+#     without the launch being cold -- and before the pkill fake existed the suite
+#     could not have caught this at all, because nothing in the farm recorded it.
+mutate "the gate kills a process before the cold launch" \
+  'the gate never kills a process before the cold launch' \
+  'assert_nothing_already_running() {' \
+  'pkill -f "${APP_BUNDLE_ID}" || true
+assert_nothing_already_running() {'
+
+# 5. Backticks in the diagnostic. The refusal message quoted the `open` command
+#    inside a double-quoted string, so bash executed `open` with no arguments
+#    while assembling the message -- printing the real tool's usage dump into the
+#    CI log immediately above the failure. The gate was correct and the evidence
+#    was a lie about what it had run.
+#
+#    Asserted by observing the fake rather than by grepping the source, so it
+#    also catches the same substitution anywhere else in the message.
+mutate "the cold-launch refusal executes open while writing its own message" \
+  'the already-running refusal does not invoke open' \
+  "and 'open' would only activate it" \
+  'and `open` would only activate it'
 
 # A process that dies on start never reaches the window server.
 mutate "an app that dies on launch is tolerated" \
