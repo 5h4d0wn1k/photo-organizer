@@ -9519,6 +9519,24 @@ fn safely_move_candidate(
 
 fn refresh_derived_views(state: &mut LibraryState) {
     refresh_asset_availability(state);
+    // Older versions retained automatically generated GPS labels after hiding.
+    // Drop only those derived labels; explicit user place names remain usable.
+    for asset in &mut state.assets {
+        if let Some(geo) = asset
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.geo.as_ref())
+            && geo.exact_hidden
+            && asset.place_hint.as_deref()
+                == Some(&format!(
+                    "GPS {:.2}, {:.2}",
+                    (geo.latitude * 100.0).round() / 100.0,
+                    (geo.longitude * 100.0).round() / 100.0,
+                ))
+        {
+            asset.place_hint = None;
+        }
+    }
     state.places = derive_places(&state.assets, &state.places);
     state.events = derive_events(&state.assets, &state.places, &state.events);
 }
@@ -9527,7 +9545,16 @@ fn refresh_missing_derived_views(state: &mut LibraryState) {
     if state.assets.is_empty() {
         return;
     }
-    if state.places.is_empty() || state.events.is_empty() {
+    if state.places.is_empty()
+        || state.events.is_empty()
+        || state.assets.iter().any(|asset| {
+            asset
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.geo.as_ref())
+                .is_some_and(|geo| geo.exact_hidden)
+        })
+    {
         refresh_derived_views(state);
     }
 }
@@ -9592,7 +9619,12 @@ fn derive_places(assets: &[crate::domain::Asset], existing: &[PlaceCluster]) -> 
                 .entry(place_hint.trim().to_string())
                 .or_default()
                 .push(asset.id);
-            if let Some(geo) = asset.metadata.as_ref().and_then(|value| value.geo.as_ref()) {
+            if let Some(geo) = asset
+                .metadata
+                .as_ref()
+                .and_then(|value| value.geo.as_ref())
+                .and_then(crate::domain::GeoTag::visible)
+            {
                 coords
                     .entry(place_hint.trim().to_string())
                     .or_default()
@@ -14448,11 +14480,11 @@ mod tests {
             .expect("date")
             .with_timezone(&Utc);
 
-        let service = GalleryService::new(AppConfig {
+        let config = AppConfig {
             runtime_root: runtime_root.to_path_buf(),
             ..AppConfig::default()
-        })
-        .expect("service");
+        };
+        let service = GalleryService::new(config.clone()).expect("service");
         service
             .update_library_settings(UpdateLibrarySettingsRequest {
                 library_root: library_root.to_string_lossy().to_string(),
@@ -14510,7 +14542,36 @@ mod tests {
             .await
             .expect("correct place");
         assert_eq!(place.label, "Home");
+        assert_eq!(place.centroid_latitude, None);
+        assert_eq!(place.centroid_longitude, None);
         assert_eq!(service.places().await[0].label, "Home");
+        let assets = service
+            .place_assets(place.id)
+            .await
+            .expect("hidden-place assets");
+        assert_eq!(
+            serde_json::to_value(&assets[0]).expect("serialize asset")["metadata"]["geo"],
+            serde_json::Value::Null
+        );
+
+        let restarted = GalleryService::new(config).expect("restart service");
+        let place_after_restart = restarted
+            .places()
+            .await
+            .into_iter()
+            .find(|place| place.label == "Home")
+            .expect("persisted place");
+        assert_eq!(place_after_restart.centroid_latitude, None);
+        assert_eq!(place_after_restart.centroid_longitude, None);
+        let assets_after_restart = restarted
+            .place_assets(place_after_restart.id)
+            .await
+            .expect("persisted hidden-place assets");
+        assert_eq!(
+            serde_json::to_value(&assets_after_restart[0]).expect("serialize persisted asset")["metadata"]
+                ["geo"],
+            serde_json::Value::Null
+        );
     }
 
     #[tokio::test]

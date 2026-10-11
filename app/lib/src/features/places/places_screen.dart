@@ -198,6 +198,7 @@ class PlacesScreen extends StatelessWidget {
         return StatefulBuilder(
           builder: (context, setDialogState) {
             return AlertDialog(
+              scrollable: true,
               title: const Text('Correct place'),
               content: SizedBox(
                 width: 520,
@@ -233,7 +234,13 @@ class PlacesScreen extends StatelessWidget {
                     CheckboxListTile(
                       contentPadding: EdgeInsets.zero,
                       value: hideExactGps,
-                      title: const Text('Hide exact GPS by default'),
+                      title: const Text('Hide exact GPS from app features'),
+                      subtitle: const Text(
+                        'Keeps your place label and hides coordinates from app '
+                        'features. Coordinates remain in the encrypted catalog '
+                        'and original files; exporting or sharing originals may '
+                        'reveal GPS metadata.',
+                      ),
                       onChanged: (value) {
                         setDialogState(() => hideExactGps = value ?? true);
                       },

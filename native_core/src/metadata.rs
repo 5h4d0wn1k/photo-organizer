@@ -234,7 +234,7 @@ pub fn coarse_place_label(metadata: &ExtractedMediaMetadata) -> Option<String> {
 }
 
 pub fn coarse_place_label_for_asset(metadata: &AssetMetadata) -> Option<String> {
-    metadata.geo.as_ref().map(|geo| {
+    metadata.geo.as_ref().and_then(GeoTag::visible).map(|geo| {
         format!(
             "GPS {:.2}, {:.2}",
             round_coord(geo.latitude),
