@@ -5344,9 +5344,9 @@ impl GalleryService {
             ));
         }
 
-        // Keep the exclusive state lock for the full migration: service and sync
-        // persistence share this lock, so no in-process writer can commit between
-        // the WAL checkpoint and the atomic database replacement.
+        // Keep this service's shared state lock for the full migration: its normal
+        // persistence paths and SyncRuntime share this lock, so those writers
+        // cannot commit between the WAL checkpoint and atomic database replacement.
         let state = self.state.write().await;
         self.persist_locked_state(&state)?;
         security::activate_encryption(&self.config).map_err(security_error)

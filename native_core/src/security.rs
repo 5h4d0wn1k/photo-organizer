@@ -1898,6 +1898,7 @@ mod tests {
             .expect("replacement fixture must be written");
         let publish_called = std::cell::Cell::new(false);
         let prepare_called = std::cell::Cell::new(false);
+        let rename_called = std::cell::Cell::new(false);
         let failed_replacement = replace_file_then(
             &replacement,
             &database_path,
@@ -1908,6 +1909,7 @@ mod tests {
                 remove_sidecar(&database_path, "shm")
             },
             |_, _| {
+                rename_called.set(true);
                 Err(SecurityError::Io(
                     "injected database replacement rename failure".to_string(),
                 ))
@@ -1925,6 +1927,10 @@ mod tests {
         assert!(
             prepare_called.get(),
             "replacement failure must occur after the production sidecar preparation step"
+        );
+        assert!(
+            rename_called.get(),
+            "replacement failure must reach the injected rename operation"
         );
         assert!(
             !publish_called.get(),
