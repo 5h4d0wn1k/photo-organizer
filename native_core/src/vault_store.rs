@@ -333,16 +333,27 @@ fn load_or_create_vault_key(
 
     let entry = keyring::Entry::new(KEYRING_SERVICE, &key_id)
         .map_err(|err| VaultStoreError::KeyStorage(err.to_string()))?;
-    match entry.get_password() {
+    load_or_create_key_from_keyring(&key_id, entry.get_password(), |value| {
+        entry.set_password(value)
+    })
+}
+
+fn load_or_create_key_from_keyring(
+    key_id: &str,
+    stored: Result<String, keyring::Error>,
+    save: impl FnOnce(&str) -> keyring::Result<()>,
+) -> Result<Zeroizing<[u8; 32]>, VaultStoreError> {
+    match stored {
         Ok(value) => decode_hex_32(&value),
-        Err(_) => {
+        Err(keyring::Error::NoEntry) => {
             let key = random_key();
             let encoded = hex_string(key.as_ref());
-            entry
-                .set_password(&encoded)
-                .map_err(|err| VaultStoreError::KeyStorage(err.to_string()))?;
+            save(&encoded).map_err(|err| VaultStoreError::KeyStorage(err.to_string()))?;
             Ok(key)
         }
+        Err(error) => Err(VaultStoreError::KeyStorage(format!(
+            "failed to read vault key {key_id} from OS keychain: {error}"
+        ))),
     }
 }
 
@@ -497,4 +508,84 @@ fn decode_hex(value: &str) -> Result<Vec<u8>, VaultStoreError> {
 
 fn io_error(error: std::io::Error) -> VaultStoreError {
     VaultStoreError::Io(error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_keychain_entry_creates_and_persists_a_key() {
+        let mut saved = None;
+        let key = load_or_create_key_from_keyring(
+            "vault-key:test",
+            Err(keyring::Error::NoEntry),
+            |value| {
+                saved = Some(value.to_string());
+                Ok(())
+            },
+        )
+        .expect("missing key should be created");
+
+        let saved = saved.expect("new key should be persisted");
+        assert_eq!(saved.len(), 64);
+        assert_eq!(
+            decode_hex_32(&saved).expect("valid key").as_ref(),
+            key.as_ref()
+        );
+    }
+
+    #[test]
+    fn keychain_access_error_does_not_replace_the_existing_key() {
+        let mut save_called = false;
+        let result = load_or_create_key_from_keyring(
+            "vault-key:test",
+            Err(keyring::Error::NoStorageAccess(Box::new(
+                std::io::Error::other("keychain is locked"),
+            ))),
+            |_| {
+                save_called = true;
+                Ok(())
+            },
+        );
+
+        assert!(matches!(result, Err(VaultStoreError::KeyStorage(_))));
+        assert!(
+            !save_called,
+            "keychain failures must not replace vault keys"
+        );
+    }
+
+    #[test]
+    fn stored_key_is_returned_without_writing_a_replacement() {
+        let existing = "ab".repeat(32);
+        let key = load_or_create_key_from_keyring("vault-key:test", Ok(existing.clone()), |_| {
+            panic!("an existing key must not be overwritten")
+        })
+        .expect("valid stored key");
+
+        assert_eq!(hex_string(key.as_ref()), existing);
+    }
+
+    #[test]
+    fn malformed_stored_key_fails_without_writing_a_replacement() {
+        let result =
+            load_or_create_key_from_keyring("vault-key:test", Ok("bad-key".to_string()), |_| {
+                panic!("a malformed existing key must not be overwritten")
+            });
+
+        assert!(matches!(result, Err(VaultStoreError::Invalid(_))));
+    }
+
+    #[test]
+    fn failed_keychain_write_propagates_without_returning_an_unstored_key() {
+        let result =
+            load_or_create_key_from_keyring("vault-key:test", Err(keyring::Error::NoEntry), |_| {
+                Err(keyring::Error::NoStorageAccess(Box::new(
+                    std::io::Error::other("keychain is locked"),
+                )))
+            });
+
+        assert!(matches!(result, Err(VaultStoreError::KeyStorage(_))));
+    }
 }
