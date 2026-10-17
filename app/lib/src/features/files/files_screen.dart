@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 
 import '../../api/local_api_client.dart';
 import '../../models/gallery_models.dart';
+import '../../services/file_export_service.dart';
 import '../../widgets/app_ui.dart';
 
 enum _FilesViewMode { folders, smart }
@@ -11,10 +12,12 @@ class FilesScreen extends StatefulWidget {
     super.key,
     required this.apiClient,
     required this.onLibraryChanged,
+    this.exportService = const FileExportService(),
   });
 
   final LocalApiClient apiClient;
   final Future<void> Function() onLibraryChanged;
+  final FileExportService exportService;
 
   @override
   State<FilesScreen> createState() => _FilesScreenState();
@@ -140,12 +143,24 @@ class _FilesScreenState extends State<FilesScreen> {
   Future<void> _download(VaultFileEntry entry) async {
     setState(() => _busy = true);
     try {
-      final bytes = await widget.apiClient.downloadFileOriginal(
-        entryId: entry.id,
+      final result = await widget.exportService.saveDesktop(
+        suggestedName: _safeExportFilename(entry.name),
+        download: (destination) => widget.apiClient.downloadFileOriginalToFile(
+          entryId: entry.id,
+          destination: destination,
+          expectedBytes: entry.bytes,
+          expectedHash: entry.contentHash,
+        ),
       );
-      _showMessage(
-        'Downloaded ${_formatBytes(bytes.length)} from ${entry.name}.',
-      );
+      switch (result.status) {
+        case FileExportStatus.saved:
+          _showMessage('Saved ${entry.name} to ${result.path}.');
+        case FileExportStatus.cancelled:
+          break;
+        case FileExportStatus.shareActionSelected:
+        case FileExportStatus.unavailable:
+          _showMessage('Could not save ${entry.name}.');
+      }
     } catch (error) {
       _showMessage('$error');
     } finally {
@@ -341,6 +356,15 @@ class _FilesScreenState extends State<FilesScreen> {
       ),
     );
   }
+}
+
+String _safeExportFilename(String value) {
+  final cleaned = value
+      .replaceAll(RegExp(r'[\\/:*?"<>|\x00-\x1F]'), '_')
+      .trim();
+  return cleaned.isEmpty || cleaned == '.' || cleaned == '..'
+      ? 'photo-organizer-export'
+      : cleaned;
 }
 
 class _SmartFileGroups extends StatelessWidget {

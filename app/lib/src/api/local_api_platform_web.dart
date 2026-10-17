@@ -50,6 +50,10 @@ Future<bool> localApiFileExists(LocalApiFile file) {
   throw _unsupportedFileStreaming();
 }
 
+Future<void> localApiRecoverDownloadedFile(LocalApiFile destination) {
+  throw _unsupportedFileStreaming();
+}
+
 Future<void> localApiDeleteFile(LocalApiFile file) {
   throw _unsupportedFileStreaming();
 }
@@ -61,11 +65,23 @@ Future<LocalApiFile> localApiRenameFile(
   throw _unsupportedFileStreaming();
 }
 
+Stream<List<int>> localApiOpenRead(LocalApiFile file) {
+  throw _unsupportedFileStreaming();
+}
+
+Future<void> localApiCommitDownloadedFile(
+  LocalApiFile temporary,
+  LocalApiFile destination,
+) {
+  throw _unsupportedFileStreaming();
+}
+
 Future<int> localApiWriteStreamToFile(
   Stream<List<int>> stream,
   LocalApiFile file, {
   required bool append,
   int? expectedBytes,
+  int? maxBytes,
   required Duration timeout,
 }) {
   throw _unsupportedFileStreaming();
