@@ -4,17 +4,46 @@ cmake_minimum_required(VERSION 3.13)
 # Some Flutter desktop environments export clang/clang++ by default even when
 # only gcc/g++ are installed. Prefer a real compiler on the host so generated
 # runners remain buildable on lean Linux setups.
+#
+# CACHE is load-bearing, not decoration. `project()` below reads the compiler out
+# of the cache, so a plain `set(...)` is a directory-scope variable that exists
+# only until this file ends -- and a directory-scope variable set before
+# `project()` is not what `project()` consults. Nothing reaches
+# CMakeCache.txt, and Flutter's build then fails with:
+#
+#   Expected .../app/build/linux/x64/release/CMakeCache.txt to contain an entry
+#   for CMAKE_CXX_COMPILER
+#
+# which is how release run 37184543519 lost the Linux leg. `CACHE FILEPATH` makes
+# the value a cache entry, which is what `project()` reads and what Flutter's
+# check looks for. Asserted structurally by
+# scripts/tests/release_workflow_test.sh, so dropping `CACHE` again cannot pass
+# review unnoticed.
+#
+# `if(NOT DEFINED ...)` is kept: the variable is also legitimately pre-set by the
+# caller (Flutter passes it on the command line), and DEFINED covers a cache
+# entry, a -D override and a parent-scope value alike.
+#
+# No FORCE on these two, and that is measured rather than assumed. FORCE would
+# only matter if a stale cache entry could survive to be overwritten -- but that
+# entry is itself what makes `NOT DEFINED` false, so the block is skipped entirely
+# on a re-configure and FORCE never runs. Verified by configuring twice into the
+# same build directory with `find_program`'s answer changed in between: identical
+# result with and without FORCE. Do not add it back with a justification about
+# stale pins -- the release step's `rm -rf app/build/linux` is what guarantees a
+# clean cache, and it is worth keeping for the GTK/Flutter version reasons, not
+# for this one.
 if(NOT DEFINED CMAKE_C_COMPILER)
   find_program(PRIVATE_GALLERY_CC NAMES clang gcc)
   if(PRIVATE_GALLERY_CC)
-    set(CMAKE_C_COMPILER "${PRIVATE_GALLERY_CC}")
+    set(CMAKE_C_COMPILER "${PRIVATE_GALLERY_CC}" CACHE FILEPATH "C compiler")
   endif()
 endif()
 
 if(NOT DEFINED CMAKE_CXX_COMPILER)
   find_program(PRIVATE_GALLERY_CXX NAMES clang++ g++)
   if(PRIVATE_GALLERY_CXX)
-    set(CMAKE_CXX_COMPILER "${PRIVATE_GALLERY_CXX}")
+    set(CMAKE_CXX_COMPILER "${PRIVATE_GALLERY_CXX}" CACHE FILEPATH "C++ compiler")
   endif()
 endif()
 
