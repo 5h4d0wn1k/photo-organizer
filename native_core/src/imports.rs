@@ -712,9 +712,7 @@ pub fn build_import_job_detail(
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::PathBuf};
-
-    use chrono::Utc;
+    use std::fs;
     use uuid::Uuid;
 
     use crate::domain::{ImportMode, ImportSourceKind, MediaKind, ScanImportSourceRequest};
@@ -724,13 +722,8 @@ mod tests {
         infer_media_kind, infer_mime_type, scan_source,
     };
 
-    fn temp_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "private-gallery-{name}-{}",
-            Utc::now().timestamp_nanos_opt().unwrap_or_default()
-        ));
-        fs::create_dir_all(&dir).expect("create temp dir");
-        dir
+    fn temp_dir(name: &str) -> crate::test_support::TestTempDir {
+        crate::test_support::TestTempDir::new(name)
     }
 
     #[test]

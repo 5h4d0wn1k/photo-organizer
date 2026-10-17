@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 
+import 'package:crypto/crypto.dart';
 import 'package:http/http.dart' as http;
 
 import 'local_api_platform_io.dart'
@@ -486,10 +487,7 @@ class LocalApiClient {
   }) async {
     final response = await _postObject(
       '/mobile/assets/$assetId/flags',
-      {
-        'favorite': ?favorite,
-        'archived': ?archived,
-      },
+      {'favorite': ?favorite, 'archived': ?archived},
       headers: _mobileHeaders(bearerToken),
       timeout: _heavyReadTimeout,
     );
@@ -544,11 +542,16 @@ class LocalApiClient {
     required String bearerToken,
     required String assetId,
     required T destination,
+    int? expectedBytes,
+    String? expectedHash,
   }) async {
-    final downloaded = await _downloadMobilePathToFile(
-      bearerToken: bearerToken,
+    final downloaded = await _downloadPathToFile(
       path: '/mobile/assets/$assetId/original',
+      headers: _mobileHeaders(bearerToken),
       destination: localApiFileFromObject(destination),
+      expectedBytes: expectedBytes,
+      expectedHash: expectedHash,
+      resumeIncomplete: true,
     );
     return downloaded as T;
   }
@@ -557,11 +560,34 @@ class LocalApiClient {
     required String bearerToken,
     required String entryId,
     required T destination,
+    int? expectedBytes,
+    String? expectedHash,
   }) async {
-    final downloaded = await _downloadMobilePathToFile(
-      bearerToken: bearerToken,
+    final downloaded = await _downloadPathToFile(
       path: '/mobile/files/$entryId/original',
+      headers: _mobileHeaders(bearerToken),
       destination: localApiFileFromObject(destination),
+      expectedBytes: expectedBytes,
+      expectedHash: expectedHash,
+      resumeIncomplete: true,
+    );
+    return downloaded as T;
+  }
+
+  Future<T> downloadFileOriginalToFile<T extends Object>({
+    required String entryId,
+    required T destination,
+    required int expectedBytes,
+    required String? expectedHash,
+    void Function(int received, int total)? onProgress,
+  }) async {
+    final downloaded = await _downloadPathToFile(
+      path: '/files/$entryId/original',
+      headers: const <String, String>{},
+      destination: localApiFileFromObject(destination),
+      expectedBytes: expectedBytes,
+      expectedHash: expectedHash,
+      onProgress: onProgress,
     );
     return downloaded as T;
   }
@@ -1422,10 +1448,7 @@ class LocalApiClient {
     final response = await _request(
       () => _httpClient.post(
         _resolve(path),
-        headers: {
-          'content-type': 'application/json',
-          ...?headers,
-        },
+        headers: {'content-type': 'application/json', ...?headers},
         body: jsonEncode(payload),
       ),
       path,
@@ -1443,10 +1466,7 @@ class LocalApiClient {
     final response = await _request(
       () => _httpClient.patch(
         _resolve(path),
-        headers: {
-          'content-type': 'application/json',
-          ...?headers,
-        },
+        headers: {'content-type': 'application/json', ...?headers},
         body: jsonEncode(payload),
       ),
       path,
@@ -1464,10 +1484,7 @@ class LocalApiClient {
     final response = await _request(
       () => _httpClient.post(
         _resolve(path),
-        headers: {
-          'content-type': 'application/json',
-          ...?headers,
-        },
+        headers: {'content-type': 'application/json', ...?headers},
         body: jsonEncode(payload),
       ),
       path,
@@ -1485,10 +1502,7 @@ class LocalApiClient {
     final response = await _request(
       () => _httpClient.put(
         _resolve(path),
-        headers: {
-          'content-type': 'application/octet-stream',
-          ...?headers,
-        },
+        headers: {'content-type': 'application/octet-stream', ...?headers},
         body: body,
       ),
       path,
@@ -1497,100 +1511,150 @@ class LocalApiClient {
     return _decodeObject(response);
   }
 
-  Future<LocalApiFile> _downloadMobilePathToFile({
-    required String bearerToken,
+  Future<LocalApiFile> _downloadPathToFile({
     required String path,
+    required Map<String, String> headers,
     required LocalApiFile destination,
+    int? expectedBytes,
+    String? expectedHash,
+    void Function(int received, int total)? onProgress,
+    bool resumeIncomplete = false,
   }) async {
+    await localApiRecoverDownloadedFile(destination);
     await localApiCreateParent(destination);
     final temp = localApiPartFile(destination);
-    var offset = await localApiFileExists(temp)
+    if (!resumeIncomplete && await localApiFileExists(temp)) {
+      await localApiDeleteFile(temp);
+    }
+    var offset = resumeIncomplete && await localApiFileExists(temp)
         ? await localApiFileLength(temp)
         : 0;
     int? expectedTotal;
     var restarted = false;
 
-    while (expectedTotal == null || offset < expectedTotal) {
-      final rangeEnd = offset + _mobileDownloadChunkBytes - 1;
-      final request = http.Request('GET', _resolve(path))
-        ..headers.addAll(_mobileHeaders(bearerToken))
-        ..headers['range'] = 'bytes=$offset-$rangeEnd';
-      late final http.StreamedResponse response;
-      try {
-        response = await _httpClient.send(request).timeout(_heavyReadTimeout);
-      } on TimeoutException {
-        throw localApiTimeoutException(_resolve(path));
-      }
+    try {
+      while (expectedTotal == null || offset < expectedTotal) {
+        final rangeEnd = offset + _mobileDownloadChunkBytes - 1;
+        final request = http.Request('GET', _resolve(path))
+          ..headers.addAll(headers);
+        if (expectedBytes != 0) {
+          request.headers['range'] = 'bytes=$offset-$rangeEnd';
+        }
+        late final http.StreamedResponse response;
+        try {
+          response = await _httpClient.send(request).timeout(_heavyReadTimeout);
+        } on TimeoutException {
+          throw localApiTimeoutException(_resolve(path));
+        }
 
-      if (response.statusCode == localHttpStatusOk && offset == 0) {
-        await localApiWriteStreamToFile(
+        if (response.statusCode == localHttpStatusOk && offset == 0) {
+          final maxBytes = expectedBytes ?? response.contentLength;
+          if (maxBytes == null) {
+            await response.stream.drain<List<int>>();
+            throw localApiTransferException(
+              'Cannot safely stream $path because its size is unknown',
+            );
+          }
+          await localApiWriteStreamToFile(
+            response.stream,
+            temp,
+            append: false,
+            expectedBytes: response.contentLength,
+            maxBytes: maxBytes,
+            timeout: _heavyReadTimeout,
+          );
+          expectedTotal = await localApiFileLength(temp);
+          offset = expectedTotal;
+          onProgress?.call(offset, expectedBytes ?? expectedTotal);
+          break;
+        }
+        if (response.statusCode == localHttpStatusOk &&
+            offset > 0 &&
+            !restarted) {
+          await response.stream.drain<List<int>>();
+          await localApiDeleteFile(temp);
+          offset = 0;
+          expectedTotal = null;
+          restarted = true;
+          continue;
+        }
+        if (response.statusCode ==
+                localHttpStatusRequestedRangeNotSatisfiable &&
+            offset > 0 &&
+            !restarted) {
+          await response.stream.drain<List<int>>();
+          await localApiDeleteFile(temp);
+          offset = 0;
+          expectedTotal = null;
+          restarted = true;
+          continue;
+        }
+        if (response.statusCode != localHttpStatusPartialContent) {
+          throw ApiException(
+            path: path,
+            statusCode: response.statusCode,
+            body: await response.stream.bytesToString(),
+          );
+        }
+
+        final contentRange = _parseContentRange(
+          response.headers['content-range'],
+        );
+        if (contentRange == null ||
+            contentRange.start != offset ||
+            contentRange.end < contentRange.start ||
+            contentRange.end >= contentRange.total ||
+            (expectedTotal != null && contentRange.total != expectedTotal) ||
+            (expectedBytes != null && contentRange.total != expectedBytes)) {
+          throw localApiTransferException(
+            'Unexpected content-range for $path: ${response.headers['content-range']} '
+            '(offset $offset, total ${contentRange?.total}, prior total $expectedTotal, '
+            'expected bytes $expectedBytes)',
+          );
+        }
+        final received = await localApiWriteStreamToFile(
           response.stream,
           temp,
-          append: false,
+          append: offset != 0,
           expectedBytes: response.contentLength,
+          maxBytes: contentRange.end - contentRange.start + 1,
           timeout: _heavyReadTimeout,
         );
-        expectedTotal = await localApiFileLength(temp);
-        offset = expectedTotal;
-        break;
-      }
-      if (response.statusCode == localHttpStatusOk &&
-          offset > 0 &&
-          !restarted) {
-        await response.stream.drain<List<int>>();
-        await localApiDeleteFile(temp);
-        offset = 0;
-        expectedTotal = null;
-        restarted = true;
-        continue;
-      }
-      if (response.statusCode == localHttpStatusRequestedRangeNotSatisfiable &&
-          offset > 0 &&
-          !restarted) {
-        await response.stream.drain<List<int>>();
-        await localApiDeleteFile(temp);
-        offset = 0;
-        expectedTotal = null;
-        restarted = true;
-        continue;
-      }
-      if (response.statusCode != localHttpStatusPartialContent) {
-        throw ApiException(
-          path: path,
-          statusCode: response.statusCode,
-          body: await response.stream.bytesToString(),
-        );
+        final expectedRangeBytes = contentRange.end - contentRange.start + 1;
+        if (received != expectedRangeBytes) {
+          throw localApiTransferException(
+            'Downloaded $received bytes for $path, expected $expectedRangeBytes',
+          );
+        }
+        expectedTotal = contentRange.total;
+        offset = contentRange.end + 1;
+        onProgress?.call(offset, expectedBytes ?? expectedTotal);
       }
 
-      final contentRange = _parseContentRange(
-        response.headers['content-range'],
-      );
-      if (contentRange == null || contentRange.start != offset) {
+      final downloadedBytes = await localApiFileLength(temp);
+      if (expectedBytes != null && downloadedBytes != expectedBytes) {
         throw localApiTransferException(
-          'Unexpected content-range for $path: ${response.headers['content-range']}',
+          'Downloaded $downloadedBytes bytes for $path; expected $expectedBytes',
         );
       }
-      final received = await localApiWriteStreamToFile(
-        response.stream,
-        temp,
-        append: offset != 0,
-        expectedBytes: response.contentLength,
-        timeout: _heavyReadTimeout,
-      );
-      final expectedRangeBytes = contentRange.end - contentRange.start + 1;
-      if (received != expectedRangeBytes) {
-        throw localApiTransferException(
-          'Downloaded $received bytes for $path, expected $expectedRangeBytes',
-        );
+      if (expectedHash != null && expectedHash.isNotEmpty) {
+        final downloadedHash = (await sha256.bind(localApiOpenRead(temp)).first)
+            .toString();
+        if (downloadedHash.toLowerCase() != expectedHash.toLowerCase()) {
+          throw localApiTransferException(
+            'Downloaded file integrity check failed for $path',
+          );
+        }
       }
-      expectedTotal = contentRange.total;
-      offset = contentRange.end + 1;
+      await localApiCommitDownloadedFile(temp, destination);
+      onProgress?.call(downloadedBytes, expectedBytes ?? downloadedBytes);
+      return destination;
+    } catch (_) {
+      if (!resumeIncomplete && await localApiFileExists(temp)) {
+        await localApiDeleteFile(temp);
+      }
+      rethrow;
     }
-
-    if (await localApiFileExists(destination)) {
-      await localApiDeleteFile(destination);
-    }
-    return localApiRenameFile(temp, destination);
   }
 
   _ContentRange? _parseContentRange(String? value) {
