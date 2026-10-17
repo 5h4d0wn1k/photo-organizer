@@ -728,7 +728,7 @@ lsappinfo_query() {
 # apart, and only the pre-launch caller reads it.
 lsappinfo_asn() {
   lsappinfo_query
-  if [[ "${LSAPPINFO_RAW}" =~ ^ASN:0x[0-9a-fA-F]+:0x[0-9a-fA-F]+:$ ]]; then
+  if [[ "${LSAPPINFO_RAW}" =~ ^ASN:0x[0-9a-fA-F]+[-:]0x[0-9a-fA-F]+:$ ]]; then
     printf '%s\n' "${LSAPPINFO_RAW}"
   fi
 }
@@ -861,7 +861,7 @@ assert_nothing_already_running() {
   lsappinfo_query
   raw="${LSAPPINFO_RAW}"
 
-  if [[ "${raw}" =~ ^ASN:0x[0-9a-fA-F]+:0x[0-9a-fA-F]+:$ ]]; then
+  if [[ "${raw}" =~ ^ASN:0x[0-9a-fA-F]+[-:]0x[0-9a-fA-F]+:$ ]]; then
     fail "${APP_BUNDLE_ID} is already registered with the window server (application serial number ${raw}); this gate requires a cold launch, so something is already running and 'open' would only activate it. Kill it and re-run."
   fi
 
