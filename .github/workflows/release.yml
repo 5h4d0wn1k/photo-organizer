@@ -816,6 +816,18 @@ jobs:
     timeout-minutes: 150
     permissions:
       contents: read
+    # The deployment target for everything this job builds for iOS, pinned once
+    # here rather than per step so the invariant cannot be half-applied.
+    #
+    # Job-level rather than on the cross-compile step only, because the value has
+    # to mean the same thing to *both* compilers in the job. See the cross-compile
+    # step for why these two disagree by default and what the symptom is.
+    #
+    # 13.0, and that is not a round number chosen for taste: it is the lowest
+    # IPHONEOS_DEPLOYMENT_TARGET in app/ios/Runner.xcodeproj/project.pbxproj, and
+    # release_workflow_test.sh fails the build if the two ever disagree.
+    env:
+      IPHONEOS_DEPLOYMENT_TARGET: "13.0"
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -832,9 +844,64 @@ jobs:
           cache: true
 
       - name: Hermetic iOS cross-compile (device + simulator + host slices; vendored sqlcipher-openssl)
+        # Why IPHONEOS_DEPLOYMENT_TARGET has to be set at all, since a Rust-only
+        # iOS build needs nothing special. The vendored OpenSSL is C.
+        #
+        # rustc defaults to the *minimum* OS version it supports, iOS 10.0, and
+        # per the rustc book that minimum is raised only by this variable. So the
+        # link line in release run 37184543519 carried:
+        #
+        #   -target arm64-apple-ios10.0.0
+        #
+        # Meanwhile clang, invoked by the `cc` crate through openssl-src with no
+        # deployment target given, takes the *SDK* default -- 26.5 on that runner.
+        # The C objects were therefore built for iOS 26.5 and the link was
+        # performed for iOS 10.0, and the two disagreed about what runtime was
+        # available:
+        #
+        #   Undefined symbols for architecture arm64:
+        #     "___chkstk_darwin", referenced from:
+        #       libopenssl_sys-....rlib[758](libcrypto-lib-slh_fors.o)
+        #   ld: symbol(s) not found for architecture arm64
+        #
+        # `___chkstk_darwin` is the stack-probing helper clang emits with
+        # -fstack-check; libSystem provides it from iOS 13.0. A 10.0 link cannot
+        # bind a symbol introduced in 13.0, so the linker refused. Nothing about
+        # OpenSSL, SQLCipher or the daemon is involved -- it is one version
+        # number being read from two places by two compilers.
+        #
+        # Setting it to 13.0 makes the *device* slice agree -- rustc's own floor
+        # for aarch64-apple-ios is 10.0, and with this set both compilers read 13.0,
+        # measured with `rustc --print deployment-target`. 13.0 is also the value the
+        # Xcode project already declares, so the shipped .app is not newly
+        # constrained. Asserted structurally by scripts/tests/release_workflow_test.sh.
+        #
+        # The simulator slice does NOT agree and is not made to: rustc clamps
+        # aarch64-apple-ios-sim to its own 14.0 floor whether or not this is set
+        # (measured, above), while `cc` emits `-mios-simulator-version-min=13.0` for
+        # the OpenSSL C. So the C is built for 13.0 and linked against 14.0, which is
+        # safe -- building for a lower minimum than you link is the ordinary
+        # direction -- and that bundle is only ever installed into the simulator,
+        # never shipped. Stated because a reader reasoning from "both sides agree"
+        # would otherwise try to pull the simulator skew down to 13.0, and rustc
+        # would refuse to be argued with.
         run: |
           set -euo pipefail
-          rustup target add aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios
+          # No x86_64-apple-ios: nothing below builds it. Adding a target that is
+          # never compiled is a false signal that the Intel simulator is covered.
+          # Supporting an Intel runner means *building* that slice, which is not
+          # claimed here.
+          #
+          # What is and is not proven about the simulator slice: it is built for
+          # aarch64-apple-ios-sim and installed into the simulator .app that the
+          # gate inspects. The gate checks the Mach-O *platform* (ios-simulator),
+          # not the CPU architecture -- so on an Intel runner an arm64-sim daemon
+          # would pass that check and still be unloadable there. macos-latest is
+          # arm64, which is why the pair is right on the runner that exists; an
+          # Intel runner would need the gate to grow an arch check rather than
+          # relying on this comment. Recorded rather than assumed, per the rule that
+          # a runner must not be credited with proving something it does not.
+          rustup target add aarch64-apple-ios aarch64-apple-ios-sim
           # Device slice: shipped in the release .app (aarch64-apple-ios).
           cargo build --manifest-path native_core/Cargo.toml --bin galleryd --release --target aarch64-apple-ios --locked
           # Simulator slice: installed into the simulator .app the gate inspects.
