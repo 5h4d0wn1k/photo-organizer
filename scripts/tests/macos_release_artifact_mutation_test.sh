@@ -487,7 +487,7 @@ mutate "an OS-level refusal to launch is tolerated" \
 # one mutation cannot cover both.
 mutate "a warm launch is accepted as a cold one" \
   'a warm launch is refused because this gate requires a cold one' \
-  '  if [[ "${raw}" =~ ^ASN:0x[0-9a-fA-F]+:0x[0-9a-fA-F]+:$ ]]; then
+  '  if [[ "${raw}" =~ ^ASN:0x[0-9a-fA-F]+[-:]0x[0-9a-fA-F]+:$ ]]; then
     fail "${APP_BUNDLE_ID} is already registered' \
   '  if false; then
     fail "${APP_BUNDLE_ID} is already registered'
@@ -531,7 +531,7 @@ mutate "the lsappinfo query reverts to the undocumented verb" \
 #    coverage of this assertion while testing nothing.
 mutate "an unparseable lsappinfo reply is claimed to be a serial number" \
   'an unanswerable window server is not reported as a warm app' \
-  '  if [[ "${raw}" =~ ^ASN:0x[0-9a-fA-F]+:0x[0-9a-fA-F]+:$ ]]; then
+  '  if [[ "${raw}" =~ ^ASN:0x[0-9a-fA-F]+[-:]0x[0-9a-fA-F]+:$ ]]; then
     fail "${APP_BUNDLE_ID} is already registered' \
   '  if [[ "${raw}" =~ . ]]; then
     fail "${APP_BUNDLE_ID} is already registered'
@@ -543,7 +543,7 @@ mutate "an unparseable lsappinfo reply is claimed to be a serial number" \
 #    invisible. The needle is one of those unit assertions.
 mutate "lsappinfo_asn passes any reply through unfiltered" \
   'lsappinfo_asn drops a rejected query instead of passing it on' \
-  '  if [[ "${LSAPPINFO_RAW}" =~ ^ASN:0x[0-9a-fA-F]+:0x[0-9a-fA-F]+:$ ]]; then
+  '  if [[ "${LSAPPINFO_RAW}" =~ ^ASN:0x[0-9a-fA-F]+[-:]0x[0-9a-fA-F]+:$ ]]; then
     printf '"'"'%s\n'"'"' "${LSAPPINFO_RAW}"' \
   '  if true; then
     printf '"'"'%s\n'"'"' "${LSAPPINFO_RAW}"'

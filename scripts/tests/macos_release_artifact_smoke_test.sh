@@ -313,7 +313,7 @@ verb="${1:-}"
 # A real application serial number. The shape matters: the gate shape-checks this
 # before believing it, so a fake returning `1` would let an assertion pass for
 # the wrong reason and would not distinguish a real ASN from a rejected query.
-readonly REAL_ASN='ASN:0x55d:0x1a2b:'
+readonly REAL_ASN='ASN:0x55d-0x1a2b:'
 case "${verb}" in
   find)
     query="${2:-}"
@@ -1844,7 +1844,9 @@ asn_parse() {
 # unchanged" test would pass for every malformed input precisely because the
 # filter is doing its job, and fail for the one input that must survive.
 #
-# 'ASN:0x55d:0x1a2b:' is the shape the fake window server really returns.
+# lsappinfo displays ASNs with a hyphen; its application-specifier syntax also
+# documents a colon form. Exercise the native display throughout the fake and
+# accept both documented forms without accepting arbitrary replies.
 expect_asn_kept() {
   local reply="$1"
   local got
@@ -1865,7 +1867,9 @@ expect_asn_dropped() {
     bad "lsappinfo_asn drops ${what} instead of passing it on" "it produced '${got}'"
   fi
 }
+expect_asn_kept "ASN:0x55d-0x1a2b:"
 expect_asn_kept "ASN:0x55d:0x1a2b:"
+expect_asn_dropped "ASN:0x55d--0x1a2b:" 0 "a serial number with a doubled separator"
 expect_asn_dropped "Unrecognized command: findLSApplication" 1 "a rejected query"
 expect_asn_dropped "ASN:0x55d:" 0 "a truncated serial number"
 expect_asn_dropped "ASN::0x1a2b:" 0 "a serial number with an empty half"
@@ -1874,11 +1878,11 @@ expect_asn_dropped "ASN:0xZZZ:0x1a2b:" 0 "a serial number with a non-hex half"
 expect_asn_dropped "" 0 "an empty reply"
 # The contract, stated as its own assertion rather than inferred from the rows
 # above: whitespace is squeezed out, so a reply split across lines still parses.
-if [[ "$(asn_parse $'ASN:0x55d:\n0x1a2b:' 0)" == "ASN:0x55d:0x1a2b:" ]]; then
+if [[ "$(asn_parse $'ASN:0x55d-\n0x1a2b:' 0)" == "ASN:0x55d-0x1a2b:" ]]; then
   ok "a serial number split across lines is rejoined by lsappinfo_asn"
 else
   bad "a serial number split across lines is rejoined by lsappinfo_asn" \
-    "got '$(asn_parse $'ASN:0x55d:\n0x1a2b:' 0)'"
+    "got '$(asn_parse $'ASN:0x55d-\n0x1a2b:' 0)'"
 fi
 # And the exit status must not reach the caller: `lsappinfo` exits non-zero for a
 # query it will not answer, and under `set -e` a propagated status kills the gate
