@@ -2842,8 +2842,6 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
-
     use chrono::Utc;
     use rusqlite::Connection;
 
@@ -2860,20 +2858,15 @@ mod tests {
         load_state, save_state,
     };
 
-    fn temp_runtime_root() -> PathBuf {
-        let path = std::env::temp_dir().join(format!(
-            "private-gallery-storage-{}",
-            Utc::now().timestamp_nanos_opt().unwrap_or_default()
-        ));
-        std::fs::create_dir_all(&path).expect("create runtime root");
-        path
+    fn temp_runtime_root() -> crate::test_support::TestTempDir {
+        crate::test_support::TestTempDir::new("storage")
     }
 
     #[test]
     fn saves_and_loads_library_settings() {
         let runtime_root = temp_runtime_root();
         let config = AppConfig {
-            runtime_root: runtime_root.clone(),
+            runtime_root: runtime_root.to_path_buf(),
             ..AppConfig::default()
         };
         let report = bootstrap_storage(&config).expect("bootstrap storage");
@@ -2904,7 +2897,7 @@ mod tests {
     fn saves_and_loads_entitlement_cache() {
         let runtime_root = temp_runtime_root();
         let config = AppConfig {
-            runtime_root: runtime_root.clone(),
+            runtime_root: runtime_root.to_path_buf(),
             ..AppConfig::default()
         };
         let report = bootstrap_storage(&config).expect("bootstrap storage");
@@ -2948,7 +2941,7 @@ mod tests {
     fn migration_preserves_existing_state_when_user_version_changes() {
         let runtime_root = temp_runtime_root();
         let config = AppConfig {
-            runtime_root: runtime_root.clone(),
+            runtime_root: runtime_root.to_path_buf(),
             ..AppConfig::default()
         };
         let report = bootstrap_storage(&config).expect("bootstrap storage");
@@ -2991,7 +2984,7 @@ mod tests {
     fn migration_allows_opaque_blob_records_without_local_asset_metadata() {
         let runtime_root = temp_runtime_root();
         let config = AppConfig {
-            runtime_root: runtime_root.clone(),
+            runtime_root: runtime_root.to_path_buf(),
             ..AppConfig::default()
         };
         let db_dir = runtime_root.join("db");
@@ -3082,7 +3075,7 @@ mod tests {
     fn migration_adds_vault_id_to_legacy_device_pairings() {
         let runtime_root = temp_runtime_root();
         let config = AppConfig {
-            runtime_root: runtime_root.clone(),
+            runtime_root: runtime_root.to_path_buf(),
             ..AppConfig::default()
         };
         let db_dir = runtime_root.join("db");
@@ -3128,7 +3121,7 @@ mod tests {
     fn migration_hashes_legacy_plaintext_pairing_tokens() {
         let runtime_root = temp_runtime_root();
         let config = AppConfig {
-            runtime_root: runtime_root.clone(),
+            runtime_root: runtime_root.to_path_buf(),
             ..AppConfig::default()
         };
         let db_dir = runtime_root.join("db");

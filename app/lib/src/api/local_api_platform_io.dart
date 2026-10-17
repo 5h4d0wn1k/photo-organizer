@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:math';
 
 typedef LocalApiFile = File;
 
@@ -53,6 +54,27 @@ Future<bool> localApiFileExists(LocalApiFile file) {
   return file.exists();
 }
 
+Future<void> localApiRecoverDownloadedFile(LocalApiFile destination) async {
+  if (await destination.exists()) {
+    return;
+  }
+  final parent = destination.parent;
+  if (!await parent.exists()) {
+    return;
+  }
+  final backupPattern = _backupPattern(destination);
+  final backups = <File>[];
+  await for (final entity in parent.list(followLinks: false)) {
+    if (entity is File && backupPattern.hasMatch(entity.path)) {
+      backups.add(entity);
+    }
+  }
+  backups.sort((left, right) => left.path.compareTo(right.path));
+  if (backups.isNotEmpty) {
+    await backups.last.rename(destination.path);
+  }
+}
+
 Future<void> localApiDeleteFile(LocalApiFile file) {
   return file.delete();
 }
@@ -64,17 +86,75 @@ Future<LocalApiFile> localApiRenameFile(
   return file.rename(destination.path);
 }
 
+Stream<List<int>> localApiOpenRead(LocalApiFile file) => file.openRead();
+
+Future<void> localApiCommitDownloadedFile(
+  LocalApiFile temporary,
+  LocalApiFile destination,
+) async {
+  final random = Random.secure();
+  var newestTimestamp = 0;
+  final parent = destination.parent;
+  if (await parent.exists()) {
+    final backupPattern = _backupPattern(destination);
+    await for (final entity in parent.list(followLinks: false)) {
+      if (entity is File) {
+        final match = backupPattern.firstMatch(entity.path);
+        if (match != null) {
+          newestTimestamp = max(newestTimestamp, int.parse(match.group(1)!));
+        }
+      }
+    }
+  }
+  final timestamp = max(
+    DateTime.now().microsecondsSinceEpoch,
+    newestTimestamp + 1,
+  ).toString().padLeft(16, '0');
+  final backupId = List<String>.generate(
+    16,
+    (_) => random.nextInt(256).toRadixString(16).padLeft(2, '0'),
+  ).join();
+  final backup = File('${destination.path}.previous.$timestamp.$backupId');
+  final hadDestination = await destination.exists();
+  if (hadDestination) {
+    await destination.rename(backup.path);
+  }
+  try {
+    await temporary.rename(destination.path);
+  } catch (_) {
+    if (hadDestination && await backup.exists()) {
+      await backup.rename(destination.path);
+    }
+    rethrow;
+  }
+  if (hadDestination && await backup.exists()) {
+    await backup.delete();
+  }
+}
+
+RegExp _backupPattern(LocalApiFile destination) {
+  return RegExp(
+    '^${RegExp.escape(destination.path)}\\.previous\\.([0-9]{16})\\.[0-9a-f]{32}\$',
+  );
+}
+
 Future<int> localApiWriteStreamToFile(
   Stream<List<int>> stream,
   LocalApiFile file, {
   required bool append,
   int? expectedBytes,
+  int? maxBytes,
   required Duration timeout,
 }) async {
   var received = 0;
   final sink = file.openWrite(mode: append ? FileMode.append : FileMode.write);
   try {
     await for (final chunk in stream.timeout(timeout)) {
+      if (maxBytes != null && chunk.length > maxBytes - received) {
+        throw localApiTransferException(
+          'Download exceeded the allowed $maxBytes bytes',
+        );
+      }
       received += chunk.length;
       sink.add(chunk);
     }

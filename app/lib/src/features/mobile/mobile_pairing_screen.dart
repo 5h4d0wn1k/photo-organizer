@@ -37,6 +37,7 @@ import '../../models/gallery_models.dart'
         VaultFileEntry,
         VaultFileTreeResponse;
 import '../../services/cloud_bootstrap_service.dart';
+import '../../services/file_export_service.dart';
 import '../../theme/app_theme.dart';
 import 'mobile_gallery_panel.dart';
 import 'mobile_media_viewer.dart';
@@ -254,7 +255,8 @@ class _MobilePairingScreenState extends State<MobilePairingScreen> {
         _bearerToken = bearerToken;
         _pendingInvite = null;
         _mode = _MobileOnboardingMode.paired;
-        _status = 'Debug device session loaded for ${deviceName ?? (Platform.isIOS ? 'iPhone' : 'Android')}.';
+        _status =
+            'Debug device session loaded for ${deviceName ?? (Platform.isIOS ? 'iPhone' : 'Android')}.';
       });
       await _refreshMobileGallery();
       return;
@@ -1271,28 +1273,45 @@ class _MobilePairingScreenState extends State<MobilePairingScreen> {
       bearerToken: token,
       assetId: asset.assetId,
       destination: file,
+      expectedBytes: asset.bytes,
+      expectedHash: asset.contentHash,
     );
   }
 
-  Future<File> _saveMobileFileOriginal(VaultFileEntry entry) async {
+  Future<File> _downloadMobileFileOriginal(
+    VaultFileEntry entry,
+    File destination,
+  ) async {
     final token = _requireBearerToken();
-    final root = await getApplicationSupportDirectory();
-    final downloadDir = Directory('${root.path}/mobile_downloads/files');
-    await downloadDir.create(recursive: true);
-    final filename = _safeLocalFilename(entry.name);
-    final file = File('${downloadDir.path}/${entry.id}_$filename');
     return _client().downloadMobileFileOriginalToFile(
       bearerToken: token,
       entryId: entry.id,
-      destination: file,
+      destination: destination,
+      expectedBytes: entry.bytes,
+      expectedHash: entry.contentHash,
     );
   }
 
   Future<void> _downloadMobileFile(VaultFileEntry entry) async {
     await _runBusy(() async {
-      final file = await _saveMobileFileOriginal(entry);
+      final result = await const FileExportService().shareMobile(
+        filename: _safeLocalFilename(entry.name),
+        mimeType: entry.mimeType,
+        download: (destination) =>
+            _downloadMobileFileOriginal(entry, destination),
+      );
+      if (!mounted || result.status == FileExportStatus.cancelled) {
+        return;
+      }
       setState(() {
-        _status = 'Downloaded ${entry.name} to ${file.path}.';
+        _status = switch (result.status) {
+          FileExportStatus.shareActionSelected =>
+            'Share action selected for ${entry.name}. Check the selected app to confirm delivery.',
+          FileExportStatus.unavailable =>
+            'Sharing is unavailable on this device.',
+          FileExportStatus.saved => 'Saved ${entry.name}.',
+          FileExportStatus.cancelled => _status,
+        };
       });
     });
   }
@@ -4450,8 +4469,7 @@ class _ReferenceLocalAssetTile extends StatelessWidget {
                     bytes,
                     fit: BoxFit.cover,
                     gaplessPlayback: true,
-                    errorBuilder: (_, _, _) =>
-                        _AssetFallback(isVideo: isVideo),
+                    errorBuilder: (_, _, _) => _AssetFallback(isVideo: isVideo),
                   );
                 },
               ),
@@ -5905,10 +5923,7 @@ class _ActionPanel extends StatelessWidget {
                       spacing: 12,
                       runSpacing: 12,
                       crossAxisAlignment: WrapCrossAlignment.center,
-                      children: [
-                        ?action,
-                        ?secondaryAction,
-                      ],
+                      children: [?action, ?secondaryAction],
                     ),
                   ],
                 ],
