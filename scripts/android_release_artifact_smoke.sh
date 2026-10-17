@@ -291,11 +291,46 @@ exit_info_has_records() {
 # zero `ApplicationExitInfo` blocks under it. Requiring a record here would fail
 # every honest first run, so the header counts as a real reply. What must never
 # count is a dump that merely contains an error string somewhere inside a record.
+#
+# The header is matched at the start of a line, case-insensitively, because its
+# spelling is not stable across API levels. On 2026-10-04 the release run failed on
+# API 30 and API 35 with a real, healthy reply that this function rejected:
+#
+#   ACTIVITY MANAGER PROCESS EXIT INFO (dumpsys activity exit-info)
+#   Last Timestamp of Persistence Into Persistent Storage: 1970-01-01 00:00:00.000
+#
+# It knew only the older `ACTIVITY MANAGER LRU PROCESSES` and
+# `Historical Process Exit`, so the gate reported "ApplicationExitInfo returned
+# output that is not a dumpsys exit-info reply" after the app had installed,
+# launched, rendered a stable 33-colour frame and left a clean crash buffer. The
+# unit fixture used the header the gate already knew, so the suite and the gate
+# agreed with each other and both disagreed with the device -- the standard
+# consequence of writing a fixture from the implementation instead of from a real
+# capture. The fixture is now the capture, verbatim, and the legacy spellings are
+# kept as their own cases so this cannot become "only accept the new header".
+#
+# Still fail-closed: matching is anchored to the start of a line, so a complaint
+# quoted *inside* a record cannot satisfy it, and `exit_info_unsupported` still
+# rejects a dump carrying "Unknown command"/"Can't find service"/"No service".
+exit_info_has_section_header() {
+  local dump="$1" line lowered
+  while IFS= read -r line; do
+    lowered="$(trim "${line}")"
+    lowered="${lowered,,}"
+    case "${lowered}" in
+      "activity manager process exit info"* | \
+        "activity manager lru processes"* | \
+        "historical process exit"*)
+        return 0
+        ;;
+    esac
+  done <<<"${dump}"
+  return 1
+}
+
 exit_info_looks_like_dumpsys() {
   local dump="$1"
-  exit_info_has_records "${dump}" ||
-    contains "ACTIVITY MANAGER LRU PROCESSES" "${dump}" ||
-    contains "Historical Process Exit" "${dump}"
+  exit_info_has_records "${dump}" || exit_info_has_section_header "${dump}"
 }
 
 # Does the service itself complain? Only meaningful for a reply that is not already
