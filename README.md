@@ -10,7 +10,7 @@ OCR text, and intelligence on devices you control. No hosted storage, no cloud
 AI, no analyzing your library on someone else's servers.
 
 Screenshots land in [`docs/screenshots/`](docs/screenshots/) at v1.0.
-
+Will be adding more features soon 
 ## Features
 
 - **Import** — scan folders and removable drives, commit with `copy` or

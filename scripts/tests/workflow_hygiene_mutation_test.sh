@@ -198,7 +198,7 @@ print(f"{old}|||{new}")
 PYTHON
 }
 
-# Usage: pin_expr <file> <two-segment-repo> <edit-kind> [value]
+# Usage: pin_expr <file> <two-segment-repo> <edit-kind> [value] [allow-duplicate]
 #
 # The SHA half of a pin is data, not a constant: it changes on every Dependabot
 # bump, which is exactly how this harness came to have a hardcoded SHA that
@@ -214,16 +214,18 @@ PYTHON
 #   minor <v>         rewrite the declared major to a minor-version comment
 #
 # The returned literal is anchored to a `uses:` line and asserted to occur
-# EXACTLY ONCE in the file. `apply` rewrites the first textual occurrence, so a
+# EXACTLY ONCE in the file unless an expected-to-pass mutation opts into
+# duplicates. `apply` rewrites the first textual occurrence, so a
 # needle that appears twice is a coin flip over which one it hit -- see the
 # `uses:`-anchoring note in pin_major_expr.
 pin_expr() {
-  python3 - "$1" "$2" "$3" "${4:-}" <<'PYTHON'
+  python3 - "$1" "$2" "$3" "${4:-}" "${5:-false}" <<'PYTHON'
 import re
 import sys
 
 edit_file, repo, kind = sys.argv[1], sys.argv[2], sys.argv[3]
 value = sys.argv[4] if len(sys.argv) > 4 else ""
+allow_duplicate = len(sys.argv) > 5 and sys.argv[5] == "allow-duplicate"
 
 # group 1 is everything up to and including the "@" -- `uses: <repo>@`,
 # indentation included -- so a replacement can be rebuilt without dropping the
@@ -269,7 +271,7 @@ else:
 # real pin and the second one would silently keep disagreeing (or not). Refuse
 # rather than guess. Quoting a pin in a comment is an established habit in this
 # repo, so this is not a hypothetical.
-if text.count(first.group(0)) != 1:
+if text.count(first.group(0)) != 1 and not allow_duplicate:
     print(
         f"NEEDLE PRECONDITION FAILED: the {repo} pin in {edit_file} occurs "
         f"{text.count(first.group(0))} times as text, so rewriting the first "
@@ -407,7 +409,7 @@ mutate "a pin's version comment is unparseable" \
 #    regex that would reject `# v2.1.3` and force someone to delete the comment.)
 MUTATIONS_RUN=$((MUTATIONS_RUN + 1))
 restore
-minor_expr="$(pin_expr "${ROOT_DIR}/.github/workflows/ci.yml" actions-rust-lang/setup-rust-toolchain minor 2.1.3)"
+minor_expr="$(pin_expr "${ROOT_DIR}/.github/workflows/ci.yml" actions-rust-lang/setup-rust-toolchain minor 2.1.3 allow-duplicate)"
 if [[ -z "$minor_expr" ]]; then
   mismatches+=("over-strict regex: pin_expr could not derive a setup-rust-toolchain pin to downgrade to a minor version")
 elif ! apply "${ROOT_DIR}/.github/workflows/ci.yml" "${minor_expr}"; then

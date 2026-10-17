@@ -24,6 +24,15 @@
 ## Required Controls
 
 - App-scoped encryption at rest for the metadata database and sensitive indexes.
+- SQLCipher activation verifies an encrypted staging database, retains its
+  verified recovery copy while replacing the live database and publishing
+  encryption state, and reconciles the database header with that state during
+  startup. This covers interrupted activation and process-crash recovery; it is
+  not a guarantee against physical storage failure or sudden power loss after
+  the operating system reports a successful sync. Apple documents
+  `F_FULLFSYNC` as best effort and notes that data can still be lost on sudden
+  power loss ([Apple file-system write guidance](https://developer.apple.com/documentation/xcode/reducing-disk-writes)).
+  Users should keep independent backups of important libraries.
 - Secure-storage integration for keys on each platform.
 - Reset and delete flow for the People feature, including face templates and labels.
 - Minimal permissions only, with no background location.
