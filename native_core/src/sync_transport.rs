@@ -7,6 +7,10 @@ use std::{
     time::Duration,
 };
 
+use cap_std::{
+    ambient_authority,
+    fs::{Dir, Metadata as CapMetadata, OpenOptions as CapOpenOptions},
+};
 use chrono::Utc;
 use iroh::{
     Endpoint, EndpointAddr, EndpointId, RelayMode, RelayUrl, SecretKey, TransportAddr,
@@ -37,6 +41,8 @@ const ALPN: &[u8] = b"private-gallery/vault-sync/1";
 const PROTOCOL_VERSION: u16 = 1;
 const MAX_METADATA_FRAME_BYTES: usize = 4 * 1024 * 1024;
 const MAX_CHUNK_FRAME_BYTES: usize = 128 * 1024 * 1024;
+static RESERVED_RECEIVE_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static RECEIVE_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
 
 #[derive(Debug, Error)]
 pub enum SyncTransportError {
@@ -574,6 +580,10 @@ async fn receive_envelope<R>(
 where
     R: AsyncRead + Unpin,
 {
+    let _receive_slot = RECEIVE_SLOTS
+        .acquire()
+        .await
+        .map_err(|error| SyncTransportError::Transport(error.to_string()))?;
     if envelope.protocol_version != PROTOCOL_VERSION {
         return Err(SyncTransportError::Invalid(format!(
             "unsupported sync protocol version {}",
@@ -588,7 +598,35 @@ where
     {
         let state = state_lock.read().await;
         validate_envelope_authorization(&state, envelope, remote_node_id, local_node_id)?;
+        validate_incoming_manifest(&state, envelope)?;
     }
+
+    let (root, canonical_root) = open_receive_root(library_root)?;
+    let reservation = {
+        let state = state_lock.read().await;
+        reserve_receive_capacity(&canonical_root, &state, envelope)?
+    };
+    let (blob_dir, _directory_anchors) = open_or_create_blob_dir(
+        &root,
+        &canonical_root,
+        envelope.blob.vault_id,
+        envelope.blob.id,
+    )?;
+    cleanup_stale_incoming(&blob_dir)?;
+    let created_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let stage_name = format!(".incoming-{created_at}-{}", Uuid::new_v4());
+    blob_dir.create_dir(&stage_name).map_err(io_error)?;
+    let stage_dir = blob_dir.open_dir(&stage_name).map_err(io_error)?;
+    let stage = IncomingStageGuard::new(stage_dir);
+    let blob_path = canonical_root
+        .join("vaults")
+        .join(envelope.blob.vault_id.to_string())
+        .join("blobs")
+        .join(envelope.blob.id.to_string());
+    let stage_path = blob_path.join(&stage_name);
 
     let mut received_chunks = Vec::with_capacity(envelope.chunks.len());
     let mut bytes_received = 0_u64;
@@ -607,19 +645,52 @@ where
                 chunk.id
             )));
         }
-        let relative_path = incoming_chunk_path(&envelope.blob, chunk)?;
-        let destination = library_root.join(&relative_path);
-        write_atomic(&destination, &ciphertext)?;
+        let staged_name = chunk_filename(chunk.chunk_index);
+        write_staged_chunk(stage.dir(), &staged_name, &ciphertext)?;
         let mut received = chunk.clone();
+        let relative_path = incoming_chunk_path(&envelope.blob, chunk);
         received.local_path = Some(path_to_storage_string(&relative_path));
         received_chunks.push(received);
         bytes_received = bytes_received.saturating_add(chunk.bytes);
     }
 
+    for chunk in &envelope.chunks {
+        let name = chunk_filename(chunk.chunk_index);
+        publish_staged_chunk(
+            stage.dir(),
+            &stage_path,
+            &name,
+            &blob_dir,
+            &blob_path,
+            &name,
+            (&chunk.encrypted_hash, chunk.encrypted_bytes),
+        )?;
+    }
+    sync_directory(&blob_path)?;
+
     let mut state = state_lock.write().await;
-    commit_received_blob(&mut state, envelope, received_chunks, bytes_received)?;
-    storage::save_state(storage_report, &state.to_persisted())
-        .map_err(|err| SyncTransportError::Storage(err.to_string()))?;
+    validate_envelope_authorization(&state, envelope, remote_node_id, local_node_id)?;
+    validate_incoming_manifest(&state, envelope)?;
+    let previous_records = state.blob_records.clone();
+    let previous_chunks = state.blob_chunks.clone();
+    let previous_replicas = state.blob_replicas.clone();
+    let previous_transfers = state.sync_transfers.clone();
+    if let Err(error) = commit_received_blob(&mut state, envelope, received_chunks, bytes_received)
+    {
+        state.blob_records = previous_records;
+        state.blob_chunks = previous_chunks;
+        state.blob_replicas = previous_replicas;
+        state.sync_transfers = previous_transfers;
+        return Err(error);
+    }
+    if let Err(error) = storage::save_state(storage_report, &state.to_persisted()) {
+        state.blob_records = previous_records;
+        state.blob_chunks = previous_chunks;
+        state.blob_replicas = previous_replicas;
+        state.sync_transfers = previous_transfers;
+        return Err(SyncTransportError::Storage(error.to_string()));
+    }
+    drop(reservation);
     Ok(bytes_received)
 }
 
@@ -1070,20 +1141,579 @@ fn endpoint_addr_from_descriptor(
     Ok(EndpointAddr::from_parts(endpoint_id, addrs))
 }
 
-fn incoming_chunk_path(
-    blob: &BlobRecord,
-    chunk: &BlobChunk,
-) -> Result<PathBuf, SyncTransportError> {
-    if let Some(local_path) = chunk.local_path.as_deref()
-        && let Some(path) = safe_relative_path(local_path)
-    {
-        return Ok(path);
-    }
-    Ok(PathBuf::from("vaults")
+fn incoming_chunk_path(blob: &BlobRecord, chunk: &BlobChunk) -> PathBuf {
+    PathBuf::from("vaults")
         .join(blob.vault_id.to_string())
         .join("blobs")
         .join(blob.id.to_string())
-        .join(format!("{:08}.pgblob", chunk.chunk_index)))
+        .join(chunk_filename(chunk.chunk_index))
+}
+
+fn chunk_filename(index: u32) -> String {
+    format!("{index:08}.pgblob")
+}
+
+fn validate_incoming_manifest(
+    state: &LibraryState,
+    envelope: &TransferEnvelope,
+) -> Result<(), SyncTransportError> {
+    let blob = &envelope.blob;
+    let chunks = &envelope.chunks;
+    if blob.tombstoned_at.is_some() || blob.chunk_count == 0 {
+        return Err(SyncTransportError::Invalid(
+            "incoming blob is tombstoned or has no chunks".to_string(),
+        ));
+    }
+    if usize::try_from(blob.chunk_count).ok() != Some(chunks.len()) {
+        return Err(SyncTransportError::Invalid(
+            "incoming chunk count does not match the blob manifest".to_string(),
+        ));
+    }
+
+    let mut chunk_ids = std::collections::HashSet::with_capacity(chunks.len());
+    let mut chunk_indexes = std::collections::HashSet::with_capacity(chunks.len());
+    let mut bytes = 0_u64;
+    let mut encrypted_bytes = 0_u64;
+    for chunk in chunks {
+        if chunk.blob_id != blob.id
+            || chunk.chunk_index >= blob.chunk_count
+            || chunk.encrypted_bytes == 0
+            || chunk.encrypted_bytes > MAX_CHUNK_FRAME_BYTES as u64
+            || !chunk_ids.insert(chunk.id)
+            || !chunk_indexes.insert(chunk.chunk_index)
+        {
+            return Err(SyncTransportError::Invalid(
+                "incoming chunk manifest has duplicate, missing, or invalid entries".to_string(),
+            ));
+        }
+        bytes = bytes.checked_add(chunk.bytes).ok_or_else(|| {
+            SyncTransportError::Invalid("incoming chunk byte count overflowed".to_string())
+        })?;
+        encrypted_bytes = encrypted_bytes
+            .checked_add(chunk.encrypted_bytes)
+            .ok_or_else(|| {
+                SyncTransportError::Invalid(
+                    "incoming encrypted chunk byte count overflowed".to_string(),
+                )
+            })?;
+        let identity_conflict = state
+            .blob_chunks
+            .iter()
+            .find(|existing| {
+                existing.id == chunk.id
+                    && (existing.blob_id != chunk.blob_id
+                        || existing.chunk_index != chunk.chunk_index
+                        || existing.encrypted_hash != chunk.encrypted_hash
+                        || existing.encrypted_bytes != chunk.encrypted_bytes
+                        || existing.bytes != chunk.bytes
+                        || !compatible_chunk_content_hash(existing, chunk)
+                        || (existing.nonce_hex.is_some()
+                            && chunk.nonce_hex.is_some()
+                            && existing.nonce_hex != chunk.nonce_hex)
+                        || (existing.aad.is_some()
+                            && chunk.aad.is_some()
+                            && existing.aad != chunk.aad))
+            })
+            .or_else(|| {
+                state.blob_chunks.iter().find(|existing| {
+                    existing.blob_id == chunk.blob_id
+                        && existing.chunk_index == chunk.chunk_index
+                        && (existing.id != chunk.id
+                            || existing.encrypted_hash != chunk.encrypted_hash
+                            || existing.encrypted_bytes != chunk.encrypted_bytes
+                            || existing.bytes != chunk.bytes
+                            || !compatible_chunk_content_hash(existing, chunk)
+                            || (existing.nonce_hex.is_some()
+                                && chunk.nonce_hex.is_some()
+                                && existing.nonce_hex != chunk.nonce_hex)
+                            || (existing.aad.is_some()
+                                && chunk.aad.is_some()
+                                && existing.aad != chunk.aad))
+                })
+            });
+        if identity_conflict.is_some() {
+            return Err(SyncTransportError::Invalid(
+                "incoming chunk conflicts with an existing local chunk identity".to_string(),
+            ));
+        }
+    }
+    if bytes != blob.bytes {
+        return Err(SyncTransportError::Invalid(
+            "incoming chunk sizes do not match the blob size".to_string(),
+        ));
+    }
+    if encrypted_bytes < bytes {
+        return Err(SyncTransportError::Invalid(
+            "encrypted chunk sizes are smaller than the plaintext manifest".to_string(),
+        ));
+    }
+    let mut ordered_chunks = chunks.iter().collect::<Vec<_>>();
+    ordered_chunks.sort_by_key(|chunk| chunk.chunk_index);
+    let mut encrypted_hash_input = Vec::new();
+    for chunk in ordered_chunks {
+        encrypted_hash_input.extend_from_slice(chunk.encrypted_hash.as_bytes());
+    }
+    if sha256_hex(&encrypted_hash_input) != blob.encrypted_hash {
+        return Err(SyncTransportError::Invalid(
+            "incoming chunk hashes do not match the blob manifest hash".to_string(),
+        ));
+    }
+
+    if let Some(existing) = state
+        .blob_records
+        .iter()
+        .find(|existing| existing.id == blob.id)
+        && (existing.tombstoned_at.is_some()
+            || existing.vault_id != blob.vault_id
+            || existing.asset_id != blob.asset_id
+            || existing.encrypted_hash != blob.encrypted_hash
+            || existing.bytes != blob.bytes
+            || existing.chunk_count != blob.chunk_count
+            || existing.encryption_key_version != blob.encryption_key_version
+            || !(existing.content_hash == blob.content_hash
+                || compatible_hash_projection(
+                    &existing.content_hash,
+                    &blob.content_hash,
+                    &blob.encrypted_hash,
+                )))
+    {
+        return Err(SyncTransportError::Invalid(
+            "incoming blob conflicts with an existing local blob identity".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn compatible_chunk_content_hash(existing: &BlobChunk, incoming: &BlobChunk) -> bool {
+    compatible_hash_projection(
+        &existing.content_hash,
+        &incoming.content_hash,
+        &existing.encrypted_hash,
+    )
+}
+
+fn compatible_hash_projection(existing: &str, incoming: &str, encrypted_hash: &str) -> bool {
+    existing == incoming
+        || (existing == opaque_hash(encrypted_hash) && is_opaque_hash(existing))
+        || (incoming == opaque_hash(encrypted_hash) && is_opaque_hash(incoming))
+}
+
+fn reserve_receive_capacity(
+    library_root: &Path,
+    state: &LibraryState,
+    envelope: &TransferEnvelope,
+) -> Result<ReceiveReservation, SyncTransportError> {
+    let transfer_bytes = envelope.chunks.iter().try_fold(0_u64, |total, chunk| {
+        total.checked_add(chunk.encrypted_bytes).ok_or_else(|| {
+            SyncTransportError::Invalid("incoming transfer size overflowed".to_string())
+        })
+    })?;
+    let vault = state
+        .vaults
+        .iter()
+        .find(|vault| vault.id == envelope.blob.vault_id)
+        .ok_or_else(|| SyncTransportError::Invalid("incoming vault is unavailable".to_string()))?;
+    let device = state
+        .devices
+        .iter()
+        .find(|device| device.id == envelope.to_device_id)
+        .ok_or_else(|| SyncTransportError::Invalid("receiver device is unavailable".to_string()))?;
+    let required_reserve = vault
+        .storage_policy
+        .min_free_space_bytes
+        .checked_add(device.storage_profile.reserved_bytes)
+        .ok_or_else(|| {
+            SyncTransportError::Invalid("configured storage reserve overflowed".to_string())
+        })?;
+    let available = available_receive_space(library_root)?;
+    let required = transfer_bytes
+        .checked_add(required_reserve)
+        .ok_or_else(|| {
+            SyncTransportError::Invalid("incoming transfer capacity overflowed".to_string())
+        })?;
+    loop {
+        let already_reserved = RESERVED_RECEIVE_BYTES.load(std::sync::atomic::Ordering::Acquire);
+        let required_with_inflight = required.checked_add(already_reserved).ok_or_else(|| {
+            SyncTransportError::Invalid("incoming transfer reservation overflowed".to_string())
+        })?;
+        if available < required_with_inflight {
+            return Err(SyncTransportError::Invalid(format!(
+                "insufficient free space for encrypted transfer to vault {}: need {transfer_bytes} bytes plus {required_reserve} bytes reserved and {already_reserved} bytes for active transfers, have {available} bytes",
+                envelope.blob.vault_id
+            )));
+        }
+        let next_reserved = already_reserved
+            .checked_add(transfer_bytes)
+            .ok_or_else(|| {
+                SyncTransportError::Invalid("active transfer reservation overflowed".to_string())
+            })?;
+        if RESERVED_RECEIVE_BYTES
+            .compare_exchange_weak(
+                already_reserved,
+                next_reserved,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            return Ok(ReceiveReservation(transfer_bytes));
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn available_receive_space(path: &Path) -> Result<u64, SyncTransportError> {
+    fs2::available_space(path).map_err(io_error)
+}
+
+#[cfg(windows)]
+fn available_receive_space(path: &Path) -> Result<u64, SyncTransportError> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+
+    let path: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let mut available_to_caller = 0_u64;
+    let result = unsafe {
+        GetDiskFreeSpaceExW(
+            path.as_ptr(),
+            &mut available_to_caller,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    if result == 0 {
+        Err(io_error(std::io::Error::last_os_error()))
+    } else {
+        Ok(available_to_caller)
+    }
+}
+
+struct ReceiveReservation(u64);
+
+impl Drop for ReceiveReservation {
+    fn drop(&mut self) {
+        RESERVED_RECEIVE_BYTES.fetch_sub(self.0, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+#[cfg(unix)]
+fn sync_directory(path: &Path) -> Result<(), SyncTransportError> {
+    std::fs::File::open(path)
+        .and_then(|directory| directory.sync_all())
+        .map_err(io_error)
+}
+
+#[cfg(windows)]
+fn sync_directory(_path: &Path) -> Result<(), SyncTransportError> {
+    // File publication on Windows uses MOVEFILE_WRITE_THROUGH. The standard
+    // library cannot flush directory handles portably on Windows.
+    Ok(())
+}
+
+fn open_receive_root(library_root: &Path) -> Result<(Dir, PathBuf), SyncTransportError> {
+    fs::create_dir_all(library_root).map_err(io_error)?;
+    let root = fs::canonicalize(library_root).map_err(io_error)?;
+    let directory = Dir::open_ambient_dir(&root, ambient_authority()).map_err(io_error)?;
+    Ok((directory, root))
+}
+
+fn open_or_create_blob_dir(
+    root: &Dir,
+    root_path: &Path,
+    vault_id: Uuid,
+    blob_id: Uuid,
+) -> Result<(Dir, Vec<Dir>), SyncTransportError> {
+    let vaults = open_or_create_directory(root, "vaults", &root_path.join("vaults"))?;
+    let vault_path = root_path.join("vaults").join(vault_id.to_string());
+    let vault = open_or_create_directory(&vaults, &vault_id.to_string(), &vault_path)?;
+    let blobs_path = vault_path.join("blobs");
+    let blobs = open_or_create_directory(&vault, "blobs", &blobs_path)?;
+    let blob = open_or_create_directory(
+        &blobs,
+        &blob_id.to_string(),
+        &blobs_path.join(blob_id.to_string()),
+    )?;
+    // Keep every directory handle alive while Windows publication uses the
+    // canonical path API. cap-std opens directory handles without
+    // FILE_SHARE_DELETE on Windows, preventing an ancestor from being
+    // replaced by a junction or symlink during the transfer.
+    Ok((blob, vec![vaults, vault, blobs]))
+}
+
+fn open_or_create_directory(
+    parent: &Dir,
+    name: &str,
+    path: &Path,
+) -> Result<Dir, SyncTransportError> {
+    let mut created = false;
+    match parent.symlink_metadata(name) {
+        Ok(metadata) => validate_storage_directory(&metadata, name)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            match create_storage_directory(parent, name, path) {
+                Ok(()) => created = true,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(io_error(error)),
+            }
+        }
+        Err(error) => return Err(io_error(error)),
+    }
+    let metadata = parent.symlink_metadata(name).map_err(io_error)?;
+    validate_storage_directory(&metadata, name)?;
+    if created {
+        let parent_path = path.parent().ok_or_else(|| {
+            SyncTransportError::Invalid("managed directory has no parent".to_string())
+        })?;
+        sync_directory(parent_path)?;
+    }
+    parent.open_dir(name).map_err(io_error)
+}
+
+#[cfg(windows)]
+fn create_storage_directory(parent: &Dir, _name: &str, path: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_WRITE_THROUGH, MoveFileExW};
+
+    let parent_path = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("managed directory has no parent"))?;
+    let staging_name = format!(".po-dir-stage-{}", Uuid::new_v4());
+    parent.create_dir(&staging_name)?;
+    let source: Vec<u16> = parent_path
+        .join(&staging_name)
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    let destination: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let moved = unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if moved != 0 {
+        Ok(())
+    } else {
+        let error = std::io::Error::last_os_error();
+        let _ = parent.remove_dir(&staging_name);
+        Err(error)
+    }
+}
+
+#[cfg(not(windows))]
+fn create_storage_directory(parent: &Dir, name: &str, _path: &Path) -> std::io::Result<()> {
+    parent.create_dir(name)
+}
+
+fn validate_storage_directory(
+    metadata: &CapMetadata,
+    name: &str,
+) -> Result<(), SyncTransportError> {
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(SyncTransportError::Invalid(format!(
+            "managed storage component {name:?} is not a real directory"
+        )));
+    }
+    Ok(())
+}
+
+fn write_staged_chunk(dir: &Dir, name: &str, bytes: &[u8]) -> Result<(), SyncTransportError> {
+    let mut options = CapOpenOptions::new();
+    options.write(true).create_new(true);
+    let mut file = dir.open_with(name, &options).map_err(io_error)?;
+    use std::io::Write;
+    file.write_all(bytes).map_err(io_error)?;
+    file.sync_all().map_err(io_error)
+}
+
+fn publish_staged_chunk(
+    stage: &Dir,
+    stage_path: &Path,
+    staged_name: &str,
+    destination: &Dir,
+    destination_path: &Path,
+    destination_name: &str,
+    expected: (&str, u64),
+) -> Result<(), SyncTransportError> {
+    if storage_file_matches(destination, destination_name, expected.0, expected.1)? {
+        return Ok(());
+    }
+    match publish_noreplace(
+        stage,
+        stage_path,
+        staged_name,
+        destination,
+        destination_path,
+        destination_name,
+    ) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            if storage_file_matches(destination, destination_name, expected.0, expected.1)? {
+                Ok(())
+            } else {
+                Err(SyncTransportError::Invalid(
+                    "incoming chunk conflicts with different existing bytes".to_string(),
+                ))
+            }
+        }
+        Err(error) => Err(io_error(error)),
+    }
+}
+
+#[cfg(unix)]
+fn publish_noreplace(
+    stage: &Dir,
+    _stage_path: &Path,
+    staged_name: &str,
+    destination: &Dir,
+    _destination_path: &Path,
+    destination_name: &str,
+) -> std::io::Result<()> {
+    rustix::fs::renameat_with(
+        stage,
+        staged_name,
+        destination,
+        destination_name,
+        rustix::fs::RenameFlags::NOREPLACE,
+    )
+    .map_err(std::io::Error::from)
+}
+
+#[cfg(windows)]
+fn publish_noreplace(
+    _stage: &Dir,
+    stage_path: &Path,
+    staged_name: &str,
+    _destination: &Dir,
+    destination_path: &Path,
+    destination_name: &str,
+) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_WRITE_THROUGH, MoveFileExW};
+
+    let source: Vec<u16> = stage_path
+        .join(staged_name)
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    let destination: Vec<u16> = destination_path
+        .join(destination_name)
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    let moved = unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if moved == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn publish_noreplace(
+    _stage: &Dir,
+    _stage_path: &Path,
+    _staged_name: &str,
+    _destination: &Dir,
+    _destination_path: &Path,
+    _destination_name: &str,
+) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "durable no-replace chunk publication is unsupported on this platform",
+    ))
+}
+
+fn storage_file_matches(
+    dir: &Dir,
+    name: &str,
+    expected_hash: &str,
+    expected_bytes: u64,
+) -> Result<bool, SyncTransportError> {
+    let metadata = match dir.symlink_metadata(name) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(io_error(error)),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(SyncTransportError::Invalid(format!(
+            "managed chunk destination {name:?} is not a regular file"
+        )));
+    }
+    if metadata.len() != expected_bytes {
+        return Ok(false);
+    }
+    let bytes = dir.read(name).map_err(io_error)?;
+    Ok(sha256_hex(&bytes) == expected_hash)
+}
+
+fn cleanup_stale_incoming(blob_dir: &Dir) -> Result<(), SyncTransportError> {
+    const STALE_AFTER: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let entries = blob_dir.entries().map_err(io_error)?;
+    for entry in entries {
+        let entry = entry.map_err(io_error)?;
+        let name = entry.file_name();
+        let Some(name_text) = name.to_str() else {
+            continue;
+        };
+        let Some((created_at, _nonce)) = name_text
+            .strip_prefix(".incoming-")
+            .and_then(|value| value.split_once('-'))
+        else {
+            continue;
+        };
+        let Ok(created_at) = created_at.parse::<u64>() else {
+            continue;
+        };
+        let metadata = match blob_dir.symlink_metadata(&name) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(io_error(error)),
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            continue;
+        }
+        let stale = now.saturating_sub(created_at) >= STALE_AFTER.as_secs();
+        if stale {
+            blob_dir.remove_dir_all(&name).map_err(io_error)?;
+        }
+    }
+    Ok(())
+}
+
+struct IncomingStageGuard(Option<Dir>);
+
+impl IncomingStageGuard {
+    fn new(dir: Dir) -> Self {
+        Self(Some(dir))
+    }
+
+    fn dir(&self) -> &Dir {
+        self.0
+            .as_ref()
+            .expect("receive staging directory is present")
+    }
+}
+
+impl Drop for IncomingStageGuard {
+    fn drop(&mut self) {
+        if let Some(dir) = self.0.take() {
+            let _ = dir.remove_open_dir_all();
+        }
+    }
 }
 
 fn safe_relative_path(value: &str) -> Option<PathBuf> {
@@ -1229,4 +1859,474 @@ fn decode_hex_32(value: &str) -> Result<[u8; 32], SyncTransportError> {
 
 fn io_error(error: std::io::Error) -> SyncTransportError {
     SyncTransportError::Io(error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        IncomingStageGuard, TransferEnvelope, chunk_filename, incoming_chunk_path,
+        open_or_create_blob_dir, open_receive_root, publish_staged_chunk, sha256_hex,
+        validate_incoming_manifest, write_staged_chunk,
+    };
+    use crate::{
+        config::AppConfig,
+        domain::{
+            BlobChunk, BlobRecord, DeviceIdentity, DeviceRole, DeviceStorageProfile,
+            DeviceTrustLevel, StoragePolicy, Vault, VaultMember,
+        },
+        service::LibraryState,
+        storage::{self, StorageBootstrapReport},
+    };
+    use chrono::Utc;
+    use std::path::PathBuf;
+    use uuid::Uuid;
+
+    struct TestRoot(PathBuf);
+
+    impl TestRoot {
+        fn new() -> Self {
+            let path =
+                std::env::temp_dir().join(format!("photo-organizer-sync-{}", Uuid::new_v4()));
+            std::fs::create_dir_all(&path).expect("create test root");
+            Self(path)
+        }
+    }
+
+    impl Drop for TestRoot {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn blob() -> BlobRecord {
+        BlobRecord {
+            id: Uuid::from_u128(2),
+            vault_id: Uuid::from_u128(1),
+            asset_id: Uuid::from_u128(3),
+            content_hash: "asset-hash".to_string(),
+            encrypted_hash: super::sha256_hex(b"cipher-0cipher-1"),
+            bytes: 11,
+            chunk_count: 2,
+            encryption_key_version: 1,
+            created_at: Utc::now(),
+            tombstoned_at: None,
+        }
+    }
+
+    fn chunk(index: u32, id: u128, bytes: u64) -> BlobChunk {
+        BlobChunk {
+            id: Uuid::from_u128(id),
+            blob_id: Uuid::from_u128(2),
+            chunk_index: index,
+            content_hash: format!("chunk-{index}"),
+            encrypted_hash: format!("cipher-{index}"),
+            bytes,
+            encrypted_bytes: 32,
+            local_path: Some("db/library.sqlite".to_string()),
+            nonce_hex: None,
+            aad: None,
+        }
+    }
+
+    fn envelope(chunks: Vec<BlobChunk>) -> TransferEnvelope {
+        TransferEnvelope {
+            protocol_version: super::PROTOCOL_VERSION,
+            transfer_id: Uuid::from_u128(6),
+            from_device_id: Uuid::from_u128(7),
+            to_device_id: Uuid::from_u128(8),
+            blob: blob(),
+            chunks,
+        }
+    }
+
+    fn authorized_state() -> LibraryState {
+        let now = Utc::now();
+        let vault_id = Uuid::from_u128(1);
+        let source_id = Uuid::from_u128(7);
+        let receiver_id = Uuid::from_u128(8);
+        let receiver_profile = DeviceStorageProfile {
+            device_id: Some(receiver_id),
+            reserved_bytes: 0,
+            accepts_storage: true,
+            ..DeviceStorageProfile::default()
+        };
+        let mut storage_policy = StoragePolicy::protected_min_2();
+        storage_policy.min_free_space_bytes = 0;
+        LibraryState {
+            vaults: vec![Vault {
+                id: vault_id,
+                name: "Test vault".to_string(),
+                storage_policy,
+                key_version: 1,
+                deletion_grace_days: 7,
+                created_at: now,
+                updated_at: now,
+            }],
+            devices: vec![
+                DeviceIdentity {
+                    id: source_id,
+                    display_name: "Source".to_string(),
+                    platform: "linux".to_string(),
+                    public_key: "remote-node".to_string(),
+                    trust_level: DeviceTrustLevel::Trusted,
+                    storage_profile: DeviceStorageProfile::default(),
+                    enrolled_at: now,
+                    last_seen_at: Some(now),
+                    revoked_at: None,
+                },
+                DeviceIdentity {
+                    id: receiver_id,
+                    display_name: "Receiver".to_string(),
+                    platform: "linux".to_string(),
+                    public_key: "local-node".to_string(),
+                    trust_level: DeviceTrustLevel::Trusted,
+                    storage_profile: receiver_profile,
+                    enrolled_at: now,
+                    last_seen_at: Some(now),
+                    revoked_at: None,
+                },
+            ],
+            vault_members: vec![
+                VaultMember {
+                    id: Uuid::from_u128(9),
+                    vault_id,
+                    device_id: source_id,
+                    role: DeviceRole::Contributor,
+                    trust_level: DeviceTrustLevel::Trusted,
+                    display_name: "Source".to_string(),
+                    added_at: now,
+                    revoked_at: None,
+                },
+                VaultMember {
+                    id: Uuid::from_u128(10),
+                    vault_id,
+                    device_id: receiver_id,
+                    role: DeviceRole::Contributor,
+                    trust_level: DeviceTrustLevel::Trusted,
+                    display_name: "Receiver".to_string(),
+                    added_at: now,
+                    revoked_at: None,
+                },
+            ],
+            ..LibraryState::default()
+        }
+    }
+
+    fn encrypted_envelope() -> (TransferEnvelope, Vec<Vec<u8>>) {
+        let ciphertexts = vec![
+            b"encrypted chunk zero".to_vec(),
+            b"encrypted chunk one".to_vec(),
+        ];
+        let mut chunks = vec![chunk(0, 4, 5), chunk(1, 5, 6)];
+        for (chunk, ciphertext) in chunks.iter_mut().zip(&ciphertexts) {
+            chunk.encrypted_hash = sha256_hex(ciphertext);
+            chunk.encrypted_bytes = ciphertext.len() as u64;
+        }
+        let mut envelope = envelope(chunks);
+        let mut hash_input = Vec::new();
+        for chunk in &envelope.chunks {
+            hash_input.extend_from_slice(chunk.encrypted_hash.as_bytes());
+        }
+        envelope.blob.encrypted_hash = sha256_hex(&hash_input);
+        (envelope, ciphertexts)
+    }
+
+    async fn invoke_receive(
+        report: &StorageBootstrapReport,
+        library_root: &std::path::Path,
+        state: std::sync::Arc<tokio::sync::RwLock<LibraryState>>,
+        envelope: &TransferEnvelope,
+        ciphertexts: &[Vec<u8>],
+    ) -> Result<u64, super::SyncTransportError> {
+        use tokio::io::AsyncWriteExt;
+
+        let (mut writer, mut reader) = tokio::io::duplex(4096);
+        for ciphertext in ciphertexts {
+            writer
+                .write_u64(ciphertext.len() as u64)
+                .await
+                .expect("write frame length");
+            writer
+                .write_all(ciphertext)
+                .await
+                .expect("write frame body");
+        }
+        drop(writer);
+        super::receive_envelope(
+            report,
+            &state,
+            &mut reader,
+            envelope,
+            "remote-node",
+            "local-node",
+            library_root,
+        )
+        .await
+    }
+
+    #[test]
+    fn sender_local_paths_never_choose_receive_destinations() {
+        let blob = blob();
+        let mut chunk = chunk(0, 4, 5);
+        let expected = PathBuf::from("vaults")
+            .join(blob.vault_id.to_string())
+            .join("blobs")
+            .join(blob.id.to_string())
+            .join("00000000.pgblob");
+
+        for untrusted_path in ["db/library.sqlite", "../../outside", "/etc/passwd"] {
+            chunk.local_path = Some(untrusted_path.to_string());
+            assert_eq!(incoming_chunk_path(&blob, &chunk), expected);
+        }
+    }
+
+    #[test]
+    fn manifest_requires_each_declared_chunk_exactly_once() {
+        let state = LibraryState::default();
+        let valid = envelope(vec![chunk(1, 5, 6), chunk(0, 4, 5)]);
+        assert!(validate_incoming_manifest(&state, &valid).is_ok());
+
+        let duplicate_index = envelope(vec![chunk(0, 4, 5), chunk(0, 5, 6)]);
+        assert!(validate_incoming_manifest(&state, &duplicate_index).is_err());
+
+        let missing_index = envelope(vec![chunk(0, 4, 5)]);
+        assert!(validate_incoming_manifest(&state, &missing_index).is_err());
+
+        let duplicate_id = envelope(vec![chunk(0, 4, 5), chunk(1, 4, 6)]);
+        assert!(validate_incoming_manifest(&state, &duplicate_id).is_err());
+
+        let mut oversized_chunk = valid;
+        oversized_chunk.chunks[0].encrypted_bytes = super::MAX_CHUNK_FRAME_BYTES as u64 + 1;
+        assert!(validate_incoming_manifest(&state, &oversized_chunk).is_err());
+
+        let mut changed_plaintext_size = envelope(vec![chunk(0, 4, 5), chunk(1, 5, 6)]);
+        let mut existing_state = LibraryState::default();
+        existing_state.blob_chunks.push(chunk(0, 4, 4));
+        assert!(validate_incoming_manifest(&existing_state, &changed_plaintext_size).is_err());
+        changed_plaintext_size.chunks[0].bytes = 5;
+        assert!(validate_incoming_manifest(&state, &changed_plaintext_size).is_ok());
+    }
+
+    #[test]
+    fn manifest_rejects_blob_identity_rebinding() {
+        let incoming = envelope(vec![chunk(0, 4, 5), chunk(1, 5, 6)]);
+        let mut existing = blob();
+        existing.vault_id = Uuid::from_u128(99);
+        let mut state = LibraryState::default();
+        state.blob_records.push(existing);
+
+        assert!(validate_incoming_manifest(&state, &incoming).is_err());
+    }
+
+    #[test]
+    fn failed_stage_is_removed_on_scope_exit() {
+        let root = TestRoot::new();
+        let (root_dir, _canonical_root) = open_receive_root(&root.0).expect("open capability root");
+        let (blob_dir, _directory_anchors) =
+            open_or_create_blob_dir(&root_dir, &root.0, Uuid::from_u128(1), Uuid::from_u128(2))
+                .expect("create blob directory");
+        let stage_name = ".incoming-test";
+        blob_dir.create_dir(stage_name).expect("create stage");
+        let stage = IncomingStageGuard::new(blob_dir.open_dir(stage_name).expect("open stage"));
+        write_staged_chunk(stage.dir(), &chunk_filename(0), b"ciphertext")
+            .expect("write staged bytes");
+        drop(stage);
+
+        assert!(
+            !blob_dir
+                .try_exists(stage_name)
+                .expect("check stage cleanup")
+        );
+    }
+
+    #[test]
+    fn receive_capacity_enforces_configured_reserve_and_checked_sum() {
+        let root = TestRoot::new();
+        let state = authorized_state();
+        let (valid, _) = encrypted_envelope();
+        let mut reserve_state = authorized_state();
+        reserve_state.vaults[0].storage_policy.min_free_space_bytes = u64::MAX;
+        assert!(super::reserve_receive_capacity(&root.0, &reserve_state, &valid).is_err());
+
+        let mut overflowing = valid;
+        overflowing.chunks[0].encrypted_bytes = u64::MAX;
+        overflowing.chunks[1].encrypted_bytes = 1;
+        assert!(super::reserve_receive_capacity(&root.0, &state, &overflowing).is_err());
+        assert!(
+            std::fs::read_dir(&root.0)
+                .expect("list untouched library root")
+                .next()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn conflicting_destination_preserves_existing_bytes() {
+        let root = TestRoot::new();
+        let (root_dir, _canonical_root) = open_receive_root(&root.0).expect("open capability root");
+        let (blob_dir, _directory_anchors) =
+            open_or_create_blob_dir(&root_dir, &root.0, Uuid::from_u128(1), Uuid::from_u128(2))
+                .expect("create blob directory");
+        let stage_name = ".incoming-test";
+        blob_dir.create_dir(stage_name).expect("create stage");
+        let stage = blob_dir.open_dir(stage_name).expect("open stage");
+        let blob_path = root
+            .0
+            .join("vaults")
+            .join(Uuid::from_u128(1).to_string())
+            .join("blobs")
+            .join(Uuid::from_u128(2).to_string());
+        let stage_path = blob_path.join(stage_name);
+        let name = chunk_filename(0);
+        write_staged_chunk(&stage, &name, b"new-ciphertext").expect("stage new bytes");
+        blob_dir
+            .write(&name, b"known-good-ciphertext")
+            .expect("write old bytes");
+
+        assert!(
+            publish_staged_chunk(
+                &stage,
+                &stage_path,
+                &name,
+                &blob_dir,
+                &blob_path,
+                &name,
+                (
+                    &sha256_hex(b"new-ciphertext"),
+                    b"new-ciphertext".len() as u64,
+                ),
+            )
+            .is_err()
+        );
+        assert_eq!(
+            blob_dir.read(&name).expect("read preserved file"),
+            b"known-good-ciphertext"
+        );
+    }
+
+    #[tokio::test]
+    async fn receive_ignores_peer_path_and_persists_only_verified_receiver_paths() {
+        let root = TestRoot::new();
+        let library = root.0.join("library");
+        let runtime = root.0.join("runtime");
+        let config = AppConfig {
+            library_root: library.clone(),
+            runtime_root: runtime,
+            ..AppConfig::default()
+        };
+        let report = storage::bootstrap_storage(&config).expect("bootstrap test database");
+        let unrelated = library.join("db/library.sqlite");
+        std::fs::create_dir_all(unrelated.parent().expect("unrelated parent"))
+            .expect("create unrelated parent");
+        std::fs::write(&unrelated, b"preserve me").expect("write unrelated file");
+
+        let (envelope, ciphertexts) = encrypted_envelope();
+        let state = std::sync::Arc::new(tokio::sync::RwLock::new(authorized_state()));
+        let result =
+            invoke_receive(&report, &library, state.clone(), &envelope, &ciphertexts).await;
+
+        assert_eq!(result.expect("receive and persist verified chunks"), 11);
+        assert_eq!(
+            std::fs::read(&unrelated).expect("read unrelated file"),
+            b"preserve me"
+        );
+        let persisted = storage::load_state(&report).expect("reload persisted state");
+        assert_eq!(persisted.blob_records.len(), 1);
+        assert_eq!(persisted.blob_chunks.len(), 2);
+        for (chunk, ciphertext) in persisted.blob_chunks.iter().zip(ciphertexts) {
+            let local_path = chunk.local_path.as_ref().expect("receiver-owned path");
+            assert!(!local_path.contains("db/library.sqlite"));
+            let bytes = std::fs::read(library.join(local_path)).expect("read stored replica");
+            assert_eq!(sha256_hex(&bytes), chunk.encrypted_hash);
+            assert_eq!(bytes, ciphertext);
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_metadata_commit_does_not_leave_a_healthy_replica_claim() {
+        let root = TestRoot::new();
+        let library = root.0.join("library");
+        std::fs::create_dir_all(&library).expect("create library root");
+        let database_path = root.0.join("not-a-database");
+        std::fs::create_dir_all(&database_path).expect("block database file creation");
+        let report = StorageBootstrapReport { database_path };
+        let (envelope, ciphertexts) = encrypted_envelope();
+        let state = std::sync::Arc::new(tokio::sync::RwLock::new(authorized_state()));
+
+        assert!(
+            invoke_receive(&report, &library, state.clone(), &envelope, &ciphertexts)
+                .await
+                .is_err()
+        );
+        let state = state.read().await;
+        assert!(state.blob_records.is_empty());
+        assert!(state.blob_chunks.is_empty());
+        assert!(state.blob_replicas.is_empty());
+        assert!(state.sync_transfers.is_empty());
+        let final_path = library.join(incoming_chunk_path(&envelope.blob, &envelope.chunks[0]));
+        assert_eq!(
+            std::fs::read(final_path).expect("verified orphan can be retried"),
+            ciphertexts[0]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn receive_refuses_symlinked_vault_directory() {
+        use std::os::unix::fs::symlink;
+
+        let root = TestRoot::new();
+        let outside = root.0.join("outside");
+        std::fs::create_dir_all(&outside).expect("create outside target");
+        let library = root.0.join("library");
+        std::fs::create_dir_all(library.join("vaults")).expect("create storage root");
+        symlink(
+            &outside,
+            library.join("vaults").join(Uuid::from_u128(1).to_string()),
+        )
+        .expect("create symlink fixture");
+
+        let (root_dir, _canonical_root) =
+            open_receive_root(&library).expect("open capability root");
+        assert!(
+            open_or_create_blob_dir(&root_dir, &root.0, Uuid::from_u128(1), Uuid::from_u128(2),)
+                .is_err()
+        );
+        assert_eq!(
+            std::fs::read_dir(&outside)
+                .expect("list outside target")
+                .count(),
+            0
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn receive_refuses_symlinked_vault_directory() {
+        use std::os::windows::fs::symlink_dir;
+
+        let root = TestRoot::new();
+        let outside = root.0.join("outside");
+        std::fs::create_dir_all(&outside).expect("create outside target");
+        let library = root.0.join("library");
+        std::fs::create_dir_all(library.join("vaults")).expect("create storage root");
+        symlink_dir(
+            &outside,
+            library.join("vaults").join(Uuid::from_u128(1).to_string()),
+        )
+        .expect("create symlink fixture");
+
+        let (root_dir, _canonical_root) =
+            open_receive_root(&library).expect("open capability root");
+        assert!(
+            open_or_create_blob_dir(&root_dir, &root.0, Uuid::from_u128(1), Uuid::from_u128(2),)
+                .is_err()
+        );
+        assert_eq!(
+            std::fs::read_dir(&outside)
+                .expect("list outside target")
+                .count(),
+            0
+        );
+    }
 }

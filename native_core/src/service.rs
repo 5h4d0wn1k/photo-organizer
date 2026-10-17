@@ -5344,6 +5344,9 @@ impl GalleryService {
             ));
         }
 
+        // Keep this service's shared state lock for the full migration: its normal
+        // persistence paths and SyncRuntime share this lock, so those writers
+        // cannot commit between the WAL checkpoint and atomic database replacement.
         let state = self.state.write().await;
         self.persist_locked_state(&state)?;
         security::activate_encryption(&self.config).map_err(security_error)
@@ -9722,13 +9725,8 @@ mod tests {
         sha256_hex_bytes,
     };
 
-    fn temp_root(name: &str) -> PathBuf {
-        let root = std::env::temp_dir().join(format!(
-            "private-gallery-service-{name}-{}",
-            Utc::now().timestamp_nanos_opt().unwrap_or_default()
-        ));
-        fs::create_dir_all(&root).expect("create temp root");
-        root
+    fn temp_root(name: &str) -> crate::test_support::TestTempDir {
+        crate::test_support::TestTempDir::new(&format!("service-{name}"))
     }
 
     async fn set_mobile_member_role(
@@ -9830,7 +9828,7 @@ mod tests {
     async fn initializes_library_settings() {
         let runtime_root = temp_root("settings");
         let service = GalleryService::new(AppConfig {
-            runtime_root: runtime_root.clone(),
+            runtime_root: runtime_root.to_path_buf(),
             ..AppConfig::default()
         })
         .expect("service");
@@ -9851,7 +9849,7 @@ mod tests {
     async fn entitlement_cache_preserves_core_access_and_offline_grace() {
         let runtime_root = temp_root("entitlements");
         let config = AppConfig {
-            runtime_root: runtime_root.clone(),
+            runtime_root: runtime_root.to_path_buf(),
             ..AppConfig::default()
         };
         let service = GalleryService::new(config.clone()).expect("service");
@@ -9918,7 +9916,7 @@ mod tests {
     async fn entitlement_cache_rejects_raw_account_identifiers() {
         let runtime_root = temp_root("entitlement-privacy");
         let service = GalleryService::new(AppConfig {
-            runtime_root: runtime_root.clone(),
+            runtime_root: runtime_root.to_path_buf(),
             ..AppConfig::default()
         })
         .expect("service");
@@ -9945,7 +9943,7 @@ mod tests {
     async fn platform_release_readiness_tracks_all_required_surfaces() {
         let runtime_root = temp_root("platform-release-readiness");
         let service = GalleryService::new(AppConfig {
-            runtime_root: runtime_root.clone(),
+            runtime_root: runtime_root.to_path_buf(),
             ..AppConfig::default()
         })
         .expect("service");
@@ -10023,7 +10021,7 @@ mod tests {
         let account_hash =
             "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789".to_string();
         let service = GalleryService::new(AppConfig {
-            runtime_root: runtime_root.clone(),
+            runtime_root: runtime_root.to_path_buf(),
             ..AppConfig::default()
         })
         .expect("service");
@@ -10096,7 +10094,7 @@ mod tests {
     async fn pairing_token_is_hashed_at_rest_and_matched_constant_time() {
         let runtime_root = temp_root("pairing-hash");
         let config = AppConfig {
-            runtime_root: runtime_root.clone(),
+            runtime_root: runtime_root.to_path_buf(),
             ..AppConfig::default()
         };
         let service = GalleryService::new(config.clone()).expect("service");
@@ -10173,7 +10171,7 @@ mod tests {
         let runtime_root = temp_root("mobile-sync");
         let library_root = runtime_root.join("library");
         let config = AppConfig {
-            runtime_root: runtime_root.clone(),
+            runtime_root: runtime_root.to_path_buf(),
             ..AppConfig::default()
         };
         let service = GalleryService::new(config.clone()).expect("service");
@@ -10442,7 +10440,7 @@ mod tests {
         let runtime_root = temp_root("mobile-document");
         let library_root = runtime_root.join("library");
         let service = GalleryService::new(AppConfig {
-            runtime_root,
+            runtime_root: runtime_root.to_path_buf(),
             ..AppConfig::default()
         })
         .expect("service");
@@ -10557,7 +10555,7 @@ mod tests {
         let original_bytes = b"desktop imported family photo".to_vec();
         fs::write(&source, &original_bytes).expect("write source");
         let service = GalleryService::new(AppConfig {
-            runtime_root,
+            runtime_root: runtime_root.to_path_buf(),
             ..AppConfig::default()
         })
         .expect("service");
@@ -10740,7 +10738,7 @@ mod tests {
         let runtime_root = temp_root("mobile-storage-node");
         let library_root = runtime_root.join("library");
         let service = GalleryService::new(AppConfig {
-            runtime_root: runtime_root.clone(),
+            runtime_root: runtime_root.to_path_buf(),
             ..AppConfig::default()
         })
         .expect("service");
@@ -11015,7 +11013,7 @@ mod tests {
         fs::write(&document_path, &bytes).expect("write document");
 
         let config = AppConfig {
-            runtime_root: runtime_root.clone(),
+            runtime_root: runtime_root.to_path_buf(),
             ..AppConfig::default()
         };
         let service = GalleryService::new(config.clone()).expect("service");
@@ -11226,7 +11224,7 @@ mod tests {
         let runtime_root = temp_root("mobile-chunk-upload");
         let library_root = runtime_root.join("library");
         let service = GalleryService::new(AppConfig {
-            runtime_root,
+            runtime_root: runtime_root.to_path_buf(),
             ..AppConfig::default()
         })
         .expect("service");
@@ -11415,7 +11413,7 @@ mod tests {
         let runtime_root = temp_root("mobile-vault-bound-pairing");
         let library_root = runtime_root.join("library");
         let service = GalleryService::new(AppConfig {
-            runtime_root,
+            runtime_root: runtime_root.to_path_buf(),
             ..AppConfig::default()
         })
         .expect("service");
@@ -11465,7 +11463,7 @@ mod tests {
         let runtime_root = temp_root("admin-audit-events");
         let library_root = runtime_root.join("library");
         let config = AppConfig {
-            runtime_root,
+            runtime_root: runtime_root.to_path_buf(),
             ..AppConfig::default()
         };
         let service = GalleryService::new(config.clone()).expect("service");
@@ -11558,7 +11556,7 @@ mod tests {
         let runtime_root = temp_root("explicit-first-vault");
         let library_root = runtime_root.join("library");
         let service = GalleryService::new(AppConfig {
-            runtime_root,
+            runtime_root: runtime_root.to_path_buf(),
             ..AppConfig::default()
         })
         .expect("service");
@@ -11591,7 +11589,7 @@ mod tests {
         let runtime_root = temp_root("cloud-group-idempotent-vault");
         let library_root = runtime_root.join("library");
         let service = GalleryService::new(AppConfig {
-            runtime_root,
+            runtime_root: runtime_root.to_path_buf(),
             ..AppConfig::default()
         })
         .expect("service");
@@ -11640,7 +11638,7 @@ mod tests {
         let runtime_root = temp_root("mobile-pairing-rejections");
         let library_root = runtime_root.join("library");
         let service = GalleryService::new(AppConfig {
-            runtime_root,
+            runtime_root: runtime_root.to_path_buf(),
             ..AppConfig::default()
         })
         .expect("service");
@@ -11769,7 +11767,7 @@ mod tests {
         let source = runtime_root.join("photo.jpg");
         fs::write(&source, b"family-photo").expect("write source");
         let config = AppConfig {
-            runtime_root: runtime_root.clone(),
+            runtime_root: runtime_root.to_path_buf(),
             ..AppConfig::default()
         };
         let service = GalleryService::new(config.clone()).expect("service");
@@ -11849,7 +11847,7 @@ mod tests {
         let original_bytes = b"family-photo-private-original";
         fs::write(&source, original_bytes).expect("write source");
         let service = GalleryService::new(AppConfig {
-            runtime_root: runtime_root.clone(),
+            runtime_root: runtime_root.to_path_buf(),
             ..AppConfig::default()
         })
         .expect("service");
@@ -11909,7 +11907,7 @@ mod tests {
         let original_bytes = b"plaintext-original-that-must-not-be-retained";
         fs::write(&source, original_bytes).expect("write source");
         let config = AppConfig {
-            runtime_root: runtime_root.clone(),
+            runtime_root: runtime_root.to_path_buf(),
             ..AppConfig::default()
         };
         let service = GalleryService::new(config.clone()).expect("service");
@@ -11996,7 +11994,7 @@ mod tests {
         let original_bytes = b"family-photo-private-original";
         fs::write(&source, original_bytes).expect("write source");
         let service = GalleryService::new(AppConfig {
-            runtime_root: runtime_root.clone(),
+            runtime_root: runtime_root.to_path_buf(),
             ..AppConfig::default()
         })
         .expect("service");
@@ -12120,13 +12118,13 @@ mod tests {
         fs::write(&source, original_bytes).expect("write source");
 
         let service_a = GalleryService::new(AppConfig {
-            runtime_root: runtime_a.clone(),
+            runtime_root: runtime_a.to_path_buf(),
             network_policy: NetworkPolicy::OfflineOnly,
             ..AppConfig::default()
         })
         .expect("service a");
         let service_b = GalleryService::new(AppConfig {
-            runtime_root: runtime_b.clone(),
+            runtime_root: runtime_b.to_path_buf(),
             network_policy: NetworkPolicy::OfflineOnly,
             ..AppConfig::default()
         })
@@ -12174,6 +12172,13 @@ mod tests {
 
         {
             let mut state_b = service_b.state.write().await;
+            state_b
+                .vaults
+                .iter_mut()
+                .find(|vault| vault.id == source_vault.id)
+                .expect("mirrored source vault")
+                .storage_policy
+                .min_free_space_bytes = 0;
             let local_b = local_device_id(&state_b).expect("local b before endpoint");
             let device = state_b
                 .devices
@@ -12182,6 +12187,7 @@ mod tests {
                 .expect("local b device");
             device.trust_level = DeviceTrustLevel::StorageOnly;
             device.storage_profile.accepts_storage = true;
+            device.storage_profile.reserved_bytes = 0;
             for member in state_b
                 .vault_members
                 .iter_mut()
@@ -12304,6 +12310,17 @@ mod tests {
             )
             .await
             .expect("single remote replica policy");
+        {
+            let mut state_a = service_a.state.write().await;
+            let local_a = local_device_id(&state_a).expect("local a");
+            state_a
+                .devices
+                .iter_mut()
+                .find(|device| device.id == local_a)
+                .expect("local a device")
+                .storage_profile
+                .reserved_bytes = 0;
+        }
         let evicted = service_a
             .evict_local_asset(imported.asset.id)
             .await
@@ -12358,7 +12375,7 @@ mod tests {
         let original_bytes = b"family-photo-private-original";
         fs::write(&source, original_bytes).expect("write source");
         let config = AppConfig {
-            runtime_root: runtime_root.clone(),
+            runtime_root: runtime_root.to_path_buf(),
             ..AppConfig::default()
         };
         let service = GalleryService::new(config).expect("service");
@@ -12457,7 +12474,7 @@ mod tests {
         let source = runtime_root.join("photo.jpg");
         fs::write(&source, b"family-photo-private-original").expect("write source");
         let service = GalleryService::new(AppConfig {
-            runtime_root: runtime_root.clone(),
+            runtime_root: runtime_root.to_path_buf(),
             ..AppConfig::default()
         })
         .expect("service");
@@ -12509,7 +12526,7 @@ mod tests {
         let source = runtime_root.join("photo.jpg");
         fs::write(&source, b"family-photo-private-original").expect("write source");
         let service = GalleryService::new(AppConfig {
-            runtime_root: runtime_root.clone(),
+            runtime_root: runtime_root.to_path_buf(),
             ..AppConfig::default()
         })
         .expect("service");
@@ -12563,7 +12580,7 @@ mod tests {
         fs::write(source_root.join("a.jpg"), b"image").expect("write file");
 
         let service = GalleryService::new(AppConfig {
-            runtime_root: runtime_root.clone(),
+            runtime_root: runtime_root.to_path_buf(),
             ..AppConfig::default()
         })
         .expect("service");
@@ -12611,7 +12628,7 @@ mod tests {
         fs::write(source_root.join("c.jpg"), b"image-c").expect("write file");
 
         let service = GalleryService::new(AppConfig {
-            runtime_root: runtime_root.clone(),
+            runtime_root: runtime_root.to_path_buf(),
             ..AppConfig::default()
         })
         .expect("service");
@@ -12673,7 +12690,7 @@ mod tests {
         fs::write(source_root.join("b.jpg"), b"image-b").expect("write file");
 
         let service = GalleryService::new(AppConfig {
-            runtime_root: runtime_root.clone(),
+            runtime_root: runtime_root.to_path_buf(),
             ..AppConfig::default()
         })
         .expect("service");
@@ -12765,7 +12782,7 @@ mod tests {
         );
 
         let restarted = GalleryService::new(AppConfig {
-            runtime_root,
+            runtime_root: runtime_root.to_path_buf(),
             ..AppConfig::default()
         })
         .expect("restarted service");
@@ -12794,7 +12811,7 @@ mod tests {
         fs::write(&invoice_path, b"invoice-bytes").expect("write file");
 
         let service = GalleryService::new(AppConfig {
-            runtime_root: runtime_root.clone(),
+            runtime_root: runtime_root.to_path_buf(),
             ..AppConfig::default()
         })
         .expect("service");
@@ -12886,7 +12903,7 @@ mod tests {
         assert_eq!(text_result.assets.len(), 1);
 
         let restarted = GalleryService::new(AppConfig {
-            runtime_root,
+            runtime_root: runtime_root.to_path_buf(),
             ..AppConfig::default()
         })
         .expect("restarted service");
@@ -12912,7 +12929,7 @@ mod tests {
         fs::write(&second_path, b"image-b").expect("write file");
 
         let service = GalleryService::new(AppConfig {
-            runtime_root: runtime_root.clone(),
+            runtime_root: runtime_root.to_path_buf(),
             ..AppConfig::default()
         })
         .expect("service");
@@ -13003,7 +13020,7 @@ mod tests {
         assert_eq!(removed_first.cover_asset_id, Some(second_id));
 
         let restarted = GalleryService::new(AppConfig {
-            runtime_root,
+            runtime_root: runtime_root.to_path_buf(),
             ..AppConfig::default()
         })
         .expect("restarted service");
@@ -13023,7 +13040,7 @@ mod tests {
         fs::write(&proposal_path, b"private proposal").expect("write proposal");
 
         let service = GalleryService::new(AppConfig {
-            runtime_root: runtime_root.clone(),
+            runtime_root: runtime_root.to_path_buf(),
             ..AppConfig::default()
         })
         .expect("service");
@@ -13110,7 +13127,7 @@ mod tests {
         assert_eq!(result.assets[0].id, imported.asset.id);
 
         let restarted = GalleryService::new(AppConfig {
-            runtime_root,
+            runtime_root: runtime_root.to_path_buf(),
             ..AppConfig::default()
         })
         .expect("restarted service");
@@ -13134,7 +13151,7 @@ mod tests {
         fs::write(source_root.join("a.jpg"), b"same-image-bytes").expect("write file");
 
         let service = GalleryService::new(AppConfig {
-            runtime_root: runtime_root.clone(),
+            runtime_root: runtime_root.to_path_buf(),
             ..AppConfig::default()
         })
         .expect("service");
@@ -13192,7 +13209,7 @@ mod tests {
         fs::write(second_source.join("b.jpg"), bytes).expect("write duplicate");
 
         let service = GalleryService::new(AppConfig {
-            runtime_root: runtime_root.clone(),
+            runtime_root: runtime_root.to_path_buf(),
             ..AppConfig::default()
         })
         .expect("service");
@@ -13264,7 +13281,7 @@ mod tests {
         fs::write(source_root.join("b.jpg"), b"same-image-bytes").expect("write b");
 
         let service = GalleryService::new(AppConfig {
-            runtime_root: runtime_root.clone(),
+            runtime_root: runtime_root.to_path_buf(),
             ..AppConfig::default()
         })
         .expect("service");
@@ -13311,7 +13328,7 @@ mod tests {
         fs::write(&sidecar_path, b"{\"title\":\"a\"}").expect("write sidecar");
 
         let service = GalleryService::new(AppConfig {
-            runtime_root: runtime_root.clone(),
+            runtime_root: runtime_root.to_path_buf(),
             ..AppConfig::default()
         })
         .expect("service");
@@ -13388,7 +13405,7 @@ mod tests {
         .expect("write sidecar");
 
         let service = GalleryService::new(AppConfig {
-            runtime_root: runtime_root.clone(),
+            runtime_root: runtime_root.to_path_buf(),
             ..AppConfig::default()
         })
         .expect("service");
@@ -13454,7 +13471,7 @@ mod tests {
         fs::write(source_root.join("a.jpg"), b"image-a").expect("write file");
 
         let service = GalleryService::new(AppConfig {
-            runtime_root: runtime_root.clone(),
+            runtime_root: runtime_root.to_path_buf(),
             ..AppConfig::default()
         })
         .expect("service");
@@ -13504,7 +13521,7 @@ mod tests {
         fs::write(source_root.join("a.jpg"), b"same-image-bytes").expect("write first file");
 
         let service = GalleryService::new(AppConfig {
-            runtime_root: runtime_root.clone(),
+            runtime_root: runtime_root.to_path_buf(),
             ..AppConfig::default()
         })
         .expect("service");
@@ -13570,7 +13587,7 @@ mod tests {
         fs::write(&media_path, b"same-image-bytes").expect("write file");
 
         let service = GalleryService::new(AppConfig {
-            runtime_root: runtime_root.clone(),
+            runtime_root: runtime_root.to_path_buf(),
             ..AppConfig::default()
         })
         .expect("service");
@@ -13618,7 +13635,7 @@ mod tests {
         fs::write(source_root.join("a.jpg"), b"image").expect("write file");
 
         let config = AppConfig {
-            runtime_root: runtime_root.clone(),
+            runtime_root: runtime_root.to_path_buf(),
             ..AppConfig::default()
         };
         let service = GalleryService::new(config.clone()).expect("service");
@@ -13660,7 +13677,7 @@ mod tests {
     async fn privacy_status_is_local_only_and_loopback_bound() {
         let runtime_root = temp_root("privacy-status");
         let service = GalleryService::new(AppConfig {
-            runtime_root,
+            runtime_root: runtime_root.to_path_buf(),
             ..AppConfig::default()
         })
         .expect("service");
@@ -13691,7 +13708,7 @@ mod tests {
     fn rejects_non_loopback_bind_without_developer_mode() {
         let runtime_root = temp_root("non-loopback-bind");
         let result = GalleryService::new(AppConfig {
-            runtime_root,
+            runtime_root: runtime_root.to_path_buf(),
             bind_host: "0.0.0.0".to_string(),
             ..AppConfig::default()
         });
@@ -13704,7 +13721,7 @@ mod tests {
     async fn allows_non_loopback_bind_for_remote_mobile_mode() {
         let runtime_root = temp_root("remote-mobile-bind");
         let service = GalleryService::new(AppConfig {
-            runtime_root,
+            runtime_root: runtime_root.to_path_buf(),
             bind_host: "100.64.0.10".to_string(),
             allow_remote_mobile: true,
             ..AppConfig::default()
@@ -13723,7 +13740,7 @@ mod tests {
     async fn model_install_requires_explicit_confirmation() {
         let runtime_root = temp_root("model-install-confirmation");
         let service = GalleryService::new(AppConfig {
-            runtime_root,
+            runtime_root: runtime_root.to_path_buf(),
             ..AppConfig::default()
         })
         .expect("service");
@@ -13745,7 +13762,7 @@ mod tests {
     async fn confirmed_model_download_requires_pinned_hash_and_approval() {
         let runtime_root = temp_root("model-install-hash");
         let service = GalleryService::new(AppConfig {
-            runtime_root,
+            runtime_root: runtime_root.to_path_buf(),
             ..AppConfig::default()
         })
         .expect("service");
@@ -13779,7 +13796,7 @@ mod tests {
     async fn sensitive_index_jobs_are_blocked_until_encryption_and_models() {
         let runtime_root = temp_root("sensitive-index-gate");
         let service = GalleryService::new(AppConfig {
-            runtime_root,
+            runtime_root: runtime_root.to_path_buf(),
             ..AppConfig::default()
         })
         .expect("service");
@@ -13813,7 +13830,7 @@ mod tests {
     async fn model_runtime_status_reports_local_python_sidecar() {
         let runtime_root = temp_root("ml-sidecar");
         let service = GalleryService::new(AppConfig {
-            runtime_root,
+            runtime_root: runtime_root.to_path_buf(),
             ..AppConfig::default()
         })
         .expect("service");
@@ -13837,7 +13854,7 @@ mod tests {
         fs::write(source_root.join("a.jpg"), b"image-a").expect("write file");
 
         let config = AppConfig {
-            runtime_root: runtime_root.clone(),
+            runtime_root: runtime_root.to_path_buf(),
             ..AppConfig::default()
         };
         let service = GalleryService::new(config.clone()).expect("service");
@@ -13899,7 +13916,7 @@ mod tests {
     async fn encryption_activation_requires_confirmation() {
         let runtime_root = temp_root("encryption-confirm");
         let service = GalleryService::new(AppConfig {
-            runtime_root,
+            runtime_root: runtime_root.to_path_buf(),
             ..AppConfig::default()
         })
         .expect("service");
@@ -13919,7 +13936,7 @@ mod tests {
     async fn ocr_rebuild_requires_encrypted_storage() {
         let runtime_root = temp_root("ocr-encryption-gate");
         let service = GalleryService::new(AppConfig {
-            runtime_root,
+            runtime_root: runtime_root.to_path_buf(),
             ..AppConfig::default()
         })
         .expect("service");
@@ -13941,7 +13958,7 @@ mod tests {
     async fn ocr_rebuild_reports_missing_local_provider() {
         let runtime_root = temp_root("ocr-missing-provider");
         let config = AppConfig {
-            runtime_root: runtime_root.clone(),
+            runtime_root: runtime_root.to_path_buf(),
             tesseract_path: Some(runtime_root.join("missing-tesseract")),
             ..AppConfig::default()
         };
@@ -13979,7 +13996,7 @@ mod tests {
         let tesseract = fake_tesseract(&runtime_root, "Family privacy receipt total");
 
         let config = AppConfig {
-            runtime_root: runtime_root.clone(),
+            runtime_root: runtime_root.to_path_buf(),
             tesseract_path: Some(tesseract),
             ..AppConfig::default()
         };
@@ -14105,7 +14122,7 @@ mod tests {
         let tesseract = fake_tesseract(&runtime_root, "Tiny batch receipt text");
 
         let service = GalleryService::new(AppConfig {
-            runtime_root: runtime_root.clone(),
+            runtime_root: runtime_root.to_path_buf(),
             tesseract_path: Some(tesseract),
             ..AppConfig::default()
         })
@@ -14184,7 +14201,7 @@ mod tests {
         let tesseract = fake_tesseract(&runtime_root, "");
 
         let service = GalleryService::new(AppConfig {
-            runtime_root: runtime_root.clone(),
+            runtime_root: runtime_root.to_path_buf(),
             tesseract_path: Some(tesseract),
             ..AppConfig::default()
         })
@@ -14262,7 +14279,7 @@ mod tests {
         write_green_ppm_with_jpg_name(&media_path);
 
         let config = AppConfig {
-            runtime_root: runtime_root.clone(),
+            runtime_root: runtime_root.to_path_buf(),
             ..AppConfig::default()
         };
         let service = GalleryService::new(config.clone()).expect("service");
@@ -14373,7 +14390,7 @@ mod tests {
             imports::derive_content_hash_from_file(&model_path).expect("hash model");
 
         let config = AppConfig {
-            runtime_root: runtime_root.clone(),
+            runtime_root: runtime_root.to_path_buf(),
             ..AppConfig::default()
         };
         let service = GalleryService::new(config.clone()).expect("service");
@@ -14432,7 +14449,7 @@ mod tests {
             .with_timezone(&Utc);
 
         let service = GalleryService::new(AppConfig {
-            runtime_root: runtime_root.clone(),
+            runtime_root: runtime_root.to_path_buf(),
             ..AppConfig::default()
         })
         .expect("service");
@@ -14506,7 +14523,7 @@ mod tests {
         fs::write(source_root.join("other.jpg"), b"image-other").expect("write other");
 
         let config = AppConfig {
-            runtime_root: runtime_root.clone(),
+            runtime_root: runtime_root.to_path_buf(),
             ..AppConfig::default()
         };
         let service = GalleryService::new(config.clone()).expect("service");
@@ -14625,7 +14642,7 @@ mod tests {
     async fn job_logs_retry_and_backup_verification_are_persistent() {
         let runtime_root = temp_root("jobs-backup");
         let config = AppConfig {
-            runtime_root: runtime_root.clone(),
+            runtime_root: runtime_root.to_path_buf(),
             ..AppConfig::default()
         };
         let service = GalleryService::new(config.clone()).expect("service");
@@ -14665,7 +14682,7 @@ mod tests {
     async fn rebuild_jobs_remain_offline_only() {
         let runtime_root = temp_root("offline-rebuilds");
         let service = GalleryService::new(AppConfig {
-            runtime_root,
+            runtime_root: runtime_root.to_path_buf(),
             network_policy: NetworkPolicy::OfflineOnly,
             ..AppConfig::default()
         })
