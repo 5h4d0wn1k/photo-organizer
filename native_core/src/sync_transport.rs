@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeSet,
     fs,
     net::SocketAddr,
     path::{Path, PathBuf},
@@ -30,10 +31,12 @@ use crate::{
     config::AppConfig,
     domain::{
         BlobChunk, BlobRecord, BlobReplica, DeviceIdentity, DeviceRole, DeviceTrustLevel,
-        LocalEndpointPayload, PeerEndpointDescriptor, RelayEndpoint, ReplicaHealth, SyncTransfer,
-        SyncTransferStatus,
+        LocalEndpointPayload, MobileUploadStatus, PeerEndpointDescriptor, RelayEndpoint,
+        ReplicaHealth, SyncTransfer, SyncTransferStatus,
     },
-    service::{LibraryState, effective_library_root, local_device_id},
+    service::{
+        LibraryState, blob_has_authorized_local_owner, effective_library_root, local_device_id,
+    },
     storage::{self, StorageBootstrapReport},
 };
 
@@ -714,6 +717,11 @@ fn build_pull_envelope(
         .ok_or_else(|| {
             SyncTransportError::Invalid("requested blob is not available on this device".into())
         })?;
+    if !blob_has_authorized_local_owner(state, blob.vault_id, blob.asset_id) {
+        return Err(SyncTransportError::Invalid(
+            "requested blob has ambiguous local vault ownership".into(),
+        ));
+    }
     let mut chunks = state
         .blob_chunks
         .iter()
@@ -796,13 +804,172 @@ fn validate_envelope_authorization(
         envelope.from_device_id,
         envelope.to_device_id,
     )?;
-    if envelope
-        .chunks
+    if envelope.chunks.is_empty() {
+        return Err(SyncTransportError::Invalid(
+            "incoming transfer must contain at least one encrypted chunk".to_string(),
+        ));
+    }
+    if envelope.chunks.len() != envelope.blob.chunk_count as usize {
+        return Err(SyncTransportError::Invalid(
+            "incoming chunk count does not match the blob record".to_string(),
+        ));
+    }
+    let mut chunk_indexes = BTreeSet::new();
+    let mut total_plaintext_bytes = 0_u64;
+    for (expected_index, chunk) in envelope.chunks.iter().enumerate() {
+        if chunk.blob_id != envelope.blob.id {
+            return Err(SyncTransportError::Invalid(
+                "incoming transfer chunk does not belong to envelope blob".into(),
+            ));
+        }
+        if chunk.chunk_index != expected_index as u32 || !chunk_indexes.insert(chunk.chunk_index) {
+            return Err(SyncTransportError::Invalid(
+                "incoming chunk indexes must be unique and contiguous".to_string(),
+            ));
+        }
+        total_plaintext_bytes =
+            total_plaintext_bytes
+                .checked_add(chunk.bytes)
+                .ok_or_else(|| {
+                    SyncTransportError::Invalid("incoming chunk byte count overflow".to_string())
+                })?;
+    }
+    if total_plaintext_bytes != envelope.blob.bytes {
+        return Err(SyncTransportError::Invalid(
+            "incoming chunk bytes do not match the blob record".to_string(),
+        ));
+    }
+    validate_blob_identity(state, envelope)?;
+    let receiver_is_storage_only = local_device.trust_level == DeviceTrustLevel::StorageOnly;
+    validate_local_blob_membership(state, &envelope.blob, receiver_is_storage_only)?;
+    Ok(())
+}
+
+fn validate_blob_identity(
+    state: &LibraryState,
+    envelope: &TransferEnvelope,
+) -> Result<(), SyncTransportError> {
+    let incoming = &envelope.blob;
+    if let Some(existing) = state
+        .blob_records
         .iter()
-        .any(|chunk| chunk.blob_id != envelope.blob.id)
+        .find(|blob| blob.id == incoming.id)
+        && (existing.vault_id != incoming.vault_id
+            || existing.asset_id != incoming.asset_id
+            || existing.tombstoned_at.is_some()
+            || existing.bytes != incoming.bytes
+            || existing.chunk_count != incoming.chunk_count
+            || existing.encryption_key_version != incoming.encryption_key_version
+            || existing.encrypted_hash != incoming.encrypted_hash
+            || (!is_opaque_hash(&existing.content_hash)
+                && !is_opaque_hash(&incoming.content_hash)
+                && existing.content_hash != incoming.content_hash))
     {
         return Err(SyncTransportError::Invalid(
-            "incoming transfer chunk does not belong to envelope blob".into(),
+            "incoming blob ID conflicts with a different local blob identity".to_string(),
+        ));
+    }
+    if state.blob_records.iter().any(|blob| {
+        blob.vault_id == incoming.vault_id
+            && blob.asset_id == incoming.asset_id
+            && blob.id != incoming.id
+    }) {
+        return Err(SyncTransportError::Invalid(
+            "incoming asset already has a different blob ID in this vault".to_string(),
+        ));
+    }
+
+    let mut incoming_chunk_ids = BTreeSet::new();
+    for chunk in &envelope.chunks {
+        if !incoming_chunk_ids.insert(chunk.id) {
+            return Err(SyncTransportError::Invalid(
+                "incoming transfer contains duplicate chunk IDs".to_string(),
+            ));
+        }
+        if let Some(existing) = state.blob_chunks.iter().find(|local| local.id == chunk.id)
+            && (existing.blob_id != chunk.blob_id
+                || existing.chunk_index != chunk.chunk_index
+                || existing.encrypted_hash != chunk.encrypted_hash
+                || existing.encrypted_bytes != chunk.encrypted_bytes
+                || existing.bytes != chunk.bytes
+                || (!is_opaque_hash(&existing.content_hash)
+                    && !is_opaque_hash(&chunk.content_hash)
+                    && existing.content_hash != chunk.content_hash))
+        {
+            return Err(SyncTransportError::Invalid(
+                "incoming chunk ID conflicts with a different local chunk identity".to_string(),
+            ));
+        }
+        if state.blob_chunks.iter().any(|local| {
+            local.blob_id == chunk.blob_id
+                && local.chunk_index == chunk.chunk_index
+                && local.id != chunk.id
+        }) {
+            return Err(SyncTransportError::Invalid(
+                "incoming blob chunk index conflicts with a different local chunk ID".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_local_blob_membership(
+    state: &LibraryState,
+    blob: &BlobRecord,
+    receiver_is_storage_only: bool,
+) -> Result<(), SyncTransportError> {
+    if !blob_has_authorized_local_owner(state, blob.vault_id, blob.asset_id) {
+        return Err(SyncTransportError::Invalid(
+            "incoming blob conflicts with local vault ownership evidence".into(),
+        ));
+    }
+    let Some(asset) = state.assets.iter().find(|asset| asset.id == blob.asset_id) else {
+        return if receiver_is_storage_only {
+            Ok(())
+        } else {
+            Err(SyncTransportError::Invalid(
+                "incoming blob has no local asset metadata or vault membership".to_string(),
+            ))
+        };
+    };
+    if !is_opaque_hash(&blob.content_hash) && asset.content_hash != blob.content_hash {
+        return Err(SyncTransportError::Invalid(
+            "incoming blob content hash does not match the local asset".to_string(),
+        ));
+    }
+    let has_vault_membership = state.file_entries.iter().any(|entry| {
+        entry.vault_id == blob.vault_id
+            && entry.asset_id == Some(blob.asset_id)
+            && entry.trashed_at.is_none()
+    }) || state.mobile_uploads.iter().any(|upload| {
+        upload.vault_id == blob.vault_id
+            && upload.asset_id == Some(blob.asset_id)
+            && upload.status == MobileUploadStatus::Completed
+    }) || (receiver_is_storage_only
+        && state.blob_records.iter().any(|existing| {
+            existing.id == blob.id
+                && existing.vault_id == blob.vault_id
+                && existing.asset_id == blob.asset_id
+                && existing.tombstoned_at.is_none()
+        }));
+    let associated_vaults = state
+        .blob_records
+        .iter()
+        .filter(|existing| existing.asset_id == blob.asset_id && existing.tombstoned_at.is_none())
+        .map(|existing| existing.vault_id)
+        .chain(state.mobile_uploads.iter().filter_map(|upload| {
+            (upload.asset_id == Some(blob.asset_id)
+                && upload.status == MobileUploadStatus::Completed)
+                .then_some(upload.vault_id)
+        }))
+        .chain(state.file_entries.iter().filter_map(|entry| {
+            (entry.asset_id == Some(blob.asset_id) && entry.trashed_at.is_none())
+                .then_some(entry.vault_id)
+        }))
+        .collect::<BTreeSet<_>>();
+    if !has_vault_membership || associated_vaults.len() > 1 {
+        return Err(SyncTransportError::Invalid(
+            "incoming blob has no unambiguous local membership in its vault".to_string(),
         ));
     }
     Ok(())
@@ -929,7 +1096,11 @@ fn commit_received_blob(
         .iter_mut()
         .find(|blob| blob.id == envelope.blob.id)
     {
-        merge_blob_record(existing, incoming_blob);
+        if storage_only_receiver {
+            *existing = incoming_blob;
+        } else {
+            merge_blob_record(existing, incoming_blob);
+        }
     } else {
         state.blob_records.push(incoming_blob);
     }
@@ -943,7 +1114,11 @@ fn commit_received_blob(
         if let Some(existing) = state.blob_chunks.iter_mut().find(|existing| {
             existing.blob_id == chunk.blob_id && existing.chunk_index == chunk.chunk_index
         }) {
-            merge_blob_chunk(existing, chunk);
+            if storage_only_receiver {
+                *existing = chunk;
+            } else {
+                merge_blob_chunk(existing, chunk);
+            }
         } else {
             state.blob_chunks.push(chunk);
         }

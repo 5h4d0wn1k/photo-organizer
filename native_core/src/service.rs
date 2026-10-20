@@ -3,7 +3,10 @@ use std::{
     fs,
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use chrono::{DateTime, Utc};
@@ -39,10 +42,12 @@ use crate::{
         MoveFileEntryRequest, OcrBlock, OriginalStoragePolicy, PersonCluster, PlaceCluster,
         PlatformReleaseEvidence, PlatformReleaseEvidenceStatus, PlatformReleaseReadinessResponse,
         PlatformReleaseReadinessStatus, PlatformReleaseSurface, PlatformReleaseSurfaceReadiness,
-        PrivacyStatus, RebuildRequest, RejectPersonMatchRequest, RelayEndpoint, RenameAlbumRequest,
-        RenameFileEntryRequest, RenamePersonRequest, ReplicaHealth, RevokeDeviceRequest,
-        RunSyncRequest, ScanImportSourceRequest, SceneTag, SearchIndexStatus, SearchQuery,
-        SearchResponse, SmartFolder, SplitPersonRequest, StoragePolicy, StoragePolicyMode,
+        PrivacyStatus, ProtectedOriginal, ProtectedOriginalChunk, QuarantineRepairRequest,
+        QuarantineRepairResult, QuarantinedOriginalSummary, RebuildRequest,
+        RejectPersonMatchRequest, RelayEndpoint, RenameAlbumRequest, RenameFileEntryRequest,
+        RenamePersonRequest, ReplicaHealth, RevokeDeviceRequest, RunSyncRequest,
+        ScanImportSourceRequest, SceneTag, SearchIndexStatus, SearchQuery, SearchResponse,
+        SmartFolder, SplitPersonRequest, StoragePolicy, StoragePolicyMode,
         SupportBundleExportRequest, SupportBundleExportResult, SyncConflict, SyncNetworkStatus,
         SyncPlan, SyncSession, SyncTransfer, SyncTransferExecutionResult,
         SyncTransferExecutionStatus, SyncTransferStatus, TimelineBucket, TimelineResponse,
@@ -52,7 +57,8 @@ use crate::{
         VaultFileDeviceSummary, VaultFileEntry, VaultFileKind, VaultFileTreeResponse, VaultInvite,
         VaultKeyEnvelope, VaultMember, VaultStatus, WatchFolder,
     },
-    events, imports, metadata, ml_sidecar, model_registry, ocr, people, search, security,
+    events, imports, metadata, ml_sidecar, model_registry, ocr, original_quarantine, people,
+    search, security,
     storage::{self, PersistedLibraryState, StorageBootstrapReport},
     sync_transport::{self, OutboundBlobTransfer, TransferDirection},
     vault_store,
@@ -63,7 +69,7 @@ const MOBILE_UPLOAD_MAX_BYTES: u64 = 512 * 1024 * 1024;
 const MOBILE_UPLOAD_CHUNK_MAX_BYTES: u64 = 8 * 1024 * 1024;
 const ORIGINAL_DOWNLOAD_RANGE_MAX_BYTES: u64 = 8 * 1024 * 1024;
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub(crate) struct LibraryState {
     pub(crate) library_settings: Option<LibrarySettings>,
     pub(crate) watch_folders: Vec<WatchFolder>,
@@ -83,6 +89,8 @@ pub(crate) struct LibraryState {
     pub(crate) vault_members: Vec<VaultMember>,
     pub(crate) blob_records: Vec<BlobRecord>,
     pub(crate) blob_chunks: Vec<BlobChunk>,
+    pub(crate) protected_originals: Vec<ProtectedOriginal>,
+    pub(crate) protected_original_chunks: Vec<ProtectedOriginalChunk>,
     pub(crate) blob_replicas: Vec<BlobReplica>,
     pub(crate) sync_transfers: Vec<SyncTransfer>,
     pub(crate) sync_conflicts: Vec<SyncConflict>,
@@ -136,6 +144,8 @@ impl From<PersistedLibraryState> for LibraryState {
             vault_members: state.vault_members,
             blob_records: state.blob_records,
             blob_chunks: state.blob_chunks,
+            protected_originals: state.protected_originals,
+            protected_original_chunks: state.protected_original_chunks,
             blob_replicas: state.blob_replicas,
             sync_transfers: state.sync_transfers,
             sync_conflicts: state.sync_conflicts,
@@ -178,6 +188,8 @@ impl LibraryState {
             vault_members: self.vault_members.clone(),
             blob_records: self.blob_records.clone(),
             blob_chunks: self.blob_chunks.clone(),
+            protected_originals: self.protected_originals.clone(),
+            protected_original_chunks: self.protected_original_chunks.clone(),
             blob_replicas: self.blob_replicas.clone(),
             sync_transfers: self.sync_transfers.clone(),
             sync_conflicts: self.sync_conflicts.clone(),
@@ -232,6 +244,7 @@ pub struct GalleryService {
     pub storage: StorageBootstrapReport,
     state: Arc<RwLock<LibraryState>>,
     sync_runtime: Arc<sync_transport::SyncRuntime>,
+    operational: Arc<AtomicBool>,
 }
 
 impl GalleryService {
@@ -248,6 +261,7 @@ impl GalleryService {
 
         let storage = storage::bootstrap_storage(&config)
             .map_err(|err| ServiceError::Storage(err.to_string()))?;
+        cleanup_quarantine_repair_staging(&config.runtime_root)?;
         let persisted =
             storage::load_state(&storage).map_err(|err| ServiceError::Storage(err.to_string()))?;
         let mut state = LibraryState::from(persisted);
@@ -255,6 +269,7 @@ impl GalleryService {
         let compacted_history = compact_job_history(&mut state);
         refresh_import_session_summaries(&mut state, &config);
         let mut startup_changed = ensure_distributed_defaults(&mut state);
+        startup_changed |= reconcile_unresolved_managed_originals(&config, &storage, &mut state)?;
         startup_changed |= refresh_blob_records(&config, &mut state);
         startup_changed |= ensure_file_namespace_defaults(&mut state);
         if compacted_history || startup_changed {
@@ -274,7 +289,28 @@ impl GalleryService {
             storage,
             state,
             sync_runtime,
+            operational: Arc::new(AtomicBool::new(true)),
         })
+    }
+
+    pub fn is_operational(&self) -> bool {
+        self.operational.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn disable_after_sensitive_cleanup_failure(&self) {
+        self.operational.store(false, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    fn cleanup_repair_stage_or_disable(&self, path: &Path) -> Result<(), ServiceError> {
+        match remove_quarantine_repair_stage(path) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                self.disable_after_sensitive_cleanup_failure();
+                Err(error)
+            }
+        }
     }
 
     pub fn config(&self) -> &AppConfig {
@@ -1036,10 +1072,25 @@ impl GalleryService {
             return Err(ServiceError::Invalid(detail));
         }
 
+        let library_root = effective_library_root(state, &self.config);
+        let library_root_path = PathBuf::from(&library_root);
         if let Some(existing) = state
             .assets
             .iter()
-            .find(|asset| asset.content_hash == actual_hash)
+            .find(|asset| {
+                asset.content_hash == actual_hash
+                    && state.blob_records.iter().any(|blob| {
+                        blob.asset_id == asset.id
+                            && blob.vault_id == upload.vault_id
+                            && blob.tombstoned_at.is_none()
+                            && encrypted_chunks_available(state, blob.id, &library_root_path)
+                    })
+                    && state.file_entries.iter().any(|entry| {
+                        entry.asset_id == Some(asset.id)
+                            && entry.vault_id == upload.vault_id
+                            && entry.trashed_at.is_none()
+                    })
+            })
             .cloned()
         {
             state.mobile_uploads[upload_index].status = MobileUploadStatus::Completed;
@@ -1052,8 +1103,6 @@ impl GalleryService {
             return Ok(completed);
         }
 
-        let library_root = effective_library_root(state, &self.config);
-        let library_root_path = PathBuf::from(&library_root);
         storage::ensure_library_layout(&library_root_path)
             .map_err(|err| ServiceError::Storage(err.to_string()))?;
         let now = Utc::now();
@@ -1069,6 +1118,7 @@ impl GalleryService {
             import_mode: Some(ImportMode::Copy),
             content_hash: Some(actual_hash.clone()),
         });
+        asset.vault_id = Some(upload.vault_id);
         let extracted = metadata::extract_media_metadata(upload_path, &[], asset.captured_at);
         asset.captured_at = extracted.captured_at;
         if asset.place_hint.is_none() {
@@ -1133,16 +1183,11 @@ impl GalleryService {
         ensure_distributed_defaults(&mut state);
         refresh_blob_records(&self.config, &mut state);
         let library_root = PathBuf::from(effective_library_root(&state, &self.config));
+        let visible_asset_ids = asset_ids_for_vault(&state, session.vault_id);
         let summaries = state
             .assets
             .iter()
-            .filter(|asset| {
-                state.blob_records.iter().any(|blob| {
-                    blob.asset_id == asset.id
-                        && blob.vault_id == session.vault_id
-                        && blob.tombstoned_at.is_none()
-                })
-            })
+            .filter(|asset| visible_asset_ids.contains(&asset.id))
             .map(|asset| MobileAssetSummary {
                 asset_id: asset.id,
                 original_filename: asset.original_filename.clone(),
@@ -1193,11 +1238,10 @@ impl GalleryService {
         let people = filter_people_for_assets(&state.people, &visible_asset_ids);
         let places = filter_places_for_assets(&state.places, &visible_asset_ids);
         let events = filter_events_for_assets(&state.events, &visible_asset_ids);
-        let jobs = if can_browse {
-            state.jobs.iter().take(25).cloned().collect::<Vec<_>>()
-        } else {
-            Vec::new()
-        };
+        // JobRecord has no vault/asset ownership field, and `detail` can
+        // contain filenames or source paths. Do not publish the global desktop
+        // job queue to a mobile member of one vault.
+        let jobs = Vec::new();
         let vault_status = build_vault_status(&state, session.vault_id)?;
         let devices = vault_status.devices.clone();
         let mobile_device_accepts_storage = devices
@@ -1216,7 +1260,7 @@ impl GalleryService {
             })
             .cloned()
             .collect::<Vec<_>>();
-        let sync_network = build_sync_network_status(&state, runtime);
+        let sync_network = build_sync_network_status(&state, runtime, Some(session.vault_id));
         let capabilities = mobile_workspace_capabilities(&role, mobile_device_accepts_storage);
         self.persist_locked_state(&state)?;
         Ok(MobileWorkspaceResponse {
@@ -1335,7 +1379,11 @@ impl GalleryService {
         let candidate_blobs = state
             .blob_records
             .iter()
-            .filter(|blob| blob.vault_id == session.vault_id && blob.tombstoned_at.is_none())
+            .filter(|blob| {
+                blob.vault_id == session.vault_id
+                    && blob.tombstoned_at.is_none()
+                    && blob_has_authorized_local_owner(&state, blob.vault_id, blob.asset_id)
+            })
             .cloned()
             .collect::<Vec<_>>();
         for blob in candidate_blobs {
@@ -1670,23 +1718,21 @@ impl GalleryService {
         bearer_token: &str,
         asset_id: Uuid,
     ) -> Result<(String, Vec<u8>), ServiceError> {
-        {
-            let mut state = self.state.write().await;
-            let session = active_mobile_session_from_state(&mut state, bearer_token)?;
-            ensure_mobile_can_download_originals(&state, &session)?;
-            ensure_distributed_defaults(&mut state);
-            refresh_blob_records(&self.config, &mut state);
-            let belongs_to_session_vault = state.blob_records.iter().any(|blob| {
-                blob.asset_id == asset_id
-                    && blob.vault_id == session.vault_id
-                    && blob.tombstoned_at.is_none()
-            });
-            if !belongs_to_session_vault {
-                return Err(ServiceError::NotFound(format!("asset {asset_id}")));
-            }
-            self.persist_locked_state(&state)?;
-        }
-        self.asset_original_bytes(asset_id).await
+        let mut state = self.state.write().await;
+        let session = active_mobile_session_from_state(&mut state, bearer_token)?;
+        ensure_mobile_can_download_originals(&state, &session)?;
+        ensure_distributed_defaults(&mut state);
+        refresh_blob_records(&self.config, &mut state);
+        let library_root = PathBuf::from(effective_library_root(&state, &self.config));
+        let result = read_original_bytes_from_vault(
+            &self.config,
+            &state,
+            &library_root,
+            session.vault_id,
+            asset_id,
+        )?;
+        self.persist_locked_state(&state)?;
+        Ok(result)
     }
 
     pub async fn mobile_original_range_bytes(
@@ -1695,23 +1741,22 @@ impl GalleryService {
         asset_id: Uuid,
         range: ByteRangeRequest,
     ) -> Result<OriginalBytesRange, ServiceError> {
-        {
-            let mut state = self.state.write().await;
-            let session = active_mobile_session_from_state(&mut state, bearer_token)?;
-            ensure_mobile_can_download_originals(&state, &session)?;
-            ensure_distributed_defaults(&mut state);
-            refresh_blob_records(&self.config, &mut state);
-            let belongs_to_session_vault = state.blob_records.iter().any(|blob| {
-                blob.asset_id == asset_id
-                    && blob.vault_id == session.vault_id
-                    && blob.tombstoned_at.is_none()
-            });
-            if !belongs_to_session_vault {
-                return Err(ServiceError::NotFound(format!("asset {asset_id}")));
-            }
-            self.persist_locked_state(&state)?;
-        }
-        self.asset_original_range_bytes(asset_id, range).await
+        let mut state = self.state.write().await;
+        let session = active_mobile_session_from_state(&mut state, bearer_token)?;
+        ensure_mobile_can_download_originals(&state, &session)?;
+        ensure_distributed_defaults(&mut state);
+        refresh_blob_records(&self.config, &mut state);
+        let library_root = PathBuf::from(effective_library_root(&state, &self.config));
+        let result = read_original_range_from_vault(
+            &self.config,
+            &state,
+            &library_root,
+            session.vault_id,
+            asset_id,
+            range,
+        )?;
+        self.persist_locked_state(&state)?;
+        Ok(result)
     }
 
     pub async fn mobile_preview_bytes(
@@ -1725,14 +1770,7 @@ impl GalleryService {
             ensure_mobile_can_download_originals(&state, &session)?;
             ensure_distributed_defaults(&mut state);
             refresh_blob_records(&self.config, &mut state);
-            let belongs_to_session_vault = state.blob_records.iter().any(|blob| {
-                blob.asset_id == asset_id
-                    && blob.vault_id == session.vault_id
-                    && blob.tombstoned_at.is_none()
-            });
-            if !belongs_to_session_vault {
-                return Err(ServiceError::NotFound(format!("asset {asset_id}")));
-            }
+            ensure_asset_belongs_to_vault(&state, session.vault_id, asset_id)?;
             self.persist_locked_state(&state)?;
         }
         self.asset_preview_bytes(asset_id).await
@@ -1753,6 +1791,9 @@ impl GalleryService {
                 .find(|asset| asset.id == asset_id)
                 .cloned()
                 .ok_or_else(|| ServiceError::NotFound(format!("asset {asset_id}")))?;
+            if target_vault_for_asset(&state, asset_id).is_none() {
+                return Err(ServiceError::NotFound(format!("asset {asset_id}")));
+            }
             let variant = asset
                 .variants
                 .iter()
@@ -1979,22 +2020,30 @@ impl GalleryService {
         &self,
         entry_id: Uuid,
     ) -> Result<(String, Vec<u8>), ServiceError> {
-        let asset_id = {
-            let mut state = self.state.write().await;
-            ensure_distributed_defaults(&mut state);
-            refresh_blob_records(&self.config, &mut state);
-            ensure_file_namespace_defaults(&mut state);
-            let entry = file_entry_by_id(&state, entry_id)?;
-            if entry.trashed_at.is_some() || entry.kind != VaultFileKind::File {
-                return Err(ServiceError::NotFound(format!("file entry {entry_id}")));
-            }
-            let asset_id = entry.asset_id.ok_or_else(|| {
+        let mut state = self.state.write().await;
+        ensure_distributed_defaults(&mut state);
+        refresh_blob_records(&self.config, &mut state);
+        ensure_file_namespace_defaults(&mut state);
+        let entry = file_entry_by_id(&state, entry_id)?;
+        if entry.trashed_at.is_some() || entry.kind != VaultFileKind::File {
+            return Err(ServiceError::NotFound(format!("file entry {entry_id}")));
+        }
+        let (vault_id, asset_id) = (
+            entry.vault_id,
+            entry.asset_id.ok_or_else(|| {
                 ServiceError::NotFound(format!("asset for file entry {entry_id}"))
-            })?;
-            self.persist_locked_state(&state)?;
-            asset_id
-        };
-        self.asset_original_bytes(asset_id).await
+            })?,
+        );
+        let library_root = PathBuf::from(effective_library_root(&state, &self.config));
+        let result = read_original_bytes_from_vault(
+            &self.config,
+            &state,
+            &library_root,
+            vault_id,
+            asset_id,
+        )?;
+        self.persist_locked_state(&state)?;
+        Ok(result)
     }
 
     pub async fn file_original_range_bytes(
@@ -2002,22 +2051,31 @@ impl GalleryService {
         entry_id: Uuid,
         range: ByteRangeRequest,
     ) -> Result<OriginalBytesRange, ServiceError> {
-        let asset_id = {
-            let mut state = self.state.write().await;
-            ensure_distributed_defaults(&mut state);
-            refresh_blob_records(&self.config, &mut state);
-            ensure_file_namespace_defaults(&mut state);
-            let entry = file_entry_by_id(&state, entry_id)?;
-            if entry.trashed_at.is_some() || entry.kind != VaultFileKind::File {
-                return Err(ServiceError::NotFound(format!("file entry {entry_id}")));
-            }
-            let asset_id = entry.asset_id.ok_or_else(|| {
+        let mut state = self.state.write().await;
+        ensure_distributed_defaults(&mut state);
+        refresh_blob_records(&self.config, &mut state);
+        ensure_file_namespace_defaults(&mut state);
+        let entry = file_entry_by_id(&state, entry_id)?;
+        if entry.trashed_at.is_some() || entry.kind != VaultFileKind::File {
+            return Err(ServiceError::NotFound(format!("file entry {entry_id}")));
+        }
+        let (vault_id, asset_id) = (
+            entry.vault_id,
+            entry.asset_id.ok_or_else(|| {
                 ServiceError::NotFound(format!("asset for file entry {entry_id}"))
-            })?;
-            self.persist_locked_state(&state)?;
-            asset_id
-        };
-        self.asset_original_range_bytes(asset_id, range).await
+            })?,
+        );
+        let library_root = PathBuf::from(effective_library_root(&state, &self.config));
+        let result = read_original_range_from_vault(
+            &self.config,
+            &state,
+            &library_root,
+            vault_id,
+            asset_id,
+            range,
+        )?;
+        self.persist_locked_state(&state)?;
+        Ok(result)
     }
 
     pub async fn mobile_file_original_bytes(
@@ -2028,7 +2086,7 @@ impl GalleryService {
         let asset_id = self
             .mobile_file_asset_id_for_download(bearer_token, entry_id)
             .await?;
-        self.asset_original_bytes(asset_id).await
+        self.mobile_original_bytes(bearer_token, asset_id).await
     }
 
     pub async fn mobile_file_original_range_bytes(
@@ -2040,7 +2098,8 @@ impl GalleryService {
         let asset_id = self
             .mobile_file_asset_id_for_download(bearer_token, entry_id)
             .await?;
-        self.asset_original_range_bytes(asset_id, range).await
+        self.mobile_original_range_bytes(bearer_token, asset_id, range)
+            .await
     }
 
     async fn mobile_file_asset_id_for_download(
@@ -2053,7 +2112,6 @@ impl GalleryService {
         ensure_mobile_can_download_originals(&state, &session)?;
         ensure_distributed_defaults(&mut state);
         refresh_blob_records(&self.config, &mut state);
-        ensure_file_namespace_defaults(&mut state);
         let entry = file_entry_by_id(&state, entry_id)?;
         if entry.vault_id != session.vault_id
             || entry.trashed_at.is_some()
@@ -2071,6 +2129,387 @@ impl GalleryService {
 
     pub async fn vaults(&self) -> Vec<Vault> {
         self.state.read().await.vaults.clone()
+    }
+
+    /// Local administrator inventory. It deliberately exposes no key, nonce,
+    /// AAD, ciphertext path, or plaintext bytes.
+    pub async fn quarantined_originals(&self) -> Vec<QuarantinedOriginalSummary> {
+        let state = self.state.read().await;
+        state
+            .protected_originals
+            .iter()
+            .filter_map(|record| {
+                state
+                    .assets
+                    .iter()
+                    .find(|asset| asset.id == record.asset_id)
+                    .map(|asset| QuarantinedOriginalSummary {
+                        asset_id: record.asset_id,
+                        object_id: record.object_id,
+                        filename: asset.original_filename.clone(),
+                        media_kind: asset.media_kind.clone(),
+                        content_hash: record.content_hash.clone(),
+                        bytes: record.bytes,
+                        reason: record.reason.clone(),
+                        source_removed: record.source_removed,
+                        created_at: record.created_at,
+                    })
+            })
+            .collect()
+    }
+
+    /// Repair a quarantined managed original into exactly the caller-selected
+    /// live vault. The quarantine remains until the new vault ciphertext has
+    /// been durably saved and independently verified.
+    pub async fn repair_quarantined_original(
+        &self,
+        asset_id: Uuid,
+        request: QuarantineRepairRequest,
+    ) -> Result<QuarantineRepairResult, ServiceError> {
+        if !request.confirm {
+            return Err(ServiceError::Invalid(
+                "explicit repair confirmation is required".to_string(),
+            ));
+        }
+        let mut state = self.state.write().await;
+        let maybe_record = state
+            .protected_originals
+            .iter()
+            .find(|record| record.asset_id == asset_id)
+            .cloned();
+        if maybe_record.is_none() {
+            let vault = state
+                .vaults
+                .iter()
+                .find(|vault| vault.id == request.target_vault_id)
+                .cloned()
+                .ok_or_else(|| {
+                    ServiceError::NotFound(format!("vault {}", request.target_vault_id))
+                })?;
+            if let Some(asset) = state.assets.iter().find(|asset| asset.id == asset_id)
+                && asset.vault_id == Some(vault.id)
+                && let Some(blob) = state
+                    .blob_records
+                    .iter()
+                    .find(|blob| {
+                        blob.asset_id == asset_id
+                            && blob.vault_id == vault.id
+                            && blob.tombstoned_at.is_none()
+                    })
+                    .cloned()
+            {
+                let chunks = state
+                    .blob_chunks
+                    .iter()
+                    .filter(|chunk| chunk.blob_id == blob.id)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let root = PathBuf::from(effective_library_root(&state, &self.config));
+                vault_store::verify_encrypted_chunk_files(&root, &chunks)
+                    .and_then(|_| {
+                        vault_store::verify_blob_plaintext(
+                            &self.config,
+                            &root,
+                            vault.id,
+                            blob.encryption_key_version,
+                            &chunks,
+                            &blob.content_hash,
+                            blob.bytes,
+                        )
+                    })
+                    .map_err(|error| ServiceError::Storage(error.to_string()))?;
+                let mut candidate = state.clone();
+                let asset = candidate
+                    .assets
+                    .iter()
+                    .find(|item| item.id == asset_id)
+                    .cloned()
+                    .ok_or_else(|| ServiceError::NotFound(format!("asset {asset_id}")))?;
+                ensure_single_live_asset_entry(&mut candidate, &asset, vault.id)?;
+                storage::save_state(&self.storage, &candidate.to_persisted())
+                    .map_err(|error| ServiceError::Storage(error.to_string()))?;
+                *state = candidate;
+                return Ok(QuarantineRepairResult {
+                    asset_id,
+                    vault_id: vault.id,
+                    blob_id: blob.id,
+                    repaired: false,
+                });
+            }
+            return Err(ServiceError::NotFound(format!(
+                "quarantined original {asset_id}"
+            )));
+        }
+        let record = maybe_record.expect("checked above");
+        let vault = state
+            .vaults
+            .iter()
+            .find(|vault| vault.id == request.target_vault_id)
+            .cloned()
+            .ok_or_else(|| ServiceError::NotFound(format!("vault {}", request.target_vault_id)))?;
+        let asset = state
+            .assets
+            .iter()
+            .find(|asset| asset.id == asset_id)
+            .cloned()
+            .ok_or_else(|| ServiceError::NotFound(format!("asset {asset_id}")))?;
+        if asset.import_mode == ImportMode::Reference {
+            return Err(ServiceError::Invalid(
+                "reference imports cannot be repaired as managed originals".to_string(),
+            ));
+        }
+        let chunks = state
+            .protected_original_chunks
+            .iter()
+            .filter(|chunk| chunk.asset_id == asset_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        let library_root = PathBuf::from(effective_library_root(&state, &self.config));
+
+        // A prior attempt may have durably installed the destination blob and
+        // stopped before quarantine retirement. Verify and finish that attempt.
+        if let Some(existing) = state
+            .blob_records
+            .iter()
+            .find(|blob| {
+                blob.asset_id == asset_id
+                    && blob.vault_id == vault.id
+                    && blob.tombstoned_at.is_none()
+                    && blob.content_hash.eq_ignore_ascii_case(&record.content_hash)
+                    && blob.bytes == record.bytes
+            })
+            .cloned()
+        {
+            let existing_chunks = state
+                .blob_chunks
+                .iter()
+                .filter(|chunk| chunk.blob_id == existing.id)
+                .cloned()
+                .collect::<Vec<_>>();
+            if vault_store::verify_encrypted_chunk_files(&library_root, &existing_chunks).is_ok()
+                && vault_store::verify_blob_plaintext(
+                    &self.config,
+                    &library_root,
+                    vault.id,
+                    existing.encryption_key_version,
+                    &existing_chunks,
+                    &record.content_hash,
+                    record.bytes,
+                )
+                .is_ok()
+            {
+                return self
+                    .finish_quarantine_repair(
+                        &mut state,
+                        &record,
+                        &asset,
+                        &vault,
+                        existing.id,
+                        existing.encryption_key_version,
+                    )
+                    .await;
+            }
+        }
+
+        verify_protected_original(&self.config, &library_root, &record, &chunks)?;
+        let descriptors = protected_chunk_descriptors(&chunks);
+        let quarantine = original_quarantine::QuarantinedOriginal {
+            object_id: record.object_id,
+            asset_id,
+            content_hash: record.content_hash.clone(),
+            encrypted_hash: record.encrypted_hash.clone(),
+            plaintext_bytes: record.bytes,
+            chunks: descriptors,
+        };
+        let reader = original_quarantine::VerifiedQuarantineReader::open(
+            &self.config,
+            &library_root,
+            &quarantine,
+        )
+        .map_err(|error| ServiceError::Storage(error.to_string()))?;
+        let blob_id = Uuid::new_v4();
+        let sealed = match vault_store::seal_asset_from_reader(
+            &self.config,
+            &library_root,
+            vault.id,
+            vault.key_version,
+            blob_id,
+            &asset,
+            reader,
+        ) {
+            Ok(sealed) => sealed,
+            Err(error) => return Err(ServiceError::Storage(error.to_string())),
+        };
+        let target_chunks = sealed
+            .chunks
+            .iter()
+            .map(|chunk| BlobChunk {
+                id: Uuid::new_v4(),
+                blob_id,
+                chunk_index: chunk.chunk_index,
+                content_hash: chunk.content_hash.clone(),
+                encrypted_hash: chunk.encrypted_hash.clone(),
+                bytes: chunk.bytes,
+                encrypted_bytes: chunk.encrypted_bytes,
+                local_path: Some(chunk.local_path.clone()),
+                nonce_hex: Some(chunk.nonce_hex.clone()),
+                aad: Some(chunk.aad.clone()),
+            })
+            .collect::<Vec<_>>();
+        vault_store::verify_encrypted_chunk_files(&library_root, &target_chunks)
+            .map_err(|error| ServiceError::Storage(error.to_string()))?;
+        vault_store::verify_blob_plaintext(
+            &self.config,
+            &library_root,
+            vault.id,
+            vault.key_version,
+            &target_chunks,
+            &record.content_hash,
+            record.bytes,
+        )
+        .map_err(|error| ServiceError::Storage(error.to_string()))?;
+
+        let mut candidate = state.clone();
+        let now = Utc::now();
+        candidate
+            .blob_records
+            .iter_mut()
+            .filter(|blob| blob.asset_id == asset_id && blob.tombstoned_at.is_none())
+            .for_each(|blob| blob.tombstoned_at = Some(now));
+        candidate.blob_records.push(BlobRecord {
+            id: blob_id,
+            vault_id: vault.id,
+            asset_id,
+            content_hash: record.content_hash.clone(),
+            encrypted_hash: sealed.encrypted_hash,
+            bytes: record.bytes,
+            chunk_count: target_chunks.len() as u32,
+            encryption_key_version: vault.key_version,
+            created_at: now,
+            tombstoned_at: None,
+        });
+        candidate.blob_chunks.extend(target_chunks);
+        if let Some(candidate_asset) = candidate.assets.iter_mut().find(|item| item.id == asset_id)
+        {
+            candidate_asset.vault_id = Some(vault.id);
+            candidate_asset.is_available = true;
+        }
+        candidate
+            .file_entries
+            .iter_mut()
+            .filter(|entry| {
+                entry.asset_id == Some(asset_id)
+                    && entry.vault_id != vault.id
+                    && entry.trashed_at.is_none()
+            })
+            .for_each(|entry| entry.trashed_at = Some(now));
+        candidate
+            .mobile_uploads
+            .retain(|upload| upload.asset_id != Some(asset_id) || upload.vault_id == vault.id);
+        ensure_single_live_asset_entry(&mut candidate, &asset, vault.id)?;
+        storage::save_state(&self.storage, &candidate.to_persisted())
+            .map_err(|error| ServiceError::Storage(error.to_string()))?;
+        *state = candidate;
+        self.finish_quarantine_repair(
+            &mut state,
+            &record,
+            &asset,
+            &vault,
+            blob_id,
+            vault.key_version,
+        )
+        .await
+    }
+
+    async fn finish_quarantine_repair(
+        &self,
+        state: &mut LibraryState,
+        record: &ProtectedOriginal,
+        asset: &crate::domain::Asset,
+        vault: &Vault,
+        blob_id: Uuid,
+        encryption_key_version: u32,
+    ) -> Result<QuarantineRepairResult, ServiceError> {
+        // Verify authoritative rows again before retiring the only quarantine copy.
+        let chunks = state
+            .blob_chunks
+            .iter()
+            .filter(|chunk| chunk.blob_id == blob_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        let library_root = PathBuf::from(effective_library_root(state, &self.config));
+        vault_store::verify_encrypted_chunk_files(&library_root, &chunks)
+            .and_then(|_| {
+                vault_store::verify_blob_plaintext(
+                    &self.config,
+                    &library_root,
+                    vault.id,
+                    encryption_key_version,
+                    &chunks,
+                    &record.content_hash,
+                    record.bytes,
+                )
+            })
+            .map_err(|error| ServiceError::Storage(error.to_string()))?;
+        // Publish a live namespace entry in the selected vault while the
+        // quarantine is still recoverable. A vault blob without an entry is
+        // encrypted but invisible in the user's file tree.
+        let mut with_namespace = state.clone();
+        let now = Utc::now();
+        with_namespace
+            .blob_records
+            .iter_mut()
+            .filter(|blob| {
+                blob.asset_id == asset.id && blob.id != blob_id && blob.tombstoned_at.is_none()
+            })
+            .for_each(|blob| blob.tombstoned_at = Some(now));
+        with_namespace
+            .mobile_uploads
+            .retain(|upload| upload.asset_id != Some(asset.id));
+        if let Some(candidate_asset) = with_namespace
+            .assets
+            .iter_mut()
+            .find(|item| item.id == asset.id)
+        {
+            candidate_asset.vault_id = Some(vault.id);
+            candidate_asset.is_available = true;
+        }
+        ensure_single_live_asset_entry(&mut with_namespace, asset, vault.id)?;
+        storage::save_state(&self.storage, &with_namespace.to_persisted())
+            .map_err(|error| ServiceError::Storage(error.to_string()))?;
+        *state = with_namespace;
+        // Retire the old copy only after the independent normal-reader check.
+        // Keep its database inventory until filesystem and keyring cleanup
+        // succeed so interrupted cleanup stays visible and safely retryable.
+        let object_dir =
+            library_root.join(format!("quarantine/managed-originals/{}", record.object_id));
+        if object_dir.exists() {
+            fs::remove_dir_all(&object_dir).map_err(|error| ServiceError::Io(error.to_string()))?;
+            sync_parent_directory(&object_dir)?;
+        }
+        original_quarantine::retire_managed_original_key(&self.config, record.object_id)
+            .map_err(|error| ServiceError::Storage(error.to_string()))?;
+        let mut candidate = state.clone();
+        candidate
+            .protected_originals
+            .retain(|item| item.asset_id != record.asset_id);
+        candidate
+            .protected_original_chunks
+            .retain(|item| item.asset_id != record.asset_id);
+        if let Some(candidate_asset) = candidate.assets.iter_mut().find(|item| item.id == asset.id)
+        {
+            candidate_asset.vault_id = Some(vault.id);
+            candidate_asset.is_available = true;
+        }
+        storage::save_state(&self.storage, &candidate.to_persisted())
+            .map_err(|error| ServiceError::Storage(error.to_string()))?;
+        *state = candidate;
+        Ok(QuarantineRepairResult {
+            asset_id: asset.id,
+            vault_id: vault.id,
+            blob_id,
+            repaired: true,
+        })
     }
 
     pub async fn create_vault(&self, request: CreateVaultRequest) -> Result<Vault, ServiceError> {
@@ -2499,7 +2938,7 @@ impl GalleryService {
     pub async fn sync_network_status(&self) -> SyncNetworkStatus {
         let state = self.state.read().await;
         let runtime = self.sync_runtime.status().await;
-        build_sync_network_status(&state, runtime)
+        build_sync_network_status(&state, runtime, None)
     }
 
     pub async fn start_sync_network(&self) -> Result<SyncNetworkStatus, ServiceError> {
@@ -3060,6 +3499,9 @@ impl GalleryService {
             .find(|asset| asset.id == asset_id)
             .cloned()
             .ok_or_else(|| ServiceError::NotFound(format!("asset {asset_id}")))?;
+        if target_vault_for_asset(&state, asset_id).is_none() {
+            return Err(ServiceError::NotFound(format!("asset {asset_id}")));
+        }
         let original_path = asset_file_path(&asset, &library_root);
         if original_path.is_file() {
             return fs::read(&original_path)
@@ -3108,6 +3550,9 @@ impl GalleryService {
             .find(|asset| asset.id == asset_id)
             .cloned()
             .ok_or_else(|| ServiceError::NotFound(format!("asset {asset_id}")))?;
+        if target_vault_for_asset(&state, asset_id).is_none() {
+            return Err(ServiceError::NotFound(format!("asset {asset_id}")));
+        }
         let (start, end) = normalize_original_range(asset.bytes, range)?;
         let original_path = asset_file_path(&asset, &library_root);
         if original_path.is_file() {
@@ -3160,21 +3605,29 @@ impl GalleryService {
         request: ScanImportSourceRequest,
     ) -> Result<ImportSession, ServiceError> {
         let mut state = self.state.write().await;
+        let target_vault_id = request
+            .target_vault_id
+            .or_else(|| (state.vaults.len() == 1).then(|| state.vaults[0].id));
+        if let Some(vault_id) = target_vault_id {
+            ensure_vault_exists(&state, vault_id)?;
+        }
         let library_root = effective_library_root(&state, &self.config);
         let library_root_path = PathBuf::from(library_root);
-        let session = imports::scan_source(
+        let mut session = imports::scan_source(
             &request,
             default_import_mode(&state),
             Some(&library_root_path),
             |hash| {
-                state
-                    .assets
-                    .iter()
-                    .find(|asset| asset.content_hash == hash)
-                    .map(|asset| asset.id)
+                let vault_id = target_vault_id?;
+                state.assets.iter().find_map(|asset| {
+                    (asset.content_hash == hash
+                        && asset_is_owned_by_vault(&state, vault_id, asset.id))
+                    .then_some(asset.id)
+                })
             },
         )
         .map_err(|err| ServiceError::Io(err.to_string()))?;
+        session.target_vault_id = target_vault_id;
 
         if let Some(existing) = state
             .import_sessions
@@ -3327,6 +3780,24 @@ impl GalleryService {
         import_mode_override: Option<ImportMode>,
         add_as_watch_folder_override: Option<bool>,
     ) -> Result<ImportSession, ServiceError> {
+        self.commit_import_session_with_target_vault(
+            session_id,
+            selected_candidate_ids,
+            import_mode_override,
+            add_as_watch_folder_override,
+            None,
+        )
+        .await
+    }
+
+    pub async fn commit_import_session_with_target_vault(
+        &self,
+        session_id: Uuid,
+        selected_candidate_ids: Vec<Uuid>,
+        import_mode_override: Option<ImportMode>,
+        add_as_watch_folder_override: Option<bool>,
+        requested_target_vault_id: Option<Uuid>,
+    ) -> Result<ImportSession, ServiceError> {
         let mut state = self.state.write().await;
         let session_index = state
             .import_sessions
@@ -3335,6 +3806,35 @@ impl GalleryService {
             .ok_or_else(|| ServiceError::NotFound(format!("import session {session_id}")))?;
 
         let mut session = state.import_sessions[session_index].clone();
+        if let (Some(scanned_vault_id), Some(requested_vault_id)) =
+            (session.target_vault_id, requested_target_vault_id)
+            && scanned_vault_id != requested_vault_id
+        {
+            return Err(ServiceError::Invalid(
+                "the import target vault changed after scanning; scan again for the selected vault"
+                    .to_string(),
+            ));
+        }
+        let target_vault_id = requested_target_vault_id
+            .or(session.target_vault_id)
+            .or_else(|| (state.vaults.len() == 1).then(|| state.vaults[0].id))
+            .ok_or_else(|| {
+                ServiceError::Invalid(
+                    "select a target vault before committing this import".to_string(),
+                )
+            })?;
+        ensure_vault_exists(&state, target_vault_id)?;
+        session.target_vault_id = Some(target_vault_id);
+        ensure_file_namespace_defaults(&mut state);
+        for candidate in &mut session.candidates {
+            if candidate
+                .duplicate_asset_id
+                .is_some_and(|asset_id| !asset_is_owned_by_vault(&state, target_vault_id, asset_id))
+            {
+                candidate.duplicate_asset_id = None;
+                candidate.safety_status = "ready".to_string();
+            }
+        }
         let selected_ids: BTreeSet<Uuid> = if selected_candidate_ids.is_empty() {
             session
                 .candidates
@@ -3374,6 +3874,7 @@ impl GalleryService {
         let mut known_hashes = state
             .assets
             .iter()
+            .filter(|asset| asset_is_owned_by_vault(&state, target_vault_id, asset.id))
             .map(|asset| asset.content_hash.clone())
             .collect::<BTreeSet<_>>();
         let mut imported_asset_ids = Vec::new();
@@ -3401,7 +3902,10 @@ impl GalleryService {
                 if let Some(existing) = state
                     .assets
                     .iter()
-                    .find(|asset| asset.content_hash == candidate.content_hash)
+                    .find(|asset| {
+                        asset.content_hash == candidate.content_hash
+                            && asset_is_owned_by_vault(&state, target_vault_id, asset.id)
+                    })
                     .or_else(|| {
                         new_assets
                             .iter()
@@ -3428,6 +3932,7 @@ impl GalleryService {
                 import_mode: Some(effective_mode),
             };
             let (mut asset, _job) = imports::build_imported_asset(request);
+            asset.vault_id = Some(target_vault_id);
             attach_extracted_metadata(
                 &mut asset,
                 candidate,
@@ -3470,6 +3975,42 @@ impl GalleryService {
         }
 
         state.assets.extend(new_assets);
+        let target_root = root_file_entry_id(&state, target_vault_id).ok_or_else(|| {
+            ServiceError::Invalid(format!(
+                "vault {target_vault_id} has no file namespace root"
+            ))
+        })?;
+        let now = Utc::now();
+        let origin_device_id = local_device_id(&state);
+        for asset_id in &imported_asset_ids {
+            let asset = state
+                .assets
+                .iter()
+                .find(|asset| asset.id == *asset_id)
+                .cloned()
+                .ok_or_else(|| ServiceError::NotFound(format!("asset {asset_id}")))?;
+            state.file_entries.push(VaultFileEntry {
+                id: Uuid::new_v4(),
+                vault_id: target_vault_id,
+                parent_id: Some(target_root),
+                asset_id: Some(asset.id),
+                name: asset.original_filename.clone(),
+                kind: VaultFileKind::File,
+                media_kind: Some(asset.media_kind.clone()),
+                mime_type: Some(asset.mime_type.clone()),
+                bytes: asset.bytes,
+                content_hash: Some(asset.content_hash.clone()),
+                origin_device_id,
+                created_at: asset.imported_at,
+                updated_at: now,
+                trashed_at: None,
+                organization: asset
+                    .metadata
+                    .as_ref()
+                    .map(|metadata| metadata.organization.clone())
+                    .unwrap_or_default(),
+            });
+        }
         ensure_distributed_defaults(&mut state);
         refresh_blob_records_strict(&self.config, &mut state)?;
         ensure_file_namespace_defaults(&mut state);
@@ -3512,6 +4053,25 @@ impl GalleryService {
         &self,
         request: ImportAssetRequest,
     ) -> Result<ImportAssetResponse, ServiceError> {
+        let target_vault_id = {
+            let state = self.state.read().await;
+            (state.vaults.len() == 1)
+                .then(|| state.vaults[0].id)
+                .ok_or_else(|| {
+                    ServiceError::Invalid(
+                        "choose a target vault when importing into a multi-vault library"
+                            .to_string(),
+                    )
+                })?
+        };
+        self.import_asset_to_vault(target_vault_id, request).await
+    }
+
+    pub async fn import_asset_to_vault(
+        &self,
+        target_vault_id: Uuid,
+        request: ImportAssetRequest,
+    ) -> Result<ImportAssetResponse, ServiceError> {
         if request.original_filename.trim().is_empty() || request.source_path.trim().is_empty() {
             return Err(ServiceError::Invalid(
                 "source_path and original_filename are required".to_string(),
@@ -3519,6 +4079,7 @@ impl GalleryService {
         }
 
         let mut state = self.state.write().await;
+        ensure_vault_exists(&state, target_vault_id)?;
         let effective_mode = request.import_mode.unwrap_or(default_import_mode(&state));
         let library_root = effective_library_root(&state, &self.config);
         let library_root_path = PathBuf::from(&library_root);
@@ -3532,6 +4093,7 @@ impl GalleryService {
             content_hash: None,
             ..request
         });
+        asset.vault_id = Some(target_vault_id);
         let source_for_metadata = PathBuf::from(&asset.source_path);
         let extracted =
             metadata::extract_media_metadata(&source_for_metadata, &[], asset.captured_at);
@@ -3541,11 +4103,10 @@ impl GalleryService {
         }
         asset.metadata = Some(extracted.into_asset_metadata(asset.id));
 
-        if state
-            .assets
-            .iter()
-            .any(|existing| existing.content_hash == asset.content_hash)
-        {
+        if state.assets.iter().any(|existing| {
+            existing.content_hash == asset.content_hash
+                && asset_is_owned_by_vault(&state, target_vault_id, existing.id)
+        }) {
             return Err(ServiceError::Invalid(
                 "asset with identical checksum already exists".to_string(),
             ));
@@ -3574,7 +4135,35 @@ impl GalleryService {
         job.completed_at = Some(Utc::now());
         job.detail = Some(format!("imported {}", asset.original_filename));
 
+        ensure_file_namespace_defaults(&mut state);
+        let parent_id = root_file_entry_id(&state, target_vault_id).ok_or_else(|| {
+            ServiceError::Invalid(format!(
+                "vault {target_vault_id} has no file namespace root"
+            ))
+        })?;
+        let origin_device_id = local_device_id(&state);
         state.assets.push(asset.clone());
+        state.file_entries.push(VaultFileEntry {
+            id: Uuid::new_v4(),
+            vault_id: target_vault_id,
+            parent_id: Some(parent_id),
+            asset_id: Some(asset.id),
+            name: asset.original_filename.clone(),
+            kind: VaultFileKind::File,
+            media_kind: Some(asset.media_kind.clone()),
+            mime_type: Some(asset.mime_type.clone()),
+            bytes: asset.bytes,
+            content_hash: Some(asset.content_hash.clone()),
+            origin_device_id,
+            created_at: asset.imported_at,
+            updated_at: Utc::now(),
+            trashed_at: None,
+            organization: asset
+                .metadata
+                .as_ref()
+                .map(|metadata| metadata.organization.clone())
+                .unwrap_or_default(),
+        });
         state.jobs.insert(0, job.clone());
         refresh_derived_views(&mut state);
         ensure_distributed_defaults(&mut state);
@@ -5366,53 +5955,89 @@ impl GalleryService {
         let database_dir = export_root.join("database");
         let manifest_dir = export_root.join("manifests");
         let library_export_dir = export_root.join("library");
-        fs::create_dir_all(&database_dir).map_err(|err| ServiceError::Io(err.to_string()))?;
-        fs::create_dir_all(&manifest_dir).map_err(|err| ServiceError::Io(err.to_string()))?;
-        fs::create_dir_all(&library_export_dir).map_err(|err| ServiceError::Io(err.to_string()))?;
-
-        let entries = {
-            let mut state = self.state.write().await;
-            ensure_distributed_defaults(&mut state);
-            let changed = refresh_blob_records(&self.config, &mut state);
-            if changed {
-                self.persist_locked_state(&state)?;
-            }
-            let library_root = PathBuf::from(effective_library_root(&state, &self.config));
-            collect_backup_file_entries(
-                &state,
-                &library_root,
-                request.include_models,
-                &self.config,
-            )?
-        };
-
         let database_copy = database_dir.join(
             self.storage
                 .database_path
                 .file_name()
                 .unwrap_or_else(|| std::ffi::OsStr::new("gallery.sqlite3")),
         );
-        fs::copy(&self.storage.database_path, &database_copy)
-            .map_err(|err| ServiceError::Io(err.to_string()))?;
+        fs::create_dir_all(&database_dir).map_err(|err| ServiceError::Io(err.to_string()))?;
+        fs::create_dir_all(&manifest_dir).map_err(|err| ServiceError::Io(err.to_string()))?;
+        fs::create_dir_all(&library_export_dir).map_err(|err| ServiceError::Io(err.to_string()))?;
+
+        let (entries, protected_original_inventory) = {
+            let mut state = self.state.write().await;
+            ensure_distributed_defaults(&mut state);
+            let changed = refresh_blob_records(&self.config, &mut state);
+            if changed {
+                self.persist_locked_state(&state)?;
+            }
+            storage::checkpoint_database(&self.storage.database_path)
+                .map_err(|error| ServiceError::Storage(error.to_string()))?;
+            fs::copy(&self.storage.database_path, &database_copy)
+                .map_err(|error| ServiceError::Io(error.to_string()))?;
+            fs::File::open(&database_copy)
+                .and_then(|file| file.sync_all())
+                .map_err(|error| ServiceError::Io(error.to_string()))?;
+            let library_root = PathBuf::from(effective_library_root(&state, &self.config));
+            let entries = collect_backup_file_entries(
+                &state,
+                &library_root,
+                request.include_models,
+                &self.config,
+            )?;
+            let protected_inventory = state
+                .protected_originals
+                .iter()
+                .map(|record| {
+                    json!({
+                        "asset_id": record.asset_id,
+                        "object_id": record.object_id,
+                        "content_hash": record.content_hash,
+                        "bytes": record.bytes,
+                        "encrypted_hash": record.encrypted_hash,
+                        "chunk_count": record.chunk_count,
+                    })
+                })
+                .collect::<Vec<_>>();
+            (entries, protected_inventory)
+        };
 
         let mut media_files_copied = 0_usize;
         let mut vault_chunks_copied = 0_usize;
+        let mut protected_original_chunks_copied = 0_usize;
         let mut bytes_copied = fs::metadata(&database_copy)
             .map(|metadata| metadata.len())
             .unwrap_or(0);
         let mut copied_entries = Vec::new();
         for entry in &entries {
             if !entry.source_path.is_file() {
-                continue;
+                return Err(ServiceError::Storage(format!(
+                    "required backup source is missing: {}",
+                    entry.source_path.to_string_lossy()
+                )));
             }
             let destination = export_root.join(&entry.backup_relative_path);
             copy_file_creating_parent(&entry.source_path, &destination)?;
             let copied = fs::metadata(&destination)
                 .map(|metadata| metadata.len())
                 .unwrap_or(0);
+            let copied_hash = imports::derive_content_hash_from_file(&destination)
+                .map_err(|error| ServiceError::Io(error.to_string()))?;
+            if entry
+                .expected_hash
+                .as_ref()
+                .is_some_and(|expected| expected != &copied_hash)
+            {
+                return Err(ServiceError::Storage(format!(
+                    "backup copy failed integrity verification: {}",
+                    entry.backup_relative_path.to_string_lossy()
+                )));
+            }
             bytes_copied = bytes_copied.saturating_add(copied);
             match entry.kind {
                 "vault_chunk" => vault_chunks_copied += 1,
+                "protected_original_chunk" => protected_original_chunks_copied += 1,
                 "model_file" => {}
                 _ => media_files_copied += 1,
             }
@@ -5423,6 +6048,12 @@ impl GalleryService {
                 "backup_relative_path": entry.backup_relative_path,
                 "restore_relative_path": entry.restore_relative_path,
                 "bytes": copied,
+                "sha256": copied_hash,
+                "chunk_id": entry.chunk_id.map(|id| id.to_string()),
+                "blob_id": entry.blob_id.map(|id| id.to_string()),
+                "object_id": entry.object_id.map(|id| id.to_string()),
+                "chunk_index": entry.chunk_index,
+                "object_chunk_count": entry.object_chunk_count,
             }));
         }
 
@@ -5431,19 +6062,25 @@ impl GalleryService {
                 export_root: Some(request.export_root.clone()),
             })
             .await?;
+        let database_copy_sha256 = imports::derive_content_hash_from_file(&database_copy)
+            .map_err(|error| ServiceError::Io(error.to_string()))?;
         let manifest_path = manifest_dir.join("private-gallery-backup-manifest.json");
         let manifest = json!({
             "exported_at": Utc::now(),
+            "format_version": 2,
             "library_root": verification.library_root,
             "database_path": verification.database_path,
             "database_copied_to": database_copy,
-            "database_sha256": verification.database_sha256,
+            "database_sha256": database_copy_sha256,
             "assets_checked": verification.assets_checked,
             "missing_asset_paths": verification.missing_asset_paths,
+            "missing_protected_original_paths": verification.missing_protected_original_paths,
             "vault_chunks_checked": verification.vault_chunks_checked,
             "missing_vault_chunk_paths": verification.missing_vault_chunk_paths,
             "media_files_copied": media_files_copied,
             "vault_chunks_copied": vault_chunks_copied,
+            "protected_original_chunks_copied": protected_original_chunks_copied,
+            "protected_originals": protected_original_inventory,
             "bytes_copied": bytes_copied,
             "model_files_checked": verification.model_files_checked,
             "missing_model_paths": verification.missing_model_paths,
@@ -5463,11 +6100,13 @@ impl GalleryService {
             export_root: export_root.to_string_lossy().to_string(),
             manifest_path: manifest_path.to_string_lossy().to_string(),
             database_copied_to: database_copy.to_string_lossy().to_string(),
-            database_sha256: verification.database_sha256,
+            database_sha256: Some(database_copy_sha256),
             assets_checked: verification.assets_checked,
             missing_asset_paths: verification.missing_asset_paths.clone(),
+            missing_protected_original_paths: verification.missing_protected_original_paths.clone(),
             media_files_copied,
             vault_chunks_copied,
+            protected_original_chunks_copied,
             bytes_copied,
             model_files_checked: verification.model_files_checked,
             missing_model_paths: verification.missing_model_paths.clone(),
@@ -5589,6 +6228,8 @@ impl GalleryService {
                     "missing_asset_count": verification.missing_asset_paths.len(),
                     "vault_chunks_checked": verification.vault_chunks_checked,
                     "missing_vault_chunk_count": verification.missing_vault_chunk_paths.len(),
+                    "protected_originals_checked": verification.protected_originals_checked,
+                    "missing_protected_original_count": verification.missing_protected_original_paths.len(),
                     "model_files_checked": verification.model_files_checked,
                     "missing_model_count": verification.missing_model_paths.len(),
                     "database_hash_present": verification.database_sha256.is_some(),
@@ -5600,6 +6241,7 @@ impl GalleryService {
                     "excluded_private_data": [
                         "media files",
                         "vault chunks",
+                        "quarantined originals",
                         "database copy",
                         "absolute paths",
                         "file names",
@@ -5647,6 +6289,27 @@ impl GalleryService {
         }
         let library_root = PathBuf::from(effective_library_root(&state, &self.config));
         let mut missing_asset_paths = Vec::new();
+        let mut protected_originals_checked = 0_usize;
+        let mut missing_protected_original_paths = Vec::new();
+        let mut verified_protected_asset_ids = BTreeSet::new();
+        for record in &state.protected_originals {
+            protected_originals_checked += 1;
+            let chunks = state
+                .protected_original_chunks
+                .iter()
+                .filter(|chunk| chunk.asset_id == record.asset_id)
+                .cloned()
+                .collect::<Vec<_>>();
+            match verify_protected_original(&self.config, &library_root, record, &chunks) {
+                Ok(()) => {
+                    verified_protected_asset_ids.insert(record.asset_id);
+                }
+                Err(error) => {
+                    missing_protected_original_paths
+                        .push(format!("asset {}: {error}", record.asset_id));
+                }
+            }
+        }
         for asset in &state.assets {
             let path = asset_file_path(asset, &library_root);
             let encrypted_available = state
@@ -5655,7 +6318,10 @@ impl GalleryService {
                 .find(|blob| blob.asset_id == asset.id && blob.tombstoned_at.is_none())
                 .map(|blob| encrypted_chunks_available(&state, blob.id, &library_root))
                 .unwrap_or(false);
-            if !path.exists() && !encrypted_available {
+            if !path.exists()
+                && !encrypted_available
+                && !verified_protected_asset_ids.contains(&asset.id)
+            {
                 missing_asset_paths.push(path.to_string_lossy().to_string());
             }
         }
@@ -5690,6 +6356,7 @@ impl GalleryService {
             imports::derive_content_hash_from_file(&self.storage.database_path).ok();
         let ok = missing_asset_paths.is_empty()
             && missing_vault_chunk_paths.is_empty()
+            && missing_protected_original_paths.is_empty()
             && missing_model_paths.is_empty();
 
         Ok(BackupVerification {
@@ -5701,6 +6368,8 @@ impl GalleryService {
             missing_asset_paths,
             vault_chunks_checked,
             missing_vault_chunk_paths,
+            protected_originals_checked,
+            missing_protected_original_paths,
             model_files_checked,
             missing_model_paths,
             ok,
@@ -5755,6 +6424,34 @@ impl GalleryService {
         copy_file_creating_parent(Path::new(&plan.database_source_path), &database_target)?;
 
         let manifest = read_backup_manifest(&export_root)?;
+        let manifest_version = manifest
+            .get("format_version")
+            .and_then(|value| value.as_u64())
+            .unwrap_or_default();
+        let expected_database_hash = manifest
+            .get("database_sha256")
+            .and_then(|value| value.as_str());
+        if manifest_version >= 2 && !expected_database_hash.is_some_and(is_sha256_hex) {
+            let _ = fs::remove_file(&database_target);
+            return Err(ServiceError::Invalid(
+                "manifest v2 is missing a valid database_sha256".to_string(),
+            ));
+        }
+        if let Some(expected_hash) = expected_database_hash {
+            let actual_hash = match imports::derive_content_hash_from_file(&database_target) {
+                Ok(hash) => hash,
+                Err(error) => {
+                    let _ = fs::remove_file(&database_target);
+                    return Err(ServiceError::Io(error.to_string()));
+                }
+            };
+            if !actual_hash.eq_ignore_ascii_case(expected_hash) {
+                let _ = fs::remove_file(&database_target);
+                return Err(ServiceError::Storage(
+                    "restored database failed its manifest hash check".to_string(),
+                ));
+            }
+        }
         let files = manifest
             .get("files")
             .and_then(|value| value.as_array())
@@ -5762,6 +6459,7 @@ impl GalleryService {
             .unwrap_or_default();
         let mut media_files_copied = 0_usize;
         let mut vault_chunks_copied = 0_usize;
+        let mut protected_original_chunks_copied = 0_usize;
         let mut bytes_copied = fs::metadata(&database_target)
             .map(|metadata| metadata.len())
             .unwrap_or(0);
@@ -5791,24 +6489,39 @@ impl GalleryService {
                     )
                 })?;
             let source = export_root.join(backup_relative_path);
-            let destination = restore_root.join(restore_relative_path);
+            let destination = restore_root.join(&restore_relative_path);
             copy_file_creating_parent(&source, &destination)?;
+            if manifest
+                .get("format_version")
+                .and_then(|value| value.as_u64())
+                .unwrap_or_default()
+                >= 2
+            {
+                let expected_hash = file
+                    .get("sha256")
+                    .and_then(|value| value.as_str())
+                    .ok_or_else(|| {
+                        ServiceError::Invalid("manifest file entry is missing sha256".to_string())
+                    })?;
+                let actual_hash = imports::derive_content_hash_from_file(&destination)
+                    .map_err(|error| ServiceError::Io(error.to_string()))?;
+                if !actual_hash.eq_ignore_ascii_case(expected_hash) {
+                    let _ = fs::remove_file(&destination);
+                    return Err(ServiceError::Storage(format!(
+                        "restored file failed its manifest hash check: {}",
+                        restore_relative_path.to_string_lossy()
+                    )));
+                }
+            }
             let copied = fs::metadata(&destination)
                 .map(|metadata| metadata.len())
                 .unwrap_or(0);
             bytes_copied = bytes_copied.saturating_add(copied);
-            if file
-                .get("kind")
-                .and_then(|value| value.as_str())
-                .is_some_and(|kind| kind == "vault_chunk")
-            {
-                vault_chunks_copied += 1;
-            } else if file
-                .get("kind")
-                .and_then(|value| value.as_str())
-                .is_none_or(|kind| kind != "model_file")
-            {
-                media_files_copied += 1;
+            match file.get("kind").and_then(|value| value.as_str()) {
+                Some("vault_chunk") => vault_chunks_copied += 1,
+                Some("protected_original_chunk") => protected_original_chunks_copied += 1,
+                Some("model_file") => {}
+                _ => media_files_copied += 1,
             }
         }
 
@@ -5819,6 +6532,7 @@ impl GalleryService {
             database_restored_to: database_target.to_string_lossy().to_string(),
             media_files_copied,
             vault_chunks_copied,
+            protected_original_chunks_copied,
             bytes_copied,
             ok: true,
             detail: "Restore staged without modifying the active library. Start the daemon with this restore root after review.".to_string(),
@@ -5922,6 +6636,86 @@ impl GalleryService {
         self.persist_locked_state(&state)?;
         Ok(job)
     }
+}
+
+fn ensure_single_live_asset_entry(
+    state: &mut LibraryState,
+    asset: &crate::domain::Asset,
+    vault_id: Uuid,
+) -> Result<(), ServiceError> {
+    ensure_file_namespace_defaults(state);
+    let root_id = root_file_entry_id(state, vault_id).ok_or_else(|| {
+        ServiceError::Invalid(format!("vault {vault_id} has no file namespace root"))
+    })?;
+    let mut matching = state
+        .file_entries
+        .iter()
+        .enumerate()
+        .filter_map(|(index, entry)| {
+            (entry.vault_id == vault_id
+                && entry.asset_id == Some(asset.id)
+                && entry.kind == VaultFileKind::File)
+                .then_some((index, entry.id))
+        })
+        .collect::<Vec<_>>();
+    matching.sort_by_key(|(_, id)| *id);
+    let now = Utc::now();
+    for entry in state.file_entries.iter_mut().filter(|entry| {
+        entry.asset_id == Some(asset.id) && entry.vault_id != vault_id && entry.trashed_at.is_none()
+    }) {
+        entry.trashed_at = Some(now);
+        entry.updated_at = now;
+    }
+    if let Some((keep_index, _)) = matching.first().copied() {
+        for (index, entry) in state.file_entries.iter_mut().enumerate() {
+            if entry.vault_id == vault_id
+                && entry.asset_id == Some(asset.id)
+                && entry.kind == VaultFileKind::File
+            {
+                if index == keep_index {
+                    entry.trashed_at = None;
+                    entry.parent_id = Some(root_id);
+                    entry.name = asset.original_filename.clone();
+                    entry.media_kind = Some(asset.media_kind.clone());
+                    entry.mime_type = Some(asset.mime_type.clone());
+                    entry.bytes = asset.bytes;
+                    entry.content_hash = Some(asset.content_hash.clone());
+                    entry.updated_at = now;
+                    entry.organization = asset
+                        .metadata
+                        .as_ref()
+                        .map(|metadata| metadata.organization.clone())
+                        .unwrap_or_default();
+                } else if entry.trashed_at.is_none() {
+                    entry.trashed_at = Some(now);
+                    entry.updated_at = now;
+                }
+            }
+        }
+    } else {
+        state.file_entries.push(VaultFileEntry {
+            id: Uuid::new_v4(),
+            vault_id,
+            parent_id: Some(root_id),
+            asset_id: Some(asset.id),
+            name: asset.original_filename.clone(),
+            kind: VaultFileKind::File,
+            media_kind: Some(asset.media_kind.clone()),
+            mime_type: Some(asset.mime_type.clone()),
+            bytes: asset.bytes,
+            content_hash: Some(asset.content_hash.clone()),
+            origin_device_id: local_device_id(state),
+            created_at: asset.imported_at,
+            updated_at: Utc::now(),
+            trashed_at: None,
+            organization: asset
+                .metadata
+                .as_ref()
+                .map(|metadata| metadata.organization.clone())
+                .unwrap_or_default(),
+        });
+    }
+    Ok(())
 }
 
 fn normalize_storage_policy(policy: Option<StoragePolicy>) -> StoragePolicy {
@@ -6050,6 +6844,47 @@ fn ensure_file_namespace_defaults(state: &mut LibraryState) -> bool {
                 changed = true;
             }
         } else {
+            let associated_vaults = state
+                .blob_records
+                .iter()
+                .filter(|candidate| {
+                    candidate.asset_id == asset.id && candidate.tombstoned_at.is_none()
+                })
+                .map(|candidate| candidate.vault_id)
+                .chain(state.mobile_uploads.iter().filter_map(|upload| {
+                    (upload.asset_id == Some(asset.id)
+                        && upload.status == MobileUploadStatus::Completed)
+                        .then_some(upload.vault_id)
+                }))
+                .chain(state.file_entries.iter().filter_map(|candidate| {
+                    (candidate.asset_id == Some(asset.id) && candidate.trashed_at.is_none())
+                        .then_some(candidate.vault_id)
+                }))
+                .filter(|candidate_vault| {
+                    state
+                        .vaults
+                        .iter()
+                        .any(|vault| vault.id == *candidate_vault)
+                })
+                .collect::<BTreeSet<_>>();
+            if associated_vaults.len() > 1 {
+                // A blob row alone cannot manufacture a second-vault grant.
+                // Conflicting legacy rows remain available for repair, but no
+                // namespace default is synthesized from them.
+                continue;
+            }
+            let has_completed_upload = state.mobile_uploads.iter().any(|upload| {
+                upload.asset_id == Some(asset.id)
+                    && upload.vault_id == blob.vault_id
+                    && upload.status == MobileUploadStatus::Completed
+            });
+            let sole_vault_legacy = state.vaults.len() == 1 && state.vaults[0].id == blob.vault_id;
+            if !has_completed_upload && !sole_vault_legacy {
+                // A blob record by itself is not an asset membership grant in
+                // a multi-vault library. Keep the bytes and let repair tooling
+                // present the association instead of promoting it at startup.
+                continue;
+            }
             state.file_entries.push(VaultFileEntry {
                 id: Uuid::new_v4(),
                 vault_id: blob.vault_id,
@@ -6113,6 +6948,16 @@ fn build_file_tree_response(
             vault_id
                 .map(|vault_id| entry.vault_id == vault_id)
                 .unwrap_or(true)
+        })
+        // A file entry is only presentable when the asset's complete live
+        // association set resolves back to that same vault. In particular,
+        // do not leak filenames or organization hints for legacy records whose
+        // blob, upload receipt, and namespace evidence disagree.
+        .filter(|entry| {
+            entry.asset_id.is_none_or(|asset_id| {
+                target_vault_for_asset(state, asset_id)
+                    .is_some_and(|vault| vault.id == entry.vault_id)
+            })
         })
         .filter(|entry| include_trashed || entry.trashed_at.is_none())
         .map(|entry| {
@@ -6466,15 +7311,42 @@ fn target_vault_for_asset(state: &LibraryState, asset_id: Uuid) -> Option<Vault>
         }
     }
     for upload in &state.mobile_uploads {
-        if upload.asset_id == Some(asset_id) {
+        if upload.asset_id == Some(asset_id) && upload.status == MobileUploadStatus::Completed {
             upload_vaults.insert(upload.vault_id);
         }
     }
     for entry in &state.file_entries {
-        if entry.asset_id == Some(asset_id) {
+        if entry.asset_id == Some(asset_id) && entry.trashed_at.is_none() {
             entry_vaults.insert(entry.vault_id);
         }
     }
+    if let Some(owner) = state
+        .assets
+        .iter()
+        .find(|asset| asset.id == asset_id)
+        .and_then(|asset| asset.vault_id)
+    {
+        let conflicting_live_evidence = blob_vaults
+            .iter()
+            .chain(upload_vaults.iter())
+            .chain(entry_vaults.iter())
+            .any(|vault_id| *vault_id != owner && live_vault(*vault_id).is_some());
+        if conflicting_live_evidence {
+            return None;
+        }
+        return live_vault(owner);
+    }
+    // Conflicting live vault associations are ambiguous, even if one row is
+    // older, a blob happens to sort first, or the candidate is the historical
+    // first vault. Preserve the rows for explicit repair rather than turning a
+    // startup reconciliation into an implicit cross-vault move.
+    let live_associated_vaults = blob_vaults
+        .iter()
+        .chain(upload_vaults.iter())
+        .chain(entry_vaults.iter())
+        .filter(|vault_id| live_vault(**vault_id).is_some())
+        .copied()
+        .collect::<BTreeSet<_>>();
     // A `BTreeSet` iterates in a total order over values, so the choice below is
     // the same before and after a reload. It is deliberately not insertion
     // order: `created_at` on a peer-supplied record is attacker-controlled
@@ -6485,6 +7357,9 @@ fn target_vault_for_asset(state: &LibraryState, asset_id: Uuid) -> Option<Vault>
         .copied()
         .filter(|v| upload_vaults.contains(v) || entry_vaults.contains(v))
         .collect();
+    if live_associated_vaults.len() > 1 {
+        return None;
+    }
     let dangling = |v: &Uuid| live_vault(*v).is_none();
 
     // (a) A live BlobRecord wins. It is rejected in one case only: nothing else
@@ -6558,7 +7433,334 @@ fn target_vault_for_asset(state: &LibraryState, asset_id: Uuid) -> Option<Vault>
 
     // (d) The historical fallback, now reachable only from here -- which is what
     //     makes it a fallback rather than a catch-all.
-    state.vaults.first().cloned()
+    (state.vaults.len() == 1)
+        .then(|| state.vaults.first().cloned())
+        .flatten()
+}
+
+fn reconcile_unresolved_managed_originals(
+    config: &AppConfig,
+    storage_report: &StorageBootstrapReport,
+    state: &mut LibraryState,
+) -> Result<bool, ServiceError> {
+    if state
+        .library_settings
+        .as_ref()
+        .map(|settings| settings.original_storage_policy)
+        .unwrap_or_default()
+        != OriginalStoragePolicy::EncryptedOnly
+    {
+        return Ok(false);
+    }
+
+    let library_root = PathBuf::from(effective_library_root(state, config));
+    let assets = state.assets.clone();
+    let mut changed = false;
+    for asset in assets {
+        if asset.import_mode == ImportMode::Reference
+            || target_vault_for_asset(state, asset.id).is_some()
+        {
+            continue;
+        }
+        let original_path = asset_file_path(&asset, &library_root);
+        let original_exists = original_path.is_file();
+        let current = state
+            .protected_originals
+            .iter()
+            .find(|record| record.asset_id == asset.id)
+            .cloned();
+
+        let (_record, _chunks) = if let Some(record) = current {
+            let chunks = state
+                .protected_original_chunks
+                .iter()
+                .filter(|chunk| chunk.asset_id == asset.id)
+                .cloned()
+                .collect::<Vec<_>>();
+            verify_protected_original(config, &library_root, &record, &chunks)?;
+            (record, chunks)
+        } else if original_exists {
+            storage::ensure_library_layout(&library_root)
+                .map_err(|error| ServiceError::Storage(error.to_string()))?;
+            let object_id = Uuid::new_v4();
+            let sealed = original_quarantine::seal_managed_original(
+                config,
+                &library_root,
+                object_id,
+                asset.id,
+                &original_path,
+                &asset.content_hash,
+            )
+            .map_err(|error| {
+                ServiceError::Storage(format!(
+                    "cannot encrypt unresolved managed original {}: {error}",
+                    asset.id
+                ))
+            })?;
+            let chunks = sealed
+                .chunks
+                .iter()
+                .map(|chunk| ProtectedOriginalChunk {
+                    id: Uuid::new_v4(),
+                    asset_id: asset.id,
+                    chunk_index: chunk.index,
+                    content_hash: chunk.plaintext_hash.clone(),
+                    encrypted_hash: chunk.encrypted_hash.clone(),
+                    bytes: chunk.plaintext_bytes,
+                    encrypted_bytes: chunk.encrypted_bytes,
+                    local_path: chunk.local_path.clone(),
+                    nonce_hex: chunk.nonce_hex.clone(),
+                    aad: chunk.aad.clone(),
+                })
+                .collect::<Vec<_>>();
+            let now = Utc::now();
+            let record = ProtectedOriginal {
+                asset_id: asset.id,
+                object_id,
+                content_hash: asset.content_hash.clone(),
+                bytes: sealed.plaintext_bytes,
+                encrypted_hash: sealed.encrypted_hash,
+                chunk_count: u32::try_from(chunks.len()).map_err(|_| {
+                    ServiceError::Storage("quarantine object has too many chunks".to_string())
+                })?,
+                key_version: 1,
+                reason: unresolved_vault_reason(state, asset.id),
+                source_removed: false,
+                created_at: now,
+                updated_at: now,
+            };
+            verify_protected_original(config, &library_root, &record, &chunks)?;
+
+            let mut candidate = state.clone();
+            candidate
+                .protected_originals
+                .retain(|value| value.asset_id != asset.id);
+            candidate
+                .protected_original_chunks
+                .retain(|value| value.asset_id != asset.id);
+            candidate.protected_originals.push(record.clone());
+            candidate.protected_original_chunks.extend(chunks.clone());
+            if let Some(candidate_asset) = candidate.assets.iter_mut().find(|v| v.id == asset.id) {
+                candidate_asset.is_available = false;
+            }
+            if let Err(error) = storage::save_state(storage_report, &candidate.to_persisted()) {
+                let _ = fs::remove_dir_all(
+                    library_root.join(format!("quarantine/managed-originals/{}", object_id)),
+                );
+                return Err(ServiceError::Storage(error.to_string()));
+            }
+            *state = candidate;
+            changed = true;
+            (record, chunks)
+        } else {
+            // Missing source bytes with no protected copy are not recreated or
+            // assigned to another vault by startup reconciliation.
+            continue;
+        };
+
+        if original_exists {
+            let source_hash = imports::derive_content_hash_from_file(&original_path)
+                .map_err(|error| ServiceError::Io(error.to_string()))?;
+            if source_hash != asset.content_hash {
+                return Err(ServiceError::Storage(format!(
+                    "managed original {} changed while vault membership was unresolved; plaintext was preserved",
+                    asset.id
+                )));
+            }
+            fs::remove_file(&original_path).map_err(|error| ServiceError::Io(error.to_string()))?;
+            sync_parent_directory(&original_path)?;
+        }
+
+        if let Some(saved) = state
+            .protected_originals
+            .iter_mut()
+            .find(|value| value.asset_id == asset.id)
+            && (!saved.source_removed || original_exists)
+        {
+            saved.source_removed = true;
+            saved.updated_at = Utc::now();
+            if let Some(saved_asset) = state.assets.iter_mut().find(|v| v.id == asset.id) {
+                saved_asset.is_available = false;
+            }
+            storage::save_state(storage_report, &state.to_persisted())
+                .map_err(|error| ServiceError::Storage(error.to_string()))?;
+            changed = true;
+        }
+    }
+    Ok(changed)
+}
+
+fn verify_protected_original(
+    config: &AppConfig,
+    library_root: &Path,
+    record: &ProtectedOriginal,
+    chunks: &[ProtectedOriginalChunk],
+) -> Result<(), ServiceError> {
+    if chunks.len() != record.chunk_count as usize {
+        return Err(ServiceError::Storage(format!(
+            "protected original {} chunk count does not match its metadata",
+            record.asset_id
+        )));
+    }
+    let total_bytes = chunks
+        .iter()
+        .try_fold(0_u64, |total, chunk| total.checked_add(chunk.bytes));
+    if total_bytes != Some(record.bytes) {
+        return Err(ServiceError::Storage(format!(
+            "protected original {} byte count does not match its metadata",
+            record.asset_id
+        )));
+    }
+    let mut encrypted_hasher = Sha256::new();
+    let mut ordered_chunks = chunks.iter().collect::<Vec<_>>();
+    ordered_chunks.sort_by_key(|chunk| chunk.chunk_index);
+    for chunk in &ordered_chunks {
+        encrypted_hasher.update(chunk.encrypted_hash.as_bytes());
+    }
+    let encrypted_hash = format!("{:x}", encrypted_hasher.finalize());
+    if encrypted_hash != record.encrypted_hash {
+        return Err(ServiceError::Storage(format!(
+            "protected original {} encrypted hash does not match its metadata",
+            record.asset_id
+        )));
+    }
+    let descriptors = protected_chunk_descriptors(chunks);
+    original_quarantine::verify_managed_original(
+        config,
+        library_root,
+        record.object_id,
+        record.asset_id,
+        &record.content_hash,
+        record.bytes,
+        &descriptors,
+    )
+    .map_err(|error| {
+        ServiceError::Storage(format!(
+            "protected original {} failed verification: {error}",
+            record.asset_id
+        ))
+    })?;
+    Ok(())
+}
+
+fn protected_chunk_descriptors(
+    chunks: &[ProtectedOriginalChunk],
+) -> Vec<original_quarantine::QuarantineChunk> {
+    chunks
+        .iter()
+        .map(|chunk| original_quarantine::QuarantineChunk {
+            index: chunk.chunk_index,
+            plaintext_bytes: chunk.bytes,
+            encrypted_bytes: chunk.encrypted_bytes,
+            local_path: chunk.local_path.clone(),
+            nonce_hex: chunk.nonce_hex.clone(),
+            aad: chunk.aad.clone(),
+            plaintext_hash: chunk.content_hash.clone(),
+            encrypted_hash: chunk.encrypted_hash.clone(),
+        })
+        .collect()
+}
+
+/// Crash recovery for plaintext repair staging. This runs before service state
+/// is loaded, so an interrupted repair cannot leave its temporary original on
+/// disk while the daemon is serving requests.
+fn cleanup_quarantine_repair_staging(runtime_root: &Path) -> Result<(), ServiceError> {
+    let staging_root = runtime_root.join("quarantine-repair");
+    let metadata = match fs::symlink_metadata(&staging_root) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(ServiceError::Io(error.to_string())),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(ServiceError::Invalid(
+            "quarantine repair staging path is not a private directory".to_string(),
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&staging_root, fs::Permissions::from_mode(0o700))
+            .map_err(|error| ServiceError::Io(error.to_string()))?;
+    }
+    for entry in fs::read_dir(&staging_root).map_err(|error| ServiceError::Io(error.to_string()))? {
+        let entry = entry.map_err(|error| ServiceError::Io(error.to_string()))?;
+        let file_type = entry
+            .file_type()
+            .map_err(|error| ServiceError::Io(error.to_string()))?;
+        let path = entry.path();
+        if file_type.is_symlink() || !file_type.is_dir() {
+            fs::remove_file(path).map_err(|error| ServiceError::Io(error.to_string()))?;
+        } else {
+            fs::remove_dir_all(path).map_err(|error| ServiceError::Io(error.to_string()))?;
+        }
+    }
+    sync_directory(&staging_root)?;
+    sync_parent_directory(&staging_root)?;
+    Ok(())
+}
+
+#[cfg(test)]
+fn remove_quarantine_repair_stage(path: &Path) -> Result<(), ServiceError> {
+    let metadata =
+        fs::symlink_metadata(path).map_err(|error| ServiceError::Io(error.to_string()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(ServiceError::Invalid(
+            "quarantine repair staging object is not a directory".to_string(),
+        ));
+    }
+    fs::remove_dir_all(path).map_err(|error| ServiceError::Io(error.to_string()))?;
+    sync_parent_directory(path)
+}
+
+#[cfg(unix)]
+fn sync_directory(path: &Path) -> Result<(), ServiceError> {
+    fs::File::open(path)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| ServiceError::Io(error.to_string()))
+}
+
+#[cfg(not(unix))]
+fn sync_directory(_path: &Path) -> Result<(), ServiceError> {
+    Ok(())
+}
+
+fn unresolved_vault_reason(state: &LibraryState, asset_id: Uuid) -> String {
+    let live_ids = state
+        .blob_records
+        .iter()
+        .filter_map(|blob| {
+            (blob.asset_id == asset_id && blob.tombstoned_at.is_none()).then_some(blob.vault_id)
+        })
+        .chain(state.mobile_uploads.iter().filter_map(|upload| {
+            (upload.asset_id == Some(asset_id) && upload.status == MobileUploadStatus::Completed)
+                .then_some(upload.vault_id)
+        }))
+        .chain(state.file_entries.iter().filter_map(|entry| {
+            (entry.asset_id == Some(asset_id) && entry.trashed_at.is_none())
+                .then_some(entry.vault_id)
+        }))
+        .filter(|id| state.vaults.iter().any(|vault| vault.id == *id))
+        .collect::<BTreeSet<_>>();
+    if live_ids.len() > 1 {
+        "conflicting_live_vault_associations".to_string()
+    } else {
+        "missing_or_removed_vault_association".to_string()
+    }
+}
+
+#[cfg(unix)]
+fn sync_parent_directory(path: &Path) -> Result<(), ServiceError> {
+    if let Some(parent) = path.parent() {
+        fs::File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| ServiceError::Io(error.to_string()))?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_parent_directory(_path: &Path) -> Result<(), ServiceError> {
+    Ok(())
 }
 
 // Best-effort repair used by read paths and startup. A seal failure must never
@@ -6601,31 +7803,9 @@ fn refresh_blob_records_impl(
     let library_root = PathBuf::from(effective_library_root(state, config));
 
     for asset in state.assets.clone() {
-        // Per-asset vault, resolved above: an asset whose vault vanished is
-        // skipped rather than misfiled (see target_vault_for_asset).
-        //
-        // Skipping is not free, and the cost is worth stating rather than
-        // leaving to be rediscovered. Everything below the `continue` is per
-        // `(asset, vault)`, and there is no vault here, so BOTH of these are
-        // silently not done for a skipped asset:
-        //
-        //   * `enforce_original_storage_policy` -- so a managed library keeps a
-        //     plaintext original for a skipped asset instead of having the
-        //     policy applied to it. It is not *cleared* here (that only happens
-        //     with a vault to seal into, and the seal is the point), but nothing
-        //     reports it either. That is the local-first "encrypted-only
-        //     originals" default going unenforced for exactly the assets whose
-        //     storage situation is already abnormal.
-        //   * the `blob_replicas` health and `bytes_present` reconciliation --
-        //     so the replica row keeps whatever health it last had, and
-        //     `bytes_present` can keep reporting bytes that are not there.
-        //
-        // Neither is repaired here rather than fixed here, because both need the
-        // vault the resolver could not supply, and inventing one is precisely
-        // the misfiling this branch exists to prevent. `refresh_asset_availability`
-        // still runs over every asset before the loop, so availability itself is
-        // not stale. Step 1b of #112 owns the repair; until then an asset in this
-        // state is under-enforced, not silently re-homed.
+        // Startup encrypts unresolved managed originals under a device-local
+        // quarantine key. They stay outside normal vault views until an
+        // explicit repair selects a destination vault.
         let Some(vault) = target_vault_for_asset(state, asset.id) else {
             continue;
         };
@@ -6923,9 +8103,24 @@ fn blob_for_mobile_session<'a>(
         .blob_records
         .iter()
         .find(|blob| {
-            blob.id == blob_id && blob.vault_id == session.vault_id && blob.tombstoned_at.is_none()
+            blob.id == blob_id
+                && blob.vault_id == session.vault_id
+                && blob.tombstoned_at.is_none()
+                && blob_has_authorized_local_owner(state, blob.vault_id, blob.asset_id)
         })
         .ok_or_else(|| ServiceError::NotFound(format!("blob {blob_id}")))
+}
+
+/// Allow an opaque replica when this device has no local Asset row. If local
+/// metadata exists, require the same unambiguous vault ownership used by browse
+/// and original-download routes before exposing or forwarding its ciphertext.
+pub(crate) fn blob_has_authorized_local_owner(
+    state: &LibraryState,
+    vault_id: Uuid,
+    asset_id: Uuid,
+) -> bool {
+    !state.assets.iter().any(|asset| asset.id == asset_id)
+        || has_vault_asset_membership(state, vault_id, asset_id)
 }
 
 fn chunk_for_blob(
@@ -8160,25 +9355,30 @@ fn execution_result(
 fn build_sync_network_status(
     state: &LibraryState,
     runtime: sync_transport::RuntimeStatus,
+    vault_scope: Option<Uuid>,
 ) -> SyncNetworkStatus {
     let pending_transfer_count = state
         .sync_transfers
         .iter()
+        .filter(|transfer| vault_scope.is_none_or(|id| transfer.vault_id == id))
         .filter(|transfer| transfer.status == SyncTransferStatus::Pending)
         .count();
     let active_transfer_count = state
         .sync_transfers
         .iter()
+        .filter(|transfer| vault_scope.is_none_or(|id| transfer.vault_id == id))
         .filter(|transfer| transfer.status == SyncTransferStatus::Running)
         .count();
     let completed_transfer_count = state
         .sync_transfers
         .iter()
+        .filter(|transfer| vault_scope.is_none_or(|id| transfer.vault_id == id))
         .filter(|transfer| transfer.status == SyncTransferStatus::Completed)
         .count();
     let failed_transfer_count = state
         .sync_transfers
         .iter()
+        .filter(|transfer| vault_scope.is_none_or(|id| transfer.vault_id == id))
         .filter(|transfer| {
             matches!(
                 transfer.status,
@@ -8279,6 +9479,12 @@ struct BackupFileEntry {
     source_path: PathBuf,
     backup_relative_path: PathBuf,
     restore_relative_path: PathBuf,
+    expected_hash: Option<String>,
+    chunk_id: Option<Uuid>,
+    blob_id: Option<Uuid>,
+    object_id: Option<Uuid>,
+    chunk_index: Option<u32>,
+    object_chunk_count: Option<u32>,
 }
 
 fn collect_backup_file_entries(
@@ -8324,6 +9530,12 @@ fn collect_backup_file_entries(
             source_path,
             backup_relative_path: relative_path.clone(),
             restore_relative_path: relative_path,
+            expected_hash: Some(asset.content_hash.clone()),
+            chunk_id: None,
+            blob_id: None,
+            object_id: None,
+            chunk_index: None,
+            object_chunk_count: None,
         });
     }
 
@@ -8341,6 +9553,40 @@ fn collect_backup_file_entries(
             source_path: library_root.join(local_path),
             backup_relative_path: relative_path.clone(),
             restore_relative_path: relative_path,
+            expected_hash: Some(chunk.encrypted_hash.clone()),
+            chunk_id: Some(chunk.id),
+            blob_id: Some(chunk.blob_id),
+            object_id: None,
+            chunk_index: Some(chunk.chunk_index),
+            object_chunk_count: None,
+        });
+    }
+
+    for chunk in &state.protected_original_chunks {
+        let relative_path = PathBuf::from("library").join(stored_relative_path(
+            &chunk.local_path,
+            &format!("{}.qblob", chunk.id),
+        ));
+        entries.push(BackupFileEntry {
+            kind: "protected_original_chunk",
+            asset_id: Some(chunk.asset_id),
+            source_path: library_root.join(&chunk.local_path),
+            backup_relative_path: relative_path.clone(),
+            restore_relative_path: relative_path,
+            expected_hash: Some(chunk.encrypted_hash.clone()),
+            chunk_id: Some(chunk.id),
+            blob_id: None,
+            object_id: state
+                .protected_originals
+                .iter()
+                .find(|record| record.asset_id == chunk.asset_id)
+                .map(|record| record.object_id),
+            chunk_index: Some(chunk.chunk_index),
+            object_chunk_count: state
+                .protected_originals
+                .iter()
+                .find(|record| record.asset_id == chunk.asset_id)
+                .map(|record| record.chunk_count),
         });
     }
 
@@ -8358,6 +9604,12 @@ fn collect_backup_file_entries(
                 source_path,
                 backup_relative_path: relative_path.clone(),
                 restore_relative_path: relative_path,
+                expected_hash: None,
+                chunk_id: None,
+                blob_id: None,
+                object_id: None,
+                chunk_index: None,
+                object_chunk_count: None,
             });
         }
     }
@@ -8397,6 +9649,12 @@ fn build_restore_plan(
     let mut destination_conflicts = Vec::new();
     let mut media_files_available = 0_usize;
     let mut vault_chunks_available = 0_usize;
+    let mut protected_original_chunks_available = 0_usize;
+    let mut protected_objects = BTreeMap::<String, (u32, BTreeSet<u32>)>::new();
+    let mut protected_inventory = BTreeMap::<String, u32>::new();
+    let mut has_protected_inventory = false;
+    let mut seen_backup_paths = BTreeSet::<PathBuf>::new();
+    let mut seen_restore_paths = BTreeSet::<PathBuf>::new();
 
     let manifest = match read_backup_manifest(&export_root) {
         Ok(manifest) => Some(manifest),
@@ -8405,9 +9663,38 @@ fn build_restore_plan(
             None
         }
     };
+    let manifest_version = manifest
+        .as_ref()
+        .and_then(|value| value.get("format_version"))
+        .and_then(|value| value.as_u64())
+        .unwrap_or_default();
     let database_source = find_database_copy(&export_root, config, manifest.as_ref());
     if !database_source.is_file() {
         missing_paths.push(database_source.to_string_lossy().to_string());
+    } else if manifest_version >= 2 {
+        match manifest
+            .as_ref()
+            .and_then(|value| value.get("database_sha256"))
+            .and_then(|value| value.as_str())
+        {
+            Some(expected_database_hash) if is_sha256_hex(expected_database_hash) => {
+                match imports::derive_content_hash_from_file(&database_source) {
+                    Ok(actual) if actual.eq_ignore_ascii_case(expected_database_hash) => {}
+                    Ok(_) => missing_paths.push(format!(
+                        "backup database hash mismatch: {}",
+                        database_source.to_string_lossy()
+                    )),
+                    Err(error) => missing_paths.push(format!(
+                        "backup database cannot be hashed: {} ({error})",
+                        database_source.to_string_lossy()
+                    )),
+                }
+            }
+            _ => missing_paths.push(format!(
+                "manifest v2 is missing a valid database_sha256: {}",
+                database_source.to_string_lossy()
+            )),
+        }
     }
     let database_name = database_source
         .file_name()
@@ -8418,6 +9705,41 @@ fn build_restore_plan(
     }
 
     if let Some(manifest) = &manifest {
+        if manifest_version >= 2 {
+            has_protected_inventory = true;
+            match manifest
+                .get("protected_originals")
+                .and_then(|v| v.as_array())
+            {
+                Some(records) => {
+                    for record in records {
+                        let identity = record
+                            .get("object_id")
+                            .and_then(|v| v.as_str())
+                            .zip(record.get("asset_id").and_then(|v| v.as_str()));
+                        let count = record
+                            .get("chunk_count")
+                            .and_then(|v| v.as_u64())
+                            .and_then(|v| u32::try_from(v).ok());
+                        match (identity, count) {
+                            (Some((object_id, asset_id)), Some(count)) if count > 0 => {
+                                let key = format!("{object_id}:{asset_id}");
+                                if protected_inventory.insert(key.clone(), count).is_some() {
+                                    missing_paths.push(format!(
+                                        "manifest contains duplicate protected-original metadata: {key}"
+                                    ));
+                                }
+                            }
+                            _ => missing_paths.push(
+                                "manifest contains invalid protected-original metadata".to_string(),
+                            ),
+                        }
+                    }
+                }
+                None => missing_paths
+                    .push("manifest v2 is missing protected-original inventory".to_string()),
+            }
+        }
         let files = manifest
             .get("files")
             .and_then(|value| value.as_array())
@@ -8437,14 +9759,92 @@ fn build_restore_plan(
                 ));
                 continue;
             };
+            if !seen_backup_paths.insert(backup_relative_path.clone()) {
+                missing_paths.push(format!(
+                    "manifest contains a duplicate backup path: {}",
+                    backup_relative_path.to_string_lossy()
+                ));
+                continue;
+            }
             let source = export_root.join(backup_relative_path);
             if !source.is_file() {
                 missing_paths.push(source.to_string_lossy().to_string());
                 continue;
             }
 
-            match file.get("kind").and_then(|value| value.as_str()) {
+            let kind = file.get("kind").and_then(|value| value.as_str());
+            if manifest
+                .get("format_version")
+                .and_then(|value| value.as_u64())
+                .unwrap_or_default()
+                >= 2
+            {
+                let expected_hash = file.get("sha256").and_then(|value| value.as_str());
+                match expected_hash {
+                    Some(expected) => match imports::derive_content_hash_from_file(&source) {
+                        Ok(actual) if actual.eq_ignore_ascii_case(expected) => {}
+                        Ok(_) => missing_paths.push(format!(
+                            "backup file hash mismatch: {}",
+                            source.to_string_lossy()
+                        )),
+                        Err(error) => missing_paths.push(format!(
+                            "backup file cannot be hashed: {} ({error})",
+                            source.to_string_lossy()
+                        )),
+                    },
+                    None => missing_paths.push(format!(
+                        "manifest entry is missing sha256: {}",
+                        source.to_string_lossy()
+                    )),
+                }
+            }
+
+            if kind == Some("protected_original_chunk") {
+                let identity = file
+                    .get("object_id")
+                    .and_then(|value| value.as_str())
+                    .zip(file.get("asset_id").and_then(|value| value.as_str()));
+                let chunk_index = file
+                    .get("chunk_index")
+                    .and_then(|value| value.as_u64())
+                    .and_then(|value| u32::try_from(value).ok());
+                let chunk_count = file
+                    .get("object_chunk_count")
+                    .and_then(|value| value.as_u64())
+                    .and_then(|value| u32::try_from(value).ok());
+                match (identity, chunk_index, chunk_count) {
+                    (Some((object_id, asset_id)), Some(index), Some(count)) if count > 0 => {
+                        let key = format!("{object_id}:{asset_id}");
+                        let entry = protected_objects
+                            .entry(key)
+                            .or_insert((count, BTreeSet::new()));
+                        if entry.0 != count || !entry.1.insert(index) {
+                            missing_paths.push(format!(
+                                "duplicate or inconsistent protected-original chunk identity: {object_id}:{asset_id}:{index}"
+                            ));
+                        }
+                    }
+                    _ => missing_paths.push(format!(
+                        "manifest protected-original chunk has incomplete identity: {}",
+                        source.to_string_lossy()
+                    )),
+                }
+                if file
+                    .get("chunk_id")
+                    .and_then(|value| value.as_str())
+                    .and_then(|value| Uuid::parse_str(value).ok())
+                    .is_none()
+                {
+                    missing_paths.push(format!(
+                        "manifest protected-original chunk has no valid chunk ID: {}",
+                        source.to_string_lossy()
+                    ));
+                }
+            }
+
+            match kind {
                 Some("vault_chunk") => vault_chunks_available += 1,
+                Some("protected_original_chunk") => protected_original_chunks_available += 1,
                 Some("model_file") => {}
                 _ => media_files_available += 1,
             }
@@ -8462,9 +9862,43 @@ fn build_restore_plan(
                 ));
                 continue;
             };
+            if !seen_restore_paths.insert(restore_relative_path.clone()) {
+                destination_conflicts.push(format!(
+                    "manifest contains a duplicate restore path: {}",
+                    restore_relative_path.to_string_lossy()
+                ));
+                continue;
+            }
             let destination = restore_root.join(restore_relative_path);
             if destination.exists() {
                 destination_conflicts.push(destination.to_string_lossy().to_string());
+            }
+        }
+    }
+    for (identity, (count, indexes)) in &protected_objects {
+        if indexes.len() != *count as usize || indexes.iter().copied().ne(0..*count) {
+            missing_paths.push(format!(
+                "protected-original object {identity} has incomplete chunk coverage"
+            ));
+        }
+    }
+    if has_protected_inventory {
+        for (identity, expected_count) in &protected_inventory {
+            match protected_objects.get(identity) {
+                Some((actual_count, indexes))
+                    if actual_count == expected_count
+                        && indexes.len() == *expected_count as usize
+                        && indexes.iter().copied().eq(0..*expected_count) => {}
+                _ => missing_paths.push(format!(
+                    "protected-original metadata has no complete chunk set: {identity}"
+                )),
+            }
+        }
+        for identity in protected_objects.keys() {
+            if !protected_inventory.contains_key(identity) {
+                missing_paths.push(format!(
+                    "protected-original chunks have no matching metadata: {identity}"
+                ));
             }
         }
     }
@@ -8503,7 +9937,7 @@ fn build_restore_plan(
     let ok = missing_paths.is_empty() && destination_conflicts.is_empty();
     let detail = if ok {
         format!(
-            "Restore can be staged with {media_files_available} media files and {vault_chunks_available} encrypted vault chunks."
+            "Restore can be staged with {media_files_available} media files, {vault_chunks_available} encrypted vault chunks, and {protected_original_chunks_available} protected-original chunks."
         )
     } else {
         format!(
@@ -8522,6 +9956,7 @@ fn build_restore_plan(
         database_target_path: database_target.to_string_lossy().to_string(),
         media_files_available,
         vault_chunks_available,
+        protected_original_chunks_available,
         missing_paths,
         destination_conflicts,
         requires_confirmation: true,
@@ -8573,6 +10008,10 @@ fn find_database_copy(
     }
 
     configured
+}
+
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn manifest_relative_path(value: &str) -> Option<PathBuf> {
@@ -8868,10 +10307,23 @@ fn timeline_response_for_assets(
 
 fn asset_ids_for_vault(state: &LibraryState, vault_id: Uuid) -> BTreeSet<Uuid> {
     state
-        .blob_records
+        .file_entries
         .iter()
-        .filter(|blob| blob.vault_id == vault_id && blob.tombstoned_at.is_none())
-        .map(|blob| blob.asset_id)
+        .filter(|entry| {
+            entry.vault_id == vault_id
+                && entry.asset_id.is_some()
+                && entry.trashed_at.is_none()
+                && entry.asset_id.is_some_and(|asset_id| {
+                    target_vault_for_asset(state, asset_id)
+                        .is_some_and(|vault| vault.id == vault_id)
+                })
+                && state.blob_records.iter().any(|blob| {
+                    blob.vault_id == vault_id
+                        && Some(blob.asset_id) == entry.asset_id
+                        && blob.tombstoned_at.is_none()
+                })
+        })
+        .filter_map(|entry| entry.asset_id)
         .collect()
 }
 
@@ -8880,13 +10332,128 @@ fn ensure_asset_belongs_to_vault(
     vault_id: Uuid,
     asset_id: Uuid,
 ) -> Result<(), ServiceError> {
-    if state.blob_records.iter().any(|blob| {
-        blob.vault_id == vault_id && blob.asset_id == asset_id && blob.tombstoned_at.is_none()
-    }) {
+    if has_vault_asset_membership(state, vault_id, asset_id)
+        && state.blob_records.iter().any(|blob| {
+            blob.vault_id == vault_id && blob.asset_id == asset_id && blob.tombstoned_at.is_none()
+        })
+    {
         Ok(())
     } else {
         Err(ServiceError::NotFound(format!("asset {asset_id}")))
     }
+}
+
+fn has_vault_asset_membership(state: &LibraryState, vault_id: Uuid, asset_id: Uuid) -> bool {
+    target_vault_for_asset(state, asset_id).is_some_and(|vault| vault.id == vault_id)
+        && state.file_entries.iter().any(|entry| {
+            entry.vault_id == vault_id
+                && entry.asset_id == Some(asset_id)
+                && entry.trashed_at.is_none()
+        })
+}
+
+/// Returns whether an asset identity is already assigned to this vault,
+/// including when its namespace entry is in the trash. Trash removes browsing
+/// membership, but it does not erase the asset row or its per-vault checksum
+/// reservation.
+fn asset_is_owned_by_vault(state: &LibraryState, vault_id: Uuid, asset_id: Uuid) -> bool {
+    target_vault_for_asset(state, asset_id).is_some_and(|vault| vault.id == vault_id)
+}
+
+fn read_original_bytes_from_vault(
+    config: &AppConfig,
+    state: &LibraryState,
+    library_root: &Path,
+    vault_id: Uuid,
+    asset_id: Uuid,
+) -> Result<(String, Vec<u8>), ServiceError> {
+    if !has_vault_asset_membership(state, vault_id, asset_id) {
+        return Err(ServiceError::NotFound(format!("asset {asset_id}")));
+    }
+    let asset = state
+        .assets
+        .iter()
+        .find(|asset| asset.id == asset_id)
+        .ok_or_else(|| ServiceError::NotFound(format!("asset {asset_id}")))?;
+    let blob = state
+        .blob_records
+        .iter()
+        .find(|blob| {
+            blob.asset_id == asset_id && blob.vault_id == vault_id && blob.tombstoned_at.is_none()
+        })
+        .ok_or_else(|| ServiceError::NotFound(format!("blob for asset {asset_id}")))?;
+    let chunks = state
+        .blob_chunks
+        .iter()
+        .filter(|chunk| chunk.blob_id == blob.id)
+        .cloned()
+        .collect::<Vec<_>>();
+    if !vault_store::encrypted_chunk_files_exist(library_root, &chunks) {
+        let availability = build_asset_availability(state, asset_id)?;
+        return Err(ServiceError::Invalid(availability.detail));
+    }
+    let bytes = vault_store::decrypt_chunks_to_bytes(
+        config,
+        library_root,
+        vault_id,
+        blob.encryption_key_version,
+        &chunks,
+    )
+    .map_err(vault_store_error)?;
+    Ok((asset.mime_type.clone(), bytes))
+}
+
+fn read_original_range_from_vault(
+    config: &AppConfig,
+    state: &LibraryState,
+    library_root: &Path,
+    vault_id: Uuid,
+    asset_id: Uuid,
+    range: ByteRangeRequest,
+) -> Result<OriginalBytesRange, ServiceError> {
+    if !has_vault_asset_membership(state, vault_id, asset_id) {
+        return Err(ServiceError::NotFound(format!("asset {asset_id}")));
+    }
+    let asset = state
+        .assets
+        .iter()
+        .find(|asset| asset.id == asset_id)
+        .ok_or_else(|| ServiceError::NotFound(format!("asset {asset_id}")))?;
+    let (start, end) = normalize_original_range(asset.bytes, range)?;
+    let blob = state
+        .blob_records
+        .iter()
+        .find(|blob| {
+            blob.asset_id == asset_id && blob.vault_id == vault_id && blob.tombstoned_at.is_none()
+        })
+        .ok_or_else(|| ServiceError::NotFound(format!("blob for asset {asset_id}")))?;
+    let chunks = state
+        .blob_chunks
+        .iter()
+        .filter(|chunk| chunk.blob_id == blob.id)
+        .cloned()
+        .collect::<Vec<_>>();
+    if !vault_store::encrypted_chunk_files_exist(library_root, &chunks) {
+        let availability = build_asset_availability(state, asset_id)?;
+        return Err(ServiceError::Invalid(availability.detail));
+    }
+    let bytes = vault_store::decrypt_chunks_range_to_bytes(
+        config,
+        library_root,
+        vault_id,
+        blob.encryption_key_version,
+        &chunks,
+        start,
+        end,
+    )
+    .map_err(vault_store_error)?;
+    Ok(OriginalBytesRange {
+        mime_type: asset.mime_type.clone(),
+        total_bytes: asset.bytes,
+        start,
+        end,
+        bytes,
+    })
 }
 
 fn filter_albums_for_assets(albums: &[Album], visible_asset_ids: &BTreeSet<Uuid>) -> Vec<Album> {
@@ -9886,11 +11453,12 @@ mod tests {
     use std::{fs, path::PathBuf};
 
     use chrono::{Datelike, Duration, Utc};
+    use uuid::Uuid;
 
     use crate::{
         config::AppConfig,
         domain::{
-            AssetAvailabilityState, BlobRecord, BlobReplica, CorrectDateRequest,
+            AssetAvailabilityState, BlobChunk, BlobRecord, BlobReplica, CorrectDateRequest,
             CorrectPlaceRequest, CreateAlbumRequest, CreateDeviceRequest, CreateFileFolderRequest,
             CreateManualPersonRequest, CreatePairingSessionRequest, CreateSmartFolderRequest,
             CreateVaultRequest, DeviceRole, DeviceStorageProfile, DeviceTrustLevel,
@@ -9901,27 +11469,78 @@ mod tests {
             MobileReplicaChunkReport, MobileReplicaReportRequest,
             MobileStorageProfileUpdateRequest, MobileUpload, MobileUploadRequest,
             MobileUploadStatus, ModelImportRequest, ModelInstallRequest, MoveFileEntryRequest,
-            NetworkPolicy, PlatformReleaseEvidenceStatus, PlatformReleaseReadinessStatus,
-            PlatformReleaseSurface, RebuildRequest, RenameAlbumRequest, RenameFileEntryRequest,
-            ReplicaHealth, RevokeDeviceRequest, RunSyncRequest, ScanImportSourceRequest,
-            SearchQuery, StoragePolicy, StoragePolicyMode, SupportBundleExportRequest,
-            SyncTransfer, SyncTransferExecutionStatus, SyncTransferStatus,
-            UpdateAlbumAssetsRequest, UpdateAssetFlagsRequest, UpdateAssetTagsRequest,
-            UpdateAssetsFlagsRequest, UpdateEntitlementCacheRequest, UpdateLibrarySettingsRequest,
-            UpdatePersonAssetsRequest, UpdateVaultStoragePolicyRequest, Vault, VaultFileEntry,
-            VaultFileKind,
+            NetworkPolicy, OriginalStoragePolicy, PlatformReleaseEvidenceStatus,
+            PlatformReleaseReadinessStatus, PlatformReleaseSurface, QuarantineRepairRequest,
+            RebuildRequest, RenameAlbumRequest, RenameFileEntryRequest, ReplicaHealth,
+            RevokeDeviceRequest, RunSyncRequest, ScanImportSourceRequest, SearchQuery,
+            StoragePolicy, StoragePolicyMode, SupportBundleExportRequest, SyncTransfer,
+            SyncTransferExecutionStatus, SyncTransferStatus, UpdateAlbumAssetsRequest,
+            UpdateAssetFlagsRequest, UpdateAssetTagsRequest, UpdateAssetsFlagsRequest,
+            UpdateEntitlementCacheRequest, UpdateLibrarySettingsRequest, UpdatePersonAssetsRequest,
+            UpdateVaultStoragePolicyRequest, Vault, VaultFileEntry, VaultFileKind,
         },
         imports,
     };
 
     use super::{
-        ByteRangeRequest, GalleryService, LibraryState, constant_time_eq, effective_library_root,
-        hash_pairing_token, local_device_id, mobile_replica_chunk_proof_hex, mobile_upload_dir,
-        refresh_blob_records, sha256_hex_bytes, target_vault_for_asset,
+        ByteRangeRequest, GalleryService, LibraryState, backup_manifest_path,
+        blob_has_authorized_local_owner, build_file_tree_response, build_sync_network_status,
+        constant_time_eq, effective_library_root, has_vault_asset_membership, hash_pairing_token,
+        local_device_id, mobile_replica_chunk_proof_hex, mobile_upload_dir, read_backup_manifest,
+        refresh_blob_records, root_file_entry_id, sha256_hex_bytes, target_vault_for_asset,
+        verify_protected_original,
     };
 
     fn temp_root(name: &str) -> crate::test_support::TestTempDir {
         crate::test_support::TestTempDir::new(&format!("service-{name}"))
+    }
+
+    #[test]
+    fn vault_scoped_sync_status_excludes_other_vault_activity() {
+        let personal = Uuid::new_v4();
+        let kids = Uuid::new_v4();
+        let now = Utc::now();
+        let state = LibraryState {
+            sync_transfers: vec![
+                SyncTransfer {
+                    id: Uuid::new_v4(),
+                    vault_id: personal,
+                    blob_id: Uuid::new_v4(),
+                    from_device_id: None,
+                    to_device_id: Uuid::new_v4(),
+                    status: SyncTransferStatus::Running,
+                    bytes_total: 10,
+                    bytes_completed: 5,
+                    started_at: Some(now),
+                    updated_at: now,
+                    resumable_until: now,
+                },
+                SyncTransfer {
+                    id: Uuid::new_v4(),
+                    vault_id: kids,
+                    blob_id: Uuid::new_v4(),
+                    from_device_id: None,
+                    to_device_id: Uuid::new_v4(),
+                    status: SyncTransferStatus::Failed,
+                    bytes_total: 20,
+                    bytes_completed: 0,
+                    started_at: None,
+                    updated_at: now,
+                    resumable_until: now,
+                },
+            ],
+            ..LibraryState::default()
+        };
+
+        let status = build_sync_network_status(
+            &state,
+            crate::sync_transport::RuntimeStatus::stopped(),
+            Some(kids),
+        );
+        assert_eq!(status.active_transfer_count, 0);
+        assert_eq!(status.failed_transfer_count, 1);
+        assert_eq!(status.pending_transfer_count, 0);
+        assert_eq!(status.completed_transfer_count, 0);
     }
 
     async fn set_mobile_member_role(
@@ -10639,7 +12258,7 @@ mod tests {
         let runtime_root = temp_root("second-vault-upload");
         let library_root = runtime_root.join("library");
         let config = AppConfig {
-            runtime_root: runtime_root.clone(),
+            runtime_root: runtime_root.as_ref().to_path_buf(),
             ..AppConfig::default()
         };
         let service = GalleryService::new(config.clone()).expect("service");
@@ -10749,16 +12368,21 @@ mod tests {
         assert_eq!(completed.vault_id, kids.id);
         let asset_id = completed.asset_id.expect("asset id");
 
-        // ...so the sealed record must live there, not in vaults[0].
+        // ...so the sealed record must live there, not in vaults[0]. A stray
+        // record without an explicit vault entry must not grant access.
         {
             let state = service.state.read().await;
-            let blob = state
+            let kids_blob = state
                 .blob_records
                 .iter()
-                .find(|blob| blob.asset_id == asset_id && blob.tombstoned_at.is_none())
-                .expect("one live blob record");
+                .find(|blob| {
+                    blob.asset_id == asset_id
+                        && blob.vault_id == kids.id
+                        && blob.tombstoned_at.is_none()
+                })
+                .expect("Kids live blob record");
             assert_eq!(
-                blob.vault_id, kids.id,
+                kids_blob.vault_id, kids.id,
                 "upload accepted into the Kids vault must be sealed there"
             );
         }
@@ -10771,6 +12395,19 @@ mod tests {
         assert!(
             kids_assets.iter().any(|asset| asset.asset_id == asset_id),
             "uploader must see its own upload"
+        );
+        let kids_workspace = service
+            .mobile_workspace(&kids_token)
+            .await
+            .expect("kids workspace");
+        assert!(
+            kids_workspace.jobs.iter().all(|job| {
+                !job.detail
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("seed.jpg")
+            }),
+            "a Kids device must not see a Personal import job's filename"
         );
         let personal_assets = service
             .mobile_assets(&personal_token)
@@ -10794,6 +12431,73 @@ mod tests {
             err.to_string().contains("not found"),
             "expected a 404-style NotFound, got: {err}"
         );
+
+        // Global content-hash equality must not turn a new upload into a
+        // membership grant for an asset already filed in another vault.
+        let personal_reservation = service
+            .reserve_mobile_upload(
+                &personal_token,
+                MobileUploadRequest {
+                    original_filename: "same-bytes.jpg".to_string(),
+                    media_kind: MediaKind::Photo,
+                    mime_type: "image/jpeg".to_string(),
+                    bytes: bytes.len() as u64,
+                    content_hash: None,
+                    captured_at: None,
+                    place_hint: None,
+                },
+            )
+            .await
+            .expect("reserve same bytes in Personal");
+        let personal_upload = service
+            .receive_mobile_upload(&personal_token, personal_reservation.id, bytes.clone())
+            .await
+            .expect("upload same bytes into Personal");
+        let personal_asset_id = personal_upload.asset_id.expect("Personal asset id");
+        assert_ne!(
+            personal_asset_id, asset_id,
+            "cross-vault content hash dedup must not share the asset identity"
+        );
+        service
+            .mobile_original_bytes(&personal_token, personal_asset_id)
+            .await
+            .expect("Personal uploader can read its own asset");
+        assert!(
+            service
+                .mobile_assets(&kids_token)
+                .await
+                .expect("Kids assets after duplicate")
+                .iter()
+                .all(|asset| asset.asset_id != personal_asset_id)
+        );
+
+        // Model a pre-existing leaked/forged blob row in Personal. Once active
+        // evidence conflicts, neither vault is chosen implicitly; the asset is
+        // quarantined until an explicit repair resolves the association.
+        {
+            let mut state = service.state.write().await;
+            let kids_blob = state
+                .blob_records
+                .iter()
+                .find(|blob| blob.asset_id == asset_id && blob.vault_id == kids.id)
+                .cloned()
+                .expect("Kids blob record");
+            let mut stray_blob = kids_blob;
+            stray_blob.id = uuid::Uuid::new_v4();
+            stray_blob.vault_id = personal.id;
+            stray_blob.encryption_key_version = personal.key_version;
+            state.blob_records.push(stray_blob);
+            service
+                .persist_locked_state(&state)
+                .expect("persist stray row");
+        }
+        for token in [&kids_token, &personal_token] {
+            let err = service
+                .mobile_original_bytes(token, asset_id)
+                .await
+                .expect_err("conflicting vault evidence must not grant an original");
+            assert!(err.to_string().contains("not found"), "got: {err}");
+        }
 
         // And the secondary vault exists on disk holding chunks.
         let kids_dir = library_root.join("vaults").join(kids.id.to_string());
@@ -11003,6 +12707,108 @@ mod tests {
         }
     }
 
+    #[test]
+    fn conflicting_live_vault_evidence_is_quarantined() {
+        let personal = vault_fixture("Personal vault");
+        let kids = vault_fixture("Kids vault");
+        let (asset, _) = imports::build_imported_asset(ImportAssetRequest {
+            source_path: "/missing/photo.jpg".to_string(),
+            original_filename: "private-kids-photo.jpg".to_string(),
+            media_kind: MediaKind::Photo,
+            mime_type: "image/jpeg".to_string(),
+            bytes: 4,
+            content_hash: Some("content-hash".to_string()),
+            captured_at: None,
+            place_hint: None,
+            import_mode: Some(ImportMode::Copy),
+        });
+        let asset_id = asset.id;
+        let mut state = resolver_state(
+            vec![personal.clone(), kids.clone()],
+            vec![blob_fixture(personal.id, asset_id)],
+            vec![upload_fixture(kids.id, asset_id)],
+            vec![entry_fixture(kids.id, asset_id)],
+        );
+        state.assets.push(asset);
+
+        assert_eq!(
+            resolved_vault_id(&state, asset_id),
+            None,
+            "a Personal blob contradicting the Kids upload and namespace entry must not be +             repaired by choosing either vault"
+        );
+        assert!(!has_vault_asset_membership(&state, personal.id, asset_id));
+        assert!(!has_vault_asset_membership(&state, kids.id, asset_id));
+        assert!(!blob_has_authorized_local_owner(
+            &state,
+            personal.id,
+            asset_id
+        ));
+        assert!(!blob_has_authorized_local_owner(&state, kids.id, asset_id));
+    }
+
+    #[test]
+    fn legacy_ownerless_asset_is_ambiguous_even_when_one_vault_has_matching_blob_and_entry() {
+        let personal = vault_fixture("Personal vault");
+        let kids = vault_fixture("Kids vault");
+        let (asset, _) = imports::build_imported_asset(ImportAssetRequest {
+            source_path: "/missing/photo.jpg".to_string(),
+            original_filename: "private-photo.jpg".to_string(),
+            media_kind: MediaKind::Photo,
+            mime_type: "image/jpeg".to_string(),
+            bytes: 4,
+            content_hash: Some("content-hash".to_string()),
+            captured_at: None,
+            place_hint: None,
+            import_mode: Some(ImportMode::Copy),
+        });
+        let asset_id = asset.id;
+        let mut state = resolver_state(
+            vec![personal.clone(), kids.clone()],
+            vec![blob_fixture(personal.id, asset_id)],
+            vec![upload_fixture(kids.id, asset_id)],
+            vec![entry_fixture(personal.id, asset_id)],
+        );
+        state.assets.push(asset);
+
+        assert_eq!(resolved_vault_id(&state, asset_id), None);
+        assert!(!has_vault_asset_membership(&state, personal.id, asset_id));
+        assert!(!has_vault_asset_membership(&state, kids.id, asset_id));
+    }
+
+    #[test]
+    fn file_tree_hides_assets_with_conflicting_vault_evidence() {
+        let personal = vault_fixture("Personal vault");
+        let kids = vault_fixture("Kids vault");
+        let (asset, _) = imports::build_imported_asset(ImportAssetRequest {
+            source_path: "/missing/photo.jpg".to_string(),
+            original_filename: "private-kids-photo.jpg".to_string(),
+            media_kind: MediaKind::Photo,
+            mime_type: "image/jpeg".to_string(),
+            bytes: 4,
+            content_hash: Some("content-hash".to_string()),
+            captured_at: None,
+            place_hint: None,
+            import_mode: Some(ImportMode::Copy),
+        });
+        let asset_id = asset.id;
+        let mut state = resolver_state(
+            vec![personal.clone(), kids.clone()],
+            vec![blob_fixture(personal.id, asset_id)],
+            vec![upload_fixture(kids.id, asset_id)],
+            vec![entry_fixture(kids.id, asset_id)],
+        );
+        state.assets.push(asset);
+        state.file_entries[0].name = "private-kids-photo.jpg".to_string();
+        state.file_entries[0].organization.project = Some("Kids trip".to_string());
+
+        let response = build_file_tree_response(&state, Some(kids.id), false);
+
+        assert!(
+            response.entries.is_empty(),
+            "ambiguous asset filename and organization metadata must not reach the mobile file tree"
+        );
+    }
+
     /// A dangling receipt must not shadow a live one. Branch (b) is "the vault
     /// the API accepted the bytes into", so a *live* receipt is evidence and a
     /// dangling one is not; taking the first match meant an asset could be
@@ -11116,11 +12922,10 @@ mod tests {
     /// that the code does nothing.
     ///
     /// So the two vaults here are built from explicit u128 values to fix their
-    /// order: `UNCORROBORATED` sorts *before* `CORROBORATED`, and only the second
-    /// is vouched for by a receipt. Preferring the corroborated one is then the
-    /// only way to get the right answer.
+    /// order. A matching receipt cannot disambiguate multiple live owners; the
+    /// only safe answer is to deny access until explicit repair.
     #[test]
-    fn a_corroborated_record_is_preferred_over_a_lower_sorting_uncorroborated_one() {
+    fn corroboration_does_not_choose_between_multiple_live_owners() {
         // Deterministic ids, so the sort order is a property of the test rather
         // than of the uuid generator. An earlier version of this test used
         // `vault_fixture`, which draws `Uuid::new_v4()`, and then asserted that
@@ -11148,13 +12953,7 @@ mod tests {
             Vec::new(),
         );
 
-        assert_eq!(
-            resolved_vault_id(&state, asset_id),
-            Some(corroborated.id),
-            "a receipt naming one vault must win over an uncorroborated record in another, \
-             even when the uncorroborated record sorts first -- otherwise which record \
-             happened to be loaded first decides where sealed data lives"
-        );
+        assert_eq!(resolved_vault_id(&state, asset_id), None);
     }
 
     /// The claim that "blob records are written in exactly one place" was false:
@@ -11182,7 +12981,7 @@ mod tests {
     /// what #112 disclosed, so it is the one branch that must not be reachable by
     /// accident in either direction.
     #[test]
-    fn live_blob_record_outranks_a_competing_reservation() {
+    fn uncorroborated_blob_conflicting_with_live_membership_is_ambiguous() {
         let personal = vault_fixture("Personal vault");
         let kids = vault_fixture("Kids vault");
         let asset_id = uuid::Uuid::new_v4();
@@ -11194,9 +12993,8 @@ mod tests {
         );
         assert_eq!(
             resolved_vault_id(&state, asset_id),
-            Some(personal.id),
-            "sealed chunks already exist in Personal; a reservation naming Kids \
-             must not move them"
+            None,
+            "a blob conflicting with live Kids upload and namespace evidence is ambiguous"
         );
     }
 
@@ -11281,7 +13079,7 @@ mod tests {
     /// association. This is the case the fallback exists for and it must keep
     /// working -- the distinction from the next test is the whole point.
     #[test]
-    fn first_vault_is_the_fallback_only_for_an_asset_with_no_association() {
+    fn multi_vault_library_requires_a_target_when_an_asset_has_no_association() {
         let personal = vault_fixture("Personal vault");
         let kids = vault_fixture("Kids vault");
         let asset_id = uuid::Uuid::new_v4();
@@ -11293,9 +13091,8 @@ mod tests {
         );
         assert_eq!(
             resolved_vault_id(&state, asset_id),
-            Some(personal.id),
-            "an asset with no association at all predates them; vaults[0] is the \
-             documented historical home"
+            None,
+            "a multi-vault library must not assign an unassociated asset by vector position"
         );
     }
 
@@ -11354,21 +13151,9 @@ mod tests {
         );
     }
 
-    /// The guard on the guard, and the only shape in which it can be observed.
-    /// A *corroborated* record has to survive a competing live association that
-    /// names a different vault. The competition is what makes the assertion
-    /// bite: if branch (a) were rejected here the fall-through would answer with
-    /// the receipt's vault, and the two answers would differ. With the receipt
-    /// and the record agreeing, the fall-through lands on the same vault and the
-    /// test passes whether or not branch (a) ran at all.
-    ///
-    /// Note what this does *not* isolate: `corroborated` and `!contradicted` are
-    /// each necessary and neither is separately observable, because rejecting
-    /// branch (a) always falls through to a corroborating association naming the
-    /// same vault. The pair is pinned by the tests above taken together, not by
-    /// this one.
+    /// A backing entry does not resolve a conflict with another live vault.
     #[test]
-    fn a_backed_record_wins_even_against_a_competing_live_receipt() {
+    fn backed_record_with_competing_live_receipt_is_ambiguous() {
         let personal = vault_fixture("Personal vault");
         let kids = vault_fixture("Kids vault");
         let asset_id = uuid::Uuid::new_v4();
@@ -11378,12 +13163,7 @@ mod tests {
             vec![upload_fixture(kids.id, asset_id)],
             vec![entry_fixture(personal.id, asset_id)],
         );
-        assert_eq!(
-            resolved_vault_id(&state, asset_id),
-            Some(personal.id),
-            "the namespace entry corroborates the record, so it is real; the \
-             receipt naming another vault does not overrule sealed data"
-        );
+        assert_eq!(resolved_vault_id(&state, asset_id), None);
     }
 
     /// The order between (b) and (c) is a policy, so it is pinned rather than
@@ -11407,9 +13187,8 @@ mod tests {
         );
         assert_eq!(
             resolved_vault_id(&state, asset_id),
-            Some(kids.id),
-            "the receipt records where the bytes were accepted; the entry records a \
-             later filing decision and does not override it"
+            None,
+            "a receipt and namespace entry naming different vaults do not establish an owner"
         );
     }
 
@@ -11418,7 +13197,7 @@ mod tests {
         let runtime_root = temp_root("orphan-vault-refresh");
         let library_root = runtime_root.join("library");
         let config = AppConfig {
-            runtime_root: runtime_root.clone(),
+            runtime_root: runtime_root.as_ref().to_path_buf(),
             ..AppConfig::default()
         };
         let service = GalleryService::new(config.clone()).expect("service");
@@ -13711,6 +15490,7 @@ mod tests {
 
         let session = service
             .scan_import_source(ScanImportSourceRequest {
+                target_vault_id: None,
                 source_path: source_root.to_string_lossy().to_string(),
                 source_kind: ImportSourceKind::Folder,
                 recursive: false,
@@ -13730,6 +15510,654 @@ mod tests {
         assert_eq!(service.timeline().await.buckets.len(), 1);
         assert_eq!(service.places().await.len(), 1);
         assert_eq!(service.events().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn import_session_keeps_its_selected_vault_across_commit_and_restart() {
+        let runtime_root = temp_root("import-target-vault");
+        let library_root = runtime_root.join("library");
+        let source_root = runtime_root.join("source");
+        fs::create_dir_all(&source_root).expect("source dir");
+        fs::write(source_root.join("a.jpg"), b"image").expect("write file");
+
+        let service = GalleryService::new(AppConfig {
+            runtime_root: runtime_root.as_ref().to_path_buf(),
+            ..AppConfig::default()
+        })
+        .expect("service");
+        service
+            .update_library_settings(UpdateLibrarySettingsRequest {
+                library_root: library_root.to_string_lossy().to_string(),
+                default_import_mode: ImportMode::Reference,
+                original_storage_policy: None,
+            })
+            .await
+            .expect("settings");
+        service
+            .import_asset(ImportAssetRequest {
+                source_path: source_root.join("a.jpg").to_string_lossy().to_string(),
+                original_filename: "personal-seed.jpg".to_string(),
+                media_kind: MediaKind::Photo,
+                mime_type: "image/jpeg".to_string(),
+                bytes: 5,
+                content_hash: None,
+                captured_at: None,
+                place_hint: None,
+                import_mode: Some(ImportMode::Reference),
+            })
+            .await
+            .expect("make the bootstrap Personal vault non-empty");
+        let second_vault = service
+            .create_vault(CreateVaultRequest {
+                id: None,
+                name: "Kids".to_string(),
+                storage_policy: None,
+            })
+            .await
+            .expect("second vault");
+
+        let session = service
+            .scan_import_source(ScanImportSourceRequest {
+                target_vault_id: Some(second_vault.id),
+                source_path: source_root.to_string_lossy().to_string(),
+                source_kind: ImportSourceKind::Folder,
+                recursive: false,
+                import_mode: Some(ImportMode::Reference),
+                add_as_watch_folder: false,
+                place_hint: None,
+            })
+            .await
+            .expect("scan");
+        assert_eq!(session.target_vault_id, Some(second_vault.id));
+
+        let wrong_vault = service.vaults().await[0].id;
+        assert!(
+            service
+                .commit_import_session_with_target_vault(
+                    session.id,
+                    vec![],
+                    Some(ImportMode::Reference),
+                    None,
+                    Some(wrong_vault),
+                )
+                .await
+                .is_err()
+        );
+        let committed = service
+            .commit_import_session(session.id, vec![], Some(ImportMode::Reference), None)
+            .await
+            .expect("commit");
+        let asset_id = committed.imported_asset_ids[0];
+        let state = service.state.read().await;
+        assert!(state.file_entries.iter().any(|entry| {
+            entry.asset_id == Some(asset_id) && entry.vault_id == second_vault.id
+        }));
+        assert!(
+            !state
+                .file_entries
+                .iter()
+                .any(|entry| { entry.asset_id == Some(asset_id) && entry.vault_id == wrong_vault })
+        );
+        drop(state);
+
+        let restarted = GalleryService::new(AppConfig {
+            runtime_root: runtime_root.as_ref().to_path_buf(),
+            ..AppConfig::default()
+        })
+        .expect("restarted service");
+        let persisted = restarted.import_session(session.id).await.expect("session");
+        assert_eq!(persisted.target_vault_id, Some(second_vault.id));
+        assert!(
+            restarted
+                .state
+                .read()
+                .await
+                .file_entries
+                .iter()
+                .any(|entry| entry.asset_id == Some(asset_id) && entry.vault_id == second_vault.id)
+        );
+    }
+
+    #[tokio::test]
+    async fn ambiguous_managed_originals_are_quarantined_before_the_service_opens() {
+        let runtime_root = temp_root("ambiguous-original-quarantine");
+        let library_root = runtime_root.join("library");
+        let source_root = runtime_root.join("source");
+        fs::create_dir_all(&source_root).expect("source dir");
+        let source = source_root.join("secret.jpg");
+        let original_bytes = b"managed original with unresolved vault membership";
+        fs::write(&source, original_bytes).expect("write source");
+        let config = AppConfig {
+            runtime_root: runtime_root.as_ref().to_path_buf(),
+            ..AppConfig::default()
+        };
+        let service = GalleryService::new(config.clone()).expect("service");
+        service
+            .update_library_settings(UpdateLibrarySettingsRequest {
+                library_root: library_root.to_string_lossy().to_string(),
+                default_import_mode: ImportMode::Copy,
+                original_storage_policy: Some(OriginalStoragePolicy::EncryptedOnly),
+            })
+            .await
+            .expect("settings");
+        let personal_vault = service.vaults().await[0].clone();
+        let imported = service
+            .import_asset_to_vault(
+                personal_vault.id,
+                ImportAssetRequest {
+                    source_path: source.to_string_lossy().to_string(),
+                    original_filename: "secret.jpg".to_string(),
+                    media_kind: MediaKind::Photo,
+                    mime_type: "image/jpeg".to_string(),
+                    bytes: original_bytes.len() as u64,
+                    content_hash: None,
+                    captured_at: None,
+                    place_hint: None,
+                    import_mode: Some(ImportMode::Copy),
+                },
+            )
+            .await
+            .expect("import managed original");
+        let kids_vault = service
+            .create_vault(CreateVaultRequest {
+                id: None,
+                name: "Kids".to_string(),
+                storage_policy: None,
+            })
+            .await
+            .expect("second vault");
+        let managed_original = library_root.join(&imported.asset.relative_original_path);
+        fs::write(&managed_original, original_bytes).expect("restore legacy plaintext fixture");
+        {
+            let mut state = service.state.write().await;
+            let kids_root = root_file_entry_id(&state, kids_vault.id).expect("kids namespace root");
+            let mut conflicting_entry = state
+                .file_entries
+                .iter()
+                .find(|entry| {
+                    entry.vault_id == personal_vault.id && entry.asset_id == Some(imported.asset.id)
+                })
+                .expect("personal membership")
+                .clone();
+            conflicting_entry.id = uuid::Uuid::new_v4();
+            conflicting_entry.vault_id = kids_vault.id;
+            conflicting_entry.parent_id = Some(kids_root);
+            conflicting_entry.created_at = Utc::now();
+            conflicting_entry.updated_at = conflicting_entry.created_at;
+            state.file_entries.push(conflicting_entry);
+            if let Some(asset) = state
+                .assets
+                .iter_mut()
+                .find(|asset| asset.id == imported.asset.id)
+            {
+                asset.is_available = true;
+            }
+            service
+                .persist_locked_state(&state)
+                .expect("persist legacy conflict");
+        }
+
+        let restarted = GalleryService::new(config.clone()).expect("reconcile on startup");
+        assert!(
+            !managed_original.exists(),
+            "plaintext original must be removed"
+        );
+        let state = restarted.state.read().await;
+        let protected = state
+            .protected_originals
+            .iter()
+            .find(|record| record.asset_id == imported.asset.id)
+            .expect("device-local protected original")
+            .clone();
+        assert!(protected.source_removed);
+        assert_eq!(protected.reason, "conflicting_live_vault_associations");
+        let chunks = state
+            .protected_original_chunks
+            .iter()
+            .filter(|chunk| chunk.asset_id == imported.asset.id)
+            .cloned()
+            .collect::<Vec<_>>();
+        verify_protected_original(&config, &library_root, &protected, &chunks)
+            .expect("quarantined bytes verify");
+        assert!(!has_vault_asset_membership(
+            &state,
+            personal_vault.id,
+            imported.asset.id
+        ));
+        assert!(!has_vault_asset_membership(
+            &state,
+            kids_vault.id,
+            imported.asset.id
+        ));
+        drop(state);
+
+        let verification = restarted
+            .verify_backup(crate::domain::BackupVerifyRequest { export_root: None })
+            .await
+            .expect("verify quarantined original backup inputs");
+        assert!(verification.ok, "{verification:?}");
+        assert_eq!(verification.protected_originals_checked, 1);
+        let export_root = runtime_root.join("protected-original-backup");
+        let backup = restarted
+            .export_backup(crate::domain::BackupExportRequest {
+                export_root: export_root.to_string_lossy().to_string(),
+                include_models: false,
+            })
+            .await
+            .expect("export protected original ciphertext");
+        assert!(backup.ok, "{backup:?}");
+        assert_eq!(backup.protected_original_chunks_copied, 1);
+        let manifest = read_backup_manifest(&export_root).expect("backup manifest");
+        assert!(
+            manifest["files"]
+                .as_array()
+                .expect("files")
+                .iter()
+                .any(|file| file["kind"] == "protected_original_chunk")
+        );
+
+        let restore_root = runtime_root.with_file_name(format!(
+            "{}-protected-original-restore",
+            runtime_root
+                .file_name()
+                .and_then(|name| name.to_str())
+                .expect("runtime root name")
+        ));
+        let plan = restarted
+            .plan_restore_backup(crate::domain::BackupRestorePlanRequest {
+                export_root: export_root.to_string_lossy().to_string(),
+                restore_root: restore_root.to_string_lossy().to_string(),
+            })
+            .await
+            .expect("plan protected-original restore");
+        assert!(
+            plan.ok,
+            "{}: missing={:?}, conflicts={:?}",
+            plan.detail, plan.missing_paths, plan.destination_conflicts
+        );
+        assert_eq!(plan.protected_original_chunks_available, 1);
+
+        let manifest_path = backup_manifest_path(&export_root);
+        let mut manifest_without_inventory = manifest.clone();
+        manifest_without_inventory["protected_originals"] = serde_json::json!([]);
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&manifest_without_inventory)
+                .expect("serialize manifest without inventory"),
+        )
+        .expect("remove protected inventory from manifest");
+        let omitted_inventory_plan = restarted
+            .plan_restore_backup(crate::domain::BackupRestorePlanRequest {
+                export_root: export_root.to_string_lossy().to_string(),
+                restore_root: runtime_root
+                    .join("protected-original-omitted-inventory-restore")
+                    .to_string_lossy()
+                    .to_string(),
+            })
+            .await
+            .expect("plan with omitted protected-original inventory");
+        assert!(!omitted_inventory_plan.ok);
+        assert!(
+            omitted_inventory_plan
+                .missing_paths
+                .iter()
+                .any(|path| path.contains("no matching metadata"))
+        );
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&manifest).expect("serialize original manifest"),
+        )
+        .expect("restore protected-original inventory");
+
+        let mut manifest_without_database_hash = manifest.clone();
+        manifest_without_database_hash
+            .as_object_mut()
+            .expect("manifest object")
+            .remove("database_sha256");
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&manifest_without_database_hash)
+                .expect("serialize manifest without database hash"),
+        )
+        .expect("remove database hash from manifest");
+        let missing_database_hash_plan = restarted
+            .plan_restore_backup(crate::domain::BackupRestorePlanRequest {
+                export_root: export_root.to_string_lossy().to_string(),
+                restore_root: runtime_root
+                    .join("protected-original-missing-db-hash-restore")
+                    .to_string_lossy()
+                    .to_string(),
+            })
+            .await
+            .expect("plan with missing database hash");
+        assert!(!missing_database_hash_plan.ok);
+        assert!(
+            missing_database_hash_plan
+                .missing_paths
+                .iter()
+                .any(|path| path.contains("database_sha256"))
+        );
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&manifest).expect("serialize original manifest"),
+        )
+        .expect("restore database hash");
+
+        let restored = restarted
+            .run_restore_backup(crate::domain::BackupRestoreRunRequest {
+                export_root: export_root.to_string_lossy().to_string(),
+                restore_root: restore_root.to_string_lossy().to_string(),
+                confirmed: true,
+            })
+            .await
+            .expect("restore protected-original backup");
+        assert_eq!(restored.protected_original_chunks_copied, 1);
+        assert!(
+            restore_root
+                .join("library")
+                .join(&chunks[0].local_path)
+                .is_file()
+        );
+        verify_protected_original(&config, &restore_root.join("library"), &protected, &chunks)
+            .expect("restored quarantine remains decryptable on this device");
+
+        let protected_manifest_entry = manifest["files"]
+            .as_array()
+            .expect("files")
+            .iter()
+            .find(|file| file["kind"] == "protected_original_chunk")
+            .expect("protected chunk manifest entry");
+        let backup_chunk = export_root.join(
+            protected_manifest_entry["backup_relative_path"]
+                .as_str()
+                .expect("backup path"),
+        );
+        fs::write(&backup_chunk, b"corrupted encrypted chunk").expect("corrupt backup chunk");
+        let corrupted_plan = restarted
+            .plan_restore_backup(crate::domain::BackupRestorePlanRequest {
+                export_root: export_root.to_string_lossy().to_string(),
+                restore_root: runtime_root
+                    .join("protected-original-corrupt-restore")
+                    .to_string_lossy()
+                    .to_string(),
+            })
+            .await
+            .expect("plan corrupted protected-original restore");
+        assert!(!corrupted_plan.ok);
+        assert!(
+            corrupted_plan
+                .missing_paths
+                .iter()
+                .any(|path| path.contains("hash mismatch"))
+        );
+
+        let second_restart = GalleryService::new(config.clone()).expect("reload protected state");
+        assert_eq!(
+            second_restart.state.read().await.protected_originals[0].asset_id,
+            imported.asset.id
+        );
+
+        let inventory = restarted.quarantined_originals().await;
+        let summary = inventory
+            .iter()
+            .find(|item| item.asset_id == imported.asset.id)
+            .expect("quarantine appears in local repair inventory");
+        assert_eq!(summary.filename, "secret.jpg");
+        let failed_confirmation = restarted
+            .repair_quarantined_original(
+                imported.asset.id,
+                QuarantineRepairRequest {
+                    target_vault_id: kids_vault.id,
+                    confirm: false,
+                },
+            )
+            .await;
+        assert!(failed_confirmation.is_err());
+        let wrong_vault = restarted
+            .repair_quarantined_original(
+                imported.asset.id,
+                QuarantineRepairRequest {
+                    target_vault_id: Uuid::new_v4(),
+                    confirm: true,
+                },
+            )
+            .await;
+        assert!(wrong_vault.is_err());
+        assert_eq!(restarted.quarantined_originals().await.len(), 1);
+        {
+            let mut state = restarted.state.write().await;
+            state.file_entries.retain(|entry| {
+                entry.asset_id != Some(imported.asset.id) || entry.vault_id != kids_vault.id
+            });
+            restarted
+                .persist_locked_state(&state)
+                .expect("persist missing target namespace entry");
+        }
+
+        let quarantine_chunk_path = library_root.join(&chunks[0].local_path);
+        let original_ciphertext =
+            fs::read(&quarantine_chunk_path).expect("read quarantine ciphertext");
+        fs::write(&quarantine_chunk_path, b"corrupt quarantine ciphertext")
+            .expect("damage quarantine for retry test");
+        assert!(
+            restarted
+                .repair_quarantined_original(
+                    imported.asset.id,
+                    QuarantineRepairRequest {
+                        target_vault_id: kids_vault.id,
+                        confirm: true
+                    }
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            restarted.quarantined_originals().await.len(),
+            1,
+            "a failed verification keeps the quarantine inventory available"
+        );
+        assert!(
+            !config.runtime_root.join("quarantine-repair").exists(),
+            "failed verification never writes clear staging data"
+        );
+        fs::write(&quarantine_chunk_path, original_ciphertext)
+            .expect("restore valid quarantine ciphertext");
+
+        // Model a process interruption after the encrypted destination blob and
+        // its database rows were saved, followed by rotation of the vault's
+        // current key version before the user retries repair.
+        let pending_blob_id = Uuid::new_v4();
+        let pending_version = kids_vault.key_version;
+        let sealed = crate::vault_store::seal_asset_from_reader(
+            &config,
+            &library_root,
+            kids_vault.id,
+            pending_version,
+            pending_blob_id,
+            &imported.asset,
+            std::io::Cursor::new(original_bytes),
+        )
+        .expect("seal interrupted repair candidate");
+        let pending_chunks = sealed
+            .chunks
+            .iter()
+            .map(|chunk| BlobChunk {
+                id: Uuid::new_v4(),
+                blob_id: pending_blob_id,
+                chunk_index: chunk.chunk_index,
+                content_hash: chunk.content_hash.clone(),
+                encrypted_hash: chunk.encrypted_hash.clone(),
+                bytes: chunk.bytes,
+                encrypted_bytes: chunk.encrypted_bytes,
+                local_path: Some(chunk.local_path.clone()),
+                nonce_hex: Some(chunk.nonce_hex.clone()),
+                aad: Some(chunk.aad.clone()),
+            })
+            .collect::<Vec<_>>();
+        {
+            let mut state = restarted.state.write().await;
+            state.blob_records.push(BlobRecord {
+                id: pending_blob_id,
+                vault_id: kids_vault.id,
+                asset_id: imported.asset.id,
+                content_hash: protected.content_hash.clone(),
+                encrypted_hash: sealed.encrypted_hash,
+                bytes: protected.bytes,
+                chunk_count: pending_chunks.len() as u32,
+                encryption_key_version: pending_version,
+                created_at: Utc::now(),
+                tombstoned_at: None,
+            });
+            state.blob_chunks.extend(pending_chunks);
+            state
+                .vaults
+                .iter_mut()
+                .find(|vault| vault.id == kids_vault.id)
+                .expect("selected vault")
+                .key_version = pending_version + 1;
+            restarted
+                .persist_locked_state(&state)
+                .expect("persist interrupted repair before rotation");
+        }
+        let repaired = restarted
+            .repair_quarantined_original(
+                imported.asset.id,
+                QuarantineRepairRequest {
+                    target_vault_id: kids_vault.id,
+                    confirm: true,
+                },
+            )
+            .await
+            .expect("retry repair after vault key rotation");
+        assert!(repaired.repaired);
+        assert_eq!(repaired.vault_id, kids_vault.id);
+        assert_eq!(repaired.blob_id, pending_blob_id);
+        assert!(restarted.quarantined_originals().await.is_empty());
+        assert!(
+            !config.runtime_root.join("quarantine-repair").exists(),
+            "repair streams verified plaintext directly into encryption without disk staging"
+        );
+        {
+            let mut state = restarted.state.write().await;
+            assert_eq!(
+                state
+                    .file_entries
+                    .iter()
+                    .filter(|entry| {
+                        entry.asset_id == Some(imported.asset.id) && entry.trashed_at.is_none()
+                    })
+                    .count(),
+                1,
+                "repair creates one live target entry when missing"
+            );
+            let live_entry = state
+                .file_entries
+                .iter_mut()
+                .find(|entry| {
+                    entry.asset_id == Some(imported.asset.id) && entry.vault_id == kids_vault.id
+                })
+                .expect("repair creates missing target file entry");
+            live_entry.trashed_at = Some(Utc::now());
+            restarted
+                .persist_locked_state(&state)
+                .expect("persist target entry trashed");
+        }
+        assert_eq!(
+            restarted
+                .asset_original_bytes(imported.asset.id)
+                .await
+                .expect("read repaired original")
+                .1,
+            original_bytes
+        );
+        let idempotent = restarted
+            .repair_quarantined_original(
+                imported.asset.id,
+                QuarantineRepairRequest {
+                    target_vault_id: kids_vault.id,
+                    confirm: true,
+                },
+            )
+            .await
+            .expect("retry after successful repair is idempotent");
+        assert!(!idempotent.repaired);
+        assert_eq!(idempotent.blob_id, repaired.blob_id);
+        let state = restarted.state.read().await;
+        assert_eq!(
+            state
+                .file_entries
+                .iter()
+                .filter(|entry| {
+                    entry.asset_id == Some(imported.asset.id) && entry.trashed_at.is_none()
+                })
+                .count(),
+            1,
+            "idempotent repair restores a trashed target entry"
+        );
+        assert!(state.file_entries.iter().any(|entry| {
+            entry.asset_id == Some(imported.asset.id)
+                && entry.vault_id == kids_vault.id
+                && entry.trashed_at.is_none()
+        }));
+    }
+
+    #[test]
+    fn startup_rejects_failed_plaintext_stage_cleanup_then_cleans_stale_stage_on_retry() {
+        let runtime_root = temp_root("quarantine-repair-staging-cleanup");
+        let config = AppConfig {
+            runtime_root: runtime_root.as_ref().to_path_buf(),
+            ..AppConfig::default()
+        };
+        drop(GalleryService::new(config.clone()).expect("initial service"));
+
+        let staging_root = runtime_root.join("quarantine-repair");
+        fs::write(&staging_root, b"blocks cleanup").expect("create invalid staging root");
+        assert!(
+            GalleryService::new(config.clone()).is_err(),
+            "startup must not silently serve while stale plaintext staging cannot be swept"
+        );
+
+        fs::remove_file(&staging_root).expect("remove blocked staging object");
+        let stale_stage = staging_root.join("interrupted-repair");
+        fs::create_dir_all(&stale_stage).expect("create stale stage directory");
+        let stale_plaintext = stale_stage.join("verified-original.tmp");
+        fs::write(&stale_plaintext, b"interrupted plaintext staging").expect("write stale stage");
+        drop(GalleryService::new(config.clone()).expect("startup retries cleanup"));
+        assert!(
+            !stale_plaintext.exists(),
+            "startup sweep removes interrupted plaintext files"
+        );
+        assert!(
+            fs::read_dir(&staging_root)
+                .expect("staging root")
+                .next()
+                .is_none()
+        );
+
+        let simulated_stage = staging_root.join("simulated-cleanup-failure");
+        let service = GalleryService::new(config.clone()).expect("service before cleanup failure");
+        fs::write(&simulated_stage, b"not a directory").expect("create invalid stage");
+        assert!(
+            service
+                .cleanup_repair_stage_or_disable(&simulated_stage)
+                .is_err()
+        );
+        assert!(
+            !service.is_operational(),
+            "cleanup failure disables API operations"
+        );
+        assert!(
+            simulated_stage.exists(),
+            "failed cleanup is surfaced and not reported as success"
+        );
+        fs::remove_file(&simulated_stage).expect("remove invalid stage");
+        fs::create_dir_all(&simulated_stage).expect("create retry stage");
+        let retry_plaintext = simulated_stage.join("verified-original.tmp");
+        fs::write(&retry_plaintext, b"retry plaintext").expect("write retry stage");
+        drop(service);
+        let restarted = GalleryService::new(config).expect("restart retries staging cleanup");
+        assert!(restarted.is_operational());
+        assert!(!simulated_stage.exists());
     }
 
     #[tokio::test]
@@ -13759,6 +16187,7 @@ mod tests {
 
         let session = service
             .scan_import_source(ScanImportSourceRequest {
+                target_vault_id: None,
                 source_path: source_root.to_string_lossy().to_string(),
                 source_kind: ImportSourceKind::Folder,
                 recursive: false,
@@ -13821,6 +16250,7 @@ mod tests {
 
         let session = service
             .scan_import_source(ScanImportSourceRequest {
+                target_vault_id: None,
                 source_path: source_root.to_string_lossy().to_string(),
                 source_kind: ImportSourceKind::Folder,
                 recursive: false,
@@ -14060,6 +16490,7 @@ mod tests {
 
         let session = service
             .scan_import_source(ScanImportSourceRequest {
+                target_vault_id: None,
                 source_path: source_root.to_string_lossy().to_string(),
                 source_kind: ImportSourceKind::Folder,
                 recursive: false,
@@ -14282,6 +16713,7 @@ mod tests {
 
         let first = service
             .scan_import_source(ScanImportSourceRequest {
+                target_vault_id: None,
                 source_path: source_root.to_string_lossy().to_string(),
                 source_kind: ImportSourceKind::Folder,
                 recursive: false,
@@ -14298,6 +16730,7 @@ mod tests {
 
         let second = service
             .scan_import_source(ScanImportSourceRequest {
+                target_vault_id: None,
                 source_path: source_root.to_string_lossy().to_string(),
                 source_kind: ImportSourceKind::Folder,
                 recursive: false,
@@ -14309,6 +16742,78 @@ mod tests {
             .expect("second scan");
 
         assert!(second.candidates[0].duplicate_asset_id.is_some());
+    }
+
+    #[tokio::test]
+    async fn reimport_after_trash_is_reported_as_duplicate_and_does_not_hit_unique_constraint() {
+        let runtime_root = temp_root("dedupe-after-trash");
+        let library_root = runtime_root.join("library");
+        let source_root = runtime_root.join("source");
+        fs::create_dir_all(&source_root).expect("source dir");
+        fs::write(source_root.join("a.jpg"), b"same-image-bytes").expect("write file");
+        let service = GalleryService::new(AppConfig {
+            runtime_root: runtime_root.as_ref().to_path_buf(),
+            ..AppConfig::default()
+        })
+        .expect("service");
+        service
+            .update_library_settings(UpdateLibrarySettingsRequest {
+                library_root: library_root.to_string_lossy().to_string(),
+                default_import_mode: ImportMode::Copy,
+                original_storage_policy: None,
+            })
+            .await
+            .expect("settings");
+        let first = service
+            .scan_import_source(ScanImportSourceRequest {
+                target_vault_id: None,
+                source_path: source_root.to_string_lossy().to_string(),
+                source_kind: ImportSourceKind::Folder,
+                recursive: false,
+                import_mode: Some(ImportMode::Copy),
+                add_as_watch_folder: false,
+                place_hint: None,
+            })
+            .await
+            .expect("first scan");
+        let first = service
+            .commit_import_session(first.id, vec![], Some(ImportMode::Copy), None)
+            .await
+            .expect("first commit");
+        let asset_id = first.imported_asset_ids[0];
+        let entry_id = service
+            .state
+            .read()
+            .await
+            .file_entries
+            .iter()
+            .find(|entry| entry.asset_id == Some(asset_id))
+            .expect("asset file entry")
+            .id;
+        service
+            .trash_file_entry(entry_id)
+            .await
+            .expect("move original into trash");
+
+        let second = service
+            .scan_import_source(ScanImportSourceRequest {
+                target_vault_id: None,
+                source_path: source_root.to_string_lossy().to_string(),
+                source_kind: ImportSourceKind::Folder,
+                recursive: false,
+                import_mode: Some(ImportMode::Copy),
+                add_as_watch_folder: false,
+                place_hint: None,
+            })
+            .await
+            .expect("rescan trashed original");
+        assert_eq!(second.candidates[0].duplicate_asset_id, Some(asset_id));
+        let committed = service
+            .commit_import_session(second.id, vec![], Some(ImportMode::Copy), None)
+            .await
+            .expect("duplicate is skipped without violating per-vault uniqueness");
+        assert!(committed.imported_asset_ids.is_empty());
+        assert_eq!(committed.skipped_duplicate_ids, vec![asset_id]);
     }
 
     #[tokio::test]
@@ -14340,6 +16845,7 @@ mod tests {
 
         let first = service
             .scan_import_source(ScanImportSourceRequest {
+                target_vault_id: None,
                 source_path: first_source.to_string_lossy().to_string(),
                 source_kind: ImportSourceKind::Folder,
                 recursive: false,
@@ -14357,6 +16863,7 @@ mod tests {
 
         let duplicate = service
             .scan_import_source(ScanImportSourceRequest {
+                target_vault_id: None,
                 source_path: second_source.to_string_lossy().to_string(),
                 source_kind: ImportSourceKind::Folder,
                 recursive: false,
@@ -14412,6 +16919,7 @@ mod tests {
 
         let session = service
             .scan_import_source(ScanImportSourceRequest {
+                target_vault_id: None,
                 source_path: source_root.to_string_lossy().to_string(),
                 source_kind: ImportSourceKind::Folder,
                 recursive: false,
@@ -14459,6 +16967,7 @@ mod tests {
 
         let session = service
             .scan_import_source(ScanImportSourceRequest {
+                target_vault_id: None,
                 source_path: source_root.to_string_lossy().to_string(),
                 source_kind: ImportSourceKind::Folder,
                 recursive: true,
@@ -14535,6 +17044,7 @@ mod tests {
 
         let session = service
             .scan_import_source(ScanImportSourceRequest {
+                target_vault_id: None,
                 source_path: source_root.to_string_lossy().to_string(),
                 source_kind: ImportSourceKind::Folder,
                 recursive: true,
@@ -14600,6 +17110,7 @@ mod tests {
             .expect("settings");
         let session = service
             .scan_import_source(ScanImportSourceRequest {
+                target_vault_id: None,
                 source_path: source_root.to_string_lossy().to_string(),
                 source_kind: ImportSourceKind::Folder,
                 recursive: false,
@@ -14652,6 +17163,7 @@ mod tests {
 
         let first = service
             .scan_import_source(ScanImportSourceRequest {
+                target_vault_id: None,
                 source_path: source_root.to_string_lossy().to_string(),
                 source_kind: ImportSourceKind::Folder,
                 recursive: true,
@@ -14669,6 +17181,7 @@ mod tests {
         fs::write(source_root.join("duplicate.jpg"), b"same-image-bytes").expect("write duplicate");
         let duplicate = service
             .scan_import_source(ScanImportSourceRequest {
+                target_vault_id: None,
                 source_path: source_root.to_string_lossy().to_string(),
                 source_kind: ImportSourceKind::Folder,
                 recursive: true,
@@ -14716,6 +17229,7 @@ mod tests {
             .expect("settings");
         let session = service
             .scan_import_source(ScanImportSourceRequest {
+                target_vault_id: None,
                 source_path: source_root.to_string_lossy().to_string(),
                 source_kind: ImportSourceKind::Folder,
                 recursive: true,
@@ -14764,6 +17278,7 @@ mod tests {
             .expect("settings");
         let session = service
             .scan_import_source(ScanImportSourceRequest {
+                target_vault_id: None,
                 source_path: source_root.to_string_lossy().to_string(),
                 source_kind: ImportSourceKind::Folder,
                 recursive: false,
@@ -14983,6 +17498,7 @@ mod tests {
             .expect("settings");
         let session = service
             .scan_import_source(ScanImportSourceRequest {
+                target_vault_id: None,
                 source_path: source_root.to_string_lossy().to_string(),
                 source_kind: ImportSourceKind::Folder,
                 recursive: false,
@@ -15126,6 +17642,7 @@ mod tests {
             .expect("settings");
         let session = service
             .scan_import_source(ScanImportSourceRequest {
+                target_vault_id: None,
                 source_path: source_root.to_string_lossy().to_string(),
                 source_kind: ImportSourceKind::Folder,
                 recursive: false,
@@ -15252,6 +17769,7 @@ mod tests {
             .expect("settings");
         let session = service
             .scan_import_source(ScanImportSourceRequest {
+                target_vault_id: None,
                 source_path: source_root.to_string_lossy().to_string(),
                 source_kind: ImportSourceKind::Folder,
                 recursive: false,
@@ -15331,6 +17849,7 @@ mod tests {
             .expect("settings");
         let session = service
             .scan_import_source(ScanImportSourceRequest {
+                target_vault_id: None,
                 source_path: source_root.to_string_lossy().to_string(),
                 source_kind: ImportSourceKind::Folder,
                 recursive: false,
@@ -15408,6 +17927,7 @@ mod tests {
             .expect("settings");
         let session = service
             .scan_import_source(ScanImportSourceRequest {
+                target_vault_id: None,
                 source_path: source_root.to_string_lossy().to_string(),
                 source_kind: ImportSourceKind::Folder,
                 recursive: false,
@@ -15578,6 +18098,7 @@ mod tests {
             .expect("settings");
         let session = service
             .scan_import_source(ScanImportSourceRequest {
+                target_vault_id: None,
                 source_path: source_root.to_string_lossy().to_string(),
                 source_kind: ImportSourceKind::Folder,
                 recursive: false,
@@ -15652,6 +18173,7 @@ mod tests {
             .expect("settings");
         let session = service
             .scan_import_source(ScanImportSourceRequest {
+                target_vault_id: None,
                 source_path: source_root.to_string_lossy().to_string(),
                 source_kind: ImportSourceKind::Folder,
                 recursive: false,

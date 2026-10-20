@@ -57,14 +57,36 @@ pub fn seal_asset(
     asset: &Asset,
     source_path: &Path,
 ) -> Result<SealedBlob, VaultStoreError> {
+    let source = fs::File::open(source_path).map_err(io_error)?;
+    seal_asset_from_reader(
+        config,
+        library_root,
+        vault_id,
+        key_version,
+        blob_id,
+        asset,
+        source,
+    )
+}
+
+/// Seal a managed original from a reader without materializing a plaintext file.
+/// The plaintext buffer is bounded to one vault chunk and zeroized on drop.
+pub fn seal_asset_from_reader<R: Read>(
+    config: &AppConfig,
+    library_root: &Path,
+    vault_id: Uuid,
+    key_version: u32,
+    blob_id: Uuid,
+    asset: &Asset,
+    mut source: R,
+) -> Result<SealedBlob, VaultStoreError> {
     let key = load_or_create_vault_key(config, vault_id, key_version)?;
     let cipher = ChaCha20Poly1305::new(Key::from_slice(key.as_ref()));
-    let mut source = fs::File::open(source_path).map_err(io_error)?;
-    let mut buffer = vec![0_u8; CHUNK_BYTES];
+    let mut buffer = Zeroizing::new(vec![0_u8; CHUNK_BYTES]);
     let mut chunks = Vec::new();
 
     loop {
-        let read = source.read(&mut buffer).map_err(io_error)?;
+        let read = source.read(buffer.as_mut_slice()).map_err(io_error)?;
         if read == 0 {
             break;
         }
@@ -162,6 +184,49 @@ pub fn decrypt_chunks_to_bytes(
     }
 
     Ok(plaintext)
+}
+
+/// Verify a sealed blob by streaming one decrypted chunk at a time into a hash
+/// accumulator. Plaintext never leaves this function and each chunk is zeroized.
+pub fn verify_blob_plaintext(
+    config: &AppConfig,
+    library_root: &Path,
+    vault_id: Uuid,
+    key_version: u32,
+    chunks: &[crate::domain::BlobChunk],
+    expected_hash: &str,
+    expected_bytes: u64,
+) -> Result<(), VaultStoreError> {
+    let key = load_existing_vault_key(config, vault_id, key_version)?;
+    let cipher = ChaCha20Poly1305::new(Key::from_slice(key.as_ref()));
+    let mut sorted_chunks = chunks.to_vec();
+    sorted_chunks.sort_by_key(|chunk| chunk.chunk_index);
+    if sorted_chunks.is_empty()
+        || sorted_chunks
+            .iter()
+            .enumerate()
+            .any(|(index, chunk)| chunk.chunk_index as usize != index)
+    {
+        return Err(VaultStoreError::Invalid(
+            "blob chunks are not contiguous".to_string(),
+        ));
+    }
+    let mut hasher = Sha256::new();
+    let mut total = 0_u64;
+    for chunk in &sorted_chunks {
+        let clear = Zeroizing::new(decrypt_chunk_to_bytes(&cipher, library_root, chunk)?);
+        total = total
+            .checked_add(clear.len() as u64)
+            .ok_or_else(|| VaultStoreError::Invalid("blob byte count overflow".to_string()))?;
+        hasher.update(&clear);
+    }
+    let hash = format!("{:x}", hasher.finalize());
+    if total != expected_bytes || !hash.eq_ignore_ascii_case(expected_hash) {
+        return Err(VaultStoreError::Invalid(
+            "blob plaintext hash or length mismatch".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 pub fn decrypt_chunks_range_to_bytes(
