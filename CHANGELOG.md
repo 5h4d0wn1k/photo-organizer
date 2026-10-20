@@ -267,11 +267,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Vault AES key storage is an explicit, documented configuration choice
   instead of a silent environment-variable downgrade (#110). `AppConfig`
-  carries `vault_key_storage` (`os_keychain` by default), and the selected
-  setting is visible in startup diagnostics and security status. Production
-  accepts only OS keychain storage; file mode and unsupported environment
-  values fail before the library is opened. Legacy file-key installations
-  remain blocked until a safe migration flow is available.
+  carries `vault_key_storage` (`os_keychain` by default). Production accepts
+  only OS keychain storage; file mode and unsupported environment values fail
+  before the library is opened, with rejection reported in startup
+  diagnostics. `GET /security/encryption/status` reports state for a running
+  supported configuration; it cannot report rejected startup settings.
+  Legacy file-key installations remain blocked until a safe migration flow
+  is available.
 
 ## [0.1.0] - 2026-09-22
 

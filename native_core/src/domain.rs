@@ -572,13 +572,13 @@ pub enum ModelTask {
 
 /// Where vault AES keys live.
 ///
-/// `OsKeychain` is the only default the vision allows: key material stays in
-/// the OS-protected store (libsecret / Keychain / DPAPI). `File` keeps keys
-/// as hex in `<runtime_root>/security/vault-keys/` -- same trust domain as
-/// the ciphertext -- and exists solely for headless deployments with no
-/// keyring (containers, CI). It is never silent: selecting it logs a startup
-/// warning, is reported by `GET /security/encryption/status`, and is
-/// documented in `docs/security-model.md`. See issue #110.
+/// Production supports only `OsKeychain`, which keeps key material in the
+/// OS-protected store (libsecret / Keychain / DPAPI). `File` is retained for
+/// test compatibility and to identify an unsupported configuration; it is
+/// not a supported headless fallback. Production startup rejects it before
+/// opening the library and reports the rejection in startup diagnostics.
+/// The security status endpoint only exists for a running supported
+/// configuration and cannot report a rejected startup setting. See issue #110.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum VaultKeyStorage {

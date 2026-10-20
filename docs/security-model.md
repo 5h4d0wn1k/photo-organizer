@@ -35,10 +35,12 @@
   Users should keep independent backups of important libraries.
 - Secure-storage integration for keys on each platform.
 - Production vault AES keys must live in OS secure storage. Selecting
-  `PRIVATE_GALLERY_VAULT_KEY_STORAGE=file` is reported in startup diagnostics
-  and `GET /security/encryption/status`, then rejected before the library is
-  opened. Legacy file-key migration is not yet supported; preserve the old
-  runtime directory and an independent offline backup.
+  `PRIVATE_GALLERY_VAULT_KEY_STORAGE=file` is rejected before the library is
+  opened, and the rejection is reported in startup diagnostics. The security
+  status endpoint is available only for a running supported configuration;
+  it cannot report a rejected startup setting. Legacy file-key migration is
+  not yet supported; preserve the old runtime directory and an independent
+  offline backup.
 - Reset and delete flow for the People feature, including face templates and labels.
 - Minimal permissions only, with no background location.
 - Explicit separation between organization features, sync, and diagnostics.
