@@ -102,9 +102,24 @@ WORK="$(mktemp -d)"
 # So: normal exit cleans up and reports; a signal cleans up, then exits 128+signo
 # WITHOUT printing a verdict. A shard that did not finish must never be able to
 # say anything that could be read as a result.
+ACTIVE_SUITE_PID=""
+SUITE_LAUNCHING=no
+SUITE_LAUNCH_BASELINE=""
 on_signal() {
   local name="$1" signo="$2"
   trap - EXIT INT TERM HUP
+  if [[ "${SUITE_LAUNCHING}" == yes && -z "${ACTIVE_SUITE_PID}" \
+    && "${!:-}" != "${SUITE_LAUNCH_BASELINE}" ]]; then
+    ACTIVE_SUITE_PID="${!:-}"
+  fi
+  if [[ -n "${ACTIVE_SUITE_PID}" ]]; then
+    kill -TERM -- "-${ACTIVE_SUITE_PID}" 2>/dev/null || true
+    kill -TERM "${ACTIVE_SUITE_PID}" 2>/dev/null || true
+    sleep 1
+    kill -KILL -- "-${ACTIVE_SUITE_PID}" 2>/dev/null || true
+    kill -KILL "${ACTIVE_SUITE_PID}" 2>/dev/null || true
+    wait "${ACTIVE_SUITE_PID}" 2>/dev/null || true
+  fi
   rm -rf "${WORK}"
   printf 'FATAL: received signal %s; this shard did not finish and reports no verdict\n' \
     "${name}" >&2
@@ -220,6 +235,29 @@ mismatches=()
 MUTATE_ENV=""
 MUTATE_RC=1
 
+# An asynchronous wait is interruptible by a signal sent to this harness alone.
+# A command substitution running the whole suite defers Bash's trap until the
+# foreground suite returns, potentially minutes later. Isolate its descendants
+# so cancellation also stops the suite, fakes, and tools it started.
+SUITE_OUTPUT=""
+SUITE_RC=0
+capture_suite() {
+  local output_path="${WORK}/suite-output.log"
+  local -a environment=(PYTHONDONTWRITEBYTECODE=1)
+  [[ -z "${MUTATE_ENV}" ]] || environment+=("${MUTATE_ENV}")
+  SUITE_LAUNCH_BASELINE="${!:-}"
+  SUITE_LAUNCHING=yes
+  python3 "${ROOT_DIR}/scripts/tests/run_in_process_group.py" env \
+    "${environment[@]}" bash "${SUITE}" >"${output_path}" 2>&1 &
+  ACTIVE_SUITE_PID=$!
+  SUITE_LAUNCHING=no
+  printf '  suite process group: %s\n' "${ACTIVE_SUITE_PID}"
+  SUITE_RC=0
+  wait "${ACTIVE_SUITE_PID}" || SUITE_RC=$?
+  ACTIVE_SUITE_PID=""
+  SUITE_OUTPUT="$(cat "${output_path}")"
+}
+
 # mutate <name> <needle> <old> <new>
 #
 # Mutations that break the *suite* are applied to the suite file; the rest break
@@ -286,13 +324,12 @@ mutate() {
     return
   fi
 
+  printf '  running  mutation %s (shard %s/%s): %s\n' \
+    "${index}" "${SHARD}" "${SHARDS}" "${name}"
   local out rc passes
-  if [[ -n "${MUTATE_ENV}" ]]; then
-    out="$(env "${MUTATE_ENV}" PYTHONDONTWRITEBYTECODE=1 bash "${SUITE}" 2>&1)"
-  else
-    out="$(PYTHONDONTWRITEBYTECODE=1 bash "${SUITE}" 2>&1)"
-  fi
-  rc=$?
+  capture_suite
+  out="${SUITE_OUTPUT}"
+  rc="${SUITE_RC}"
   passes="$(pass_count "${out}")"
 
   # Liveness: the suite must actually have run its assertions. A mutation that
@@ -796,8 +833,9 @@ if [[ -n "${MODE_VERIFY_ONLY}" ]]; then
   exit 0
 fi
 
-final_out="$(PYTHONDONTWRITEBYTECODE=1 bash "${SUITE}" 2>&1)"
-final_rc=$?
+capture_suite
+final_out="${SUITE_OUTPUT}"
+final_rc="${SUITE_RC}"
 echo
 if [[ ${final_rc} -ne 0 ]]; then
   mismatches+=("restoring the originals did not return the suite to green")
