@@ -551,5 +551,63 @@ else
   ok "every mutation harness exits 143 on SIGTERM without printing a verdict"
 fi
 
+# Group cancellation alone cannot detect Bash deferring a PID-only signal while
+# waiting on a foreground suite. Exercise the macOS harness during a real run.
+if python3 - "${TESTS_DIR}/macos_release_artifact_mutation_test.sh" <<'PYTHON'
+import os
+from pathlib import Path
+import re
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+
+with tempfile.TemporaryDirectory() as work:
+    output = Path(work) / "signal.log"
+    with output.open("w") as stream:
+        child = subprocess.Popen(["bash", sys.argv[1]], stdout=stream,
+                                 stderr=subprocess.STDOUT,
+                                 env={**os.environ, "MUTATION_SHARDS": "45", "MUTATION_SHARD": "0"},
+                                 start_new_session=True)
+        suite_group = None
+        try:
+            deadline = time.monotonic() + 20
+            while not (ready := re.search(r"suite process group: ([0-9]+)", output.read_text())):
+                if child.poll() is not None or time.monotonic() >= deadline:
+                    raise RuntimeError("harness did not start a real mutation")
+                time.sleep(0.05)
+            suite_group = int(ready[1])
+            child.send_signal(signal.SIGTERM)
+            if child.wait(timeout=5) != 143:
+                raise RuntimeError("harness did not return the TERM exit status")
+            processes = subprocess.check_output(["ps", "-eo", "pgid=,stat="], text=True)
+            if any(int(group) == suite_group and not state.startswith("Z")
+                   for group, state in (row.split() for row in processes.splitlines())):
+                raise RuntimeError("suite descendants survived cancellation")
+            text = output.read_text()
+            if any(marker in text for marker in ("COULD NOT APPLY", "NON-BITING", "mutations:")):
+                raise RuntimeError("interrupted harness printed a mutation verdict")
+            if "reports no verdict" not in text:
+                raise RuntimeError("interrupted harness omitted its diagnostic")
+        finally:
+            if suite_group is not None:
+                try:
+                    os.killpg(suite_group, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            try:
+                os.killpg(child.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            child.wait()
+PYTHON
+then
+  ok "the macOS harness exits promptly on PID-only SIGTERM without a verdict"
+else
+  no "the macOS harness exits promptly on PID-only SIGTERM without a verdict" \
+    "the active suite delayed cancellation or the interrupted harness reported a result"
+fi
+
 printf '  %d passed, %d failed\n' "${PASS_COUNT}" "${FAIL_COUNT}"
 [[ ${FAIL_COUNT} -eq 0 ]]
