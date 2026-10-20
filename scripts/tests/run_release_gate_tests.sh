@@ -45,7 +45,9 @@ DEGRADED_MARKER='RELEASE_GATE_SUITE_DEGRADED:'
 shards_for_suite() {
   case "$1" in
     ios_release_artifact_mutation_test.sh) printf '8' ;;
-    macos_release_artifact_mutation_test.sh) printf '8' ;;
+    # Match the CI matrix's four-shard setting and the runner's 4 vCPU capacity.
+    # The driver owns the actual fanout, so keep this aligned with the workflow.
+    macos_release_artifact_mutation_test.sh) printf '4' ;;
     windows_release_artifact_mutation_test.sh) printf '8' ;;
     *) printf '1' ;;
   esac

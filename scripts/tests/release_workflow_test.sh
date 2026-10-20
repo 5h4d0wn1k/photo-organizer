@@ -1723,7 +1723,7 @@ matrix_spec = matrix_jobs.get(matrix_name, {}) if matrix_name else {}
 # capped so it cannot grow into "never times out" either.
 #
 # The cost is measured, not guessed: one shard alone took 772s for its 6 mutations
-# on #164, so ~130s per mutation and 45 mutations is ~97.5 CPU-minutes; sharded 8
+# on #164, so ~130s per mutation and 45 mutations is ~97.5 CPU-minutes; sharded 4
 # ways over this job's 4 vCPU that is ~26 minutes. 60 is roughly 2x that.
 # An interrupted leg must expose shard progress in the job log as it runs. The
 # observed job cancellation skipped the `if: always()` upload step. Artifacts
