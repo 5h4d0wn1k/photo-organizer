@@ -88,26 +88,27 @@ impl AppConfig {
         {
             config.tesseract_path = Some(PathBuf::from(value));
         }
-        // Vault AES key store. "file" keeps keys as hex under
-        // <runtime_root>/security/vault-keys/ -- same trust domain as the
-        // ciphertext -- and is only for headless deployments with no OS
-        // keyring. Anything else (including unset) is the OS keychain, and an
-        // unrecognised value warns on stderr and falls back to the keychain:
-        // silently accepting a typo here would choose the weaker store.
+        // Keep the selected backend visible for startup diagnostics/status,
+        // but production validation rejects File before the library opens.
         // eprintln, not tracing: from_env runs before the subscriber exists.
         match env::var("PRIVATE_GALLERY_VAULT_KEY_STORAGE").map(|value| value.trim().to_lowercase())
         {
             Ok(value) if value == "file" => {
                 config.vault_key_storage = VaultKeyStorage::File;
             }
-            Ok(value) if value.is_empty() || value == "os_keychain" || value == "keychain" => {
+            Ok(value)
+                if value.is_empty()
+                    || value == "keyring"
+                    || value == "os_keychain"
+                    || value == "keychain" =>
+            {
                 config.vault_key_storage = VaultKeyStorage::OsKeychain;
             }
             Ok(other) => {
                 eprintln!(
-                    "warning: unrecognised PRIVATE_GALLERY_VAULT_KEY_STORAGE={other:?}; \
-                     using the OS keychain. Set it to 'file' only for headless \
-                     deployments with no keyring -- see docs/security-model.md."
+                    "error: unsupported PRIVATE_GALLERY_VAULT_KEY_STORAGE={other:?}; \
+                     production startup refuses this setting. Use 'keyring' or unset \
+                     the variable; see docs/security-model.md."
                 );
                 config.vault_key_storage = VaultKeyStorage::OsKeychain;
             }
@@ -187,7 +188,15 @@ mod tests {
         // A typo must choose the stronger store, never the weaker one: the
         // defect in #110 was a silent downgrade, so the fallback direction is
         // the load-bearing property here, not the parsing.
-        for value in ["os_keychain", "keychain", "", "files", "disk", "FILEE"] {
+        for value in [
+            "os_keychain",
+            "keychain",
+            "keyring",
+            "",
+            "files",
+            "disk",
+            "FILEE",
+        ] {
             assert_eq!(
                 vault_storage_with_env(Some(value)),
                 VaultKeyStorage::OsKeychain,

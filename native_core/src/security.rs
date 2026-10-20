@@ -789,18 +789,23 @@ pub fn encryption_status(config: &AppConfig) -> EncryptionStatus {
     match read_state(config) {
         Ok(Some(state)) => {
             let key_available = load_key_for_state(&config.database_path(), &state).is_ok();
+            let vault_key_warning = vault_key_storage_warning(config);
             EncryptionStatus {
                 database_encrypted: true,
                 derived_data_encrypted: true,
                 key_storage: Some(state.key_storage),
                 sensitive_indexing_allowed: key_available,
-                warning: if key_available {
-                    "Encrypted SQLCipher database is active; sensitive local indexing is allowed when required models are installed."
+                warning: format!(
+                    "{}{}",
+                    vault_key_warning,
+                    if key_available {
+                        "Encrypted SQLCipher database is active; sensitive local indexing is allowed when required models are installed."
                         .to_string()
-                } else {
-                    "Encrypted database is active, but its key is unavailable from secure storage; sensitive indexing is blocked."
+                    } else {
+                        "Encrypted database is active, but its key is unavailable from secure storage; sensitive indexing is blocked."
                         .to_string()
-                },
+                    }
+                ),
             }
         }
         Ok(None) => EncryptionStatus {
@@ -809,7 +814,8 @@ pub fn encryption_status(config: &AppConfig) -> EncryptionStatus {
             key_storage: Some("not_configured".to_string()),
             sensitive_indexing_allowed: false,
             warning: format!(
-                "{} Plaintext-to-SQLCipher activation has not run yet.",
+                "{}{} Plaintext-to-SQLCipher activation has not run yet.",
+                vault_key_storage_warning(config),
                 if sqlcipher_available(&config.database_path()) {
                     "SQLCipher support is compiled in."
                 } else {
@@ -824,6 +830,14 @@ pub fn encryption_status(config: &AppConfig) -> EncryptionStatus {
             sensitive_indexing_allowed: false,
             warning: format!("Unable to read encryption status: {error}"),
         },
+    }
+}
+
+fn vault_key_storage_warning(config: &AppConfig) -> &'static str {
+    if config.vault_key_storage == crate::domain::VaultKeyStorage::File {
+        "Vault AES keys are configured for plaintext file storage, which production refuses. "
+    } else {
+        ""
     }
 }
 
@@ -2750,8 +2764,7 @@ mod tests {
         config.vault_key_storage = VaultKeyStorage::OsKeychain;
         let status = encryption_status(&config);
         assert!(
-            !status.warning.contains("vault-keys")
-                && !status.warning.contains("Vault AES keys"),
+            !status.warning.contains("vault-keys") && !status.warning.contains("Vault AES keys"),
             "OS keychain mode must not report file-key storage, got: {}",
             status.warning
         );

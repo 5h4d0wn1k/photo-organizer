@@ -14,11 +14,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let config = AppConfig::from_env();
     if config.vault_key_storage == native_core::domain::VaultKeyStorage::File {
-        tracing::warn!(
-            "vault AES keys are stored as files under {}/security/vault-keys \
-             (PRIVATE_GALLERY_VAULT_KEY_STORAGE=file). Key material shares a \
-             trust domain with the ciphertext; use the OS keychain wherever a \
-             keyring exists. See docs/security-model.md.",
+        tracing::error!(
+            "refusing production file-backed vault-key storage under {}/security/vault-keys \
+             (PRIVATE_GALLERY_VAULT_KEY_STORAGE=file). Preserve legacy key material and \
+             follow docs/security-model.md; migration is not yet supported.",
             config.runtime_root.display()
         );
     }
