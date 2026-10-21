@@ -499,7 +499,7 @@ fn read_key_marker(marker: &Path) -> Result<Option<KeyMarkerState>, VaultStoreEr
 }
 
 fn write_key_marker(marker: &Path, state: KeyMarkerState) -> Result<(), VaultStoreError> {
-    let parent = marker
+    let _parent = marker
         .parent()
         .ok_or_else(|| VaultStoreError::Invalid("key marker parent missing".into()))?;
     let (path, contents) = match state {
@@ -526,7 +526,7 @@ fn write_key_marker(marker: &Path, state: KeyMarkerState) -> Result<(), VaultSto
     file.write_all(contents).map_err(io_error)?;
     file.sync_all().map_err(io_error)?;
     #[cfg(unix)]
-    fs::File::open(parent)
+    fs::File::open(_parent)
         .and_then(|directory| directory.sync_all())
         .map_err(io_error)?;
     if state == KeyMarkerState::Initialized {
@@ -534,7 +534,7 @@ fn write_key_marker(marker: &Path, state: KeyMarkerState) -> Result<(), VaultSto
         // ciphertext. Keep the provisioning marker as an append-only history;
         // this avoids non-atomic replacement on Windows.
         #[cfg(unix)]
-        fs::File::open(parent)
+        fs::File::open(_parent)
             .and_then(|directory| directory.sync_all())
             .map_err(io_error)?;
     }
