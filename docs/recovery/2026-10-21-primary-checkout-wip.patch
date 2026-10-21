@@ -1,0 +1,72 @@
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index 15f29195..47f1097b 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -81,18 +81,19 @@ jobs:
+       # so a single failure cannot hide a second, independent one.
+       fail-fast: false
+       matrix:
+-        suite:
+-          - release_workflow_test.sh
+-          - android_release_signing_test.sh
+-          - apksigner_gate_test.sh
+-          - android_release_artifact_smoke_test.sh
+-          - windows_release_artifact_smoke_test.sh
+-          - linux_release_artifact_smoke_test.sh
+-          - macos_release_artifact_smoke_test.sh
+-          - macos_release_artifact_mutation_test.sh
+-          - windows_release_artifact_mutation_test.sh
+-          - ios_release_artifact_smoke_test.sh
+-          - ios_release_artifact_mutation_test.sh
++        include:
++          - suite: release_workflow_test.sh
++          - suite: android_release_signing_test.sh
++          - suite: apksigner_gate_test.sh
++          - suite: android_release_artifact_smoke_test.sh
++          - suite: windows_release_artifact_smoke_test.sh
++          - suite: linux_release_artifact_smoke_test.sh
++          - suite: macos_release_artifact_smoke_test.sh
++          - suite: macos_release_artifact_mutation_test.sh
++            mutation_shards: '4'
++          - suite: windows_release_artifact_mutation_test.sh
++          - suite: ios_release_artifact_smoke_test.sh
++          - suite: ios_release_artifact_mutation_test.sh
+     steps:
+       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+       # Pin the interpreter rather than inheriting whatever python3 the runner
+@@ -122,6 +123,8 @@ jobs:
+       # same dispatcher a local full run uses, for exactly one suite. An unknown
+       # name is a hard error, so a typo cannot run nothing and report success.
+       - name: Run the release gate suite
++        env:
++          MUTATION_SHARDS: ${{ matrix.mutation_shards || '1' }}
+         run: bash scripts/tests/run_release_gate_tests.sh --only-suite "${{ matrix.suite }}"
+ 
+   # The aggregate. `needs:` alone is not enough: a job whose dependencies failed
+diff --git a/app/linux/CMakeLists.txt b/app/linux/CMakeLists.txt
+index 1ce8ca00..1b072287 100644
+--- a/app/linux/CMakeLists.txt
++++ b/app/linux/CMakeLists.txt
+@@ -7,14 +7,20 @@ cmake_minimum_required(VERSION 3.13)
+ if(NOT DEFINED CMAKE_C_COMPILER)
+   find_program(PRIVATE_GALLERY_CC NAMES clang gcc)
+   if(PRIVATE_GALLERY_CC)
+-    set(CMAKE_C_COMPILER "${PRIVATE_GALLERY_CC}")
++    # Populate the CMake cache (not just a normal variable) so tooling that
++    # reads CMAKE_C_COMPILER from CMakeCache.txt -- notably Flutter's
++    # native-assets build hooks -- can discover it. CMake 4.x stopped caching
++    # the compiler when it is set as a normal variable before project().
++    set(CMAKE_C_COMPILER "${PRIVATE_GALLERY_CC}" CACHE FILEPATH "C compiler")
+   endif()
+ endif()
+ 
+ if(NOT DEFINED CMAKE_CXX_COMPILER)
+   find_program(PRIVATE_GALLERY_CXX NAMES clang++ g++)
+   if(PRIVATE_GALLERY_CXX)
+-    set(CMAKE_CXX_COMPILER "${PRIVATE_GALLERY_CXX}")
++    # See the C compiler note above: must be a cache entry for Flutter's
++    # native-assets build hooks to read CMAKE_CXX_COMPILER from CMakeCache.txt.
++    set(CMAKE_CXX_COMPILER "${PRIVATE_GALLERY_CXX}" CACHE FILEPATH "C++ compiler")
+   endif()
+ endif()
+ 
