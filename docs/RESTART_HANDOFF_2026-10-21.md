@@ -37,7 +37,7 @@ Open PRs are work in progress, not merged changes. Do not interpret “mergeable
 
 | PR | Work | Current disposition |
 | --- | --- | --- |
-| [#201](https://github.com/5h4d0wn1k/photo-organizer/pull/201) | This restart map, issue #180 | Expanded handoff is committed at `878ec775`, independently reviewed, and pushed. The fresh full required CI run for this head is still in progress; wait for it before merging. |
+| [#201](https://github.com/5h4d0wn1k/photo-organizer/pull/201) | This restart map, issue #180 | Expanded handoff is committed, independently reviewed, and pushed. Fresh required CI has started for the latest head; refresh checks before merging. |
 | [#198](https://github.com/5h4d0wn1k/photo-organizer/pull/198), [#195](https://github.com/5h4d0wn1k/photo-organizer/pull/195), [#179](https://github.com/5h4d0wn1k/photo-organizer/pull/179), [#177](https://github.com/5h4d0wn1k/photo-organizer/pull/177) | Dependabot pub/actions updates | Merge only after their own full required CI/security review; not release blockers proven by this audit. |
 | [#191](https://github.com/5h4d0wn1k/photo-organizer/pull/191) | Hidden exact GPS projection fix | Security/privacy scoped PR, mergeable; verify latest checks/review before merge. |
 | [#175](https://github.com/5h4d0wn1k/photo-organizer/pull/175) | Iroh 0.98→1.x compatibility | Open dependency/security upgrade with explicit wire-compatibility tests; verify current CI and review. |
@@ -75,7 +75,7 @@ Recent completed PRs on `main`: #200 TLS trust dependencies (`66df8c06`), #197 k
 | `_local/worktrees/po-wt/gate-ios` | `feat/98-ios-release-gate`, 3 untracked iOS gate scripts | Stale conflicting draft: those paths already exist on main with different contents. Do not overwrite current versions. |
 | `_local/worktrees/po-wt/gate-macos` | `feat/98-macos-release-gate`, 2 modified macOS gate test scripts | Unpublished test edits; compare with current #173 and main before consolidating. |
 | `_local/worktrees/po-wt/gate-win2` | Mismatched `feat/98-windows-artifact-gate`, 5 commits ahead/12 behind its incorrectly configured Linux upstream; 3 untracked Windows smoke scripts | Mixed Linux history plus Windows helper draft; preserve and compare with canonical Windows #146. |
-| `/home/shadowarch/.codex/worktrees/photo-organizer-handoff/photo-organizer` | Clean handoff branch `codex/180-worktree-handoff` at `878ec775` | Issue #180 / PR #201. Independent review passed; latest full CI is running. |
+| `/home/shadowarch/.codex/worktrees/photo-organizer-handoff/photo-organizer` | Clean handoff branch `codex/180-worktree-handoff` | Issue #180 / PR #201. Independent review passed; fresh required CI has started. |
 
 ### Clean snapshots and branches to retain or archive only after verification
 
@@ -169,6 +169,6 @@ Not merged or deleted: code PRs with red checks, conflicts, migration questions,
 - #118 at `4c7378f8`: all observed checks pass; mergeable. The legacy-key migration and real platform keychain evidence remain release decisions.
 - #123 at `2f966ece`: Rust/Flutter/security/dependency/platform smoke and all three platform mutation suites pass. CodeQL fails with one critical alert at `original_quarantine.rs:572`; an independent review believes the nonce is overwritten by `OsRng`, but the required check remains red pending explicit disposition. GitHub reports mergeable; do not merge with CodeQL red.
 - #173 at `52243a83`: latest rerun attempt 2 failed macOS mutation after about 8 minutes and the required release aggregate failed. Inspect logs and rerun after a fix or evidence-backed runner diagnosis. GitHub reports mergeable; CI remains red, so do not merge.
-- #201 at `878ec775`: the preceding head had all observed CI pass; this expanded doc/patch head has passed independent review and is pushed. Its fresh Rust, Flutter, security, encryption durability, and artifact release gates are still running. Do not merge until the new head is fully green.
+- #201: the preceding head had all observed CI pass; the expanded doc/patch is independently reviewed and pushed. Fresh required CI has started on the latest head; refresh `gh pr checks 201` and do not merge until all required checks are green.
 - #161 head `201c500a`: conflicting with `main`. Local dirty workflow changes fail 10 `release_workflow_test.sh` assertions; its matrix shard environment value is ignored by the driver. The Linux CMake edit corresponds to #166. Keep the diff parked in the saved patch and do not commit it as-is.
 - Root `main` is not checked out in the primary working directory yet. After this patch is committed/pushed and its PR checks pass, restore the two primary checkout files from its saved patch if needed, run `git restore -- .github/workflows/ci.yml app/linux/CMakeLists.txt` in the primary checkout, switch to `main`, fast-forward from `origin/main`, and verify `git status --short --branch` is clean before starting manual work. The original PR #161 branch remains on its local/remote ref.
