@@ -738,12 +738,12 @@ fn decode_nonce(value: &str) -> Result<[u8; 12], QuarantineError> {
 }
 
 fn decode_hex(value: &str) -> Result<Vec<u8>, QuarantineError> {
-    if !value.len().is_multiple_of(2) {
+    let (chunks, remainder) = value.as_bytes().as_chunks::<2>();
+    if !remainder.is_empty() {
         return Err(QuarantineError::Invalid("odd-length hex value".to_string()));
     }
-    value
-        .as_bytes()
-        .chunks_exact(2)
+    chunks
+        .iter()
         .map(|pair| {
             let pair = std::str::from_utf8(pair)
                 .map_err(|error| QuarantineError::Invalid(error.to_string()))?;
