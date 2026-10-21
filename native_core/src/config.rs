@@ -91,31 +91,18 @@ impl AppConfig {
         // Keep the selected backend visible for startup diagnostics/status,
         // but production validation rejects File before the library opens.
         // eprintln, not tracing: from_env runs before the subscriber exists.
-        match env::var("PRIVATE_GALLERY_VAULT_KEY_STORAGE").map(|value| value.trim().to_lowercase())
+        let raw_vault_key_storage = env::var("PRIVATE_GALLERY_VAULT_KEY_STORAGE").ok();
+        if let Some(value) = raw_vault_key_storage.as_deref()
+            && !is_supported_vault_key_storage_value(value)
         {
-            Ok(value) if value == "file" => {
-                config.vault_key_storage = VaultKeyStorage::File;
-            }
-            Ok(value)
-                if value.is_empty()
-                    || value == "keyring"
-                    || value == "os_keychain"
-                    || value == "keychain" =>
-            {
-                config.vault_key_storage = VaultKeyStorage::OsKeychain;
-            }
-            Ok(other) => {
-                eprintln!(
-                    "error: unsupported PRIVATE_GALLERY_VAULT_KEY_STORAGE={other:?}; \
-                     production startup refuses this setting. Use 'keyring' or unset \
-                     the variable; see docs/security-model.md."
-                );
-                config.vault_key_storage = VaultKeyStorage::OsKeychain;
-            }
-            Err(_) => {
-                config.vault_key_storage = VaultKeyStorage::OsKeychain;
-            }
+            eprintln!(
+                "error: unsupported PRIVATE_GALLERY_VAULT_KEY_STORAGE={:?}; \
+                 production startup refuses this setting. Use 'keyring' or unset \
+                 the variable; see docs/security-model.md.",
+                value.trim().to_lowercase()
+            );
         }
+        config.vault_key_storage = parse_vault_key_storage(raw_vault_key_storage.as_deref());
 
         config
     }
@@ -129,43 +116,27 @@ impl AppConfig {
     }
 }
 
+fn is_supported_vault_key_storage_value(value: &str) -> bool {
+    matches!(
+        value.trim().to_lowercase().as_str(),
+        "file" | "" | "keyring" | "os_keychain" | "keychain"
+    )
+}
+
+fn parse_vault_key_storage(value: Option<&str>) -> VaultKeyStorage {
+    match value.map(|value| value.trim().to_lowercase()) {
+        Some(value) if value == "file" => VaultKeyStorage::File,
+        _ => VaultKeyStorage::OsKeychain,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    // from_env reads the real process environment, and Rust runs tests in
-    // threads: without serialisation, two tests setting the knob concurrently
-    // would observe each other's values. The lock also restores the previous
-    // value, so these tests cannot leak configuration into unrelated ones.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-    fn vault_storage_with_env(value: Option<&str>) -> VaultKeyStorage {
-        let _guard = ENV_LOCK.lock().unwrap();
-        // SAFETY: the mutex serialises every writer in this module, and
-        // PRIVATE_GALLERY_VAULT_KEY_STORAGE is read only by from_env, whose
-        // other callers in the test suite do not depend on this knob's value
-        // (vault_store forces the file store under cfg(test) regardless, and
-        // the security tests build AppConfig::default() directly). No test
-        // observes a half-written value; the previous value is restored below.
-        unsafe {
-            let old = std::env::var("PRIVATE_GALLERY_VAULT_KEY_STORAGE").ok();
-            match value {
-                Some(v) => std::env::set_var("PRIVATE_GALLERY_VAULT_KEY_STORAGE", v),
-                None => std::env::remove_var("PRIVATE_GALLERY_VAULT_KEY_STORAGE"),
-            }
-            let parsed = AppConfig::from_env().vault_key_storage;
-            match old {
-                Some(v) => std::env::set_var("PRIVATE_GALLERY_VAULT_KEY_STORAGE", v),
-                None => std::env::remove_var("PRIVATE_GALLERY_VAULT_KEY_STORAGE"),
-            }
-            parsed
-        }
-    }
 
     #[test]
     fn vault_key_storage_defaults_to_os_keychain() {
-        assert_eq!(vault_storage_with_env(None), VaultKeyStorage::OsKeychain);
+        assert_eq!(parse_vault_key_storage(None), VaultKeyStorage::OsKeychain);
         assert_eq!(
             AppConfig::default().vault_key_storage,
             VaultKeyStorage::OsKeychain
@@ -174,11 +145,11 @@ mod tests {
 
     #[test]
     fn vault_key_storage_file_is_explicit() {
-        assert_eq!(vault_storage_with_env(Some("file")), VaultKeyStorage::File);
+        assert_eq!(parse_vault_key_storage(Some("file")), VaultKeyStorage::File);
         // Case and surrounding whitespace are tolerated; the choice stays loud
         // (warning + status) wherever it is spelled.
         assert_eq!(
-            vault_storage_with_env(Some("  FILE ")),
+            parse_vault_key_storage(Some("  FILE ")),
             VaultKeyStorage::File
         );
     }
@@ -198,7 +169,7 @@ mod tests {
             "FILEE",
         ] {
             assert_eq!(
-                vault_storage_with_env(Some(value)),
+                parse_vault_key_storage(Some(value)),
                 VaultKeyStorage::OsKeychain,
                 "value {value:?} must not select the file store"
             );
