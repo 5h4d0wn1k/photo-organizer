@@ -15756,13 +15756,7 @@ mod tests {
                 .any(|file| file["kind"] == "protected_original_chunk")
         );
 
-        let restore_root = runtime_root.with_file_name(format!(
-            "{}-protected-original-restore",
-            runtime_root
-                .file_name()
-                .and_then(|name| name.to_str())
-                .expect("runtime root name")
-        ));
+        let restore_root = temp_root("protected-original-restore");
         let plan = restarted
             .plan_restore_backup(crate::domain::BackupRestorePlanRequest {
                 export_root: export_root.to_string_lossy().to_string(),
