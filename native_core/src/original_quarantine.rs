@@ -11,7 +11,7 @@ use std::{
 
 use chacha20poly1305::{
     ChaCha20Poly1305, Key, Nonce,
-    aead::{Aead, KeyInit, OsRng, rand_core::RngCore},
+    aead::{Aead, AeadCore, KeyInit, OsRng, rand_core::RngCore},
 };
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -569,12 +569,11 @@ fn encrypt_chunk(
     index: u32,
     plaintext: &[u8],
 ) -> Result<QuarantineChunk, QuarantineError> {
-    let mut nonce = [0_u8; 12];
-    OsRng.fill_bytes(&mut nonce);
+    let nonce = ChaCha20Poly1305::generate_nonce(&mut OsRng);
     let aad = associated_data(object_id, asset_id, index);
     let ciphertext = cipher
         .encrypt(
-            Nonce::from_slice(&nonce),
+            &nonce,
             chacha20poly1305::aead::Payload {
                 msg: plaintext,
                 aad: aad.as_bytes(),
@@ -594,7 +593,7 @@ fn encrypt_chunk(
         plaintext_bytes: plaintext.len() as u64,
         encrypted_bytes: ciphertext.len() as u64,
         local_path: String::new(),
-        nonce_hex: hex_string(nonce),
+        nonce_hex: hex_string(nonce.as_slice()),
         aad,
         plaintext_hash: sha256_hex(plaintext),
         encrypted_hash: sha256_hex(&ciphertext),
