@@ -516,6 +516,7 @@ fn read_key_marker(marker: &Path) -> Result<Option<KeyMarkerState>, VaultStoreEr
 }
 
 fn write_key_marker(marker: &Path, state: KeyMarkerState) -> Result<(), VaultStoreError> {
+    #[cfg(unix)]
     let parent = marker
         .parent()
         .ok_or_else(|| VaultStoreError::Invalid("key marker parent missing".into()))?;
