@@ -355,7 +355,7 @@ fn validate_backend_selection(value: Option<&std::ffi::OsStr>) -> Result<(), Vau
 /// regeneration.
 pub fn provision_vault_key_if_new(
     config: &AppConfig,
-    library_root: &Path,
+    _library_root: &Path,
     vault_id: Uuid,
     key_version: u32,
     has_encrypted_history: bool,
@@ -386,14 +386,13 @@ pub fn provision_vault_key_if_new(
         .map_err(io_error)?;
     fs2::FileExt::lock_exclusive(&lock).map_err(io_error)?;
     let marker = marker_root.join(format!("{stem}.initialized"));
-    // Directory presence also protects ciphertext whose database transaction
-    // was interrupted or whose catalog was restored from an older backup.
-    let history = has_encrypted_history
-        || library_root
-            .join("vaults")
-            .join(vault_id.to_string())
-            .try_exists()
-            .map_err(io_error)?;
+    // The caller supplies history for this exact key version from the catalog.
+    // A vault-wide ciphertext directory cannot be used here: it may contain
+    // valid ciphertext written under an older key version. For new writes, the
+    // initialized marker is durably persisted before sealing can create any
+    // ciphertext, so interrupted seals remain protected even if their catalog
+    // transaction did not commit.
+    let history = has_encrypted_history;
     #[cfg(test)]
     {
         let path = file_key_path(config, &key_id);
@@ -769,6 +768,33 @@ mod tests {
                 |_| panic!("encrypted history must prevent key replacement")
             )
             .is_err()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn older_version_ciphertext_does_not_block_new_key_version() {
+        let (root, _) = marker_fixture();
+        let config = AppConfig {
+            runtime_root: root.clone(),
+            ..AppConfig::default()
+        };
+        let library = root.join("library");
+        let vault_id = Uuid::new_v4();
+        // The on-disk layout is vault scoped, not key-version scoped. Existing
+        // v1 ciphertext must not make a missing v2 key look lost.
+        let older_version_ciphertext = library
+            .join("vaults")
+            .join(vault_id.to_string())
+            .join("blobs/older-version/00000000.pgblob");
+        fs::create_dir_all(older_version_ciphertext.parent().unwrap()).unwrap();
+        fs::write(&older_version_ciphertext, b"v1 ciphertext").unwrap();
+
+        provision_vault_key_if_new(&config, &library, vault_id, 2, false).unwrap();
+        assert!(load_existing_vault_key(&config, vault_id, 2).is_ok());
+        assert_eq!(
+            fs::read(older_version_ciphertext).unwrap(),
+            b"v1 ciphertext"
         );
         fs::remove_dir_all(root).unwrap();
     }
