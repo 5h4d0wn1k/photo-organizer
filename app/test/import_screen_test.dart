@@ -185,6 +185,66 @@ void main() {
     expect(outcome!.session.skippedDuplicateIds, ['dup-1', 'dup-2']);
   });
 
+  testWidgets(
+    'back after commit returns an outcome that refreshes the caller',
+    (WidgetTester tester) async {
+      tester.view.physicalSize = const Size(1200, 1800);
+      tester.view.devicePixelRatio = 1;
+      addTearDown(() {
+        tester.view.resetPhysicalSize();
+        tester.view.resetDevicePixelRatio();
+      });
+
+      final repository = _FakeGalleryRepository(
+        scanSession: _session(status: ImportSessionStatus.scanned),
+        commitSession: _session(
+          status: ImportSessionStatus.committed,
+          importedAssetIds: const ['asset-1'],
+        ),
+      );
+      ImportOutcome? outcome;
+
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Builder(
+            builder: (context) => ElevatedButton(
+              onPressed: () async {
+                outcome = await Navigator.of(context).push<ImportOutcome>(
+                  MaterialPageRoute(
+                    builder: (_) => ImportScreen(
+                      repository: repository,
+                      defaultImportMode: ImportMode.copy,
+                    ),
+                  ),
+                );
+              },
+              child: const Text('open import'),
+            ),
+          ),
+        ),
+      );
+      await tester.tap(find.text('open import'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.widgetWithText(FilledButton, 'Scan source'));
+      await tester.pumpAndSettle();
+      await tester.scrollUntilVisible(
+        find.textContaining('Import 1 selected'),
+        500,
+        scrollable: find.byType(Scrollable).first,
+      );
+      await tester.tap(find.textContaining('Import 1 selected'));
+      await tester.pumpAndSettle();
+      expect(find.text('Import result'), findsOneWidget);
+
+      await tester.binding.handlePopRoute();
+      await tester.pumpAndSettle();
+
+      expect(outcome, isNotNull);
+      expect(outcome!.viewDuplicateSummary, isFalse);
+      expect(outcome!.session.importedAssetIds, ['asset-1']);
+    },
+  );
+
   testWidgets('no review button when nothing was skipped', (
     WidgetTester tester,
   ) async {

@@ -233,300 +233,311 @@ class _ImportScreenState extends State<ImportScreen> {
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
 
-    return Scaffold(
-      appBar: AppBar(title: const Text('Import files')),
-      body: ListView(
-        padding: const EdgeInsets.all(24),
-        children: [
-          Text(
-            'Preview and safely organize local files before committing changes.',
-            style: theme.textTheme.headlineSmall,
-          ),
-          const SizedBox(height: 12),
-          Text(
-            'Scan is read-only. Move mode verifies file hashes before the old path is removed, keeps matching JSON sidecars with files, and avoids creating a duplicate archive.',
-            style: theme.textTheme.bodyLarge,
-          ),
-          const SizedBox(height: 16),
-          _OrganizedArchivePanel(onSelect: _applyPreset),
-          const SizedBox(height: 16),
-          Card(
-            color: theme.colorScheme.primaryContainer,
-            child: const Padding(
-              padding: EdgeInsets.all(16),
-              child: Wrap(
-                spacing: 16,
-                runSpacing: 8,
-                children: [
-                  _SafetyPill(icon: Icons.lock_outline, label: 'Local only'),
-                  _SafetyPill(
-                    icon: Icons.cloud_off_outlined,
-                    label: 'No cloud upload',
-                  ),
-                  _SafetyPill(
-                    icon: Icons.rule_folder_outlined,
-                    label: 'Sidecars kept with files',
-                  ),
-                  _SafetyPill(
-                    icon: Icons.verified_outlined,
-                    label: 'Hash verified move',
-                  ),
-                ],
-              ),
+    return PopScope<ImportOutcome>(
+      canPop: _committedSession == null && !_busy,
+      onPopInvokedWithResult: (didPop, _) {
+        final committed = _committedSession;
+        if (!didPop && committed != null) {
+          Navigator.of(context).pop(ImportOutcome(session: committed));
+        }
+      },
+      child: Scaffold(
+        appBar: AppBar(title: const Text('Import files')),
+        body: ListView(
+          padding: const EdgeInsets.all(24),
+          children: [
+            Text(
+              'Preview and safely organize local files before committing changes.',
+              style: theme.textTheme.headlineSmall,
             ),
-          ),
-          if (_error != null) ...[
+            const SizedBox(height: 12),
+            Text(
+              'Scan is read-only. Move mode verifies file hashes before the old path is removed, keeps matching JSON sidecars with files, and avoids creating a duplicate archive.',
+              style: theme.textTheme.bodyLarge,
+            ),
+            const SizedBox(height: 16),
+            _OrganizedArchivePanel(onSelect: _applyPreset),
             const SizedBox(height: 16),
             Card(
-              color: theme.colorScheme.errorContainer,
-              child: Padding(
-                padding: const EdgeInsets.all(16),
-                child: Text(_error!),
+              color: theme.colorScheme.primaryContainer,
+              child: const Padding(
+                padding: EdgeInsets.all(16),
+                child: Wrap(
+                  spacing: 16,
+                  runSpacing: 8,
+                  children: [
+                    _SafetyPill(icon: Icons.lock_outline, label: 'Local only'),
+                    _SafetyPill(
+                      icon: Icons.cloud_off_outlined,
+                      label: 'No cloud upload',
+                    ),
+                    _SafetyPill(
+                      icon: Icons.rule_folder_outlined,
+                      label: 'Sidecars kept with files',
+                    ),
+                    _SafetyPill(
+                      icon: Icons.verified_outlined,
+                      label: 'Hash verified move',
+                    ),
+                  ],
+                ),
               ),
             ),
-          ],
-          const SizedBox(height: 24),
-          Card(
-            child: Padding(
-              padding: const EdgeInsets.all(24),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text('Scan source', style: theme.textTheme.titleLarge),
-                  const SizedBox(height: 16),
-                  TextField(
-                    controller: _sourcePathController,
-                    decoration: const InputDecoration(
-                      labelText: 'Source path',
-                      hintText: _recommendedSourceRoot,
-                      border: OutlineInputBorder(),
+            if (_error != null) ...[
+              const SizedBox(height: 16),
+              Card(
+                color: theme.colorScheme.errorContainer,
+                child: Padding(
+                  padding: const EdgeInsets.all(16),
+                  child: Text(_error!),
+                ),
+              ),
+            ],
+            const SizedBox(height: 24),
+            Card(
+              child: Padding(
+                padding: const EdgeInsets.all(24),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text('Scan source', style: theme.textTheme.titleLarge),
+                    const SizedBox(height: 16),
+                    TextField(
+                      controller: _sourcePathController,
+                      decoration: const InputDecoration(
+                        labelText: 'Source path',
+                        hintText: _recommendedSourceRoot,
+                        border: OutlineInputBorder(),
+                      ),
                     ),
-                  ),
-                  const SizedBox(height: 16),
-                  SegmentedButton<ImportSourceKind>(
-                    segments: ImportSourceKind.values
-                        .map(
-                          (source) => ButtonSegment<ImportSourceKind>(
-                            value: source,
-                            label: Text(source.label),
-                            icon: Icon(
-                              source == ImportSourceKind.folder
-                                  ? Icons.folder_outlined
-                                  : Icons.usb_outlined,
+                    const SizedBox(height: 16),
+                    SegmentedButton<ImportSourceKind>(
+                      segments: ImportSourceKind.values
+                          .map(
+                            (source) => ButtonSegment<ImportSourceKind>(
+                              value: source,
+                              label: Text(source.label),
+                              icon: Icon(
+                                source == ImportSourceKind.folder
+                                    ? Icons.folder_outlined
+                                    : Icons.usb_outlined,
+                              ),
                             ),
-                          ),
-                        )
-                        .toList(),
-                    selected: {_importSource},
-                    onSelectionChanged: (selection) {
-                      setState(() {
-                        _importSource = selection.first;
-                        if (_importSource == ImportSourceKind.removableDrive) {
-                          _addAsWatchFolder = false;
-                        }
-                      });
-                    },
-                  ),
-                  const SizedBox(height: 16),
-                  SegmentedButton<ImportMode>(
-                    segments: ImportMode.values
-                        .map(
-                          (mode) => ButtonSegment<ImportMode>(
-                            value: mode,
-                            label: Text(mode.label),
-                          ),
-                        )
-                        .toList(),
-                    selected: {_importMode},
-                    onSelectionChanged: (selection) {
-                      setState(() {
-                        _importMode = selection.first;
-                        _moveConfirmed = false;
-                      });
-                    },
-                  ),
-                  const SizedBox(height: 16),
-                  TextField(
-                    controller: _placeHintController,
-                    decoration: const InputDecoration(
-                      labelText: 'Optional place hint',
-                      hintText: 'Goa trip or Home archive',
-                      border: OutlineInputBorder(),
-                    ),
-                  ),
-                  const SizedBox(height: 16),
-                  SwitchListTile.adaptive(
-                    contentPadding: EdgeInsets.zero,
-                    value: _addAsWatchFolder,
-                    title: const Text('Add folder as watched source'),
-                    subtitle: const Text(
-                      'Keep this off for removable drives and one-off imports.',
-                    ),
-                    onChanged: _importSource == ImportSourceKind.removableDrive
-                        ? null
-                        : (value) {
-                            setState(() => _addAsWatchFolder = value);
-                          },
-                  ),
-                  const SizedBox(height: 8),
-                  SwitchListTile.adaptive(
-                    contentPadding: EdgeInsets.zero,
-                    value: _recursive,
-                    title: const Text('Scan subfolders'),
-                    subtitle: const Text(
-                      'Turn this off for a single flat import directory.',
-                    ),
-                    onChanged: (value) {
-                      setState(() => _recursive = value);
-                    },
-                  ),
-                  const SizedBox(height: 16),
-                  FilledButton.icon(
-                    onPressed: _busy ? null : _scan,
-                    icon: _busy
-                        ? const SizedBox(
-                            height: 18,
-                            width: 18,
-                            child: CircularProgressIndicator(strokeWidth: 2),
                           )
-                        : const Icon(Icons.travel_explore_outlined),
-                    label: const Text('Scan source'),
+                          .toList(),
+                      selected: {_importSource},
+                      onSelectionChanged: (selection) {
+                        setState(() {
+                          _importSource = selection.first;
+                          if (_importSource ==
+                              ImportSourceKind.removableDrive) {
+                            _addAsWatchFolder = false;
+                          }
+                        });
+                      },
+                    ),
+                    const SizedBox(height: 16),
+                    SegmentedButton<ImportMode>(
+                      segments: ImportMode.values
+                          .map(
+                            (mode) => ButtonSegment<ImportMode>(
+                              value: mode,
+                              label: Text(mode.label),
+                            ),
+                          )
+                          .toList(),
+                      selected: {_importMode},
+                      onSelectionChanged: (selection) {
+                        setState(() {
+                          _importMode = selection.first;
+                          _moveConfirmed = false;
+                        });
+                      },
+                    ),
+                    const SizedBox(height: 16),
+                    TextField(
+                      controller: _placeHintController,
+                      decoration: const InputDecoration(
+                        labelText: 'Optional place hint',
+                        hintText: 'Goa trip or Home archive',
+                        border: OutlineInputBorder(),
+                      ),
+                    ),
+                    const SizedBox(height: 16),
+                    SwitchListTile.adaptive(
+                      contentPadding: EdgeInsets.zero,
+                      value: _addAsWatchFolder,
+                      title: const Text('Add folder as watched source'),
+                      subtitle: const Text(
+                        'Keep this off for removable drives and one-off imports.',
+                      ),
+                      onChanged:
+                          _importSource == ImportSourceKind.removableDrive
+                          ? null
+                          : (value) {
+                              setState(() => _addAsWatchFolder = value);
+                            },
+                    ),
+                    const SizedBox(height: 8),
+                    SwitchListTile.adaptive(
+                      contentPadding: EdgeInsets.zero,
+                      value: _recursive,
+                      title: const Text('Scan subfolders'),
+                      subtitle: const Text(
+                        'Turn this off for a single flat import directory.',
+                      ),
+                      onChanged: (value) {
+                        setState(() => _recursive = value);
+                      },
+                    ),
+                    const SizedBox(height: 16),
+                    FilledButton.icon(
+                      onPressed: _busy ? null : _scan,
+                      icon: _busy
+                          ? const SizedBox(
+                              height: 18,
+                              width: 18,
+                              child: CircularProgressIndicator(strokeWidth: 2),
+                            )
+                          : const Icon(Icons.travel_explore_outlined),
+                      label: const Text('Scan source'),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+            if (_session != null) ...[
+              const SizedBox(height: 24),
+              _ImportPreflightPanel(
+                session: _session!,
+                selectedCandidateCount: _selectedNonDuplicateCount(_session!),
+                selectedBytes: _selectedBytes(_session!),
+                selectedSidecarCount: _selectedSidecars(_session!),
+              ),
+              if (_importMode == ImportMode.move) ...[
+                const SizedBox(height: 12),
+                CheckboxListTile(
+                  value: _moveConfirmed,
+                  onChanged:
+                      _selectedNonDuplicateCount(_session!) == 0 ||
+                          _committedSession != null
+                      ? null
+                      : (value) {
+                          setState(() => _moveConfirmed = value ?? false);
+                        },
+                  title: const Text(
+                    'I understand selected files will move into the managed library after hash verification.',
+                  ),
+                  subtitle: const Text(
+                    'Source files are removed only after the destination hash matches.',
+                  ),
+                ),
+              ],
+              if (_committedSession != null) ...[
+                const SizedBox(height: 16),
+                _CommitResultPanel(
+                  session: _committedSession!,
+                  onViewDuplicateSummary:
+                      _committedSession!.skippedDuplicateIds.isNotEmpty
+                      ? () => Navigator.of(context).pop(
+                          ImportOutcome(
+                            session: _committedSession!,
+                            viewDuplicateSummary: true,
+                          ),
+                        )
+                      : null,
+                ),
+              ],
+              const SizedBox(height: 24),
+              _ImportSessionResults(
+                session: _session!,
+                selectedCandidateIds: _selectedCandidateIds,
+                onToggleCandidate: (candidateId, selected) {
+                  setState(() {
+                    if (selected) {
+                      _selectedCandidateIds.add(candidateId);
+                    } else {
+                      _selectedCandidateIds.remove(candidateId);
+                    }
+                    _moveConfirmed = false;
+                  });
+                },
+              ),
+              const SizedBox(height: 16),
+              Wrap(
+                spacing: 12,
+                runSpacing: 12,
+                children: [
+                  FilledButton.icon(
+                    onPressed:
+                        _busy ||
+                            _committedSession != null ||
+                            _selectedNonDuplicateCount(_session!) == 0 ||
+                            (_importMode == ImportMode.move && !_moveConfirmed)
+                        ? null
+                        : _commit,
+                    icon: const Icon(Icons.file_download_done_outlined),
+                    label: Text(
+                      _importMode == ImportMode.move
+                          ? 'Move verified files'
+                          : 'Import ${_selectedNonDuplicateCount(_session!)} selected',
+                    ),
+                  ),
+                  if (_committedSession != null)
+                    FilledButton.tonalIcon(
+                      onPressed: () {
+                        Navigator.of(
+                          context,
+                        ).pop(ImportOutcome(session: _committedSession!));
+                      },
+                      icon: const Icon(Icons.check_circle_outline),
+                      label: const Text('Done and refresh library'),
+                    ),
+                  OutlinedButton.icon(
+                    onPressed: _busy || _committedSession != null
+                        ? null
+                        : () {
+                            setState(() {
+                              _selectedCandidateIds = _session!.candidates
+                                  .where((candidate) => !candidate.isDuplicate)
+                                  .map((candidate) => candidate.id)
+                                  .toSet();
+                              _moveConfirmed = false;
+                            });
+                          },
+                    icon: const Icon(Icons.done_all_outlined),
+                    label: const Text('Select non-duplicates'),
                   ),
                 ],
               ),
-            ),
-          ),
-          if (_session != null) ...[
-            const SizedBox(height: 24),
-            _ImportPreflightPanel(
-              session: _session!,
-              selectedCandidateCount: _selectedNonDuplicateCount(_session!),
-              selectedBytes: _selectedBytes(_session!),
-              selectedSidecarCount: _selectedSidecars(_session!),
-            ),
-            if (_importMode == ImportMode.move) ...[
-              const SizedBox(height: 12),
-              CheckboxListTile(
-                value: _moveConfirmed,
-                onChanged:
-                    _selectedNonDuplicateCount(_session!) == 0 ||
-                        _committedSession != null
-                    ? null
-                    : (value) {
-                        setState(() => _moveConfirmed = value ?? false);
-                      },
-                title: const Text(
-                  'I understand selected files will move into the managed library after hash verification.',
-                ),
-                subtitle: const Text(
-                  'Source files are removed only after the destination hash matches.',
-                ),
+            ],
+            if (_recentSessions.isNotEmpty) ...[
+              const SizedBox(height: 24),
+              _RecentImportSessions(
+                sessions: _recentSessions,
+                onOpen: (session) {
+                  setState(() {
+                    _session = session;
+                    _importMode = session.importMode;
+                    _committedSession =
+                        session.status == ImportSessionStatus.committed
+                        ? session
+                        : null;
+                    _selectedCandidateIds = session.candidates
+                        .where(
+                          (candidate) =>
+                              candidate.selected && !candidate.isDuplicate,
+                        )
+                        .map((candidate) => candidate.id)
+                        .toSet();
+                    _moveConfirmed =
+                        session.status == ImportSessionStatus.committed;
+                  });
+                },
               ),
             ],
-            if (_committedSession != null) ...[
-              const SizedBox(height: 16),
-              _CommitResultPanel(
-                session: _committedSession!,
-                onViewDuplicateSummary:
-                    _committedSession!.skippedDuplicateIds.isNotEmpty
-                    ? () => Navigator.of(context).pop(
-                        ImportOutcome(
-                          session: _committedSession!,
-                          viewDuplicateSummary: true,
-                        ),
-                      )
-                    : null,
-              ),
-            ],
-            const SizedBox(height: 24),
-            _ImportSessionResults(
-              session: _session!,
-              selectedCandidateIds: _selectedCandidateIds,
-              onToggleCandidate: (candidateId, selected) {
-                setState(() {
-                  if (selected) {
-                    _selectedCandidateIds.add(candidateId);
-                  } else {
-                    _selectedCandidateIds.remove(candidateId);
-                  }
-                  _moveConfirmed = false;
-                });
-              },
-            ),
-            const SizedBox(height: 16),
-            Wrap(
-              spacing: 12,
-              runSpacing: 12,
-              children: [
-                FilledButton.icon(
-                  onPressed:
-                      _busy ||
-                          _committedSession != null ||
-                          _selectedNonDuplicateCount(_session!) == 0 ||
-                          (_importMode == ImportMode.move && !_moveConfirmed)
-                      ? null
-                      : _commit,
-                  icon: const Icon(Icons.file_download_done_outlined),
-                  label: Text(
-                    _importMode == ImportMode.move
-                        ? 'Move verified files'
-                        : 'Import ${_selectedNonDuplicateCount(_session!)} selected',
-                  ),
-                ),
-                if (_committedSession != null)
-                  FilledButton.tonalIcon(
-                    onPressed: () {
-                      Navigator.of(
-                        context,
-                      ).pop(ImportOutcome(session: _committedSession!));
-                    },
-                    icon: const Icon(Icons.check_circle_outline),
-                    label: const Text('Done and refresh library'),
-                  ),
-                OutlinedButton.icon(
-                  onPressed: _busy || _committedSession != null
-                      ? null
-                      : () {
-                          setState(() {
-                            _selectedCandidateIds = _session!.candidates
-                                .where((candidate) => !candidate.isDuplicate)
-                                .map((candidate) => candidate.id)
-                                .toSet();
-                            _moveConfirmed = false;
-                          });
-                        },
-                  icon: const Icon(Icons.done_all_outlined),
-                  label: const Text('Select non-duplicates'),
-                ),
-              ],
-            ),
           ],
-          if (_recentSessions.isNotEmpty) ...[
-            const SizedBox(height: 24),
-            _RecentImportSessions(
-              sessions: _recentSessions,
-              onOpen: (session) {
-                setState(() {
-                  _session = session;
-                  _importMode = session.importMode;
-                  _committedSession =
-                      session.status == ImportSessionStatus.committed
-                      ? session
-                      : null;
-                  _selectedCandidateIds = session.candidates
-                      .where(
-                        (candidate) =>
-                            candidate.selected && !candidate.isDuplicate,
-                      )
-                      .map((candidate) => candidate.id)
-                      .toSet();
-                  _moveConfirmed =
-                      session.status == ImportSessionStatus.committed;
-                });
-              },
-            ),
-          ],
-        ],
+        ),
       ),
     );
   }
