@@ -12,11 +12,15 @@ class FilesScreen extends StatefulWidget {
     super.key,
     required this.apiClient,
     required this.onLibraryChanged,
+    this.refreshToken = 0,
     this.exportService = const FileExportService(),
   });
 
   final LocalApiClient apiClient;
   final Future<void> Function() onLibraryChanged;
+
+  /// Changing this value refreshes the cached file and duplicate summaries.
+  final int refreshToken;
   final FileExportService exportService;
 
   @override
@@ -32,6 +36,7 @@ class _FilesScreenState extends State<FilesScreen> {
   bool _includeTrashed = false;
   _FilesViewMode _viewMode = _FilesViewMode.folders;
   String? _error;
+  int _loadGeneration = 0;
 
   @override
   void initState() {
@@ -39,7 +44,16 @@ class _FilesScreenState extends State<FilesScreen> {
     _loadTree();
   }
 
+  @override
+  void didUpdateWidget(covariant FilesScreen oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.refreshToken != widget.refreshToken) {
+      _loadTree(preferredFolderId: _currentFolder?.id);
+    }
+  }
+
   Future<void> _loadTree({String? preferredFolderId}) async {
+    final generation = ++_loadGeneration;
     setState(() {
       _loading = true;
       _error = null;
@@ -51,7 +65,7 @@ class _FilesScreenState extends State<FilesScreen> {
       final duplicateSummary = await _safeDuplicateReviewSummary();
       final preferred = preferredFolderId ?? _currentFolder?.id;
       final current = _folderById(tree, preferred) ?? tree.roots.firstOrNull;
-      if (!mounted) {
+      if (!mounted || generation != _loadGeneration) {
         return;
       }
       setState(() {
@@ -61,7 +75,7 @@ class _FilesScreenState extends State<FilesScreen> {
         _loading = false;
       });
     } catch (error) {
-      if (!mounted) {
+      if (!mounted || generation != _loadGeneration) {
         return;
       }
       setState(() {
