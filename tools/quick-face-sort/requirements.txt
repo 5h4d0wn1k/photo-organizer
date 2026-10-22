@@ -31,6 +31,6 @@ face-recognition-models==0.3.0
 click==8.5.0
 dlib==20.0.1
 numpy==2.5.3
-pillow==12.3.0
+pillow==13.0.0
 # face-recognition-models imports pkg_resources; new venvs do not bundle it.
 setuptools==80.9.0
