@@ -9,11 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- Update the Iroh transport from 0.98.2 to 1.3.0. Existing persisted endpoint
-  identities and the Photo Organizer sync ALPN are unchanged. A local direct
-  loopback tests cover endpoint negotiation and the app's Push/Pull chunk
-  transfer in both mixed-version directions (old and new peers as client and
-  server). Public-relay interoperability was not tested; Iroh ended relay
+- Update the Iroh transport from 0.98.2 to Iroh 1.x (manifest minimum 1.3.0;
+  lockfile resolves 1.4.1). Existing persisted endpoint identities and the
+  Photo Organizer sync ALPN are unchanged. A local direct-loopback harness
+  exercises endpoint negotiation and the app's Push/Pull chunk transfer
+  against a hermetic Iroh 0.98.2 peer in both directions. The old-side peer is
+  a fixture, not the historical Photo Organizer application. Public-relay
+  interoperability was not tested; Iroh ended relay
   support for 0.9x clients on September 30, 2026. Devices that relied on that
   retired route need a supported transport path. See the
   [Iroh 1.0 compatibility announcement](https://www.iroh.computer/blog/v1).
