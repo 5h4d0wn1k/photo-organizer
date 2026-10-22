@@ -61,8 +61,10 @@ deprecated major line.
 
 ## Decision
 
-Proceed with Iroh 1.3.0, retaining the current app ALPN and protocol version.
-The dependency graph is updated and the former Hickory ignores are removed.
+Proceed with the Iroh 1.x API, retaining the current app ALPN and protocol
+version. The manifest requires Iroh 1.3.0 or newer in the compatible 1.x line;
+the current lockfile resolves Iroh 1.4.1. The dependency graph is updated and
+the former Hickory ignores are removed.
 Repository tests cover the Iroh 1.x transport and service behavior.
 
 An isolated, direct-loopback probe was run with separate 0.98.2 and 1.3.0

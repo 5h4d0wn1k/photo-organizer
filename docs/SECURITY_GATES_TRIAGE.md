@@ -36,9 +36,9 @@ rationale.
   optional OCR feature path.
 - `hickory-proto` GHSA-q2qq-hmj6-3wpp and `hickory-net` GHSA-3v94-mw7p-v465 —
   the prior `tolerable_risk` dismissals and matching `.cargo/audit.toml`
-  suppressions were removed with issue #175's Iroh 1.3.0 update. The current
+  suppressions were removed with issue #175's Iroh 1.x update. The current
   locked dependency graph contains no Hickory packages, so these advisories no
-  longer apply to this repository. The Iroh 1.3.0 graph also removes the old
+  longer apply to this repository. The Iroh 1.4.1 locked graph also removes the old
   `atomic-polyfill` warning and upgrades `lru` to 0.18.5, above the patched
   minimum. `cargo audit --json` reports zero vulnerabilities and one visible
   informational warning: `paste` 1.0.15 is an unmaintained compile-time macro
@@ -65,7 +65,7 @@ rationale.
   (`aead::OsRng`/`RngCore` renamed, `Array::from_slice` deprecated); deliberately
   deferred, it is security-sensitive code.
 - `sha2` 0.10 -> 0.11 — the prior upstream resolution blocker is gone: Iroh
-  1.3.0 resolves stable `sha2 0.11.0`. The application still directly uses
+  1.4.1 resolves stable `sha2 0.11.0`. The application still directly uses
   `sha2 0.10`; evaluate its API and behavior in a separately tested update.
 - `keyring` 3 -> 4 — API break; `apple-native` feature dropped upstream.
 - `reqwest` 0.12 -> 0.13 — API break; `rustls-tls` feature renamed upstream.
