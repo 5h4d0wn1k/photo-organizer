@@ -123,7 +123,9 @@ class FaceRecognitionApp:
             rgb_target_img = cv2.cvtColor(target_img, cv2.COLOR_BGR2RGB)
             target_encoding = face_recognition.face_encodings(rgb_target_img)
 
-            # Loop through each image in the folder with tqdm for progress indication
+            # Collect the images in the folder; progress is reported through
+            # self.progress_var, not a tqdm bar (tqdm is not a dependency --
+            # this comment used to claim it was).
             image_files = [filename for filename in os.listdir(folder_path) if filename.endswith(('.jpg', '.jpeg', '.png', '.webp'))]
             total_images = len(image_files)
 

@@ -138,7 +138,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for the full development workflow.
 `tools/quick-face-sort/` is a standalone legacy tool (Python + tkinter) that
 sorts a photo folder against a reference face using dlib face encodings. It is
 kept for import/export workflows and is independent of the Photo Organizer
-daemon.
+daemon. It requires Python 3.12 or newer.
 
 ```bash
 pip install -r tools/quick-face-sort/requirements.txt
