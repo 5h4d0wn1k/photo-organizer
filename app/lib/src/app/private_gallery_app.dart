@@ -25,6 +25,10 @@ import '../widgets/app_ui.dart';
 
 enum GalleryClientMode { desktop, mobile }
 
+/// Selects the workspace page to show after an import completes.
+int importLandingIndex({required bool viewDuplicateSummary}) =>
+    viewDuplicateSummary ? 1 : 0;
+
 class PrivateGalleryApp extends StatelessWidget {
   const PrivateGalleryApp({super.key, this.mode});
 
@@ -70,6 +74,7 @@ class _GalleryBootstrapPageState extends State<GalleryBootstrapPage> {
   bool _loading = true;
   bool _submittingSetup = false;
   int _selectedIndex = 0;
+  int _filesRefreshToken = 0;
 
   @override
   void initState() {
@@ -348,9 +353,16 @@ class _GalleryBootstrapPageState extends State<GalleryBootstrapPage> {
       return;
     }
     final session = result.session;
-    // A duplicate-review request lands on the Files tab, which hosts the
-    // duplicate review panel; anything else lands on the gallery as before.
-    setState(() => _selectedIndex = result.reviewDuplicates ? 1 : 0);
+    setState(() {
+      _selectedIndex = importLandingIndex(
+        viewDuplicateSummary: result.viewDuplicateSummary,
+      );
+      if (result.viewDuplicateSummary) {
+        // Narrow layouts preserve every page in an IndexedStack. Bump the
+        // FilesScreen token so its cached local summary is reloaded.
+        _filesRefreshToken++;
+      }
+    });
     _showMessage(
       'Imported ${session.importedAssetIds.length} assets, moved ${session.movedAssetIds.length}, moved ${session.sidecarsMoved} sidecars, skipped ${session.skippedDuplicateIds.length} duplicates.',
     );
@@ -436,6 +448,7 @@ class _GalleryBootstrapPageState extends State<GalleryBootstrapPage> {
           workspace: launchResult.workspace!,
           repository: _repository,
           selectedIndex: _selectedIndex,
+          filesRefreshToken: _filesRefreshToken,
           loading: _loading,
           onSelectIndex: (value) {
             setState(() => _selectedIndex = value);
@@ -471,6 +484,7 @@ class _GalleryWorkspaceShell extends StatelessWidget {
     required this.workspace,
     required this.repository,
     required this.selectedIndex,
+    required this.filesRefreshToken,
     required this.loading,
     required this.onSelectIndex,
     required this.onRefresh,
@@ -499,6 +513,7 @@ class _GalleryWorkspaceShell extends StatelessWidget {
   final WorkspaceSnapshot workspace;
   final GalleryRepository repository;
   final int selectedIndex;
+  final int filesRefreshToken;
   final bool loading;
   final ValueChanged<int> onSelectIndex;
   final Future<void> Function() onRefresh;
@@ -553,7 +568,11 @@ class _GalleryWorkspaceShell extends StatelessWidget {
         },
         onLibraryChanged: onRefresh,
       ),
-      FilesScreen(apiClient: LocalApiClient(), onLibraryChanged: onRefresh),
+      FilesScreen(
+        apiClient: LocalApiClient(),
+        onLibraryChanged: onRefresh,
+        refreshToken: filesRefreshToken,
+      ),
       AlbumsScreen(
         albums: workspace.dashboard.albums,
         libraryRoot: workspace.settings.libraryRoot,

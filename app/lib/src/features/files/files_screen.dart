@@ -12,11 +12,15 @@ class FilesScreen extends StatefulWidget {
     super.key,
     required this.apiClient,
     required this.onLibraryChanged,
+    this.refreshToken = 0,
     this.exportService = const FileExportService(),
   });
 
   final LocalApiClient apiClient;
   final Future<void> Function() onLibraryChanged;
+
+  /// Changing this value refreshes the cached file and duplicate summaries.
+  final int refreshToken;
   final FileExportService exportService;
 
   @override
@@ -37,6 +41,14 @@ class _FilesScreenState extends State<FilesScreen> {
   void initState() {
     super.initState();
     _loadTree();
+  }
+
+  @override
+  void didUpdateWidget(covariant FilesScreen oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.refreshToken != widget.refreshToken) {
+      _loadTree(preferredFolderId: _currentFolder?.id);
+    }
   }
 
   Future<void> _loadTree({String? preferredFolderId}) async {

@@ -5,9 +5,82 @@ import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:http/http.dart' as http;
 import 'package:private_gallery_app/src/api/local_api_client.dart';
+import 'package:private_gallery_app/src/app/private_gallery_app.dart';
 import 'package:private_gallery_app/src/features/files/files_screen.dart';
 
 void main() {
+  testWidgets(
+    'narrow IndexedStack import navigation refreshes duplicate summary',
+    (WidgetTester tester) async {
+      tester.view.physicalSize = const Size(400, 900);
+      tester.view.devicePixelRatio = 1;
+      addTearDown(() {
+        tester.view.resetPhysicalSize();
+        tester.view.resetDevicePixelRatio();
+      });
+
+      final httpClient = _FilesTreeClient()..duplicateCandidates = 2;
+      final apiClient = LocalApiClient(
+        httpClient: httpClient,
+        baseUri: Uri.parse('http://127.0.0.1:4821'),
+      );
+      var selectedIndex = 0;
+      var refreshToken = 0;
+
+      await tester.pumpWidget(
+        MaterialApp(
+          home: StatefulBuilder(
+            builder: (context, setState) => Scaffold(
+              body: Column(
+                children: [
+                  Expanded(
+                    child: IndexedStack(
+                      index: selectedIndex,
+                      children: [
+                        const Center(child: Text('Gallery target')),
+                        FilesScreen(
+                          apiClient: apiClient,
+                          onLibraryChanged: () async {},
+                          refreshToken: refreshToken,
+                        ),
+                      ],
+                    ),
+                  ),
+                  TextButton(
+                    onPressed: () {
+                      setState(() {
+                        httpClient.duplicateCandidates = 7;
+                        selectedIndex = importLandingIndex(
+                          viewDuplicateSummary: true,
+                        );
+                        refreshToken++;
+                      });
+                    },
+                    child: const Text('Complete duplicate import'),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      expect(httpClient.duplicateSummaryRequests, 1);
+      expect(importLandingIndex(viewDuplicateSummary: false), 0);
+      expect(find.text('Gallery target'), findsOneWidget);
+
+      await tester.tap(find.text('Complete duplicate import'));
+      await tester.pumpAndSettle();
+
+      expect(importLandingIndex(viewDuplicateSummary: true), 1);
+      expect(httpClient.duplicateSummaryRequests, 2);
+      expect(find.text('Duplicate review'), findsOneWidget);
+      expect(find.text('7 skipped duplicates across 1 import'), findsOneWidget);
+      expect(find.text('Gallery target'), findsNothing);
+    },
+  );
+
   testWidgets('shows smart file groups from local organization hints', (
     WidgetTester tester,
   ) async {
@@ -83,6 +156,8 @@ void main() {
 class _FilesTreeClient extends http.BaseClient {
   var evictions = 0;
   var pins = 0;
+  var duplicateCandidates = 2;
+  var duplicateSummaryRequests = 0;
 
   @override
   Future<http.StreamedResponse> send(http.BaseRequest request) async {
@@ -134,10 +209,11 @@ class _FilesTreeClient extends http.BaseClient {
       });
     }
     if (request.method == 'GET' && request.url.path == '/duplicates') {
+      duplicateSummaryRequests++;
       return _jsonResponse({
         'generated_at': '2026-05-13T06:00:00Z',
         'duplicate_assets': 1,
-        'duplicate_candidates': 2,
+        'duplicate_candidates': duplicateCandidates,
         'protected_bytes': 4096,
         'sessions_with_duplicates': 1,
         'entries': [
@@ -145,8 +221,8 @@ class _FilesTreeClient extends http.BaseClient {
             'asset_id': 'asset-1',
             'media_kind': 'document',
             'original_bytes': 2048,
-            'duplicate_candidates': 2,
-            'protected_bytes': 4096,
+            'duplicate_candidates': duplicateCandidates,
+            'protected_bytes': duplicateCandidates * 2048,
             'first_seen_at': '2026-05-13T06:00:00Z',
             'last_seen_at': '2026-05-13T06:05:00Z',
             'import_session_ids': ['session-1'],

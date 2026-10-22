@@ -170,7 +170,7 @@ void main() {
     await tester.pumpAndSettle();
 
     expect(find.text('Import result'), findsOneWidget);
-    final reviewButton = find.text('Review 2 skipped duplicates');
+    final reviewButton = find.text('View duplicate summary');
     expect(reviewButton, findsOneWidget);
     await tester.scrollUntilVisible(
       reviewButton,
@@ -181,7 +181,7 @@ void main() {
     await tester.pumpAndSettle();
 
     expect(outcome, isNotNull);
-    expect(outcome!.reviewDuplicates, isTrue);
+    expect(outcome!.viewDuplicateSummary, isTrue);
     expect(outcome!.session.skippedDuplicateIds, ['dup-1', 'dup-2']);
   });
 
@@ -224,7 +224,7 @@ void main() {
     await tester.pumpAndSettle();
 
     expect(find.text('Import result'), findsOneWidget);
-    expect(find.textContaining('Review'), findsNothing);
+    expect(find.text('View duplicate summary'), findsNothing);
   });
 }
 
@@ -789,4 +789,3 @@ ImportSession _session({
     selectedOutsideSourceCount: 0,
   );
 }
-

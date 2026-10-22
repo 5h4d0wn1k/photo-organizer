@@ -19,14 +19,15 @@ class ImportScreen extends StatefulWidget {
 }
 
 /// What the import screen hands back: the committed session, plus whether
-/// the user asked to review its skipped duplicates (P2: one-click review).
-/// The caller switches to the Files tab, which hosts the duplicate review
-/// panel, instead of the default gallery landing.
+/// the user asked to view the library-wide duplicate summary.
 class ImportOutcome {
-  const ImportOutcome({required this.session, this.reviewDuplicates = false});
+  const ImportOutcome({
+    required this.session,
+    this.viewDuplicateSummary = false,
+  });
 
   final ImportSession session;
-  final bool reviewDuplicates;
+  final bool viewDuplicateSummary;
 }
 
 class _ImportScreenState extends State<ImportScreen> {
@@ -426,13 +427,14 @@ class _ImportScreenState extends State<ImportScreen> {
               const SizedBox(height: 16),
               _CommitResultPanel(
                 session: _committedSession!,
-                onReviewDuplicates: _committedSession!.skippedDuplicateIds.isNotEmpty
+                onViewDuplicateSummary:
+                    _committedSession!.skippedDuplicateIds.isNotEmpty
                     ? () => Navigator.of(context).pop(
-                          ImportOutcome(
-                            session: _committedSession!,
-                            reviewDuplicates: true,
-                          ),
-                        )
+                        ImportOutcome(
+                          session: _committedSession!,
+                          viewDuplicateSummary: true,
+                        ),
+                      )
                     : null,
               ),
             ],
@@ -474,9 +476,9 @@ class _ImportScreenState extends State<ImportScreen> {
                 if (_committedSession != null)
                   FilledButton.tonalIcon(
                     onPressed: () {
-                      Navigator.of(context).pop(
-                        ImportOutcome(session: _committedSession!),
-                      );
+                      Navigator.of(
+                        context,
+                      ).pop(ImportOutcome(session: _committedSession!));
                     },
                     icon: const Icon(Icons.check_circle_outline),
                     label: const Text('Done and refresh library'),
@@ -740,13 +742,15 @@ class _PreflightChip extends StatelessWidget {
 }
 
 class _CommitResultPanel extends StatelessWidget {
-  const _CommitResultPanel({required this.session, this.onReviewDuplicates});
+  const _CommitResultPanel({
+    required this.session,
+    this.onViewDuplicateSummary,
+  });
 
   final ImportSession session;
 
-  /// Shown only when the session skipped duplicates; navigates to the Files
-  /// tab's duplicate review panel. Null hides the button.
-  final VoidCallback? onReviewDuplicates;
+  /// Shown only when duplicates were skipped; opens the library summary.
+  final VoidCallback? onViewDuplicateSummary;
 
   @override
   Widget build(BuildContext context) {
@@ -768,14 +772,12 @@ class _CommitResultPanel extends StatelessWidget {
             Text(
               '${session.importedAssetIds.length} imported • ${session.movedAssetIds.length} moved • $duplicateCount duplicates skipped • $failedCount failed • ${session.sidecarsMoved} sidecars moved',
             ),
-            if (onReviewDuplicates != null) ...[
+            if (onViewDuplicateSummary != null) ...[
               const SizedBox(height: 12),
               OutlinedButton.icon(
-                onPressed: onReviewDuplicates,
+                onPressed: onViewDuplicateSummary,
                 icon: const Icon(Icons.content_copy_outlined),
-                label: Text(
-                  'Review $duplicateCount skipped duplicate${duplicateCount == 1 ? '' : 's'}',
-                ),
+                label: const Text('View duplicate summary'),
               ),
             ],
             if (failedCount > 0) ...[
