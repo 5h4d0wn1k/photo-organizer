@@ -50,6 +50,15 @@
 #      So this gate exercises a JIT debug build. A device-only failure -- AOT
 #      snapshotting, the dylib embedded in App.framework, bitcode/signing
 #      flags, device-only plugins -- is invisible here.
+#   3. It does not check the CPU architecture of the native daemon, only its
+#      Mach-O *platform* (see EXPECTED_PLATFORM / assert_macho_platform:
+#      `ios-simulator`). The workflow builds the simulator slice for
+#      `aarch64-apple-ios-sim`, and `macos-latest` is Apple silicon, so the pair
+#      is right today. On an Intel runner an arm64-sim daemon would pass this gate
+#      and then fail to load -- the platform would read `ios-simulator` in both
+#      cases, and that is the only thing compared. Recorded as a known gap rather
+#      than implied coverage: this gate proves the daemon is a simulator binary,
+#      not that it is the right simulator binary for the machine inspecting it.
 #   3. It proves nothing about App Store or TestFlight acceptance, and nothing
 #      about installation on a real iPhone.
 #   4. It is not real hardware: no real camera, no real Photos library, no real
