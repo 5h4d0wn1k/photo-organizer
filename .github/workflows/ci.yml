@@ -266,6 +266,8 @@ jobs:
       # declared permissions) is a security property: the workflow file decides
       # what code runs with what secrets. scripts/tests/workflow_hygiene_test.sh
       # asserts it from the parsed YAML, mutation-tested.
+      - name: Workspace status regression tests
+        run: make workspace-status-test
       - name: Workflow hygiene
         run: bash scripts/tests/workflow_hygiene_test.sh
       # 3.6s. Proves the hygiene assertions above actually fail when the

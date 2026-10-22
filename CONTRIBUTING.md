@@ -129,3 +129,27 @@ never manually.
 
 Be kind and constructive. All interactions fall under our
 [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md).
+## Resume a development session
+
+Run `make workspace-status` for an offline inventory of registered worktrees,
+changed filenames, ignored-entry counts, local branches and missing upstreams.
+The command asks Git for status and does not modify worktrees. Git may inspect
+tracked files and use configured filters while determining status; fsmonitor
+hooks are disabled for these commands. Paths and
+branch names stay on your machine; file contents and ignored filenames are never
+included. Reports can contain sensitive local paths, so keep them local.
+
+For a dated snapshot including live GitHub PR/check metadata:
+
+```bash
+python3 scripts/workspace_status.py --github \
+  --output-dir "_local/reports/status-$(date +%Y%m%d-%H%M%S)"
+```
+
+The output directory must be new. JSON and Markdown reports include timestamps
+and commit IDs. GitHub access is opt-in and requires `gh` authentication; failed
+queries or inaccessible worktrees are marked unavailable and exit with status 2.
+Dirty worktrees and missing upstreams are reported without changing them.
+Ignored directories count as one entry, avoiding an expensive build-cache scan.
+Use the release checklist and required CI checks before any merge or release;
+this inventory does not establish release readiness.
