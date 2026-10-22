@@ -236,6 +236,7 @@ pub struct GalleryService {
 
 impl GalleryService {
     pub fn new(config: AppConfig) -> Result<Self, ServiceError> {
+        vault_store::validate_key_storage(&config).map_err(vault_store_error)?;
         if !config.developer_mode
             && !config.allow_remote_mobile
             && !model_registry::is_loopback_host(&config.bind_host)
@@ -6486,15 +6487,33 @@ fn refresh_blob_records_impl(
         if blob_needs_local_seal(state, blob_id, &library_root) {
             let source_path = asset_file_path(&asset, &library_root);
             if source_path.is_file() {
-                match vault_store::seal_asset(
+                let has_encrypted_history = state.blob_records.iter().any(|blob| {
+                    blob.vault_id == vault.id
+                        && blob.encryption_key_version == vault.key_version
+                        && (!blob.encrypted_hash.starts_with("unsealed-")
+                            || state
+                                .blob_chunks
+                                .iter()
+                                .any(|chunk| chunk.blob_id == blob.id && chunk.encrypted_bytes > 0))
+                });
+                match vault_store::provision_vault_key_if_new(
                     config,
                     &library_root,
                     vault.id,
                     vault.key_version,
-                    blob_id,
-                    &asset,
-                    &source_path,
-                ) {
+                    has_encrypted_history,
+                )
+                .and_then(|_| {
+                    vault_store::seal_asset(
+                        config,
+                        &library_root,
+                        vault.id,
+                        vault.key_version,
+                        blob_id,
+                        &asset,
+                        &source_path,
+                    )
+                }) {
                     Ok(sealed) => {
                         if let Some(blob) = state
                             .blob_records
