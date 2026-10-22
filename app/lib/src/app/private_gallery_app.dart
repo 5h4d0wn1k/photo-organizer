@@ -357,11 +357,9 @@ class _GalleryBootstrapPageState extends State<GalleryBootstrapPage> {
       _selectedIndex = importLandingIndex(
         viewDuplicateSummary: result.viewDuplicateSummary,
       );
-      if (result.viewDuplicateSummary) {
-        // Narrow layouts preserve every page in an IndexedStack. Bump the
-        // FilesScreen token so its cached local summary is reloaded.
-        _filesRefreshToken++;
-      }
+      // Narrow layouts preserve every page in an IndexedStack. Every
+      // committed import invalidates the cached file and duplicate summaries.
+      _filesRefreshToken++;
     });
     _showMessage(
       'Imported ${session.importedAssetIds.length} assets, moved ${session.movedAssetIds.length}, moved ${session.sidecarsMoved} sidecars, skipped ${session.skippedDuplicateIds.length} duplicates.',

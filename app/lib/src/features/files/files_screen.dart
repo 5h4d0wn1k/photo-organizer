@@ -36,6 +36,7 @@ class _FilesScreenState extends State<FilesScreen> {
   bool _includeTrashed = false;
   _FilesViewMode _viewMode = _FilesViewMode.folders;
   String? _error;
+  int _loadGeneration = 0;
 
   @override
   void initState() {
@@ -52,6 +53,7 @@ class _FilesScreenState extends State<FilesScreen> {
   }
 
   Future<void> _loadTree({String? preferredFolderId}) async {
+    final generation = ++_loadGeneration;
     setState(() {
       _loading = true;
       _error = null;
@@ -63,7 +65,7 @@ class _FilesScreenState extends State<FilesScreen> {
       final duplicateSummary = await _safeDuplicateReviewSummary();
       final preferred = preferredFolderId ?? _currentFolder?.id;
       final current = _folderById(tree, preferred) ?? tree.roots.firstOrNull;
-      if (!mounted) {
+      if (!mounted || generation != _loadGeneration) {
         return;
       }
       setState(() {
@@ -73,7 +75,7 @@ class _FilesScreenState extends State<FilesScreen> {
         _loading = false;
       });
     } catch (error) {
-      if (!mounted) {
+      if (!mounted || generation != _loadGeneration) {
         return;
       }
       setState(() {

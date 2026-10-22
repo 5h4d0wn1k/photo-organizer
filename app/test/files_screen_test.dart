@@ -9,8 +9,61 @@ import 'package:private_gallery_app/src/app/private_gallery_app.dart';
 import 'package:private_gallery_app/src/features/files/files_screen.dart';
 
 void main() {
+  testWidgets('older duplicate response cannot overwrite a newer refresh', (
+    WidgetTester tester,
+  ) async {
+    final httpClient = _FilesTreeClient()
+      ..deferDuplicateSummaryResponses = true;
+    final apiClient = LocalApiClient(
+      httpClient: httpClient,
+      baseUri: Uri.parse('http://127.0.0.1:4821'),
+    );
+    var refreshToken = 0;
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: StatefulBuilder(
+          builder: (context, setState) => Scaffold(
+            body: Column(
+              children: [
+                Expanded(
+                  child: FilesScreen(
+                    apiClient: apiClient,
+                    onLibraryChanged: () async {},
+                    refreshToken: refreshToken,
+                  ),
+                ),
+                TextButton(
+                  onPressed: () => setState(() => refreshToken++),
+                  child: const Text('Refresh'),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+    await tester.pump();
+    await tester.pump();
+    expect(httpClient.duplicateSummaryRequests, 1);
+
+    await tester.tap(find.text('Refresh'));
+    await tester.pump();
+    await tester.pump();
+    expect(httpClient.duplicateSummaryRequests, 2);
+
+    httpClient.completeDuplicateSummary(1, candidates: 7);
+    await tester.pumpAndSettle();
+    expect(find.text('7 skipped duplicates across 1 import'), findsOneWidget);
+
+    httpClient.completeDuplicateSummary(0, candidates: 2);
+    await tester.pumpAndSettle();
+    expect(find.text('7 skipped duplicates across 1 import'), findsOneWidget);
+    expect(find.text('2 skipped duplicates across 1 import'), findsNothing);
+  });
+
   testWidgets(
-    'narrow IndexedStack import navigation refreshes duplicate summary',
+    'narrow Done import refreshes summary before later opening Files',
     (WidgetTester tester) async {
       tester.view.physicalSize = const Size(400, 900);
       tester.view.devicePixelRatio = 1;
@@ -51,12 +104,16 @@ void main() {
                       setState(() {
                         httpClient.duplicateCandidates = 7;
                         selectedIndex = importLandingIndex(
-                          viewDuplicateSummary: true,
+                          viewDuplicateSummary: false,
                         );
                         refreshToken++;
                       });
                     },
-                    child: const Text('Complete duplicate import'),
+                    child: const Text('Done with duplicate import'),
+                  ),
+                  TextButton(
+                    onPressed: () => setState(() => selectedIndex = 1),
+                    child: const Text('Open Files'),
                   ),
                 ],
               ),
@@ -70,11 +127,15 @@ void main() {
       expect(importLandingIndex(viewDuplicateSummary: false), 0);
       expect(find.text('Gallery target'), findsOneWidget);
 
-      await tester.tap(find.text('Complete duplicate import'));
+      await tester.tap(find.text('Done with duplicate import'));
       await tester.pumpAndSettle();
 
       expect(importLandingIndex(viewDuplicateSummary: true), 1);
+      expect(find.text('Gallery target'), findsOneWidget);
       expect(httpClient.duplicateSummaryRequests, 2);
+
+      await tester.tap(find.text('Open Files'));
+      await tester.pumpAndSettle();
       expect(find.text('Duplicate review'), findsOneWidget);
       expect(find.text('7 skipped duplicates across 1 import'), findsOneWidget);
       expect(find.text('Gallery target'), findsNothing);
@@ -158,6 +219,15 @@ class _FilesTreeClient extends http.BaseClient {
   var pins = 0;
   var duplicateCandidates = 2;
   var duplicateSummaryRequests = 0;
+  bool deferDuplicateSummaryResponses = false;
+  final Map<int, Completer<http.StreamedResponse>> _pendingDuplicateResponses =
+      {};
+
+  void completeDuplicateSummary(int requestIndex, {required int candidates}) {
+    _pendingDuplicateResponses
+        .remove(requestIndex)!
+        .complete(_jsonResponse(_duplicateSummaryJson(candidates)));
+  }
 
   @override
   Future<http.StreamedResponse> send(http.BaseRequest request) async {
@@ -210,27 +280,12 @@ class _FilesTreeClient extends http.BaseClient {
     }
     if (request.method == 'GET' && request.url.path == '/duplicates') {
       duplicateSummaryRequests++;
-      return _jsonResponse({
-        'generated_at': '2026-05-13T06:00:00Z',
-        'duplicate_assets': 1,
-        'duplicate_candidates': duplicateCandidates,
-        'protected_bytes': 4096,
-        'sessions_with_duplicates': 1,
-        'entries': [
-          {
-            'asset_id': 'asset-1',
-            'media_kind': 'document',
-            'original_bytes': 2048,
-            'duplicate_candidates': duplicateCandidates,
-            'protected_bytes': duplicateCandidates * 2048,
-            'first_seen_at': '2026-05-13T06:00:00Z',
-            'last_seen_at': '2026-05-13T06:05:00Z',
-            'import_session_ids': ['session-1'],
-            'source_kinds': ['folder'],
-          },
-        ],
-        'privacy_detail': 'Computed locally.',
-      });
+      if (deferDuplicateSummaryResponses) {
+        final response = Completer<http.StreamedResponse>();
+        _pendingDuplicateResponses[duplicateSummaryRequests - 1] = response;
+        return response.future;
+      }
+      return _jsonResponse(_duplicateSummaryJson(duplicateCandidates));
     }
     if (request.method == 'GET' &&
         request.url.path == '/assets/asset-1/availability') {
@@ -264,6 +319,28 @@ class _FilesTreeClient extends http.BaseClient {
     }
     return _jsonResponse({'error': 'not found'}, statusCode: 404);
   }
+
+  Map<String, Object?> _duplicateSummaryJson(int candidates) => {
+    'generated_at': '2026-05-13T06:00:00Z',
+    'duplicate_assets': 1,
+    'duplicate_candidates': candidates,
+    'protected_bytes': 4096,
+    'sessions_with_duplicates': 1,
+    'entries': [
+      {
+        'asset_id': 'asset-1',
+        'media_kind': 'document',
+        'original_bytes': 2048,
+        'duplicate_candidates': candidates,
+        'protected_bytes': candidates * 2048,
+        'first_seen_at': '2026-05-13T06:00:00Z',
+        'last_seen_at': '2026-05-13T06:05:00Z',
+        'import_session_ids': ['session-1'],
+        'source_kinds': ['folder'],
+      },
+    ],
+    'privacy_detail': 'Computed locally.',
+  };
 
   Map<String, Object?> _availabilityJson({
     String state = 'under_replicated',
