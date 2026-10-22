@@ -355,7 +355,7 @@ fn validate_backend_selection(value: Option<&std::ffi::OsStr>) -> Result<(), Vau
 /// regeneration.
 pub fn provision_vault_key_if_new(
     config: &AppConfig,
-    _library_root: &Path,
+    library_root: &Path,
     vault_id: Uuid,
     key_version: u32,
     has_encrypted_history: bool,
@@ -387,12 +387,19 @@ pub fn provision_vault_key_if_new(
     fs2::FileExt::lock_exclusive(&lock).map_err(io_error)?;
     let marker = marker_root.join(format!("{stem}.initialized"));
     // The caller supplies history for this exact key version from the catalog.
-    // A vault-wide ciphertext directory cannot be used here: it may contain
-    // valid ciphertext written under an older key version. For new writes, the
-    // initialized marker is durably persisted before sealing can create any
-    // ciphertext, so interrupted seals remain protected even if their catalog
-    // transaction did not commit.
-    let history = has_encrypted_history;
+    // Before this lifecycle protocol existed, an interrupted seal could leave
+    // ciphertext without catalog rows or a marker, so retain the conservative
+    // vault-wide check for wholly unmarked legacy vaults. Once any version has
+    // a lifecycle marker, new ciphertext is guaranteed to be preceded by that
+    // version's durable marker and history can be checked per key version.
+    let has_any_lifecycle_marker = has_any_key_lifecycle_marker(&marker_root, vault_id)?;
+    let has_unmarked_legacy_ciphertext = !has_any_lifecycle_marker
+        && library_root
+            .join("vaults")
+            .join(vault_id.to_string())
+            .try_exists()
+            .map_err(io_error)?;
+    let history = has_encrypted_history || has_unmarked_legacy_ciphertext;
     #[cfg(test)]
     {
         let path = file_key_path(config, &key_id);
@@ -432,6 +439,30 @@ pub fn provision_vault_key_if_new(
         })?;
     }
     Ok(())
+}
+
+fn has_any_key_lifecycle_marker(
+    marker_root: &Path,
+    vault_id: Uuid,
+) -> Result<bool, VaultStoreError> {
+    let entries = match fs::read_dir(marker_root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(io_error(error)),
+    };
+    let prefix = format!("{vault_id}-v");
+    for entry in entries {
+        let entry = entry.map_err(io_error)?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if name.starts_with(&prefix)
+            && (name.ends_with(".initialized") || name.ends_with(".provisioning"))
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn prepare_key_version(
@@ -781,14 +812,19 @@ mod tests {
         };
         let library = root.join("library");
         let vault_id = Uuid::new_v4();
-        // The on-disk layout is vault scoped, not key-version scoped. Existing
-        // v1 ciphertext must not make a missing v2 key look lost.
+        // The on-disk layout is vault scoped, not key-version scoped. A v1
+        // lifecycle marker means v2 history can safely be version scoped.
         let older_version_ciphertext = library
             .join("vaults")
             .join(vault_id.to_string())
             .join("blobs/older-version/00000000.pgblob");
         fs::create_dir_all(older_version_ciphertext.parent().unwrap()).unwrap();
         fs::write(&older_version_ciphertext, b"v1 ciphertext").unwrap();
+        let v1_marker = root
+            .join("security/vault-key-initialization")
+            .join(format!("{vault_id}-v1.initialized"));
+        fs::create_dir_all(v1_marker.parent().unwrap()).unwrap();
+        fs::write(v1_marker, b"initialized-v1\n").unwrap();
 
         provision_vault_key_if_new(&config, &library, vault_id, 2, false).unwrap();
         assert!(load_existing_vault_key(&config, vault_id, 2).is_ok());
@@ -796,6 +832,22 @@ mod tests {
             fs::read(older_version_ciphertext).unwrap(),
             b"v1 ciphertext"
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn unmarked_legacy_ciphertext_blocks_ambiguous_key_provisioning() {
+        let (root, _) = marker_fixture();
+        let config = AppConfig {
+            runtime_root: root.clone(),
+            ..AppConfig::default()
+        };
+        let library = root.join("library");
+        let vault_id = Uuid::new_v4();
+        fs::create_dir_all(library.join("vaults").join(vault_id.to_string())).unwrap();
+
+        assert!(provision_vault_key_if_new(&config, &library, vault_id, 2, false).is_err());
+        assert!(load_existing_vault_key(&config, vault_id, 2).is_err());
         fs::remove_dir_all(root).unwrap();
     }
 
