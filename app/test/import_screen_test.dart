@@ -179,6 +179,11 @@ void main() {
     await tester.tap(find.text('open import'));
     await tester.pumpAndSettle();
 
+    await tester.enterText(
+      find.widgetWithText(TextField, 'Source path'),
+      '/tmp/source',
+    );
+    await tester.pumpAndSettle();
     await tester.tap(find.widgetWithText(FilledButton, 'Scan source'));
     await tester.pumpAndSettle();
     await tester.scrollUntilVisible(
@@ -245,6 +250,11 @@ void main() {
       );
       await tester.tap(find.text('open import'));
       await tester.pumpAndSettle();
+      await tester.enterText(
+        find.widgetWithText(TextField, 'Source path'),
+        '/tmp/source',
+      );
+      await tester.pumpAndSettle();
       await tester.tap(find.widgetWithText(FilledButton, 'Scan source'));
       await tester.pumpAndSettle();
       await tester.scrollUntilVisible(
@@ -293,6 +303,11 @@ void main() {
     );
     await tester.pumpAndSettle();
 
+    await tester.enterText(
+      find.widgetWithText(TextField, 'Source path'),
+      '/tmp/source',
+    );
+    await tester.pumpAndSettle();
     await tester.tap(find.widgetWithText(FilledButton, 'Scan source'));
     await tester.pumpAndSettle();
     await tester.scrollUntilVisible(
@@ -312,8 +327,12 @@ class _FakeGalleryRepository implements GalleryRepository {
   _FakeGalleryRepository({
     required this.scanSession,
     required this.commitSession,
-    this.vaults = const [],
-  });
+    List<Vault>? vaults,
+  }) : vaults =
+           vaults ??
+           [
+             Vault.fromJson(const {'id': 'vault-1', 'name': 'Personal'}),
+           ];
 
   final ImportSession scanSession;
   final ImportSession commitSession;
