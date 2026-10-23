@@ -37,10 +37,10 @@ packages:
     dependency: transitive
     description:
       name: archive
-      sha256: a96e8b390886ee8abb49b7bd3ac8df6f451c621619f52a26e815fdcf568959ff
+      sha256: "0d58d1fa1fddf6588251ccf2819f3fb3b6d0452c1b2813ac7413a05592bfbefe"
       url: "https://pub.dev"
     source: hosted
-    version: "4.0.9"
+    version: "4.5.2"
   args:
     dependency: transitive
     description:
@@ -356,10 +356,10 @@ packages:
     dependency: transitive
     description:
       name: gotrue
-      sha256: cd73a6de4198baca71341177bed233673d7965aca2a0257ab5561feb2abdaf59
+      sha256: cca816226824160e40d149816fd89740cc64dda1eaa3d9161e334330b18bba89
       url: "https://pub.dev"
     source: hosted
-    version: "2.27.2"
+    version: "2.27.3"
   gtk:
     dependency: transitive
     description:
@@ -404,10 +404,10 @@ packages:
     dependency: "direct main"
     description:
       name: image
-      sha256: a1e7f4951e538a568e14b856702afc9ae1d2f4b202daced8d22c1b9cd211ce89
+      sha256: "89ed75b2f8231fe676808c5564f9590d728024ded7ac782a7ed8474f1c95b72a"
       url: "https://pub.dev"
     source: hosted
-    version: "4.10.1"
+    version: "4.12.0"
   intl:
     dependency: "direct main"
     description:
@@ -732,10 +732,10 @@ packages:
     dependency: transitive
     description:
       name: realtime_client
-      sha256: ff731ce21fd775e0d7accfb1eaccdcf47b687610720822ba8b9fd8f5bccb2bd9
+      sha256: "2ef680d83ba2c0f76019d16194ca7067fa2458b2d4091b52323a9ca4a964fd40"
       url: "https://pub.dev"
     source: hosted
-    version: "2.13.0"
+    version: "2.13.2"
   record_use:
     dependency: transitive
     description:
@@ -748,10 +748,10 @@ packages:
     dependency: "direct main"
     description:
       name: share_plus
-      sha256: "34f00f9becd2743c1fb05363d624f9f70d37f7ccdcdda47450bc0b8c9d327b8c"
+      sha256: db40767f130189d53f3ae8a6393c217ff4a492da1baff718a9873679c0c00224
       url: "https://pub.dev"
     source: hosted
-    version: "13.3.0"
+    version: "13.3.1"
   share_plus_platform_interface:
     dependency: transitive
     description:
@@ -841,10 +841,10 @@ packages:
     dependency: transitive
     description:
       name: storage_client
-      sha256: b16aaaadcef812fda31fca056f50fb3485afe64f94e5d537d30f485ed55dec5e
+      sha256: b951281b8e2b293460f0e6cc4e866f2546681390f0e37d24fbbd7b4a0deb27a3
       url: "https://pub.dev"
     source: hosted
-    version: "2.8.0"
+    version: "2.8.1"
   stream_channel:
     dependency: transitive
     description:
@@ -865,10 +865,10 @@ packages:
     dependency: transitive
     description:
       name: supabase
-      sha256: "0645becf76f49d2633d8ec9bfd78ab98dce42de6899da8fa1f069c2c836d5d23"
+      sha256: "123fe08792b24e5e7c4b9a01145de8e95ebaa9183cd5f3c9d48dd2ff890f28a6"
       url: "https://pub.dev"
     source: hosted
-    version: "2.16.1"
+    version: "2.16.5"
   supabase_common:
     dependency: transitive
     description:
@@ -881,10 +881,10 @@ packages:
     dependency: "direct main"
     description:
       name: supabase_flutter
-      sha256: "26eb3d3b71bcc5651551e64d6b131ba929ea261998570bbcc90356b1b42fd532"
+      sha256: "48bbde226e68bdb293020859a1bfa42d0f3bd2239992fba0ec4f9194cbb842e6"
       url: "https://pub.dev"
     source: hosted
-    version: "2.17.2"
+    version: "2.18.3"
   term_glyph:
     dependency: transitive
     description:
@@ -1001,10 +1001,10 @@ packages:
     dependency: "direct main"
     description:
       name: video_player
-      sha256: "8c837b570dccb9ae6ff73d2e0b03c7e708bfefd3bd1194faa7f3e7f200dfc399"
+      sha256: "07ae1e03f2d4c8e2e9a75ee678f90acbc4506d4458a9c628512d119a1eee5754"
       url: "https://pub.dev"
     source: hosted
-    version: "2.14.0"
+    version: "2.14.1"
   video_player_android:
     dependency: transitive
     description:
