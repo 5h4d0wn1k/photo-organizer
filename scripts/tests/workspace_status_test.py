@@ -4,8 +4,7 @@ import os
 from pathlib import Path
 import subprocess
 import tempfile
-import unittest
-from unittest import mock
+from unittest import TestCase, main, mock
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'workspace_status.py'
 spec = importlib.util.spec_from_file_location('workspace_status', SCRIPT)
@@ -13,7 +12,7 @@ status = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(status)
 
 
-class WorkspaceStatusTest(unittest.TestCase):
+class WorkspaceStatusTest(TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix='workspace status ')
         self.addCleanup(self.temp.cleanup)
@@ -85,6 +84,34 @@ class WorkspaceStatusTest(unittest.TestCase):
         self.assertNotIn('<img', text)
         self.assertNotIn('](', text)
 
+    def test_disk_requirement_boundaries_and_unavailable(self):
+        from collections import namedtuple
+        usage = namedtuple('usage', 'total used free')
+        with mock.patch.object(status.shutil, 'disk_usage', return_value=usage(20*1024**3, 10*1024**3, 10*1024**3)):
+            equal = status.collect(self.root, minimum_free_gib=10)
+            low = status.collect(self.root, minimum_free_gib=11)
+        self.assertIs(equal['disk']['requirement_met'], True)
+        self.assertIs(low['disk']['requirement_met'], False)
+        self.assertIn('Free-space requirement: 11 GiB; FAIL', status.markdown(low))
+        with mock.patch.object(status.shutil, 'disk_usage', side_effect=OSError):
+            unavailable = status.collect(self.root, minimum_free_gib=0)
+        self.assertEqual(unavailable['disk']['status'], 'unavailable')
+        self.assertIs(unavailable['disk']['requirement_met'], False)
+        self.assertIn('UNAVAILABLE: filesystem capacity', status.markdown(unavailable))
+
+    def test_disk_preflight_cli_exit_codes(self):
+        from collections import namedtuple
+        usage = namedtuple('usage', 'total used free')
+        for free, wanted in [(10*1024**3, 0), (9*1024**3, 2)]:
+            with mock.patch.object(status.shutil, 'disk_usage', return_value=usage(20*1024**3, 20*1024**3-free, free)), mock.patch('sys.argv', [str(SCRIPT), '--repo', str(self.root), '--require-free-gib', '10']), mock.patch('builtins.print'):
+                self.assertEqual(status.main(), wanted)
+        with mock.patch.object(status.shutil, 'disk_usage', side_effect=OSError), mock.patch('sys.argv', [str(SCRIPT), '--repo', str(self.root)]), mock.patch('builtins.print'):
+            self.assertEqual(status.main(), 2)
+        for argument in ['-1', 'nan', '1.5']:
+            with mock.patch('sys.argv', [str(SCRIPT), '--require-free-gib', argument]), mock.patch('sys.stderr'), self.assertRaises(SystemExit) as caught:
+                status.main()
+            self.assertEqual(caught.exception.code, 2)
+
     def test_output_refuses_existing_directory(self):
         dest = Path(self.temp.name) / 'report'
         args = ['python3', str(SCRIPT), '--repo', str(self.root), '--output-dir', str(dest)]
@@ -97,4 +124,4 @@ class WorkspaceStatusTest(unittest.TestCase):
 
 
 if __name__ == '__main__':
-    unittest.main()
+    main()
