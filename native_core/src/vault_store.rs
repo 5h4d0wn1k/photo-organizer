@@ -15,6 +15,7 @@ use zeroize::Zeroizing;
 
 use crate::{config::AppConfig, domain::Asset};
 
+#[cfg(not(test))]
 const KEYRING_SERVICE: &str = "private-gallery-vaults";
 pub const CHUNK_BYTES: usize = 64 * 1024 * 1024;
 
@@ -57,7 +58,7 @@ pub fn seal_asset(
     asset: &Asset,
     source_path: &Path,
 ) -> Result<SealedBlob, VaultStoreError> {
-    let key = load_or_create_vault_key(config, vault_id, key_version)?;
+    let key = load_existing_vault_key(config, vault_id, key_version)?;
     let cipher = ChaCha20Poly1305::new(Key::from_slice(key.as_ref()));
     let mut source = fs::File::open(source_path).map_err(io_error)?;
     let mut buffer = vec![0_u8; CHUNK_BYTES];
@@ -317,25 +318,245 @@ pub fn key_reference(vault_id: Uuid, key_version: u32) -> String {
     format!("vault-key:{vault_id}:v{key_version}")
 }
 
-fn load_or_create_vault_key(
+/// Reject insecure production selection before opening or mutating the library.
+pub fn validate_key_storage(config: &AppConfig) -> Result<(), VaultStoreError> {
+    validate_backend_selection(std::env::var_os("PRIVATE_GALLERY_VAULT_KEY_STORAGE").as_deref())?;
+    #[cfg(not(test))]
+    if match config
+        .runtime_root
+        .join("security/vault-keys")
+        .symlink_metadata()
+    {
+        Ok(_) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => return Err(io_error(error)),
+    } {
+        return Err(VaultStoreError::KeyStorage(
+            "legacy plaintext vault keys detected; preserve the library and recover the exact keys into OS secure storage before starting; automatic migration is unavailable".into()));
+    }
+    #[cfg(test)]
+    let _ = config;
+    Ok(())
+}
+
+fn validate_backend_selection(value: Option<&std::ffi::OsStr>) -> Result<(), VaultStoreError> {
+    match value {
+        None => Ok(()),
+        Some(value) if value == "keyring" => Ok(()),
+        _ => Err(VaultStoreError::KeyStorage(
+            "PRIVATE_GALLERY_VAULT_KEY_STORAGE only supports keyring; plaintext file storage is forbidden".into())),
+    }
+}
+
+/// Provision only a never-initialized key version. The marker is durable before
+/// touching the provider. An interrupted provisioning attempt may retry only
+/// while the marker still says `Provisioning` and no encrypted-history evidence
+/// exists; initialized or unknown states require exact-key recovery instead of
+/// regeneration.
+pub fn provision_vault_key_if_new(
     config: &AppConfig,
+    library_root: &Path,
     vault_id: Uuid,
     key_version: u32,
-) -> Result<Zeroizing<[u8; 32]>, VaultStoreError> {
+    has_encrypted_history: bool,
+) -> Result<(), VaultStoreError> {
+    validate_key_storage(config)?;
     let key_id = key_reference(vault_id, key_version);
-    if cfg!(test)
-        || std::env::var("PRIVATE_GALLERY_VAULT_KEY_STORAGE")
-            .map(|value| value == "file")
-            .unwrap_or(false)
-    {
-        return load_or_create_file_key(config, &key_id);
+    let marker_root = config
+        .runtime_root
+        .join("security/vault-key-initialization");
+    fs::create_dir_all(&marker_root).map_err(io_error)?;
+    #[cfg(unix)]
+    for directory in [
+        &config.runtime_root,
+        &config.runtime_root.join("security"),
+        &marker_root,
+    ] {
+        fs::File::open(directory)
+            .and_then(|file| file.sync_all())
+            .map_err(io_error)?;
     }
+    let stem = format!("{vault_id}-v{key_version}");
+    let lock = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(marker_root.join(format!("{stem}.lock")))
+        .map_err(io_error)?;
+    fs2::FileExt::lock_exclusive(&lock).map_err(io_error)?;
+    let marker = marker_root.join(format!("{stem}.initialized"));
+    // The caller supplies history for this exact key version from the catalog.
+    // Before this lifecycle protocol existed, an interrupted seal could leave
+    // ciphertext without catalog rows or a marker, so retain the conservative
+    // vault-wide check for wholly unmarked legacy vaults. Once any version has
+    // a lifecycle marker, new ciphertext is guaranteed to be preceded by that
+    // version's durable marker and history can be checked per key version.
+    let has_any_lifecycle_marker = has_any_key_lifecycle_marker(&marker_root, vault_id)?;
+    let has_unmarked_legacy_ciphertext = !has_any_lifecycle_marker
+        && library_root
+            .join("vaults")
+            .join(vault_id.to_string())
+            .try_exists()
+            .map_err(io_error)?;
+    let history = has_encrypted_history || has_unmarked_legacy_ciphertext;
+    #[cfg(test)]
+    {
+        let path = file_key_path(config, &key_id);
+        let stored = match fs::read_to_string(&path) {
+            Ok(value) => Ok(value),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Err(keyring::Error::NoEntry)
+            }
+            Err(error) => Err(keyring::Error::NoStorageAccess(Box::new(error))),
+        };
+        prepare_key_version(&marker, history, &key_id, stored, |value| {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)
+                    .map_err(|e| keyring::Error::NoStorageAccess(Box::new(e)))?;
+            }
+            let mut options = fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let mut file = options
+                .open(&path)
+                .map_err(|e| keyring::Error::NoStorageAccess(Box::new(e)))?;
+            file.write_all(value.as_bytes())
+                .and_then(|_| file.sync_all())
+                .map_err(|e| keyring::Error::NoStorageAccess(Box::new(e)))
+        })?;
+    }
+    #[cfg(not(test))]
+    {
+        let entry = keyring::Entry::new(KEYRING_SERVICE, &key_id)
+            .map_err(|error| VaultStoreError::KeyStorage(error.to_string()))?;
+        prepare_key_version(&marker, history, &key_id, entry.get_password(), |value| {
+            entry.set_password(value)
+        })?;
+    }
+    Ok(())
+}
 
-    let entry = keyring::Entry::new(KEYRING_SERVICE, &key_id)
-        .map_err(|err| VaultStoreError::KeyStorage(err.to_string()))?;
-    load_or_create_key_from_keyring(&key_id, entry.get_password(), |value| {
-        entry.set_password(value)
-    })
+fn has_any_key_lifecycle_marker(
+    marker_root: &Path,
+    vault_id: Uuid,
+) -> Result<bool, VaultStoreError> {
+    let entries = match fs::read_dir(marker_root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(io_error(error)),
+    };
+    let prefix = format!("{vault_id}-v");
+    for entry in entries {
+        let entry = entry.map_err(io_error)?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if name.starts_with(&prefix)
+            && (name.ends_with(".initialized") || name.ends_with(".provisioning"))
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn prepare_key_version(
+    marker: &Path,
+    has_history: bool,
+    key_id: &str,
+    stored: keyring::Result<String>,
+    save: impl FnOnce(&str) -> keyring::Result<()>,
+) -> Result<Zeroizing<[u8; 32]>, VaultStoreError> {
+    let marker_state = read_key_marker(marker)?;
+    let missing = matches!(&stored, Err(keyring::Error::NoEntry));
+    let retryable_provisioning = marker_state == Some(KeyMarkerState::Provisioning);
+    if missing && (has_history || (marker_state.is_some() && !retryable_provisioning)) {
+        return Err(VaultStoreError::KeyStorage(format!(
+            "vault key {key_id} requires recovery; restore the exact existing key in OS secure storage; refusing replacement"
+        )));
+    }
+    // Validate provider reads before persisting any lifecycle change.
+    if let Ok(value) = &stored {
+        decode_hex_32(value)?;
+    }
+    if marker_state.is_none() {
+        write_key_marker(marker, KeyMarkerState::Provisioning)?;
+    }
+    let key = load_or_create_key_from_keyring(key_id, stored, save)?;
+    // The provisioning state is retryable only while there is no evidence that
+    // ciphertext was ever written. Persisting Initialized before returning
+    // closes the window before seal_asset can create the vault directory.
+    write_key_marker(marker, KeyMarkerState::Initialized)?;
+    Ok(key)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum KeyMarkerState {
+    Provisioning,
+    Initialized,
+}
+
+fn read_key_marker(marker: &Path) -> Result<Option<KeyMarkerState>, VaultStoreError> {
+    if marker.try_exists().map_err(io_error)? {
+        // Older marker formats did not distinguish an interrupted write from a
+        // completed initialization. Any existing initialized marker is trusted
+        // conservatively, regardless of its contents.
+        return Ok(Some(KeyMarkerState::Initialized));
+    }
+    let provisioning = marker.with_extension("provisioning");
+    if provisioning.try_exists().map_err(io_error)? {
+        return Ok(Some(KeyMarkerState::Provisioning));
+    }
+    Ok(None)
+}
+
+fn write_key_marker(marker: &Path, state: KeyMarkerState) -> Result<(), VaultStoreError> {
+    #[cfg(unix)]
+    let parent = marker
+        .parent()
+        .ok_or_else(|| VaultStoreError::Invalid("key marker parent missing".into()))?;
+    let (path, contents) = match state {
+        KeyMarkerState::Provisioning => (
+            marker.with_extension("provisioning"),
+            b"provisioning-v1\n".as_slice(),
+        ),
+        KeyMarkerState::Initialized => (marker.to_path_buf(), b"initialized-v1\n".as_slice()),
+    };
+    let mut file = match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error)
+            if error.kind() == std::io::ErrorKind::AlreadyExists
+                && read_key_marker(marker)? == Some(state) =>
+        {
+            return Ok(());
+        }
+        Err(error) => return Err(io_error(error)),
+    };
+    file.write_all(contents).map_err(io_error)?;
+    file.sync_all().map_err(io_error)?;
+    #[cfg(unix)]
+    fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(io_error)?;
+    if state == KeyMarkerState::Initialized {
+        // The initialized marker is created durably before any caller can write
+        // ciphertext. Keep the provisioning marker as an append-only history;
+        // this avoids non-atomic replacement on Windows.
+        #[cfg(unix)]
+        fs::File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(io_error)?;
+    }
+    Ok(())
 }
 
 fn load_or_create_key_from_keyring(
@@ -362,49 +583,24 @@ fn load_existing_vault_key(
     vault_id: Uuid,
     key_version: u32,
 ) -> Result<Zeroizing<[u8; 32]>, VaultStoreError> {
+    validate_key_storage(config)?;
     let key_id = key_reference(vault_id, key_version);
-    if cfg!(test)
-        || std::env::var("PRIVATE_GALLERY_VAULT_KEY_STORAGE")
-            .map(|value| value == "file")
-            .unwrap_or(false)
+    #[cfg(test)]
+    return load_existing_file_key(config, &key_id);
+    #[cfg(not(test))]
     {
-        return load_existing_file_key(config, &key_id);
-    }
-
-    let entry = keyring::Entry::new(KEYRING_SERVICE, &key_id)
-        .map_err(|err| VaultStoreError::KeyStorage(err.to_string()))?;
-    match entry.get_password() {
-        Ok(value) => decode_hex_32(&value),
-        Err(_) => Err(VaultStoreError::KeyStorage(format!(
-            "vault key {key_id} is missing"
-        ))),
+        let entry = keyring::Entry::new(KEYRING_SERVICE, &key_id)
+            .map_err(|err| VaultStoreError::KeyStorage(err.to_string()))?;
+        match entry.get_password() {
+            Ok(value) => decode_hex_32(&value),
+            Err(_) => Err(VaultStoreError::KeyStorage(format!(
+                "vault key {key_id} is missing or OS keychain is unavailable; exact-key recovery is required"
+            ))),
+        }
     }
 }
 
-fn load_or_create_file_key(
-    config: &AppConfig,
-    key_id: &str,
-) -> Result<Zeroizing<[u8; 32]>, VaultStoreError> {
-    let path = file_key_path(config, key_id);
-    if path.exists() {
-        let value = fs::read_to_string(path).map_err(io_error)?;
-        return decode_hex_32(value.trim());
-    }
-    let key = random_key();
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(io_error)?;
-    }
-    fs::write(&path, hex_string(key.as_ref())).map_err(io_error)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut permissions = fs::metadata(&path).map_err(io_error)?.permissions();
-        permissions.set_mode(0o600);
-        fs::set_permissions(&path, permissions).map_err(io_error)?;
-    }
-    Ok(key)
-}
-
+#[cfg(test)]
 fn load_existing_file_key(
     config: &AppConfig,
     key_id: &str,
@@ -419,6 +615,7 @@ fn load_existing_file_key(
     decode_hex_32(value.trim())
 }
 
+#[cfg(test)]
 fn file_key_path(config: &AppConfig, key_id: &str) -> PathBuf {
     config
         .runtime_root
@@ -513,6 +710,254 @@ fn io_error(error: std::io::Error) -> VaultStoreError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn marker_fixture() -> (PathBuf, PathBuf) {
+        let root = std::env::temp_dir().join(format!("vault-key-lifecycle-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let marker = root.join("initialized");
+        (root, marker)
+    }
+
+    #[test]
+    fn production_backend_selection_rejects_plaintext_and_unknown_values() {
+        use std::ffi::OsStr;
+        assert!(validate_backend_selection(None).is_ok());
+        assert!(validate_backend_selection(Some(OsStr::new("keyring"))).is_ok());
+        for value in ["file", "FILE", "", "unknown"] {
+            assert!(validate_backend_selection(Some(OsStr::new(value))).is_err());
+        }
+    }
+
+    #[test]
+    fn missing_initialized_or_historical_key_never_invokes_save() {
+        let (root, marker) = marker_fixture();
+        for history in [true, false] {
+            if !history {
+                fs::write(&marker, b"initialized").unwrap();
+            }
+            let result = prepare_key_version(
+                &marker,
+                history,
+                "test",
+                Err(keyring::Error::NoEntry),
+                |_| panic!("must never replace an existing key"),
+            );
+            assert!(matches!(result, Err(VaultStoreError::KeyStorage(_))));
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failed_initial_provider_write_can_retry_before_ciphertext_exists() {
+        let (root, marker) = marker_fixture();
+        let failed =
+            prepare_key_version(&marker, false, "test", Err(keyring::Error::NoEntry), |_| {
+                assert_eq!(
+                    read_key_marker(&marker).unwrap(),
+                    Some(KeyMarkerState::Provisioning),
+                    "retryable marker must precede provider mutation"
+                );
+                Err(keyring::Error::NoStorageAccess(Box::new(
+                    std::io::Error::other("provider failed"),
+                )))
+            });
+        assert!(failed.is_err());
+        // No key or ciphertext was created, so a later successful provider
+        // operation can safely provision this same key version.
+        let mut saved = None;
+        let provisioned = prepare_key_version(
+            &marker,
+            false,
+            "test",
+            Err(keyring::Error::NoEntry),
+            |value| {
+                saved = Some(value.to_string());
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            hex_string(provisioned.as_ref()),
+            saved.expect("successful retry stores key")
+        );
+        assert_eq!(
+            read_key_marker(&marker).unwrap(),
+            Some(KeyMarkerState::Initialized)
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn provisioning_marker_cannot_retry_after_ciphertext_evidence() {
+        let (root, marker) = marker_fixture();
+        write_key_marker(&marker, KeyMarkerState::Provisioning).unwrap();
+        assert!(
+            prepare_key_version(
+                &marker,
+                true,
+                "test",
+                Err(keyring::Error::NoEntry),
+                |_| panic!("encrypted history must prevent key replacement")
+            )
+            .is_err()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn older_version_ciphertext_does_not_block_new_key_version() {
+        let (root, _) = marker_fixture();
+        let config = AppConfig {
+            runtime_root: root.clone(),
+            ..AppConfig::default()
+        };
+        let library = root.join("library");
+        let vault_id = Uuid::new_v4();
+        // The on-disk layout is vault scoped, not key-version scoped. A v1
+        // lifecycle marker means v2 history can safely be version scoped.
+        let older_version_ciphertext = library
+            .join("vaults")
+            .join(vault_id.to_string())
+            .join("blobs/older-version/00000000.pgblob");
+        fs::create_dir_all(older_version_ciphertext.parent().unwrap()).unwrap();
+        fs::write(&older_version_ciphertext, b"v1 ciphertext").unwrap();
+        let v1_marker = root
+            .join("security/vault-key-initialization")
+            .join(format!("{vault_id}-v1.initialized"));
+        fs::create_dir_all(v1_marker.parent().unwrap()).unwrap();
+        fs::write(v1_marker, b"initialized-v1\n").unwrap();
+
+        provision_vault_key_if_new(&config, &library, vault_id, 2, false).unwrap();
+        assert!(load_existing_vault_key(&config, vault_id, 2).is_ok());
+        assert_eq!(
+            fs::read(older_version_ciphertext).unwrap(),
+            b"v1 ciphertext"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn unmarked_legacy_ciphertext_blocks_ambiguous_key_provisioning() {
+        let (root, _) = marker_fixture();
+        let config = AppConfig {
+            runtime_root: root.clone(),
+            ..AppConfig::default()
+        };
+        let library = root.join("library");
+        let vault_id = Uuid::new_v4();
+        fs::create_dir_all(library.join("vaults").join(vault_id.to_string())).unwrap();
+
+        assert!(provision_vault_key_if_new(&config, &library, vault_id, 2, false).is_err());
+        assert!(load_existing_vault_key(&config, vault_id, 2).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn new_provisioning_is_marked_and_provider_errors_do_not_initialize() {
+        let (root, marker) = marker_fixture();
+        let failed = prepare_key_version(
+            &marker,
+            false,
+            "test",
+            Err(keyring::Error::NoStorageAccess(Box::new(
+                std::io::Error::other("locked"),
+            ))),
+            |_| panic!("provider reads must fail closed"),
+        );
+        assert!(failed.is_err());
+        assert!(!marker.exists());
+        let mut stored = None;
+        let key = prepare_key_version(
+            &marker,
+            false,
+            "test",
+            Err(keyring::Error::NoEntry),
+            |value| {
+                assert_eq!(
+                    read_key_marker(&marker).unwrap(),
+                    Some(KeyMarkerState::Provisioning)
+                );
+                stored = Some(value.to_string());
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(stored.unwrap(), hex_string(key.as_ref()));
+        assert_eq!(
+            read_key_marker(&marker).unwrap(),
+            Some(KeyMarkerState::Initialized)
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn concurrent_provisioning_reuses_one_key_version() {
+        let (root, _) = marker_fixture();
+        let config = AppConfig {
+            runtime_root: root.clone(),
+            ..AppConfig::default()
+        };
+        let library = root.join("library");
+        let vault = Uuid::new_v4();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let handles = (0..2)
+            .map(|_| {
+                let config = config.clone();
+                let library = library.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    provision_vault_key_if_new(&config, &library, vault, 1, false).unwrap();
+                    load_existing_vault_key(&config, vault, 1).unwrap()
+                })
+            })
+            .collect::<Vec<_>>();
+        let keys = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(keys[0].as_ref(), keys[1].as_ref());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn missing_key_preserves_existing_ciphertext_and_refuses_further_seals() {
+        let (root, _) = marker_fixture();
+        let config = AppConfig {
+            runtime_root: root.clone(),
+            ..AppConfig::default()
+        };
+        let library = root.join("library");
+        fs::create_dir_all(&library).unwrap();
+        let source = root.join("source.jpg");
+        fs::write(&source, b"original private bytes").unwrap();
+        let (asset, _) = crate::imports::build_imported_asset(crate::domain::ImportAssetRequest {
+            source_path: source.to_string_lossy().into_owned(),
+            original_filename: "source.jpg".into(),
+            media_kind: crate::domain::MediaKind::Photo,
+            mime_type: "image/jpeg".into(),
+            bytes: 22,
+            captured_at: None,
+            place_hint: None,
+            import_mode: Some(crate::domain::ImportMode::Copy),
+            content_hash: None,
+        });
+        let vault_id = Uuid::new_v4();
+        let blob_id = Uuid::new_v4();
+        provision_vault_key_if_new(&config, &library, vault_id, 1, false).unwrap();
+        let sealed = seal_asset(&config, &library, vault_id, 1, blob_id, &asset, &source).unwrap();
+        let chunk_path = library.join(&sealed.chunks[0].local_path);
+        let before = fs::read(&chunk_path).unwrap();
+        let key_path = file_key_path(&config, &key_reference(vault_id, 1));
+        fs::remove_file(&key_path).unwrap();
+        // Even an incorrect "no catalog history" hint cannot bypass the
+        // durable marker or ciphertext-directory history.
+        assert!(provision_vault_key_if_new(&config, &library, vault_id, 1, false).is_err());
+        assert!(seal_asset(&config, &library, vault_id, 1, blob_id, &asset, &source).is_err());
+        assert!(!key_path.exists());
+        assert_eq!(fs::read(chunk_path).unwrap(), before);
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn missing_keychain_entry_creates_and_persists_a_key() {
