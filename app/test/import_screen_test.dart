@@ -35,6 +35,12 @@ void main() {
     );
     await tester.pumpAndSettle();
 
+    await tester.enterText(
+      find.widgetWithText(TextField, 'Source path'),
+      '/tmp/source',
+    );
+    await tester.pumpAndSettle();
+
     final scanButton = find.widgetWithText(FilledButton, 'Scan source');
     await tester.ensureVisible(scanButton);
     await tester.tap(scanButton);
@@ -67,11 +73,12 @@ void main() {
     await tester.pumpAndSettle();
 
     expect(repository.commitCalls, 1);
+    expect(repository.commitRequests.single.targetVaultId, 'vault-1');
     expect(find.text('Import result'), findsOneWidget);
     expect(find.textContaining('1 imported'), findsOneWidget);
   });
 
-  testWidgets('organized archive preset indexes photos by reference', (
+  testWidgets('scan uses a user-selected vault and source path', (
     WidgetTester tester,
   ) async {
     tester.view.physicalSize = const Size(1200, 1800);
@@ -87,6 +94,10 @@ void main() {
         importMode: ImportMode.reference,
       ),
       commitSession: _session(status: ImportSessionStatus.committed),
+      vaults: [
+        Vault.fromJson(const {'id': 'vault-1', 'name': 'Personal'}),
+        Vault.fromJson(const {'id': 'vault-2', 'name': 'Kids'}),
+      ],
     );
 
     await tester.pumpWidget(
@@ -99,7 +110,20 @@ void main() {
     );
     await tester.pumpAndSettle();
 
-    await tester.tap(find.text('Index organized photos'));
+    await tester.enterText(
+      find.widgetWithText(TextField, 'Source path'),
+      '/photos/kids',
+    );
+    await tester.pumpAndSettle();
+    final vaultPicker = find.byType(DropdownButtonFormField<String>);
+    await tester.ensureVisible(vaultPicker);
+    await tester.tap(vaultPicker);
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Kids').last);
+    await tester.pumpAndSettle();
+    final referenceMode = find.text('Reference in place');
+    await tester.ensureVisible(referenceMode);
+    await tester.tap(referenceMode);
     await tester.pumpAndSettle();
     await tester.ensureVisible(
       find.widgetWithText(FilledButton, 'Scan source'),
@@ -107,13 +131,9 @@ void main() {
     await tester.tap(find.widgetWithText(FilledButton, 'Scan source'));
     await tester.pumpAndSettle();
 
-    expect(
-      repository.scanRequests.single.sourcePath,
-      '/mnt/windows/transfer/Ok/Photos/Unfiltered',
-    );
+    expect(repository.scanRequests.single.sourcePath, '/photos/kids');
+    expect(repository.scanRequests.single.targetVaultId, 'vault-2');
     expect(repository.scanRequests.single.importMode, ImportMode.reference);
-    expect(repository.scanRequests.single.addAsWatchFolder, isTrue);
-    expect(repository.scanRequests.single.placeHint, 'Local organized photos');
     expect(find.text('Preflight before importing'), findsOneWidget);
   });
 
@@ -159,6 +179,11 @@ void main() {
     await tester.tap(find.text('open import'));
     await tester.pumpAndSettle();
 
+    await tester.enterText(
+      find.widgetWithText(TextField, 'Source path'),
+      '/tmp/source',
+    );
+    await tester.pumpAndSettle();
     await tester.tap(find.widgetWithText(FilledButton, 'Scan source'));
     await tester.pumpAndSettle();
     await tester.scrollUntilVisible(
@@ -225,6 +250,11 @@ void main() {
       );
       await tester.tap(find.text('open import'));
       await tester.pumpAndSettle();
+      await tester.enterText(
+        find.widgetWithText(TextField, 'Source path'),
+        '/tmp/source',
+      );
+      await tester.pumpAndSettle();
       await tester.tap(find.widgetWithText(FilledButton, 'Scan source'));
       await tester.pumpAndSettle();
       await tester.scrollUntilVisible(
@@ -273,6 +303,11 @@ void main() {
     );
     await tester.pumpAndSettle();
 
+    await tester.enterText(
+      find.widgetWithText(TextField, 'Source path'),
+      '/tmp/source',
+    );
+    await tester.pumpAndSettle();
     await tester.tap(find.widgetWithText(FilledButton, 'Scan source'));
     await tester.pumpAndSettle();
     await tester.scrollUntilVisible(
@@ -292,12 +327,19 @@ class _FakeGalleryRepository implements GalleryRepository {
   _FakeGalleryRepository({
     required this.scanSession,
     required this.commitSession,
-  });
+    List<Vault>? vaults,
+  }) : vaults =
+           vaults ??
+           [
+             Vault.fromJson(const {'id': 'vault-1', 'name': 'Personal'}),
+           ];
 
   final ImportSession scanSession;
   final ImportSession commitSession;
+  final List<Vault> vaults;
   int commitCalls = 0;
   final List<ImportScanRequest> scanRequests = [];
+  final List<ImportCommitRequest> commitRequests = [];
 
   @override
   Future<EncryptionActivationResult> activateEncryption() {
@@ -376,6 +418,7 @@ class _FakeGalleryRepository implements GalleryRepository {
   @override
   Future<ImportSession> commitImport(ImportCommitRequest request) async {
     commitCalls += 1;
+    commitRequests.add(request);
     return commitSession;
   }
 
@@ -663,7 +706,13 @@ class _FakeGalleryRepository implements GalleryRepository {
 
   @override
   Future<List<Vault>> fetchVaults() {
-    throw UnimplementedError();
+    return Future.value(
+      vaults.isEmpty
+          ? [
+              Vault.fromJson(const {'id': 'vault-1', 'name': 'Personal'}),
+            ]
+          : vaults,
+    );
   }
 
   @override
@@ -801,6 +850,7 @@ ImportSession _session({
 }) {
   return ImportSession(
     id: 'session-1',
+    targetVaultId: null,
     sourceKind: ImportSourceKind.folder,
     sourcePath: '/tmp/source',
     importMode: importMode,

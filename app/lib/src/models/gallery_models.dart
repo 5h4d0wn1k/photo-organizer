@@ -631,9 +631,9 @@ class ModelRuntimeStatus {
       pythonExecutable: json['python_executable'] as String? ?? 'python3',
       pythonVersion: json['python_version'] as String?,
       offlineReady: json['offline_ready'] as bool? ?? false,
-      dependencies: _readList(
-        json['dependencies'],
-      ).map((item) => ModelRuntimeDependency.fromJson(item)).toList(),
+      dependencies: _readList(json['dependencies'])
+          .map((item) => ModelRuntimeDependency.fromJson(item))
+          .toList(),
       detail: json['detail'] as String? ?? 'Runtime status unavailable.',
     );
   }
@@ -692,9 +692,9 @@ class PrivacyStatus {
       telemetryEnabled: json['telemetry_enabled'] as bool? ?? false,
       analyticsEnabled: json['analytics_enabled'] as bool? ?? false,
       cloudAiEnabled: json['cloud_ai_enabled'] as bool? ?? false,
-      installedModels: _readList(
-        json['installed_models'],
-      ).map((item) => ModelArtifact.fromJson(item)).toList(),
+      installedModels: _readList(json['installed_models'])
+          .map((item) => ModelArtifact.fromJson(item))
+          .toList(),
       localOnlyDisclosure:
           json['local_only_disclosure'] as String? ??
           'Photos and generated intelligence stay local.',
@@ -1210,9 +1210,9 @@ class PlatformReleaseSurfaceReadiness {
         json['status'] as String?,
       ),
       distribution: json['distribution'] as String? ?? '',
-      evidence: _readList(
-        json['evidence'],
-      ).map((item) => PlatformReleaseEvidence.fromJson(item)).toList(),
+      evidence: _readList(json['evidence'])
+          .map((item) => PlatformReleaseEvidence.fromJson(item))
+          .toList(),
       blockers: _readStringList(json['blockers']),
       nextStep: json['next_step'] as String? ?? '',
     );
@@ -1243,9 +1243,9 @@ class PlatformReleaseReadinessResponse {
       .length;
 
   factory PlatformReleaseReadinessResponse.fromJson(Map<String, dynamic> json) {
-    final surfaces = _readList(
-      json['surfaces'],
-    ).map((item) => PlatformReleaseSurfaceReadiness.fromJson(item)).toList();
+    final surfaces = _readList(json['surfaces'])
+        .map((item) => PlatformReleaseSurfaceReadiness.fromJson(item))
+        .toList();
     return PlatformReleaseReadinessResponse(
       generatedAt: _readDateTime(json['generated_at']),
       overallStatus: PlatformReleaseReadinessStatusX.fromJson(
@@ -1344,6 +1344,8 @@ class BackupVerification {
     required this.missingAssetPaths,
     required this.vaultChunksChecked,
     required this.missingVaultChunkPaths,
+    required this.protectedOriginalsChecked,
+    required this.missingProtectedOriginalPaths,
     required this.modelFilesChecked,
     required this.missingModelPaths,
     required this.ok,
@@ -1357,6 +1359,8 @@ class BackupVerification {
   final List<String> missingAssetPaths;
   final int vaultChunksChecked;
   final List<String> missingVaultChunkPaths;
+  final int protectedOriginalsChecked;
+  final List<String> missingProtectedOriginalPaths;
   final int modelFilesChecked;
   final List<String> missingModelPaths;
   final bool ok;
@@ -1372,6 +1376,11 @@ class BackupVerification {
       vaultChunksChecked: (json['vault_chunks_checked'] as num?)?.toInt() ?? 0,
       missingVaultChunkPaths: _readStringList(
         json['missing_vault_chunk_paths'],
+      ),
+      protectedOriginalsChecked:
+          (json['protected_originals_checked'] as num?)?.toInt() ?? 0,
+      missingProtectedOriginalPaths: _readStringList(
+        json['missing_protected_original_paths'],
       ),
       modelFilesChecked: (json['model_files_checked'] as num?)?.toInt() ?? 0,
       missingModelPaths: _readStringList(json['missing_model_paths']),
@@ -1389,8 +1398,10 @@ class BackupExportResult {
     required this.databaseSha256,
     required this.assetsChecked,
     required this.missingAssetPaths,
+    required this.missingProtectedOriginalPaths,
     required this.mediaFilesCopied,
     required this.vaultChunksCopied,
+    required this.protectedOriginalChunksCopied,
     required this.bytesCopied,
     required this.modelFilesChecked,
     required this.missingModelPaths,
@@ -1404,8 +1415,10 @@ class BackupExportResult {
   final String? databaseSha256;
   final int assetsChecked;
   final List<String> missingAssetPaths;
+  final List<String> missingProtectedOriginalPaths;
   final int mediaFilesCopied;
   final int vaultChunksCopied;
+  final int protectedOriginalChunksCopied;
   final int bytesCopied;
   final int modelFilesChecked;
   final List<String> missingModelPaths;
@@ -1420,8 +1433,13 @@ class BackupExportResult {
       databaseSha256: json['database_sha256'] as String?,
       assetsChecked: (json['assets_checked'] as num?)?.toInt() ?? 0,
       missingAssetPaths: _readStringList(json['missing_asset_paths']),
+      missingProtectedOriginalPaths: _readStringList(
+        json['missing_protected_original_paths'],
+      ),
       mediaFilesCopied: (json['media_files_copied'] as num?)?.toInt() ?? 0,
       vaultChunksCopied: (json['vault_chunks_copied'] as num?)?.toInt() ?? 0,
+      protectedOriginalChunksCopied:
+          (json['protected_original_chunks_copied'] as num?)?.toInt() ?? 0,
       bytesCopied: (json['bytes_copied'] as num?)?.toInt() ?? 0,
       modelFilesChecked: (json['model_files_checked'] as num?)?.toInt() ?? 0,
       missingModelPaths: _readStringList(json['missing_model_paths']),
@@ -1472,6 +1490,7 @@ class BackupRestorePlan {
     required this.databaseTargetPath,
     required this.mediaFilesAvailable,
     required this.vaultChunksAvailable,
+    required this.protectedOriginalChunksAvailable,
     required this.missingPaths,
     required this.destinationConflicts,
     required this.requiresConfirmation,
@@ -1487,6 +1506,7 @@ class BackupRestorePlan {
   final String databaseTargetPath;
   final int mediaFilesAvailable;
   final int vaultChunksAvailable;
+  final int protectedOriginalChunksAvailable;
   final List<String> missingPaths;
   final List<String> destinationConflicts;
   final bool requiresConfirmation;
@@ -1505,6 +1525,8 @@ class BackupRestorePlan {
           (json['media_files_available'] as num?)?.toInt() ?? 0,
       vaultChunksAvailable:
           (json['vault_chunks_available'] as num?)?.toInt() ?? 0,
+      protectedOriginalChunksAvailable:
+          (json['protected_original_chunks_available'] as num?)?.toInt() ?? 0,
       missingPaths: _readStringList(json['missing_paths']),
       destinationConflicts: _readStringList(json['destination_conflicts']),
       requiresConfirmation: json['requires_confirmation'] as bool? ?? true,
@@ -1521,6 +1543,7 @@ class BackupRestoreRunResult {
     required this.databaseRestoredTo,
     required this.mediaFilesCopied,
     required this.vaultChunksCopied,
+    required this.protectedOriginalChunksCopied,
     required this.bytesCopied,
     required this.ok,
     required this.detail,
@@ -1531,6 +1554,7 @@ class BackupRestoreRunResult {
   final String databaseRestoredTo;
   final int mediaFilesCopied;
   final int vaultChunksCopied;
+  final int protectedOriginalChunksCopied;
   final int bytesCopied;
   final bool ok;
   final String detail;
@@ -1542,6 +1566,8 @@ class BackupRestoreRunResult {
       databaseRestoredTo: json['database_restored_to'] as String? ?? '',
       mediaFilesCopied: (json['media_files_copied'] as num?)?.toInt() ?? 0,
       vaultChunksCopied: (json['vault_chunks_copied'] as num?)?.toInt() ?? 0,
+      protectedOriginalChunksCopied:
+          (json['protected_original_chunks_copied'] as num?)?.toInt() ?? 0,
       bytesCopied: (json['bytes_copied'] as num?)?.toInt() ?? 0,
       ok: json['ok'] as bool? ?? false,
       detail: json['detail'] as String? ?? '',
@@ -2227,29 +2253,29 @@ class MobileWorkspaceSnapshot {
               rawSession.map((key, value) => MapEntry(key.toString(), value)),
             )
           : MobileSession.fromJson(const <String, dynamic>{}),
-      sessions: _readList(
-        json['sessions'],
-      ).map((item) => MobileSession.fromJson(item)).toList(),
+      sessions: _readList(json['sessions'])
+          .map((item) => MobileSession.fromJson(item))
+          .toList(),
       timeline: rawTimeline is Map
           ? TimelineResponse.fromJson(
               rawTimeline.map((key, value) => MapEntry(key.toString(), value)),
             )
           : TimelineResponse.fromJson(const <String, dynamic>{}),
-      albums: _readList(
-        json['albums'],
-      ).map((item) => Album.fromJson(item)).toList(),
-      people: _readList(
-        json['people'],
-      ).map((item) => PersonCluster.fromJson(item)).toList(),
-      places: _readList(
-        json['places'],
-      ).map((item) => PlaceCluster.fromJson(item)).toList(),
-      events: _readList(
-        json['events'],
-      ).map((item) => EventCluster.fromJson(item)).toList(),
-      jobs: _readList(
-        json['jobs'],
-      ).map((item) => JobRecord.fromJson(item)).toList(),
+      albums: _readList(json['albums'])
+          .map((item) => Album.fromJson(item))
+          .toList(),
+      people: _readList(json['people'])
+          .map((item) => PersonCluster.fromJson(item))
+          .toList(),
+      places: _readList(json['places'])
+          .map((item) => PlaceCluster.fromJson(item))
+          .toList(),
+      events: _readList(json['events'])
+          .map((item) => EventCluster.fromJson(item))
+          .toList(),
+      jobs: _readList(json['jobs'])
+          .map((item) => JobRecord.fromJson(item))
+          .toList(),
       vaultStatus: rawVaultStatus is Map
           ? VaultStatus.fromJson(
               rawVaultStatus.map(
@@ -2257,9 +2283,9 @@ class MobileWorkspaceSnapshot {
               ),
             )
           : VaultStatus.fromJson(const <String, dynamic>{}),
-      devices: _readList(
-        json['devices'],
-      ).map((item) => DeviceIdentity.fromJson(item)).toList(),
+      devices: _readList(json['devices'])
+          .map((item) => DeviceIdentity.fromJson(item))
+          .toList(),
       syncNetwork: rawSyncNetwork is Map
           ? SyncNetworkStatus.fromJson(
               rawSyncNetwork.map(
@@ -2351,9 +2377,9 @@ class MobileReplicaAssignment {
       assetId: json['asset_id']?.toString() ?? '',
       encryptedHash: json['encrypted_hash'] as String? ?? '',
       bytesTotal: (json['bytes_total'] as num?)?.toInt() ?? 0,
-      chunks: _readList(
-        json['chunks'],
-      ).map(MobileReplicaChunkDescriptor.fromJson).toList(),
+      chunks: _readList(json['chunks'])
+          .map(MobileReplicaChunkDescriptor.fromJson)
+          .toList(),
     );
   }
 }
@@ -2381,9 +2407,9 @@ class MobileStoragePlan {
               rawDevice.map((key, value) => MapEntry(key.toString(), value)),
             )
           : DeviceIdentity.fromJson(const <String, dynamic>{}),
-      assignments: _readList(
-        json['assignments'],
-      ).map(MobileReplicaAssignment.fromJson).toList(),
+      assignments: _readList(json['assignments'])
+          .map(MobileReplicaAssignment.fromJson)
+          .toList(),
       detail: json['detail'] as String? ?? '',
     );
   }
@@ -2586,20 +2612,20 @@ class SyncPlan {
       generatedAt:
           _readDateTime(json['generated_at']) ?? DateTime.now().toUtc(),
       vaultIds: _readStringList(json['vault_ids']),
-      transfers: _readList(
-        json['transfers'],
-      ).map((item) => SyncTransfer.fromJson(item)).toList(),
-      conflicts: _readList(
-        json['conflicts'],
-      ).map((item) => SyncConflict.fromJson(item)).toList(),
+      transfers: _readList(json['transfers'])
+          .map((item) => SyncTransfer.fromJson(item))
+          .toList(),
+      conflicts: _readList(json['conflicts'])
+          .map((item) => SyncConflict.fromJson(item))
+          .toList(),
       underReplicatedBlobIds: _readStringList(
         json['under_replicated_blob_ids'],
       ),
       policySatisfied: json['policy_satisfied'] as bool? ?? false,
       detail: json['detail'] as String? ?? '',
-      executionResults: _readList(
-        json['execution_results'],
-      ).map((item) => SyncTransferExecutionResult.fromJson(item)).toList(),
+      executionResults: _readList(json['execution_results'])
+          .map((item) => SyncTransferExecutionResult.fromJson(item))
+          .toList(),
     );
   }
 }
@@ -2732,12 +2758,12 @@ class VaultStatus {
               rawVault.map((key, value) => MapEntry(key.toString(), value)),
             )
           : Vault.fromJson(const <String, dynamic>{}),
-      members: _readList(
-        json['members'],
-      ).map((item) => VaultMember.fromJson(item)).toList(),
-      devices: _readList(
-        json['devices'],
-      ).map((item) => DeviceIdentity.fromJson(item)).toList(),
+      members: _readList(json['members'])
+          .map((item) => VaultMember.fromJson(item))
+          .toList(),
+      devices: _readList(json['devices'])
+          .map((item) => DeviceIdentity.fromJson(item))
+          .toList(),
       assetsTotal: (json['assets_total'] as num?)?.toInt() ?? 0,
       blobsTotal: (json['blobs_total'] as num?)?.toInt() ?? 0,
       localAvailableAssets:
@@ -2873,12 +2899,12 @@ class VaultFileTreeResponse {
     return VaultFileTreeResponse(
       vaultId: json['vault_id']?.toString(),
       rootEntryIds: _readStringList(json['root_entry_ids']),
-      entries: _readList(
-        json['entries'],
-      ).map((item) => VaultFileEntry.fromJson(item)).toList(),
-      devices: _readList(
-        json['devices'],
-      ).map((item) => VaultFileDeviceSummary.fromJson(item)).toList(),
+      entries: _readList(json['entries'])
+          .map((item) => VaultFileEntry.fromJson(item))
+          .toList(),
+      devices: _readList(json['devices'])
+          .map((item) => VaultFileDeviceSummary.fromJson(item))
+          .toList(),
     );
   }
 }
@@ -3218,9 +3244,9 @@ class Asset {
               ),
             )
           : null,
-      variants: _readList(
-        json['variants'],
-      ).map((item) => AssetVariant.fromJson(item)).toList(),
+      variants: _readList(json['variants'])
+          .map((item) => AssetVariant.fromJson(item))
+          .toList(),
     );
   }
 }
@@ -3479,9 +3505,9 @@ class TimelineBucket {
   final int totalAssets;
 
   factory TimelineBucket.fromJson(Map<String, dynamic> json) {
-    final assets = _readList(
-      json['assets'],
-    ).map((item) => Asset.fromJson(item)).toList();
+    final assets = _readList(json['assets'])
+        .map((item) => Asset.fromJson(item))
+        .toList();
     return TimelineBucket(
       label: json['label'] as String? ?? 'Untitled bucket',
       assetIds: _readStringList(json['asset_ids']),
@@ -3548,9 +3574,9 @@ class TimelineResponse {
   }
 
   factory TimelineResponse.fromJson(Map<String, dynamic> json) {
-    final buckets = _readList(
-      json['buckets'],
-    ).map((item) => TimelineBucket.fromJson(item)).toList();
+    final buckets = _readList(json['buckets'])
+        .map((item) => TimelineBucket.fromJson(item))
+        .toList();
     return TimelineResponse(
       buckets: buckets,
       nextCursor: json['next_cursor'] as String?,
@@ -3708,18 +3734,18 @@ class SearchResponse {
 
     return SearchResponse(
       query: SearchQuery.fromJson(queryMap),
-      assets: _readList(
-        json['assets'],
-      ).map((item) => Asset.fromJson(item)).toList(),
-      people: _readList(
-        json['people'],
-      ).map((item) => PersonCluster.fromJson(item)).toList(),
-      places: _readList(
-        json['places'],
-      ).map((item) => PlaceCluster.fromJson(item)).toList(),
-      events: _readList(
-        json['events'],
-      ).map((item) => EventCluster.fromJson(item)).toList(),
+      assets: _readList(json['assets'])
+          .map((item) => Asset.fromJson(item))
+          .toList(),
+      people: _readList(json['people'])
+          .map((item) => PersonCluster.fromJson(item))
+          .toList(),
+      places: _readList(json['places'])
+          .map((item) => PlaceCluster.fromJson(item))
+          .toList(),
+      events: _readList(json['events'])
+          .map((item) => EventCluster.fromJson(item))
+          .toList(),
     );
   }
 }
@@ -4032,6 +4058,7 @@ class ImportCandidate {
 class ImportSession {
   const ImportSession({
     required this.id,
+    this.targetVaultId,
     required this.sourceKind,
     required this.sourcePath,
     required this.importMode,
@@ -4060,6 +4087,7 @@ class ImportSession {
   });
 
   final String id;
+  final String? targetVaultId;
   final ImportSourceKind sourceKind;
   final String sourcePath;
   final ImportMode importMode;
@@ -4099,9 +4127,9 @@ class ImportSession {
       .fold<int>(0, (sum, candidate) => sum + candidate.bytes);
 
   factory ImportSession.fromJson(Map<String, dynamic> json) {
-    final candidates = _readList(
-      json['candidates'],
-    ).map((item) => ImportCandidate.fromJson(item)).toList();
+    final candidates = _readList(json['candidates'])
+        .map((item) => ImportCandidate.fromJson(item))
+        .toList();
     final unsupportedFilePaths = _readStringList(
       json['unsupported_file_paths'],
     );
@@ -4122,6 +4150,7 @@ class ImportSession {
 
     return ImportSession(
       id: json['id'].toString(),
+      targetVaultId: json['target_vault_id'] as String?,
       sourceKind: ImportSourceKindX.fromJson(json['source_kind'] as String?),
       sourcePath: json['source_path'] as String? ?? '',
       importMode: ImportModeX.fromJson(json['import_mode'] as String?),
@@ -4228,9 +4257,9 @@ class DuplicateReviewSummary {
       protectedBytes: (json['protected_bytes'] as num?)?.toInt() ?? 0,
       sessionsWithDuplicates:
           (json['sessions_with_duplicates'] as num?)?.toInt() ?? 0,
-      entries: _readList(
-        json['entries'],
-      ).map((item) => DuplicateReviewEntry.fromJson(item)).toList(),
+      entries: _readList(json['entries'])
+          .map((item) => DuplicateReviewEntry.fromJson(item))
+          .toList(),
       privacyDetail:
           json['privacy_detail'] as String? ??
           'Duplicate review is computed locally.',
@@ -4242,6 +4271,7 @@ class ImportScanRequest {
   const ImportScanRequest({
     required this.sourcePath,
     required this.sourceKind,
+    this.targetVaultId,
     required this.importMode,
     required this.addAsWatchFolder,
     required this.placeHint,
@@ -4250,6 +4280,7 @@ class ImportScanRequest {
 
   final String sourcePath;
   final ImportSourceKind sourceKind;
+  final String? targetVaultId;
   final ImportMode importMode;
   final bool addAsWatchFolder;
   final String? placeHint;
@@ -4259,6 +4290,7 @@ class ImportScanRequest {
     return {
       'source_path': sourcePath,
       'source_kind': sourceKind.wireValue,
+      if (targetVaultId != null) 'target_vault_id': targetVaultId,
       'import_mode': importMode.wireValue,
       'add_as_watch_folder': addAsWatchFolder,
       'recursive': recursive,
@@ -4272,17 +4304,20 @@ class ImportCommitRequest {
   const ImportCommitRequest({
     required this.sessionId,
     required this.candidateIds,
+    this.targetVaultId,
     required this.importMode,
   });
 
   final String sessionId;
   final List<String> candidateIds;
+  final String? targetVaultId;
   final ImportMode importMode;
 
   Map<String, dynamic> toJson() {
     return {
       'session_id': sessionId,
       'selected_candidate_ids': candidateIds,
+      if (targetVaultId != null) 'target_vault_id': targetVaultId,
       'import_mode': importMode.wireValue,
     };
   }
@@ -4309,9 +4344,9 @@ class LibraryStatus {
 
     return LibraryStatus(
       settings: settings,
-      watchFolders: _readList(
-        json['watch_folders'],
-      ).map((item) => WatchFolder.fromJson(item)).toList(),
+      watchFolders: _readList(json['watch_folders'])
+          .map((item) => WatchFolder.fromJson(item))
+          .toList(),
       isInitialized: json['is_initialized'] as bool? ?? settings != null,
     );
   }

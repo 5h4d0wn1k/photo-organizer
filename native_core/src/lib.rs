@@ -7,6 +7,7 @@ pub mod metadata;
 pub mod ml_sidecar;
 pub mod model_registry;
 pub mod ocr;
+pub mod original_quarantine;
 pub mod people;
 pub mod search;
 pub mod security;

@@ -146,6 +146,11 @@ pub fn router(state: AppState) -> Router {
             get(mobile_file_original),
         )
         .route("/vaults", get(list_vaults).post(create_vault))
+        .route("/quarantine/originals", get(list_quarantined_originals))
+        .route(
+            "/quarantine/originals/{asset_id}/repair",
+            post(repair_quarantined_original),
+        )
         .route("/vaults/{vault_id}/status", get(vault_status))
         .route(
             "/vaults/{vault_id}/storage-policy",
@@ -206,6 +211,10 @@ pub fn router(state: AppState) -> Router {
         .route("/smart-folders/{folder_id}", delete(delete_smart_folder))
         .route("/smart-folders/{folder_id}/search", get(run_smart_folder))
         .route("/imports/assets", post(import_asset))
+        .route(
+            "/vaults/{vault_id}/imports/assets",
+            post(import_asset_to_vault),
+        )
         .route("/imports/scan", post(scan_import_source))
         .route("/imports/commit", post(commit_import_session))
         .route("/imports/sessions", get(list_import_sessions))
@@ -282,9 +291,12 @@ pub fn router(state: AppState) -> Router {
         .route("/models/{model_id}/verify", post(verify_model))
         .route("/release/readiness", get(platform_release_readiness))
         .route("/diagnostics", get(diagnostics))
-        .with_state(state)
+        .with_state(state.clone())
         .layer(DefaultBodyLimit::max(MOBILE_UPLOAD_BODY_LIMIT_BYTES))
-        .layer(middleware::from_fn(enforce_private_api_boundary))
+        .layer(middleware::from_fn_with_state(
+            state,
+            enforce_private_api_boundary,
+        ))
         .layer(private_cors_layer())
         .layer(TraceLayer::new_for_http())
 }
@@ -305,7 +317,20 @@ fn private_cors_layer() -> CorsLayer {
         .allow_headers([CONTENT_TYPE, AUTHORIZATION])
 }
 
-async fn enforce_private_api_boundary(request: Request, next: Next) -> Response {
+async fn enforce_private_api_boundary(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if !state.service.is_operational() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "error": "daemon operations are disabled until sensitive repair staging is safely cleaned; restart after resolving the staging cleanup error"
+            })),
+        )
+            .into_response();
+    }
     let path = request.uri().path().to_string();
     let remote = request
         .extensions()
@@ -1043,6 +1068,25 @@ async fn list_vaults(
     Ok(Json(state.service.vaults().await))
 }
 
+async fn list_quarantined_originals(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<crate::domain::QuarantinedOriginalSummary>>, ApiError> {
+    Ok(Json(state.service.quarantined_originals().await))
+}
+
+async fn repair_quarantined_original(
+    State(state): State<AppState>,
+    Path(asset_id): Path<Uuid>,
+    Json(request): Json<crate::domain::QuarantineRepairRequest>,
+) -> Result<Json<crate::domain::QuarantineRepairResult>, ApiError> {
+    Ok(Json(
+        state
+            .service
+            .repair_quarantined_original(asset_id, request)
+            .await?,
+    ))
+}
+
 async fn create_vault(
     State(state): State<AppState>,
     Json(request): Json<CreateVaultRequest>,
@@ -1265,11 +1309,12 @@ async fn commit_import_session(
     Ok(Json(
         state
             .service
-            .commit_import_session(
+            .commit_import_session_with_target_vault(
                 request.session_id,
                 request.selected_candidate_ids,
                 request.import_mode,
                 request.add_as_watch_folder,
+                request.target_vault_id,
             )
             .await?,
     ))
@@ -1299,6 +1344,19 @@ async fn import_asset(
     Json(request): Json<crate::domain::ImportAssetRequest>,
 ) -> Result<Json<crate::domain::ImportAssetResponse>, ApiError> {
     Ok(Json(state.service.import_asset(request).await?))
+}
+
+async fn import_asset_to_vault(
+    State(state): State<AppState>,
+    Path(vault_id): Path<Uuid>,
+    Json(request): Json<crate::domain::ImportAssetRequest>,
+) -> Result<Json<crate::domain::ImportAssetResponse>, ApiError> {
+    Ok(Json(
+        state
+            .service
+            .import_asset_to_vault(vault_id, request)
+            .await?,
+    ))
 }
 
 async fn rebuild_metadata(
@@ -1942,6 +2000,7 @@ mod tests {
         is_desktop_api_client, is_public_remote_route, local_web_file_path, local_web_relative_path,
     };
     use axum::http::{HeaderMap, HeaderValue};
+    use tower::ServiceExt;
 
     #[test]
     fn loopback_without_tailnet_headers_is_desktop_api_client() {
@@ -1979,6 +2038,41 @@ mod tests {
         assert!(is_public_remote_route("/local-web/main.dart.js"));
         assert!(!is_public_remote_route("/library/status"));
         assert!(!is_public_remote_route("/assets/asset-1/original"));
+        assert!(!is_public_remote_route("/quarantine/originals"));
+        assert!(!is_public_remote_route(
+            "/quarantine/originals/asset-1/repair"
+        ));
+    }
+
+    #[tokio::test]
+    async fn sensitive_staging_cleanup_failure_disables_every_api_route() {
+        let runtime_root = std::env::temp_dir().join(format!(
+            "photo-organizer-api-disabled-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let service = crate::service::GalleryService::new(crate::config::AppConfig {
+            runtime_root,
+            ..crate::config::AppConfig::default()
+        })
+        .expect("service");
+        service.disable_after_sensitive_cleanup_failure();
+        assert!(!service.is_operational());
+        let app = super::router(super::AppState {
+            service: std::sync::Arc::new(service),
+        });
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/health")
+                    .body(axum::body::Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
     }
 
     #[test]

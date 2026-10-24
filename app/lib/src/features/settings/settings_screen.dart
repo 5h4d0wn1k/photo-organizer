@@ -147,9 +147,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
       if (!mounted) {
         return;
       }
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text('$error')));
+      ScaffoldMessenger.of(context)
+          .showSnackBar(SnackBar(content: Text('$error')));
     } finally {
       if (mounted) {
         setState(() => _savingSettings = false);
@@ -179,16 +178,14 @@ class _SettingsScreenState extends State<SettingsScreen> {
         return;
       }
       _watchFolderController.clear();
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(const SnackBar(content: Text('Watch folder added.')));
+      ScaffoldMessenger.of(context)
+          .showSnackBar(const SnackBar(content: Text('Watch folder added.')));
     } catch (error) {
       if (!mounted) {
         return;
       }
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text('$error')));
+      ScaffoldMessenger.of(context)
+          .showSnackBar(SnackBar(content: Text('$error')));
     } finally {
       if (mounted) {
         setState(() => _savingWatchFolder = false);
@@ -239,9 +236,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
       if (!mounted) {
         return;
       }
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text('$error')));
+      ScaffoldMessenger.of(context)
+          .showSnackBar(SnackBar(content: Text('$error')));
     } finally {
       if (mounted) {
         setState(() => _importingModel = false);
@@ -272,9 +268,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
       if (!mounted) {
         return;
       }
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text('$error')));
+      ScaffoldMessenger.of(context)
+          .showSnackBar(SnackBar(content: Text('$error')));
     } finally {
       if (mounted) {
         setState(() => _verifyingModel = false);
@@ -307,9 +302,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
       if (!mounted) {
         return;
       }
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text('$error')));
+      ScaffoldMessenger.of(context)
+          .showSnackBar(SnackBar(content: Text('$error')));
     } finally {
       if (mounted) {
         setState(() => _verifyingBackup = false);
@@ -346,9 +340,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
       if (!mounted) {
         return;
       }
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text('$error')));
+      ScaffoldMessenger.of(context)
+          .showSnackBar(SnackBar(content: Text('$error')));
     } finally {
       if (mounted) {
         setState(() => _exportingBackup = false);
@@ -388,9 +381,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
       if (!mounted) {
         return;
       }
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text('$error')));
+      ScaffoldMessenger.of(context)
+          .showSnackBar(SnackBar(content: Text('$error')));
     } finally {
       if (mounted) {
         setState(() => _exportingSupportBundle = false);
@@ -431,9 +423,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
       if (!mounted) {
         return;
       }
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text('$error')));
+      ScaffoldMessenger.of(context)
+          .showSnackBar(SnackBar(content: Text('$error')));
     } finally {
       if (mounted) {
         setState(() => _planningRestore = false);
@@ -475,9 +466,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
       if (!mounted) {
         return;
       }
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text('$error')));
+      ScaffoldMessenger.of(context)
+          .showSnackBar(SnackBar(content: Text('$error')));
     } finally {
       if (mounted) {
         setState(() => _runningRestore = false);
@@ -614,8 +604,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   decoration: const InputDecoration(
                     labelText: 'Restore staging path',
                     border: OutlineInputBorder(),
-                    helperText:
-                        'Use an empty folder outside the active library/runtime.',
+                    helperText: 'Use an empty folder outside the active library/runtime.',
                   ),
                 ),
                 const SizedBox(height: 12),
@@ -721,8 +710,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   const EmptyStatePanel(
                     icon: Icons.fact_check_outlined,
                     title: 'Release readiness unavailable',
-                    message:
-                        'This daemon did not report platform release evidence. Treat all platform releases as incomplete until the checklist is recorded.',
+                    message: 'This daemon did not report platform release evidence. Treat all platform releases as incomplete until the checklist is recorded.',
                   )
                 else
                   _PlatformReleaseReadinessPanel(
@@ -748,8 +736,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   const EmptyStatePanel(
                     icon: Icons.workspace_premium_outlined,
                     title: 'Entitlement status unavailable',
-                    message:
-                        'Local library access remains available while this daemon version or connection does not report entitlement state.',
+                    message: 'Local library access remains available while this daemon version or connection does not report entitlement state.',
                   )
                 else
                   _EntitlementStatusPanel(
@@ -773,8 +760,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   const EmptyStatePanel(
                     icon: Icons.manage_history_outlined,
                     title: 'No admin events recorded yet',
-                    message:
-                        'Successful vault, device, sync, and storage actions will appear here after the daemon records them locally.',
+                    message: 'Successful vault, device, sync, and storage actions will appear here after the daemon records them locally.',
                   )
                 else
                   _AuditLogPanel(events: auditEvents, formatter: formatter),
@@ -795,8 +781,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   const EmptyStatePanel(
                     icon: Icons.folder_copy_outlined,
                     title: 'No watch folders yet',
-                    message:
-                        'The library can still import one-off folders and removable drives. Add stable desktop folders here when you want the daemon to remember them.',
+                    message: 'The library can still import one-off folders and removable drives. Add stable desktop folders here when you want the daemon to remember them.',
                   )
                 else
                   for (final folder in watchFolders)
@@ -870,8 +855,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   const EmptyStatePanel(
                     icon: Icons.shield_outlined,
                     title: 'Privacy status unavailable',
-                    message:
-                        'The daemon may be older than this client. The app still uses the loopback API endpoint by default.',
+                    message: 'The daemon may be older than this client. The app still uses the loopback API endpoint by default.',
                   )
                 else ...[
                   ListTile(
@@ -974,8 +958,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   const EmptyStatePanel(
                     icon: Icons.memory_outlined,
                     title: 'ML runtime status unavailable',
-                    message:
-                        'The daemon did not return Python sidecar status. Faces, scenes, and semantic search remain blocked.',
+                    message: 'The daemon did not return Python sidecar status. Faces, scenes, and semantic search remain blocked.',
                   )
                 else
                   _ModelRuntimePanel(status: runtimeStatus),
@@ -985,8 +968,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   decoration: const InputDecoration(
                     labelText: 'Model id',
                     border: OutlineInputBorder(),
-                    helperText:
-                        'Example: scrfd-face-detector, arcface-embedding, scene-classifier-onnx',
+                    helperText: 'Example: scrfd-face-detector, arcface-embedding, scene-classifier-onnx',
                   ),
                 ),
                 const SizedBox(height: 12),
@@ -995,8 +977,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   decoration: const InputDecoration(
                     labelText: 'Local model file path',
                     border: OutlineInputBorder(),
-                    helperText:
-                        'Use a reviewed local file only. The app verifies the hash before install.',
+                    helperText: 'Use a reviewed local file only. The app verifies the hash before install.',
                   ),
                 ),
                 const SizedBox(height: 12),
@@ -1005,8 +986,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   decoration: const InputDecoration(
                     labelText: 'Expected SHA-256',
                     border: OutlineInputBorder(),
-                    helperText:
-                        'Required. Wrong hashes are rejected and the model is not installed.',
+                    helperText: 'Required. Wrong hashes are rejected and the model is not installed.',
                   ),
                 ),
                 const SizedBox(height: 12),
@@ -1045,8 +1025,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   const EmptyStatePanel(
                     icon: Icons.model_training_outlined,
                     title: 'No approved local models installed',
-                    message:
-                        'Faces, scenes, and semantic search stay unavailable until reviewed models are installed. OCR can use the local Tesseract CLI after encryption is active.',
+                    message: 'Faces, scenes, and semantic search stay unavailable until reviewed models are installed. OCR can use the local Tesseract CLI after encryption is active.',
                   )
                 else
                   for (final model in models)
@@ -1393,18 +1372,27 @@ class _BackupVerificationPanel extends StatelessWidget {
         'Library: ${result.libraryRoot}',
         'Assets checked: ${result.assetsChecked}',
         'Missing assets: ${result.missingAssetPaths.length}',
+        'Missing protected originals: ${result.missingProtectedOriginalPaths.length}',
         'Encrypted vault chunks checked: ${result.vaultChunksChecked}',
         'Missing encrypted chunks: ${result.missingVaultChunkPaths.length}',
+        'Protected originals checked: ${result.protectedOriginalsChecked}',
+        'Missing protected originals: ${result.missingProtectedOriginalPaths.length}',
         'Model files checked: ${result.modelFilesChecked}',
         'Missing model files: ${result.missingModelPaths.length}',
         if (result.databaseSha256 != null)
           'Database SHA-256: ${result.databaseSha256}',
+        ...result.missingProtectedOriginalPaths
+            .take(5)
+            .map((path) => 'Missing protected original: $path'),
         ...result.missingAssetPaths
             .take(5)
             .map((path) => 'Missing asset: $path'),
         ...result.missingVaultChunkPaths
             .take(5)
             .map((path) => 'Missing encrypted chunk: $path'),
+        ...result.missingProtectedOriginalPaths
+            .take(5)
+            .map((path) => 'Missing protected original: $path'),
         ...result.missingModelPaths
             .take(5)
             .map((path) => 'Missing model: $path'),
@@ -1563,6 +1551,7 @@ class _BackupExportPanel extends StatelessWidget {
         'Assets checked: ${result.assetsChecked}',
         'Media files copied: ${result.mediaFilesCopied}',
         'Encrypted vault chunks copied: ${result.vaultChunksCopied}',
+        'Protected original chunks copied: ${result.protectedOriginalChunksCopied}',
         'Bytes copied: ${result.bytesCopied}',
         'Missing assets: ${result.missingAssetPaths.length}',
         'Model files checked: ${result.modelFilesChecked}',
@@ -1621,6 +1610,7 @@ class _BackupRestorePlanPanel extends StatelessWidget {
         'Database target: ${result.databaseTargetPath}',
         'Media files available: ${result.mediaFilesAvailable}',
         'Encrypted vault chunks available: ${result.vaultChunksAvailable}',
+        'Protected original chunks available: ${result.protectedOriginalChunksAvailable}',
         'Missing paths: ${result.missingPaths.length}',
         'Destination conflicts: ${result.destinationConflicts.length}',
         ...result.missingPaths.take(5).map((path) => 'Missing: $path'),
@@ -1646,6 +1636,7 @@ class _BackupRestoreRunPanel extends StatelessWidget {
         'Database restored to: ${result.databaseRestoredTo}',
         'Media files copied: ${result.mediaFilesCopied}',
         'Encrypted vault chunks copied: ${result.vaultChunksCopied}',
+        'Protected original chunks copied: ${result.protectedOriginalChunksCopied}',
         'Bytes copied: ${result.bytesCopied}',
       ],
     );
