@@ -153,3 +153,15 @@ Dirty worktrees and missing upstreams are reported without changing them.
 Ignored directories count as one entry, avoiding an expensive build-cache scan.
 Use the release checklist and required CI checks before any merge or release;
 this inventory does not establish release readiness.
+
+The status report also shows filesystem capacity without scanning build caches.
+Before a large local build, you can require a free-space budget explicitly:
+
+```bash
+python3 scripts/workspace_status.py --require-free-gib 10 && make check
+```
+
+The threshold is a nonnegative integer in GiB (1 GiB = 1,073,741,824 bytes).
+A failed capacity query or unmet requirement exits 2 and appears in the report.
+This is a capacity snapshot, not a disk reservation or a build-size estimate;
+choose a budget appropriate to your build. Nothing is deleted automatically.
