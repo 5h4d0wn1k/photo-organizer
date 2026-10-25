@@ -79,3 +79,36 @@ The desktop app expects the Rust daemon on `http://127.0.0.1:4821`. It can try t
 ```bash
 cargo run --manifest-path native_core/Cargo.toml --bin galleryd
 ```
+
+## Stable-release desktop acceptance
+
+Tracked by issues #216 (release workflows), #217 (encrypted media display),
+and #218 (device-neutral local family groups).
+
+Desktop is a local gallery and file workspace. Gallery, Files, Albums, People,
+Places, Events, Search, Archive, My Devices, Activity and Settings must remain
+reachable at typical laptop and compact window sizes. Presence of a screen is
+not acceptance: verify importing real media, seeing previews, opening a photo,
+organizing files, exporting a selected original and recovering from an offline
+peer or unavailable file.
+
+Managed originals remain encrypted-only by default. Desktop previews use the
+loopback-private media API; the grid requests a thumbnail and photo detail
+requests full-size decrypted bytes in memory. Neither flow should create a
+plaintext temporary original. Remote peers must use their own scoped sessions;
+opening desktop management routes to the LAN is not a pairing implementation.
+
+Family groups must not require a dedicated desktop or a cloud account. A device
+may own a library, join another group, and store selected encrypted replicas;
+Admin/Contributor/Viewer/StorageOnly permissions remain independent of hardware.
+The current implementation has gaps: desktop rejects local group invites and
+mobile cannot yet run a supported local backend to create a fully offline group.
+Optional hosted bootstrap currently stores unencrypted group/device membership
+metadata and does not satisfy this release requirement.
+
+Required family acceptance: phone creates a group offline, desktop joins,
+selected photos/files transfer end-to-end encrypted, both restart and reconnect,
+a member is revoked and access is denied, and key recovery is exercised. Repeat
+with a desktop-created group. Android and iOS runtime/key-storage integration must
+be proven separately; iOS background availability must be stated accurately.
+These are release blockers, not completed features.
