@@ -1385,7 +1385,14 @@ fi
 # the cold-launch check pass precisely when it had not been performed.
 scenario_with "LSAPPINFO_RC=3"
 expect_fail "an unanswerable window server fails rather than proving a cold launch" \
-  "could not ask the window server" run_gate
+  "ERROR: could not ask the window server" run_gate
+# A later registration timeout must not disguise a warning-only cold-launch
+# check as a refusal: this failure must happen before the app is launched.
+if [[ -f "${FAKE_STATE}/open-invoked" ]]; then
+  bad "an unanswerable window server is refused before opening the app"
+else
+  ok "an unanswerable window server is refused before opening the app"
+fi
 scenario_with
 
 # `lsappinfo` writes some errors to stdout, so a query it rejects is
