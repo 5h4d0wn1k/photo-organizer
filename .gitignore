@@ -56,3 +56,7 @@ __pycache__/
 # Ignored so a developer's local venv cannot be committed by accident.
 .venv-test/
 .venv/
+
+# Preserve generated local release QA evidence without staging it as source.
+/android-smoke-evidence/
+/linux-smoke-evidence/
