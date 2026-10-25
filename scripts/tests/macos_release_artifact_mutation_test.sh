@@ -596,8 +596,8 @@ mutate "the lsappinfo status is read inside a command substitution (subshell)" \
 mutate "the gate kills a process before the cold launch" \
   'the gate never kills a process before the cold launch' \
   'assert_nothing_already_running() {' \
-  'pkill -f "${APP_BUNDLE_ID}" || true
-assert_nothing_already_running() {'
+  'assert_nothing_already_running() {
+  pkill -f "${APP_BUNDLE_ID}" || true'
 
 # 5. Backticks in the diagnostic. The refusal message quoted the `open` command
 #    inside a double-quoted string, so bash executed `open` with no arguments

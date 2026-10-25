@@ -665,7 +665,7 @@ set -uo pipefail
 # shellcheck source=/dev/null
 . "${FAKE_MACOS_BIN}/fake-lib"
 touch_state pkill-invoked
-if [[ ! -f "${FAKE_STATE}/open-invoked" ]]; then
+if ! state_exists open-invoked; then
   touch_state pkill-before-open
 fi
 printf 'pkill %s\n' "$*"
@@ -992,6 +992,25 @@ else
   bad "the default scenario records a PASS verdict in its evidence"
 fi
 
+# Prove the process-control recorder works in its standalone environment.
+# Only execute the absolute fake path, never the host process-control command.
+scenario_with
+if gate_env "${FAKE_BIN}/pkill" -f "${BUNDLE_ID}" >"${WORK_DIR}/fake-pkill.log" 2>&1 &&
+  [[ -f "${FAKE_STATE}/pkill-invoked" && -f "${FAKE_STATE}/pkill-before-open" ]]; then
+  ok "the fake pkill records a process kill before launch"
+else
+  bad "the fake pkill records a process kill before launch"
+fi
+scenario_with
+: >"${FAKE_STATE}/open-invoked"
+if gate_env "${FAKE_BIN}/pkill" -f "${BUNDLE_ID}" >>"${WORK_DIR}/fake-pkill.log" 2>&1 &&
+  [[ -f "${FAKE_STATE}/pkill-invoked" && ! -f "${FAKE_STATE}/pkill-before-open" ]]; then
+  ok "the fake pkill distinguishes a process kill after launch"
+else
+  bad "the fake pkill distinguishes a process kill after launch"
+fi
+scenario_with
+
 # Two guards on the fake toolchain itself. Without them the failure cases below
 # could be testing the fake rather than the gate: a fake `open` that never
 # reports a launch would make every "crash on start" case pass for the wrong
@@ -1062,7 +1081,13 @@ make_path_farm() {
   # shellcheck disable=SC2086 # GATE_TOOLS is a deliberate word list
   for tool in ${GATE_TOOLS}; do
     [[ -e "${destination}/${tool}" ]] && continue
-    dir="$(command -v "${tool}" 2>/dev/null || true)"
+    # A restricted PATH must keep the same fake tools as gate_env. Resolving
+    # pkill from the host here lets a deliberately broken gate kill the runner.
+    if [[ -x "${FAKE_BIN}/${tool}" ]]; then
+      dir="${FAKE_BIN}/${tool}"
+    else
+      dir="$(command -v "${tool}" 2>/dev/null || true)"
+    fi
     [[ -n "${dir}" ]] && ln -sf "${dir}" "${destination}/${tool}"
   done
 }
@@ -1081,6 +1106,32 @@ if [[ -e "${NO_HDITOOL_BIN}/hdiutil" ]]; then
 else
   ok "the missing-hdiutil fixture really removes hdiutil from the farm"
 fi
+# Fail before invoking any gate if a restricted PATH can escape the fake
+# process-control command. Checking inode identity never executes the command.
+path_farm_has_fake_pkill() {
+  [[ "$1/pkill" -ef "${FAKE_BIN}/pkill" ]]
+}
+for farm in "${FARM_BIN}" "${NO_HDITOOL_BIN}"; do
+  if path_farm_has_fake_pkill "${farm}"; then
+    ok "a restricted PATH resolves pkill to the safe fake"
+  else
+    bad "a restricted PATH resolves pkill to the safe fake" \
+      "refusing to execute a gate with host process-control commands"
+    exit 1
+  fi
+done
+# Exercise the safety check's negative path with a harmless stand-in; neither
+# the stand-in nor a real pkill is invoked by this check.
+UNSAFE_FARM="${WORK_DIR}/path-wrong-pkill"
+mkdir -p "${UNSAFE_FARM}"
+printf '#!/bin/sh\nexit 0\n' >"${UNSAFE_FARM}/pkill"
+if path_farm_has_fake_pkill "${UNSAFE_FARM}"; then
+  bad "the PATH safety check rejects a different process-control command"
+  exit 1
+else
+  ok "the PATH safety check rejects a different process-control command"
+fi
+
 if gate_env env "PATH=${FARM_BIN}" bash "${SCRIPT}" "${WORK_DIR}/release.dmg" >"${WORK_DIR}/farm.log" 2>&1; then
   ok "the restricted PATH is complete enough for the gate to pass"
 else
