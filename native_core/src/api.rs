@@ -2035,6 +2035,14 @@ mod tests {
             })
             .expect("service"),
         );
+        service
+            .update_library_settings(crate::domain::UpdateLibrarySettingsRequest {
+                library_root: library.to_string_lossy().into_owned(),
+                default_import_mode: crate::domain::ImportMode::Copy,
+                original_storage_policy: Some(crate::domain::OriginalStoragePolicy::EncryptedOnly),
+            })
+            .await
+            .expect("encrypted-only library settings");
         let imported = service
             .import_asset(crate::domain::ImportAssetRequest {
                 source_path: source.to_string_lossy().into_owned(),
