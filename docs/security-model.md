@@ -92,9 +92,21 @@ under the same key reference cannot recover existing data and is forbidden.
 
 An interrupted first provisioning attempt can leave a provisioning marker
 without a stored key. A retry may provision the key only while there is no
-encrypted-history record or ciphertext directory for that vault version. Once
+encrypted-history record or ciphertext directory for that vault. A marker for
+another key version is not proof that ambiguous legacy ciphertext is safe.
+Existing OS-stored keys remain usable; automatic rotation into a missing new
+key version on a populated vault is unsupported until explicit inventory and
+allocation verification exists. Once
 there is any such evidence, a missing key requires exact-key recovery and the
 app will not generate a replacement. Recovery after actual key loss is
 unavailable without a backup.
 These changes protect key storage; they do not fix cross-vault isolation (#112)
 or complete the remaining #110 recovery tooling.
+
+Provider read/create is additionally serialized across runtime roots using
+per-user application locks: `~/.local/share/photo-organizer/vault-key-provider-locks`
+on Linux, `~/Library/Application Support/photo-organizer/vault-key-provider-locks`
+on Apple platforms, and `%LOCALAPPDATA%/photo-organizer/vault-key-provider-locks`
+on Windows. These contain only nonsecret lock files, never keys. Instances
+sharing the OS credential store must use the same OS user application directory;
+changing HOME/LOCALAPPDATA is not a supported way to isolate a shared key store.

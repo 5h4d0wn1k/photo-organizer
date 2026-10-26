@@ -386,20 +386,18 @@ pub fn provision_vault_key_if_new(
         .map_err(io_error)?;
     fs2::FileExt::lock_exclusive(&lock).map_err(io_error)?;
     let marker = marker_root.join(format!("{stem}.initialized"));
-    // The caller supplies history for this exact key version from the catalog.
-    // Before this lifecycle protocol existed, an interrupted seal could leave
-    // ciphertext without catalog rows or a marker, so retain the conservative
-    // vault-wide check for wholly unmarked legacy vaults. Once any version has
-    // a lifecycle marker, new ciphertext is guaranteed to be preceded by that
-    // version's durable marker and history can be checked per key version.
-    let has_any_lifecycle_marker = has_any_key_lifecycle_marker(&marker_root, vault_id)?;
-    let has_unmarked_legacy_ciphertext = !has_any_lifecycle_marker
-        && library_root
-            .join("vaults")
-            .join(vault_id.to_string())
-            .try_exists()
-            .map_err(io_error)?;
-    let history = has_encrypted_history || has_unmarked_legacy_ciphertext;
+    // Catalog evidence can be incomplete after an interrupted legacy seal.
+    // Chunk paths are vault-scoped, not version-scoped: a marker for another
+    // version cannot prove which key encrypted those bytes. Never create a
+    // missing key while any ambiguous on-disk vault history remains. Existing
+    // provider keys are still reused by prepare_key_version, including v2+.
+    // Future rotation needs an explicit verified allocation/inventory protocol.
+    let has_vault_ciphertext_directory = library_root
+        .join("vaults")
+        .join(vault_id.to_string())
+        .try_exists()
+        .map_err(io_error)?;
+    let history = has_encrypted_history || has_vault_ciphertext_directory;
     #[cfg(test)]
     {
         let path = file_key_path(config, &key_id);
@@ -432,6 +430,10 @@ pub fn provision_vault_key_if_new(
     }
     #[cfg(not(test))]
     {
+        // OS credentials are shared across runtime roots. Serialize provider
+        // read/create under the same per-user application lock, not only the
+        // runtime-local lifecycle lock above.
+        let _provider_lock = lock_provider_key_at(&provider_lock_root()?, &stem)?;
         let entry = keyring::Entry::new(KEYRING_SERVICE, &key_id)
             .map_err(|error| VaultStoreError::KeyStorage(error.to_string()))?;
         prepare_key_version(&marker, history, &key_id, entry.get_password(), |value| {
@@ -441,28 +443,40 @@ pub fn provision_vault_key_if_new(
     Ok(())
 }
 
-fn has_any_key_lifecycle_marker(
-    marker_root: &Path,
-    vault_id: Uuid,
-) -> Result<bool, VaultStoreError> {
-    let entries = match fs::read_dir(marker_root) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => return Err(io_error(error)),
-    };
-    let prefix = format!("{vault_id}-v");
-    for entry in entries {
-        let entry = entry.map_err(io_error)?;
-        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-            continue;
-        };
-        if name.starts_with(&prefix)
-            && (name.ends_with(".initialized") || name.ends_with(".provisioning"))
-        {
-            return Ok(true);
+#[cfg(not(test))]
+fn provider_lock_root() -> Result<PathBuf, VaultStoreError> {
+    #[cfg(windows)]
+    let base = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
+    #[cfg(not(windows))]
+    let base = std::env::var_os("HOME").map(PathBuf::from).map(|home| {
+        if cfg!(target_vendor = "apple") {
+            home.join("Library/Application Support")
+        } else {
+            home.join(".local/share")
         }
+    });
+    let base = base.filter(|path| path.is_absolute()).ok_or_else(|| {
+        VaultStoreError::KeyStorage(
+            "absolute per-user application directory is required for vault key locking".into(),
+        )
+    })?;
+    Ok(base.join("photo-organizer/vault-key-provider-locks"))
+}
+
+fn lock_provider_key_at(root: &Path, stem: &str) -> Result<fs::File, VaultStoreError> {
+    fs::create_dir_all(root).map_err(io_error)?;
+    let mut options = fs::OpenOptions::new();
+    options.create(true).truncate(false).read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
     }
-    Ok(false)
+    let lock = options
+        .open(root.join(format!("{stem}.lock")))
+        .map_err(io_error)?;
+    fs2::FileExt::lock_exclusive(&lock).map_err(io_error)?;
+    Ok(lock)
 }
 
 fn prepare_key_version(
@@ -805,7 +819,43 @@ mod tests {
     }
 
     #[test]
-    fn older_version_ciphertext_does_not_block_new_key_version() {
+    fn unrelated_version_markers_never_allow_missing_key_replacement() {
+        for (requested_version, marker_name) in [
+            (1, "v2.initialized"),
+            (1, "v2.provisioning"),
+            (2, "v1.initialized"),
+        ] {
+            let (root, _) = marker_fixture();
+            let config = AppConfig {
+                runtime_root: root.clone(),
+                ..AppConfig::default()
+            };
+            let library = root.join("library");
+            let vault_id = Uuid::new_v4();
+            let ciphertext = library
+                .join("vaults")
+                .join(vault_id.to_string())
+                .join("blobs/legacy/00000000.pgblob");
+            fs::create_dir_all(ciphertext.parent().unwrap()).unwrap();
+            fs::write(&ciphertext, b"preserve legacy ciphertext").unwrap();
+            let marker = root
+                .join("security/vault-key-initialization")
+                .join(format!("{vault_id}-{marker_name}"));
+            fs::create_dir_all(marker.parent().unwrap()).unwrap();
+            fs::write(marker, b"marker for another version").unwrap();
+            assert!(
+                provision_vault_key_if_new(&config, &library, vault_id, requested_version, false)
+                    .is_err(),
+                "another version cannot prove the requested missing key is new"
+            );
+            assert!(load_existing_vault_key(&config, vault_id, requested_version).is_err());
+            assert_eq!(fs::read(ciphertext).unwrap(), b"preserve legacy ciphertext");
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn populated_vault_reuses_existing_key_of_another_version() {
         let (root, _) = marker_fixture();
         let config = AppConfig {
             runtime_root: root.clone(),
@@ -813,26 +863,17 @@ mod tests {
         };
         let library = root.join("library");
         let vault_id = Uuid::new_v4();
-        // The on-disk layout is vault scoped, not key-version scoped. A v1
-        // lifecycle marker means v2 history can safely be version scoped.
-        let older_version_ciphertext = library
-            .join("vaults")
-            .join(vault_id.to_string())
-            .join("blobs/older-version/00000000.pgblob");
-        fs::create_dir_all(older_version_ciphertext.parent().unwrap()).unwrap();
-        fs::write(&older_version_ciphertext, b"v1 ciphertext").unwrap();
-        let v1_marker = root
-            .join("security/vault-key-initialization")
-            .join(format!("{vault_id}-v1.initialized"));
-        fs::create_dir_all(v1_marker.parent().unwrap()).unwrap();
-        fs::write(v1_marker, b"initialized-v1\n").unwrap();
-
+        fs::create_dir_all(library.join("vaults").join(vault_id.to_string())).unwrap();
+        let key_path = file_key_path(&config, &key_reference(vault_id, 2));
+        fs::create_dir_all(key_path.parent().unwrap()).unwrap();
+        let existing_key = hex_string([42_u8; 32]);
+        fs::write(&key_path, &existing_key).unwrap();
         provision_vault_key_if_new(&config, &library, vault_id, 2, false).unwrap();
-        assert!(load_existing_vault_key(&config, vault_id, 2).is_ok());
         assert_eq!(
-            fs::read(older_version_ciphertext).unwrap(),
-            b"v1 ciphertext"
+            hex_string(load_existing_vault_key(&config, vault_id, 2).unwrap()),
+            existing_key
         );
+        assert_eq!(fs::read_to_string(key_path).unwrap(), existing_key);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -917,6 +958,59 @@ mod tests {
             .map(|handle| handle.join().unwrap())
             .collect::<Vec<_>>();
         assert_eq!(keys[0].as_ref(), keys[1].as_ref());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn separate_runtime_roots_share_one_provider_key_creation() {
+        use std::sync::{
+            Arc, Barrier, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let (root, _) = marker_fixture();
+        let provider = Arc::new(Mutex::new(None::<String>));
+        let writes = Arc::new(AtomicUsize::new(0));
+        let ready = Arc::new(Barrier::new(2));
+        let handles = (0..2)
+            .map(|index| {
+                let runtime = root.join(format!("runtime-{index}"));
+                fs::create_dir_all(&runtime).unwrap();
+                let locks = root.join("per-user-provider-locks");
+                let provider = provider.clone();
+                let writes = writes.clone();
+                let ready = ready.clone();
+                std::thread::spawn(move || {
+                    ready.wait();
+                    let _lock = lock_provider_key_at(&locks, "same-vault-v1").unwrap();
+                    let stored = provider
+                        .lock()
+                        .unwrap()
+                        .clone()
+                        .ok_or(keyring::Error::NoEntry);
+                    // Widen the absent-read/write race. The shared lock must cover
+                    // both operations even though the lifecycle roots differ.
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                    prepare_key_version(
+                        &runtime.join("initialized"),
+                        false,
+                        "same-vault-v1",
+                        stored,
+                        |value| {
+                            writes.fetch_add(1, Ordering::SeqCst);
+                            *provider.lock().unwrap() = Some(value.to_string());
+                            Ok(())
+                        },
+                    )
+                    .unwrap()
+                })
+            })
+            .collect::<Vec<_>>();
+        let keys = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(keys[0].as_ref(), keys[1].as_ref());
+        assert_eq!(writes.load(Ordering::SeqCst), 1);
         fs::remove_dir_all(root).unwrap();
     }
 

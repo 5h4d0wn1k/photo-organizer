@@ -23,13 +23,16 @@ mkdir -p "$TMPDIR"
 
 dbus-run-session -- bash -euo pipefail <<'SESSION'
   isolated_home="$PHOTO_ORGANIZER_SECRET_SERVICE_TEST_ROOT/home"
-  mkdir -p "$isolated_home/data"
+  mkdir -p "$isolated_home/data" "$PHOTO_ORGANIZER_SECRET_SERVICE_TEST_ROOT/run" "$PHOTO_ORGANIZER_SECRET_SERVICE_TEST_ROOT/control"
+  chmod 700 "$PHOTO_ORGANIZER_SECRET_SERVICE_TEST_ROOT/run" "$PHOTO_ORGANIZER_SECRET_SERVICE_TEST_ROOT/control"
+  export XDG_RUNTIME_DIR="$PHOTO_ORGANIZER_SECRET_SERVICE_TEST_ROOT/run"
+  unset GNOME_KEYRING_CONTROL
   export HOME="$isolated_home"
   export XDG_DATA_HOME="$isolated_home/data"
 
   # Unlock a new temporary keyring with an empty passphrase. This keyring lives
   # only under the per-run temporary HOME and is removed when the session ends.
-  eval "$(printf "\\n" | gnome-keyring-daemon --unlock --components=secrets)"
+  eval "$(printf "\\n" | gnome-keyring-daemon --unlock --components=secrets --control-directory="$PHOTO_ORGANIZER_SECRET_SERVICE_TEST_ROOT/control")"
   cd "$PHOTO_ORGANIZER_SECRET_SERVICE_TEST_REPO/native_core"
   cargo test --locked --test vault_key_production \
     production_keyring_provisions_and_reopens_vault_key -- --exact --ignored

@@ -93,7 +93,7 @@ async fn production_keyring_provisions_and_reopens_vault_key() {
     );
     drop(service);
 
-    let reopened = GalleryService::new(config).expect("reopen service");
+    let reopened = GalleryService::new(config.clone()).expect("reopen service");
     assert_eq!(
         reopened
             .asset_original_bytes(imported.asset.id)
@@ -102,5 +102,94 @@ async fn production_keyring_provisions_and_reopens_vault_key() {
             .1,
         bytes,
     );
+    // Only the unique key created above in this isolated Secret Service is
+    // deleted. Never enumerate or touch any credential from the user's session.
+    let isolated_root = std::env::var_os("PHOTO_ORGANIZER_SECRET_SERVICE_TEST_ROOT")
+        .expect("run through the isolated Secret Service harness");
+    assert!(root.starts_with(std::path::Path::new(&isolated_root)));
+    let vault = reopened.vaults().await.into_iter().next().expect("vault");
+    let entry = keyring::Entry::new(
+        "private-gallery-vaults",
+        &native_core::vault_store::key_reference(vault.id, vault.key_version),
+    )
+    .expect("test-created entry");
+    let ciphertext_before = ciphertext_snapshot(&library.join("vaults"));
+    assert!(
+        !ciphertext_before.is_empty(),
+        "fixture must contain encrypted chunks"
+    );
+    entry
+        .delete_credential()
+        .expect("remove only test-created key");
+    assert!(matches!(entry.get_password(), Err(keyring::Error::NoEntry)));
+    assert!(
+        reopened
+            .asset_original_bytes(imported.asset.id)
+            .await
+            .is_err()
+    );
+    let second = root.join("second.jpg");
+    let second_bytes = b"different private asset after lost key";
+    fs::write(&second, second_bytes).expect("second source");
+    assert!(
+        reopened
+            .import_asset(ImportAssetRequest {
+                source_path: second.to_string_lossy().into_owned(),
+                original_filename: "second.jpg".into(),
+                media_kind: MediaKind::Photo,
+                mime_type: "image/jpeg".into(),
+                bytes: second_bytes.len() as u64,
+                content_hash: None,
+                captured_at: None,
+                place_hint: None,
+                import_mode: Some(ImportMode::Copy),
+            })
+            .await
+            .is_err(),
+        "missing initialized key must fail import, not replace it"
+    );
+    assert!(matches!(entry.get_password(), Err(keyring::Error::NoEntry)));
+    assert_eq!(
+        ciphertext_snapshot(&library.join("vaults")),
+        ciphertext_before
+    );
+    drop(reopened);
+    let after_loss = GalleryService::new(config).expect("reopen without replacing missing key");
+    assert!(
+        after_loss
+            .asset_original_bytes(imported.asset.id)
+            .await
+            .is_err()
+    );
+    assert!(matches!(entry.get_password(), Err(keyring::Error::NoEntry)));
+    assert_eq!(
+        ciphertext_snapshot(&library.join("vaults")),
+        ciphertext_before
+    );
+    drop(after_loss);
     fs::remove_dir_all(root).expect("remove isolated runtime and library");
+}
+
+fn ciphertext_snapshot(
+    root: &std::path::Path,
+) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+    fn visit(
+        path: &std::path::Path,
+        files: &mut std::collections::BTreeMap<std::path::PathBuf, Vec<u8>>,
+    ) {
+        for entry in fs::read_dir(path).expect("ciphertext directory") {
+            let path = entry.expect("ciphertext entry").path();
+            if path.is_dir() {
+                visit(&path, files);
+            } else if path
+                .extension()
+                .is_some_and(|extension| extension == "pgblob")
+            {
+                files.insert(path.clone(), fs::read(path).expect("ciphertext bytes"));
+            }
+        }
+    }
+    let mut files = std::collections::BTreeMap::new();
+    visit(root, &mut files);
+    files
 }
