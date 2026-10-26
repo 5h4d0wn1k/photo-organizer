@@ -951,6 +951,93 @@ fn write_encryption_settings_row(config: &AppConfig) -> Result<(), SecurityError
     Ok(())
 }
 
+/// Capture a standalone SQLite snapshot, including committed WAL pages, using
+/// the existing database key. Never create a replacement key or overwrite a
+/// previous backup. Callers serialize application state/media copying separately.
+pub fn snapshot_database(source_path: &Path, destination: &Path) -> Result<(), SecurityError> {
+    if !source_path.is_file() {
+        return Err(SecurityError::Invalid(
+            "backup source database is missing".into(),
+        ));
+    }
+    let source = open_database(source_path)?;
+    let state = read_state_for_database_path(source_path)?;
+    let key = state
+        .as_ref()
+        .map(|state| load_key_for_state(source_path, state))
+        .transpose()?
+        .map(Zeroizing::new);
+    if database_file_is_encrypted(source_path) && key.is_none() {
+        return Err(SecurityError::KeyStorage(
+            "encrypted backup source has no verified key state".into(),
+        ));
+    }
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    // Only clean up a destination this invocation successfully reserved.
+    let reservation = options.open(destination).map_err(io_error)?;
+    drop(reservation);
+    let result = (|| {
+        let mut target = Connection::open(destination).map_err(database_error)?;
+        if let Some(key) = &key {
+            key_connection(&target, key)?;
+        }
+        source
+            .execute_batch("BEGIN; SELECT count(*) FROM sqlite_master;")
+            .map_err(database_error)?;
+        let user_version: i64 = source
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .map_err(database_error)?;
+        {
+            let backup =
+                rusqlite::backup::Backup::new(&source, &mut target).map_err(database_error)?;
+            if !matches!(
+                backup.step(-1).map_err(database_error)?,
+                rusqlite::backup::StepResult::Done
+            ) {
+                return Err(SecurityError::Database(
+                    "backup snapshot was busy or incomplete; retry export".into(),
+                ));
+            }
+        }
+        source.execute_batch("ROLLBACK;").map_err(database_error)?;
+        // A recovery snapshot must not depend on destination WAL sidecars.
+        target
+            .pragma_update(None, "journal_mode", "DELETE")
+            .map_err(database_error)?;
+        let integrity: String = target
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .map_err(database_error)?;
+        let copied_version: i64 = target
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .map_err(database_error)?;
+        let foreign_key_errors = target
+            .prepare("PRAGMA foreign_key_check")
+            .map_err(database_error)?
+            .exists([])
+            .map_err(database_error)?;
+        if integrity != "ok" || user_version != copied_version || foreign_key_errors {
+            return Err(SecurityError::Database(
+                "backup snapshot integrity or schema validation failed".into(),
+            ));
+        }
+        drop(target);
+        fs::File::open(destination)
+            .and_then(|file| file.sync_all())
+            .map_err(io_error)?;
+        Ok(())
+    })();
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) => Err(cleanup_candidate_after_error(destination, error)),
+    }
+}
+
 fn export_plaintext_to_encrypted(
     database_path: &Path,
     encrypted_temp: &Path,
@@ -1525,6 +1612,84 @@ mod tests {
         };
         let raw = serde_json::to_vec(&manifest).expect("serialize recovery manifest");
         atomic_write_file(&manifest_path, &raw).expect("persist recovery manifest");
+    }
+
+    #[test]
+    fn backup_snapshot_preserves_wal_commits_encryption_and_schema() {
+        for encrypted in [false, true] {
+            let (config, root) = test_config("online-backup");
+            seed_db(&config);
+            if encrypted {
+                activate_encryption(&config).expect("encrypt source");
+            }
+            let writer = open_database(&config.database_path()).expect("writer");
+            writer
+                .pragma_update(None, "journal_mode", "WAL")
+                .expect("WAL");
+            writer
+                .pragma_update(None, "user_version", 21)
+                .expect("schema version");
+            let reader = open_database(&config.database_path()).expect("reader");
+            reader
+                .execute_batch("BEGIN; SELECT * FROM recovery_canary;")
+                .expect("pin WAL snapshot");
+            writer
+                .execute(
+                    "INSERT INTO recovery_canary(note) VALUES (?1)",
+                    ["acknowledged-WAL-write"],
+                )
+                .expect("commit");
+            let destination = root.join("recovery.sqlite3");
+            snapshot_database(&config.database_path(), &destination).expect("consistent snapshot");
+            let copied = Connection::open(&destination).expect("snapshot connection");
+            if encrypted {
+                assert!(database_file_is_encrypted(&destination));
+                assert!(
+                    copied
+                        .query_row("SELECT count(*) FROM sqlite_master", [], |row| row
+                            .get::<_, i64>(0))
+                        .is_err(),
+                    "unkeyed connection must not read recovery catalog"
+                );
+                let state = read_state_for_database_path(&config.database_path())
+                    .unwrap()
+                    .unwrap();
+                let key = load_key_for_state(&config.database_path(), &state).unwrap();
+                key_connection(&copied, &key).expect("original key reads backup");
+            } else {
+                assert!(database_file_is_plaintext(&destination));
+            }
+            let count: i64 = copied
+                .query_row(
+                    "SELECT count(*) FROM recovery_canary WHERE note='acknowledged-WAL-write'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 1);
+            let version: i64 = copied
+                .query_row("PRAGMA user_version", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(version, 21);
+            let integrity: String = copied
+                .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(integrity, "ok");
+            drop(copied);
+            let digest = database_sha256(&destination);
+            assert!(
+                snapshot_database(&config.database_path(), &destination).is_err(),
+                "previous backup must never be overwritten"
+            );
+            assert_eq!(database_sha256(&destination), digest);
+            assert!(
+                snapshot_database(&root.join("missing.sqlite3"), &root.join("absent.sqlite3"))
+                    .is_err()
+            );
+            assert!(!root.join("missing.sqlite3").exists());
+            assert!(!root.join("absent.sqlite3").exists());
+            reader.execute_batch("ROLLBACK").unwrap();
+        }
     }
 
     fn cleanup(root: &Path) {

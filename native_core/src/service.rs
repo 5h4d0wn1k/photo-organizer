@@ -5370,8 +5370,10 @@ impl GalleryService {
         fs::create_dir_all(&manifest_dir).map_err(|err| ServiceError::Io(err.to_string()))?;
         fs::create_dir_all(&library_export_dir).map_err(|err| ServiceError::Io(err.to_string()))?;
 
+        // Keep catalog mutations and media retirement out of the complete
+        // snapshot/inventory/copy window. Verification below uses this same state.
+        let mut state = self.state.write().await;
         let entries = {
-            let mut state = self.state.write().await;
             ensure_distributed_defaults(&mut state);
             let changed = refresh_blob_records(&self.config, &mut state);
             if changed {
@@ -5392,8 +5394,8 @@ impl GalleryService {
                 .file_name()
                 .unwrap_or_else(|| std::ffi::OsStr::new("gallery.sqlite3")),
         );
-        fs::copy(&self.storage.database_path, &database_copy)
-            .map_err(|err| ServiceError::Io(err.to_string()))?;
+        security::snapshot_database(&self.storage.database_path, &database_copy)
+            .map_err(security_error)?;
 
         let mut media_files_copied = 0_usize;
         let mut vault_chunks_copied = 0_usize;
@@ -5426,11 +5428,11 @@ impl GalleryService {
             }));
         }
 
-        let verification = self
-            .verify_backup(BackupVerifyRequest {
-                export_root: Some(request.export_root.clone()),
-            })
-            .await?;
+        let mut verification = self.verify_backup_locked(&state)?;
+        verification.database_sha256 = Some(
+            imports::derive_content_hash_from_file(&database_copy)
+                .map_err(|error| ServiceError::Io(error.to_string()))?,
+        );
         let manifest_path = manifest_dir.join("private-gallery-backup-manifest.json");
         let manifest = json!({
             "exported_at": Utc::now(),
@@ -5645,7 +5647,14 @@ impl GalleryService {
         if changed {
             self.persist_locked_state(&state)?;
         }
-        let library_root = PathBuf::from(effective_library_root(&state, &self.config));
+        self.verify_backup_locked(&state)
+    }
+
+    fn verify_backup_locked(
+        &self,
+        state: &LibraryState,
+    ) -> Result<BackupVerification, ServiceError> {
+        let library_root = PathBuf::from(effective_library_root(state, &self.config));
         let mut missing_asset_paths = Vec::new();
         for asset in &state.assets {
             let path = asset_file_path(asset, &library_root);
@@ -5653,7 +5662,7 @@ impl GalleryService {
                 .blob_records
                 .iter()
                 .find(|blob| blob.asset_id == asset.id && blob.tombstoned_at.is_none())
-                .map(|blob| encrypted_chunks_available(&state, blob.id, &library_root))
+                .map(|blob| encrypted_chunks_available(state, blob.id, &library_root))
                 .unwrap_or(false);
             if !path.exists() && !encrypted_available {
                 missing_asset_paths.push(path.to_string_lossy().to_string());
@@ -14636,6 +14645,50 @@ mod tests {
             .await
             .expect("remove asset");
         assert_eq!(removed.asset_ids, vec![other_asset]);
+    }
+
+    #[tokio::test]
+    async fn backup_export_includes_committed_wal_state_with_pinned_reader() {
+        let root = temp_root("backup-pinned-wal");
+        let config = AppConfig {
+            runtime_root: root.to_path_buf(),
+            ..AppConfig::default()
+        };
+        let service = GalleryService::new(config.clone()).expect("service");
+        let reader = crate::security::open_database(&config.database_path()).expect("reader");
+        reader
+            .execute_batch("BEGIN; SELECT count(*) FROM jobs;")
+            .expect("pin old snapshot");
+        let latest = service.index_people().await.expect("committed job");
+        assert!(PathBuf::from(format!("{}-wal", config.database_path().display())).is_file());
+        let backup = service
+            .export_backup(crate::domain::BackupExportRequest {
+                export_root: root.join("export").to_string_lossy().into_owned(),
+                include_models: false,
+            })
+            .await
+            .expect("export");
+        let exported =
+            rusqlite::Connection::open(&backup.database_copied_to).expect("exported catalog");
+        let found: i64 = exported
+            .query_row(
+                "SELECT count(*) FROM jobs WHERE id=?1",
+                [latest.id.to_string()],
+                |row| row.get(0),
+            )
+            .expect("job query");
+        assert_eq!(
+            found, 1,
+            "acknowledged WAL writes must be in recovery catalog"
+        );
+        assert_eq!(
+            backup.database_sha256,
+            imports::derive_content_hash_from_file(std::path::Path::new(
+                &backup.database_copied_to
+            ))
+            .ok()
+        );
+        reader.execute_batch("ROLLBACK").expect("reader closes");
     }
 
     #[tokio::test]
