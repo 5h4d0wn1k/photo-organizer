@@ -113,3 +113,27 @@ Resume rollout only after all applicable items are true:
 - [ ] Record skipped checks and accepted residual risk.
 - [ ] Close the incident only after support channels show no active data-loss,
       privacy, or restore reports for the release window.
+
+
+## Catalog snapshot contract
+
+Backup export captures the catalog with SQLite's online backup API, including
+committed WAL records. The destination is a new standalone database file; an
+existing exported catalog is refused rather than overwritten. Use a new export
+directory for each backup and retain the previous verified backup.
+
+An encrypted source produces an encrypted snapshot using the existing catalog
+key. No new key is generated and no key is written into the export. Recovery
+still requires the user's exact original secure-store key and applicable state;
+this does not introduce portable key wrapping or solve lost-key recovery.
+
+The service holds its library-state write lock through inventory, database
+snapshot and media copying. Imports, sync catalog writes and media retirement
+through this service wait for that capture to finish. The manifest/result hash
+is computed from the exported database, not the live source main file. External
+programs can still change reference files; a coherent catalog snapshot is not a
+filesystem-wide snapshot of arbitrary external media.
+
+If export fails, do not treat the partially written directory as a valid backup.
+Retain earlier verified exports; inspect the failure, then retry into a new
+export directory. No success manifest is published by a failed catalog snapshot.
