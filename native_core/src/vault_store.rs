@@ -433,12 +433,22 @@ pub fn provision_vault_key_if_new(
         // OS credentials are shared across runtime roots. Serialize provider
         // read/create under the same per-user application lock, not only the
         // runtime-local lifecycle lock above.
-        let _provider_lock = lock_provider_key_at(&provider_lock_root()?, &stem)?;
+        let provider_root = provider_lock_root()?;
+        let _provider_lock = lock_provider_key_at(&provider_root, &stem)?;
+        let provider_marker = provider_root.join(format!("{stem}.initialized"));
+        let local_initialized = read_key_marker(&marker)? == Some(KeyMarkerState::Initialized);
         let entry = keyring::Entry::new(KEYRING_SERVICE, &key_id)
             .map_err(|error| VaultStoreError::KeyStorage(error.to_string()))?;
-        prepare_key_version(&marker, history, &key_id, entry.get_password(), |value| {
-            entry.set_password(value)
-        })?;
+        // Share lifecycle history as well as serialization. A second runtime
+        // with no local catalog must not regenerate a lost shared credential.
+        prepare_key_version(
+            &provider_marker,
+            history || local_initialized,
+            &key_id,
+            entry.get_password(),
+            |value| entry.set_password(value),
+        )?;
+        write_key_marker(&marker, KeyMarkerState::Initialized)?;
     }
     Ok(())
 }

@@ -45,6 +45,9 @@ async fn production_keyring_provisions_and_reopens_vault_key() {
     };
 
     let root = std::env::temp_dir().join(format!("vault-keyring-roundtrip-{}", Uuid::new_v4()));
+    let isolated_root = std::env::var_os("PHOTO_ORGANIZER_SECRET_SERVICE_TEST_ROOT")
+        .expect("run through the isolated Secret Service harness");
+    assert!(root.starts_with(std::path::Path::new(&isolated_root)));
     let library = root.join("library");
     let source = root.join("source.jpg");
     let bytes = b"production keyring encrypted asset";
@@ -104,9 +107,6 @@ async fn production_keyring_provisions_and_reopens_vault_key() {
     );
     // Only the unique key created above in this isolated Secret Service is
     // deleted. Never enumerate or touch any credential from the user's session.
-    let isolated_root = std::env::var_os("PHOTO_ORGANIZER_SECRET_SERVICE_TEST_ROOT")
-        .expect("run through the isolated Secret Service harness");
-    assert!(root.starts_with(std::path::Path::new(&isolated_root)));
     let vault = reopened.vaults().await.into_iter().next().expect("vault");
     let entry = keyring::Entry::new(
         "private-gallery-vaults",
@@ -121,6 +121,22 @@ async fn production_keyring_provisions_and_reopens_vault_key() {
     entry
         .delete_credential()
         .expect("remove only test-created key");
+    assert!(matches!(entry.get_password(), Err(keyring::Error::NoEntry)));
+    let other_config = AppConfig {
+        runtime_root: root.join("other-runtime"),
+        ..AppConfig::default()
+    };
+    assert!(
+        native_core::vault_store::provision_vault_key_if_new(
+            &other_config,
+            &root.join("other-library"),
+            vault.id,
+            vault.key_version,
+            false,
+        )
+        .is_err(),
+        "a different runtime cannot replace a lost shared key"
+    );
     assert!(matches!(entry.get_password(), Err(keyring::Error::NoEntry)));
     assert!(
         reopened

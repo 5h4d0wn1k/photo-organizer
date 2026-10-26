@@ -107,6 +107,8 @@ Provider read/create is additionally serialized across runtime roots using
 per-user application locks: `~/.local/share/photo-organizer/vault-key-provider-locks`
 on Linux, `~/Library/Application Support/photo-organizer/vault-key-provider-locks`
 on Apple platforms, and `%LOCALAPPDATA%/photo-organizer/vault-key-provider-locks`
-on Windows. These contain only nonsecret lock files, never keys. Instances
+on Windows. These contain only nonsecret lock files and initialization markers, never keys.
+Shared markers also prevent a fresh runtime from regenerating an initialized
+credential after key loss. Instances
 sharing the OS credential store must use the same OS user application directory;
 changing HOME/LOCALAPPDATA is not a supported way to isolate a shared key store.
