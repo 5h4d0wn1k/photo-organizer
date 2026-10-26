@@ -98,7 +98,26 @@ WORK="$(mktemp -d)"
 #
 # It only has to delete the private tree: nothing the run mutates lives outside it
 # (see below), so there is no worktree snapshot to restore.
-trap 'rm -rf "${WORK}"' EXIT INT TERM HUP
+#
+# The signal handlers must EXIT. `trap 'rm -rf "${WORK}"' EXIT INT TERM HUP` looks
+# equivalent and is not: for EXIT the trap is correct, but for a signal bash runs
+# the handler and then *resumes the script*. So a signalled shard deleted its own
+# tree and then kept going, and every later mutation operated on files that no
+# longer existed. Proven on the macOS sibling (issue #172), where the residue read
+# as four mutations that "do not bite" when they had never been tested -- and it
+# also meant a cancelled job could not honour the cancellation.
+on_signal() {
+  local name="$1" signo="$2"
+  trap - EXIT INT TERM HUP
+  rm -rf "${WORK}"
+  printf 'FATAL: received signal %s; this shard did not finish and reports no verdict\n' \
+    "${name}" >&2
+  exit "$((128 + signo))"
+}
+trap 'rm -rf "${WORK}"' EXIT
+trap 'on_signal INT 2' INT
+trap 'on_signal TERM 15' TERM
+trap 'on_signal HUP 1' HUP
 
 # The whole relevant tree is COPIED and mutated in place: `scripts/` because the
 # gate and suite live there, and `.github/` because the suite's soft-fail guard
