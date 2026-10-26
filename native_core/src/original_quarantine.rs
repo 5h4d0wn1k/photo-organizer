@@ -20,6 +20,7 @@ use zeroize::Zeroizing;
 
 use crate::config::AppConfig;
 
+#[cfg(not(test))]
 const KEYRING_SERVICE: &str = "private-gallery-vaults";
 const KEY_ID_PREFIX: &str = "managed-original-quarantine:v1:";
 const CHUNK_BYTES: usize = 8 * 1024 * 1024;
@@ -243,6 +244,19 @@ pub fn seal_managed_original(
     expected_content_hash: &str,
 ) -> Result<QuarantinedOriginal, QuarantineError> {
     validate_hash(expected_content_hash)?;
+    // Refuse published objects before provider access. A lost key must not be
+    // replaced merely because a retry will later fail its overwrite check.
+    // symlink_metadata also refuses dangling links and non-directory objects.
+    let final_root = object_root(library_root, object_id);
+    match fs::symlink_metadata(&final_root) {
+        Ok(_) => {
+            return Err(QuarantineError::Invalid(format!(
+                "quarantine object {object_id} already exists"
+            )));
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(io_error(error)),
+    }
     let key = load_or_create_object_key(config, object_id)?;
     let cipher = ChaCha20Poly1305::new(Key::from_slice(key.as_ref()));
 
@@ -300,7 +314,6 @@ pub fn seal_managed_original(
         )));
     }
 
-    let final_root = object_root(library_root, object_id);
     if final_root.exists() {
         return Err(QuarantineError::Invalid(format!(
             "quarantine object {object_id} already exists"
@@ -429,18 +442,24 @@ pub fn retire_managed_original_key(
     object_id: Uuid,
 ) -> Result<(), QuarantineError> {
     let key_id = format!("{KEY_ID_PREFIX}{object_id}");
-    if file_key_override() {
-        match fs::remove_file(file_key_path(config, &key_id)) {
-            Ok(()) => return Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(error) => return Err(io_error(error)),
+    #[cfg(test)]
+    return match fs::remove_file(file_key_path(config, &key_id)) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(io_error(error)),
+    };
+    #[cfg(not(test))]
+    {
+        let _ = config;
+        validate_backend_selection(
+            std::env::var_os("PRIVATE_GALLERY_VAULT_KEY_STORAGE").as_deref(),
+        )?;
+        let entry = keyring::Entry::new(KEYRING_SERVICE, &key_id)
+            .map_err(|error| QuarantineError::KeyStorage(error.to_string()))?;
+        match entry.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+            Err(error) => Err(QuarantineError::KeyStorage(error.to_string())),
         }
-    }
-    let entry = keyring::Entry::new(KEYRING_SERVICE, &key_id)
-        .map_err(|error| QuarantineError::KeyStorage(error.to_string()))?;
-    match entry.delete_credential() {
-        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-        Err(error) => Err(QuarantineError::KeyStorage(error.to_string())),
     }
 }
 
@@ -605,21 +624,27 @@ fn load_or_create_object_key(
     object_id: Uuid,
 ) -> Result<Zeroizing<[u8; 32]>, QuarantineError> {
     let key_id = format!("{KEY_ID_PREFIX}{object_id}");
-    if file_key_override() {
-        return load_or_create_file_key(config, &key_id);
-    }
-    let entry = keyring::Entry::new(KEYRING_SERVICE, &key_id)
-        .map_err(|error| QuarantineError::KeyStorage(error.to_string()))?;
-    match entry.get_password() {
-        Ok(value) => decode_key(&value),
-        Err(keyring::Error::NoEntry) => {
-            let key = random_key();
-            entry
-                .set_password(&hex_string(key.as_ref()))
-                .map_err(|error| QuarantineError::KeyStorage(error.to_string()))?;
-            Ok(key)
+    #[cfg(test)]
+    return load_or_create_file_key(config, &key_id);
+    #[cfg(not(test))]
+    {
+        let _ = config;
+        validate_backend_selection(
+            std::env::var_os("PRIVATE_GALLERY_VAULT_KEY_STORAGE").as_deref(),
+        )?;
+        let entry = keyring::Entry::new(KEYRING_SERVICE, &key_id)
+            .map_err(|error| QuarantineError::KeyStorage(error.to_string()))?;
+        match entry.get_password() {
+            Ok(value) => decode_key(&value),
+            Err(keyring::Error::NoEntry) => {
+                let key = random_key();
+                entry
+                    .set_password(&hex_string(key.as_ref()))
+                    .map_err(|error| QuarantineError::KeyStorage(error.to_string()))?;
+                Ok(key)
+            }
+            Err(error) => Err(QuarantineError::KeyStorage(error.to_string())),
         }
-        Err(error) => Err(QuarantineError::KeyStorage(error.to_string())),
     }
 }
 
@@ -628,19 +653,27 @@ fn load_existing_object_key(
     object_id: Uuid,
 ) -> Result<Zeroizing<[u8; 32]>, QuarantineError> {
     let key_id = format!("{KEY_ID_PREFIX}{object_id}");
-    if file_key_override() {
-        let path = file_key_path(config, &key_id);
-        let value = fs::read_to_string(path).map_err(io_error)?;
-        return decode_key(value.trim());
+    #[cfg(test)]
+    {
+        let value = fs::read_to_string(file_key_path(config, &key_id)).map_err(io_error)?;
+        decode_key(value.trim())
     }
-    let entry = keyring::Entry::new(KEYRING_SERVICE, &key_id)
-        .map_err(|error| QuarantineError::KeyStorage(error.to_string()))?;
-    let value = entry
-        .get_password()
-        .map_err(|error| QuarantineError::KeyStorage(error.to_string()))?;
-    decode_key(&value)
+    #[cfg(not(test))]
+    {
+        let _ = config;
+        validate_backend_selection(
+            std::env::var_os("PRIVATE_GALLERY_VAULT_KEY_STORAGE").as_deref(),
+        )?;
+        let entry = keyring::Entry::new(KEYRING_SERVICE, &key_id)
+            .map_err(|error| QuarantineError::KeyStorage(error.to_string()))?;
+        let value = entry
+            .get_password()
+            .map_err(|error| QuarantineError::KeyStorage(error.to_string()))?;
+        decode_key(&value)
+    }
 }
 
+#[cfg(test)]
 fn load_or_create_file_key(
     config: &AppConfig,
     key_id: &str,
@@ -668,6 +701,7 @@ fn load_or_create_file_key(
     Ok(key)
 }
 
+#[cfg(test)]
 fn file_key_path(config: &AppConfig, key_id: &str) -> PathBuf {
     config
         .runtime_root
@@ -676,12 +710,14 @@ fn file_key_path(config: &AppConfig, key_id: &str) -> PathBuf {
         .join(format!("{key_id}.key"))
 }
 
-fn file_key_override() -> bool {
-    cfg!(test)
-        || (cfg!(unix)
-            && std::env::var("PRIVATE_GALLERY_VAULT_KEY_STORAGE")
-                .map(|value| value == "file")
-                .unwrap_or(false))
+fn validate_backend_selection(value: Option<&std::ffi::OsStr>) -> Result<(), QuarantineError> {
+    match value {
+        None => Ok(()),
+        Some(value) if value == "keyring" => Ok(()),
+        _ => Err(QuarantineError::KeyStorage(
+            "PRIVATE_GALLERY_VAULT_KEY_STORAGE only supports keyring; plaintext file storage is forbidden".into(),
+        )),
+    }
 }
 
 fn object_root(library_root: &Path, object_id: Uuid) -> PathBuf {
@@ -937,6 +973,73 @@ mod tests {
 
     fn hash(bytes: &[u8]) -> String {
         sha256_hex(bytes)
+    }
+
+    #[test]
+    fn production_backend_selection_rejects_file_and_unknown_values() {
+        use std::ffi::OsStr;
+        assert!(validate_backend_selection(None).is_ok());
+        assert!(validate_backend_selection(Some(OsStr::new("keyring"))).is_ok());
+        for value in ["file", "FILE", "", "unknown"] {
+            assert!(validate_backend_selection(Some(OsStr::new(value))).is_err());
+        }
+    }
+
+    #[test]
+    fn retry_of_existing_object_with_missing_key_never_creates_a_replacement() {
+        let root = test_root("existing-object-missing-key");
+        let library = root.join("library");
+        fs::create_dir_all(&library).expect("library root");
+        let source = root.join("original.jpg");
+        let bytes = b"preserve quarantined private original";
+        fs::write(&source, bytes).expect("source");
+        let config = test_config(&root);
+        let object_id = Uuid::new_v4();
+        let asset_id = Uuid::new_v4();
+        let sealed = seal_managed_original(
+            &config,
+            &library,
+            object_id,
+            asset_id,
+            &source,
+            &hash(bytes),
+        )
+        .expect("initial quarantine");
+        let ciphertext = sealed
+            .chunks
+            .iter()
+            .map(|chunk| {
+                let path = library.join(&chunk.local_path);
+                (path.clone(), fs::read(path).expect("initial ciphertext"))
+            })
+            .collect::<Vec<_>>();
+        let key_path = file_key_path(&config, &format!("{KEY_ID_PREFIX}{object_id}"));
+        fs::remove_file(&key_path).expect("simulate lost object key");
+        let result = seal_managed_original(
+            &config,
+            &library,
+            object_id,
+            asset_id,
+            &source,
+            &hash(bytes),
+        );
+        assert!(matches!(result, Err(QuarantineError::Invalid(_))));
+        assert!(
+            !key_path.exists(),
+            "overwrite refusal must precede any key creation"
+        );
+        for (path, expected) in ciphertext {
+            assert_eq!(fs::read(path).unwrap(), expected);
+        }
+        assert_eq!(fs::read(source).unwrap(), bytes);
+        assert_eq!(
+            fs::read_dir(library.join("quarantine/managed-originals"))
+                .unwrap()
+                .count(),
+            1,
+            "retry must not create a staging object"
+        );
+        fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[test]
