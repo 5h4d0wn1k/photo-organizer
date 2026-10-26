@@ -474,34 +474,23 @@ fn provider_lock_root() -> Result<PathBuf, VaultStoreError> {
 }
 
 fn create_durable_provider_directory(root: &Path) -> Result<(), VaultStoreError> {
-    // Record missing ancestors before recursive creation. Sync each new entry
-    // in its parent before any OS credential can be created; syncing only the
-    // leaf would not persist the application's first-run directory chain.
-    let mut missing = Vec::new();
-    let mut current = root;
-    while !current.try_exists().map_err(io_error)? {
-        missing.push(current.to_path_buf());
-        current = current.parent().ok_or_else(|| {
-            VaultStoreError::Invalid("provider directory has no existing ancestor".into())
-        })?;
+    if !root.is_absolute() {
+        return Err(VaultStoreError::Invalid(
+            "provider directory must be absolute".into(),
+        ));
     }
     fs::create_dir_all(root).map_err(io_error)?;
     #[cfg(unix)]
     {
-        for directory in missing.iter().rev() {
+        // Flush every ancestor, not just directories this caller saw missing.
+        // Another concurrent first-run caller may have created the chain but
+        // not yet persisted its parent entries. Complete that work before any
+        // shared credential can be initialized, regardless of who created it.
+        for directory in root.ancestors().collect::<Vec<_>>().into_iter().rev() {
             fs::File::open(directory)
                 .and_then(|file| file.sync_all())
                 .map_err(io_error)?;
-            if let Some(parent) = directory.parent() {
-                fs::File::open(parent)
-                    .and_then(|file| file.sync_all())
-                    .map_err(io_error)?;
-            }
         }
-        // Also flush an existing leaf, including first use by another process.
-        fs::File::open(root)
-            .and_then(|file| file.sync_all())
-            .map_err(io_error)?;
     }
     Ok(())
 }
