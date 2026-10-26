@@ -473,8 +473,41 @@ fn provider_lock_root() -> Result<PathBuf, VaultStoreError> {
     Ok(base.join("photo-organizer/vault-key-provider-locks"))
 }
 
-fn lock_provider_key_at(root: &Path, stem: &str) -> Result<fs::File, VaultStoreError> {
+fn create_durable_provider_directory(root: &Path) -> Result<(), VaultStoreError> {
+    // Record missing ancestors before recursive creation. Sync each new entry
+    // in its parent before any OS credential can be created; syncing only the
+    // leaf would not persist the application's first-run directory chain.
+    let mut missing = Vec::new();
+    let mut current = root;
+    while !current.try_exists().map_err(io_error)? {
+        missing.push(current.to_path_buf());
+        current = current.parent().ok_or_else(|| {
+            VaultStoreError::Invalid("provider directory has no existing ancestor".into())
+        })?;
+    }
     fs::create_dir_all(root).map_err(io_error)?;
+    #[cfg(unix)]
+    {
+        for directory in missing.iter().rev() {
+            fs::File::open(directory)
+                .and_then(|file| file.sync_all())
+                .map_err(io_error)?;
+            if let Some(parent) = directory.parent() {
+                fs::File::open(parent)
+                    .and_then(|file| file.sync_all())
+                    .map_err(io_error)?;
+            }
+        }
+        // Also flush an existing leaf, including first use by another process.
+        fs::File::open(root)
+            .and_then(|file| file.sync_all())
+            .map_err(io_error)?;
+    }
+    Ok(())
+}
+
+fn lock_provider_key_at(root: &Path, stem: &str) -> Result<fs::File, VaultStoreError> {
+    create_durable_provider_directory(root)?;
     let mut options = fs::OpenOptions::new();
     options.create(true).truncate(false).read(true).write(true);
     #[cfg(unix)]
@@ -968,6 +1001,20 @@ mod tests {
             .map(|handle| handle.join().unwrap())
             .collect::<Vec<_>>();
         assert_eq!(keys[0].as_ref(), keys[1].as_ref());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn provider_directory_creation_rejects_invalid_ancestry_before_key_use() {
+        let (root, _) = marker_fixture();
+        let nested = root.join("new-user-data/application/provider-history");
+        create_durable_provider_directory(&nested).unwrap();
+        create_durable_provider_directory(&nested).unwrap();
+        assert!(nested.is_dir());
+        let blocker = root.join("not-a-directory");
+        fs::write(&blocker, b"unchanged").unwrap();
+        assert!(create_durable_provider_directory(&blocker.join("provider-history")).is_err());
+        assert_eq!(fs::read(&blocker).unwrap(), b"unchanged");
         fs::remove_dir_all(root).unwrap();
     }
 
