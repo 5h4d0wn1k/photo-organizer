@@ -25,7 +25,7 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libdbus-1-dev pkg-config libsecret-1-dev
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends gnome-keyring libdbus-1-dev pkg-config libsecret-1-dev
       - name: Format
         run: cargo fmt --check
       - name: Clippy
@@ -45,6 +45,8 @@ jobs:
               exit 1
             fi
           done
+      - name: Verify production vault keys round-trip through Secret Service
+        run: bash scripts/test_vault_keyring_e2e.sh
 
   encryption-durability:
     name: Encryption durability (${{ matrix.os }})
