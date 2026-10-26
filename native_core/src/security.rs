@@ -1027,7 +1027,11 @@ pub fn snapshot_database(source_path: &Path, destination: &Path) -> Result<(), S
             ));
         }
         drop(target);
-        fs::File::open(destination)
+        // Windows FlushFileBuffers requires a writable handle as well.
+        fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(destination)
             .and_then(|file| file.sync_all())
             .map_err(io_error)?;
         Ok(())
