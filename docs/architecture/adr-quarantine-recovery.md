@@ -4,8 +4,12 @@
 
 Partially implemented in PR #123: local inventory and explicit same-device
 repair are implemented, including verified decrypt/reseal and retry handling.
-Portable backup key wrapping is not implemented and remains a release blocker
-for users who need to restore quarantined originals on a different device.
+Portable backup key wrapping is not implemented and remains a release blocker.
+Restore planning and execution fail closed for encrypted catalogs or encrypted
+vault/quarantine payloads before destination writes, because destination key
+activation and path rebinding are not implemented. Export still preserves those
+files; a verified copy is not a usable recovered library. Unencrypted catalogs
+without encrypted media can be staged, without claiming activation.
 
 ## Context
 
@@ -21,7 +25,10 @@ Existing backup export copies quarantine ciphertext and metadata, but not that k
 does not install quarantine keys on the destination device. Therefore a copied
 backup alone does not prove portable recovery. Local inventory and explicit
 same-device repair APIs are implemented; they do not establish cross-device
-key recovery.
+key recovery. The existing backup test previously decrypted copied quarantine
+with the original configuration, which proved ciphertext preservation rather
+than independent destination recovery. The restore admission tests now require
+refusal without destination writes and preserve the original recoverable copy.
 
 ## Decision
 
@@ -167,7 +174,12 @@ quarantine retirement only after verifying the already-persisted normal blob.
 ## Remaining work
 
 - Portable passphrase-wrapped backup recovery as specified above, with a
-  dedicated security review and cross-config restore tests.
+  dedicated security review and cross-config restore tests. The complete bundle
+  must include the SQLCipher catalog key/state binding, every required vault key
+  version, and quarantine keys. Activation must remap restored library paths,
+  verify all ciphertext with destination credentials, handle existing-key
+  collisions, and roll back only credentials created by that restore. Wrapping
+  only quarantine keys does not satisfy this requirement.
 - Unit tests inject one-shot failures at 11 repair boundaries around sealing,
   catalog/namespace saves, directory/key retirement, and final inventory save.
   Each case reopens from disk, verifies a readable copy, retries, and reopens

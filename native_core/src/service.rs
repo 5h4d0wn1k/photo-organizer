@@ -6477,6 +6477,8 @@ impl GalleryService {
             let state = self.state.read().await;
             PathBuf::from(effective_library_root(&state, &self.config))
         };
+        let export_root = PathBuf::from(&request.export_root);
+        let manifest = read_backup_manifest(&export_root)?;
         let plan = build_restore_plan(
             &request.export_root,
             &request.restore_root,
@@ -6485,17 +6487,26 @@ impl GalleryService {
         )?;
         if !plan.ok {
             return Err(ServiceError::Invalid(format!(
-                "restore plan is not safe to run: {}",
-                plan.detail
+                "restore plan is not safe to run: {} {}",
+                plan.detail,
+                plan.missing_paths.join("; ")
             )));
         }
 
-        let export_root = PathBuf::from(&request.export_root);
+        if read_backup_manifest(&export_root)? != manifest {
+            return Err(ServiceError::Invalid(
+                "backup manifest changed during restore admission; retry planning".to_string(),
+            ));
+        }
         let restore_root = PathBuf::from(&request.restore_root);
         let database_target = PathBuf::from(&plan.database_target_path);
-        copy_file_creating_parent(Path::new(&plan.database_source_path), &database_target)?;
-
-        let manifest = read_backup_manifest(&export_root)?;
+        copy_restore_file_exclusively(Path::new(&plan.database_source_path), &database_target)?;
+        if !restore_key_activation_blockers(&database_target).is_empty() {
+            let _ = fs::remove_file(&database_target);
+            return Err(ServiceError::Invalid(
+                "copied backup requires unavailable destination key activation".to_string(),
+            ));
+        }
         let manifest_version = manifest
             .get("format_version")
             .and_then(|value| value.as_u64())
@@ -6562,7 +6573,7 @@ impl GalleryService {
                 })?;
             let source = export_root.join(backup_relative_path);
             let destination = restore_root.join(&restore_relative_path);
-            copy_file_creating_parent(&source, &destination)?;
+            copy_restore_file_exclusively(&source, &destination)?;
             if manifest
                 .get("format_version")
                 .and_then(|value| value.as_u64())
@@ -6607,7 +6618,7 @@ impl GalleryService {
             protected_original_chunks_copied,
             bytes_copied,
             ok: true,
-            detail: "Restore staged without modifying the active library. Start the daemon with this restore root after review.".to_string(),
+            detail: "Unencrypted files staged without modifying the active library. This is a staging result, not activation of a recovered library.".to_string(),
         };
         fs::write(
             &report_path,
@@ -9724,6 +9735,36 @@ fn copy_file_creating_parent(source: &Path, destination: &Path) -> Result<u64, S
     fs::copy(source, destination).map_err(|err| ServiceError::Io(err.to_string()))
 }
 
+// Restore never overwrites a file which appeared after planning. Cleanup is
+// limited to the destination this invocation exclusively created.
+fn copy_restore_file_exclusively(source: &Path, destination: &Path) -> Result<u64, ServiceError> {
+    let parent = destination
+        .parent()
+        .ok_or_else(|| ServiceError::Invalid("restore destination has no parent".into()))?;
+    fs::create_dir_all(parent).map_err(|error| ServiceError::Io(error.to_string()))?;
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut target = options
+        .open(destination)
+        .map_err(|error| ServiceError::Io(error.to_string()))?;
+    let copied = (|| -> std::io::Result<u64> {
+        let mut input = fs::File::open(source)?;
+        let bytes = std::io::copy(&mut input, &mut target)?;
+        target.sync_all()?;
+        Ok(bytes)
+    })();
+    drop(target);
+    if copied.is_err() {
+        let _ = fs::remove_file(destination);
+    }
+    copied.map_err(|error| ServiceError::Io(error.to_string()))
+}
+
 fn build_restore_plan(
     export_root: &str,
     restore_root: &str,
@@ -9795,6 +9836,12 @@ fn build_restore_plan(
             )),
         }
     }
+    if database_source.is_file() {
+        missing_paths.extend(restore_key_activation_blockers(&database_source));
+    }
+    if !(1..=2).contains(&manifest_version) {
+        missing_paths.push("unsupported backup manifest version".to_string());
+    }
     let database_name = database_source
         .file_name()
         .unwrap_or_else(|| std::ffi::OsStr::new(&config.database_filename));
@@ -9844,6 +9891,14 @@ fn build_restore_plan(
             .and_then(|value| value.as_array())
             .cloned()
             .unwrap_or_default();
+        if files.iter().any(|file| {
+            matches!(
+                file.get("kind").and_then(|kind| kind.as_str()),
+                Some("vault_chunk" | "protected_original_chunk")
+            )
+        }) {
+            missing_paths.push("destination key activation is unavailable for encrypted media in this backup; preserve the backup and original device keys".to_string());
+        }
         for file in files {
             let Some(backup_relative_path) = file
                 .get("backup_relative_path")
@@ -10062,6 +10117,66 @@ fn build_restore_plan(
         ok,
         detail,
     })
+}
+
+// A successful ciphertext copy does not establish a usable destination.
+// Until key installation/path rebinding exists, reject encrypted restores before
+// writing anything. Inspect the catalog itself, so omitting manifest file kinds
+// cannot bypass the key requirement. Never use the mutating recovery opener on
+// a backup; immutable SQLite mode cannot create WAL/state/recovery sidecars.
+fn restore_key_activation_blockers(database: &Path) -> Vec<String> {
+    let unavailable = || {
+        vec![
+        "destination key activation is unavailable for this encrypted backup; preserve the backup and original device keys".to_string()
+    ]
+    };
+    let mut header = [0_u8; 16];
+    if fs::File::open(database)
+        .and_then(|mut file| file.read_exact(&mut header))
+        .is_err()
+    {
+        return vec!["backup catalog header cannot be read".to_string()];
+    }
+    if &header != b"SQLite format 3\0" {
+        return unavailable();
+    }
+    let Some(path) = database.to_str() else {
+        return vec!["backup catalog path is not supported".to_string()];
+    };
+    let uri_path = path
+        .as_bytes()
+        .iter()
+        .map(|byte| {
+            if byte.is_ascii_alphanumeric() || b"/-._~".contains(byte) {
+                (*byte as char).to_string()
+            } else {
+                format!("%{byte:02X}")
+            }
+        })
+        .collect::<String>();
+    let result = (|| -> Result<bool, rusqlite::Error> {
+        let connection = rusqlite::Connection::open_with_flags(
+            format!("file:{uri_path}?immutable=1"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+        )?;
+        let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        if version != 24 {
+            return Err(rusqlite::Error::InvalidQuery);
+        }
+        let encrypted: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM blob_chunks WHERE encrypted_bytes > 0)
+                OR EXISTS(SELECT 1 FROM blob_records WHERE chunk_count > 0 OR encrypted_hash NOT LIKE 'unsealed-%')
+                OR EXISTS(SELECT 1 FROM protected_originals)
+                OR EXISTS(SELECT 1 FROM protected_original_chunks)",
+            [], |row| row.get(0),
+        )?;
+        Ok(encrypted)
+    })();
+    match result {
+        Ok(false) => Vec::new(),
+        Ok(true) => unavailable(),
+        Err(_) => vec!["backup catalog recovery requirements cannot be verified; unsupported or invalid catalog".to_string()],
+    }
 }
 
 fn read_backup_manifest(export_root: &Path) -> Result<serde_json::Value, ServiceError> {
@@ -15359,8 +15474,173 @@ mod tests {
         let _ = service_b.stop_sync_network().await;
     }
 
+    #[test]
+    fn restore_copy_never_overwrites_and_cleans_only_its_own_failed_copy() {
+        let root = temp_root("exclusive-restore-copy");
+        let source = root.join("source");
+        let target = root.join("target");
+        fs::write(&source, b"backup bytes").unwrap();
+        fs::write(&target, b"existing user file").unwrap();
+        assert!(super::copy_restore_file_exclusively(&source, &target).is_err());
+        assert_eq!(fs::read(&target).unwrap(), b"existing user file");
+        let absent = root.join("created");
+        assert!(super::copy_restore_file_exclusively(&root.join("missing"), &absent).is_err());
+        assert!(!absent.exists());
+        assert_eq!(fs::read(&source).unwrap(), b"backup bytes");
+    }
+
     #[tokio::test]
-    async fn backup_export_restore_preserves_encrypted_chunks_without_plaintext_original() {
+    async fn unencrypted_catalog_can_be_staged_without_claiming_library_activation() {
+        let root = temp_root("plain-catalog-staging");
+        let service = GalleryService::new(AppConfig {
+            runtime_root: root.join("runtime"),
+            library_root: root.join("library"),
+            ..AppConfig::default()
+        })
+        .unwrap();
+        let export_root = root.join("export");
+        service
+            .export_backup(crate::domain::BackupExportRequest {
+                export_root: export_root.to_string_lossy().into_owned(),
+                include_models: false,
+            })
+            .await
+            .unwrap();
+        let restore_root = root.join("restore");
+        let request = crate::domain::BackupRestorePlanRequest {
+            export_root: export_root.to_string_lossy().into_owned(),
+            restore_root: restore_root.to_string_lossy().into_owned(),
+        };
+        assert!(
+            service
+                .plan_restore_backup(request.clone())
+                .await
+                .unwrap()
+                .ok
+        );
+        let result = service
+            .run_restore_backup(crate::domain::BackupRestoreRunRequest {
+                export_root: request.export_root,
+                restore_root: request.restore_root,
+                confirmed: true,
+            })
+            .await
+            .unwrap();
+        assert!(result.ok);
+        assert!(result.detail.contains("not activation"));
+        assert!(std::path::Path::new(&result.database_restored_to).is_file());
+        // Manifest evidence independently blocks encrypted payloads, even if
+        // the plaintext catalog itself has no encrypted rows.
+        let mut manifest = read_backup_manifest(&export_root).unwrap();
+        manifest["files"] = serde_json::json!([{"kind": "vault_chunk"}]);
+        fs::write(
+            backup_manifest_path(&export_root),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        let blocked = service
+            .plan_restore_backup(crate::domain::BackupRestorePlanRequest {
+                export_root: export_root.to_string_lossy().into_owned(),
+                restore_root: root.join("other").to_string_lossy().into_owned(),
+            })
+            .await
+            .unwrap();
+        assert!(!blocked.ok);
+        assert!(
+            blocked
+                .missing_paths
+                .iter()
+                .any(|cause| cause.contains("destination key activation"))
+        );
+        manifest["files"] = serde_json::json!([]);
+        manifest["format_version"] = serde_json::json!(3);
+        fs::write(
+            backup_manifest_path(&export_root),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        let blocked = service
+            .plan_restore_backup(crate::domain::BackupRestorePlanRequest {
+                export_root: export_root.to_string_lossy().into_owned(),
+                restore_root: root.join("future").to_string_lossy().into_owned(),
+            })
+            .await
+            .unwrap();
+        assert!(!blocked.ok);
+        assert!(
+            blocked
+                .missing_paths
+                .iter()
+                .any(|cause| cause.contains("unsupported backup manifest version"))
+        );
+    }
+
+    #[tokio::test]
+    async fn encrypted_catalog_restore_requires_destination_key_activation_before_writes() {
+        let root = temp_root("encrypted-restore-activation");
+        let config = AppConfig {
+            runtime_root: root.join("runtime"),
+            library_root: root.join("library"),
+            ..AppConfig::default()
+        };
+        let service = GalleryService::new(config.clone()).expect("service");
+        service
+            .activate_encryption(crate::domain::EncryptionActivationRequest {
+                confirmed: true,
+                backup_root: None,
+            })
+            .await
+            .expect("encrypted catalog");
+        let export_root = root.join("export");
+        let exported = service
+            .export_backup(crate::domain::BackupExportRequest {
+                export_root: export_root.to_string_lossy().into_owned(),
+                include_models: false,
+            })
+            .await
+            .expect("encrypted snapshot export");
+        let snapshot = fs::read(&exported.database_copied_to).expect("snapshot");
+        let restore_root = root.join("unactivated-restore");
+        let plan = service
+            .plan_restore_backup(crate::domain::BackupRestorePlanRequest {
+                export_root: export_root.to_string_lossy().into_owned(),
+                restore_root: restore_root.to_string_lossy().into_owned(),
+            })
+            .await
+            .expect("read-only plan");
+        assert!(
+            !plan.ok,
+            "an encrypted snapshot without destination key activation cannot be restored"
+        );
+        assert!(
+            plan.missing_paths
+                .iter()
+                .any(|cause| cause.contains("destination key activation"))
+        );
+        assert!(
+            service
+                .run_restore_backup(crate::domain::BackupRestoreRunRequest {
+                    export_root: export_root.to_string_lossy().into_owned(),
+                    restore_root: restore_root.to_string_lossy().into_owned(),
+                    confirmed: true,
+                })
+                .await
+                .is_err()
+        );
+        assert!(
+            !restore_root.exists(),
+            "failed recovery admission must precede destination writes"
+        );
+        assert_eq!(fs::read(&exported.database_copied_to).unwrap(), snapshot);
+        assert!(!PathBuf::from(format!("{}-wal", exported.database_copied_to)).exists());
+        assert!(
+            !export_root.join("security").exists(),
+            "planning must not create backup recovery state"
+        );
+    }
+
+    #[tokio::test]
+    async fn backup_export_preserves_encrypted_chunks_and_restore_requires_key_activation() {
         let runtime_root = temp_root("chunk-backup");
         let restore_root = temp_root("chunk-restore");
         let library_root = runtime_root.join("library");
@@ -15441,23 +15721,43 @@ mod tests {
             })
             .await
             .expect("restore plan");
-        assert!(plan.ok, "{}", plan.detail);
+        assert!(!plan.ok, "encrypted media needs destination key activation");
+        assert!(
+            plan.missing_paths
+                .iter()
+                .any(|cause| cause.contains("destination key activation"))
+        );
         assert_eq!(plan.media_files_available, 0);
         assert!(plan.vault_chunks_available >= 1);
 
-        let restored = service
-            .run_restore_backup(crate::domain::BackupRestoreRunRequest {
-                export_root: export_root.to_string_lossy().to_string(),
-                restore_root: restore_root.to_string_lossy().to_string(),
-                confirmed: true,
+        let files_before = fs::read(&export.database_copied_to).expect("backup catalog");
+        assert!(
+            service
+                .run_restore_backup(crate::domain::BackupRestoreRunRequest {
+                    export_root: export_root.to_string_lossy().into_owned(),
+                    restore_root: restore_root.to_string_lossy().into_owned(),
+                    confirmed: true,
+                })
+                .await
+                .is_err()
+        );
+        assert_eq!(fs::read_dir(&restore_root).unwrap().count(), 0);
+        assert_eq!(fs::read(&export.database_copied_to).unwrap(), files_before);
+        let manifest_path = backup_manifest_path(&export_root);
+        let mut manifest = read_backup_manifest(&export_root).unwrap();
+        manifest["files"] = serde_json::json!([]);
+        fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        let hidden_chunks_plan = service
+            .plan_restore_backup(crate::domain::BackupRestorePlanRequest {
+                export_root: export_root.to_string_lossy().into_owned(),
+                restore_root: restore_root.to_string_lossy().into_owned(),
             })
             .await
-            .expect("restore run");
-        assert!(restored.ok);
-        assert_eq!(restored.media_files_copied, 0);
-        assert!(restored.vault_chunks_copied >= 1);
-        assert!(PathBuf::from(restored.database_restored_to).exists());
-        assert!(find_pgblob(&restore_root.join("library")).is_some());
+            .unwrap();
+        assert!(
+            !hidden_chunks_plan.ok,
+            "omitting manifest files cannot hide encrypted catalog rows"
+        );
     }
 
     #[tokio::test]
@@ -15902,9 +16202,13 @@ mod tests {
             .await
             .expect("plan protected-original restore");
         assert!(
-            plan.ok,
-            "{}: missing={:?}, conflicts={:?}",
-            plan.detail, plan.missing_paths, plan.destination_conflicts
+            !plan.ok,
+            "quarantine keys are not installed at the destination"
+        );
+        assert!(
+            plan.missing_paths
+                .iter()
+                .any(|cause| cause.contains("destination key activation"))
         );
         assert_eq!(plan.protected_original_chunks_available, 1);
 
@@ -15974,23 +16278,23 @@ mod tests {
         )
         .expect("restore database hash");
 
-        let restored = restarted
-            .run_restore_backup(crate::domain::BackupRestoreRunRequest {
-                export_root: export_root.to_string_lossy().to_string(),
-                restore_root: restore_root.to_string_lossy().to_string(),
-                confirmed: true,
-            })
-            .await
-            .expect("restore protected-original backup");
-        assert_eq!(restored.protected_original_chunks_copied, 1);
         assert!(
-            restore_root
-                .join("library")
-                .join(&chunks[0].local_path)
-                .is_file()
+            restarted
+                .run_restore_backup(crate::domain::BackupRestoreRunRequest {
+                    export_root: export_root.to_string_lossy().into_owned(),
+                    restore_root: restore_root.to_string_lossy().into_owned(),
+                    confirmed: true,
+                })
+                .await
+                .is_err()
         );
-        verify_protected_original(&config, &restore_root.join("library"), &protected, &chunks)
-            .expect("restored quarantine remains decryptable on this device");
+        assert_eq!(
+            fs::read_dir(&restore_root).unwrap().count(),
+            0,
+            "unavailable destination quarantine keys must fail before writes"
+        );
+        verify_protected_original(&config, &library_root, &protected, &chunks)
+            .expect("failed restore preserves the original recoverable copy");
 
         let protected_manifest_entry = manifest["files"]
             .as_array()

@@ -586,7 +586,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 ),
                 const SizedBox(height: 12),
                 const Text(
-                  'This verifies the encrypted database, managed originals, encrypted vault chunks, and installed model files. Export writes a restorable local backup; restore stages into a separate folder without modifying the active library.',
+                  'This verifies the encrypted database, managed originals, encrypted vault chunks, and installed model files. Export preserves local backup files. Encrypted restores remain blocked until destination recovery keys can be installed and verified. Unencrypted restores stage files in a separate folder without modifying the active library.',
                 ),
                 const SizedBox(height: 16),
                 TextField(
