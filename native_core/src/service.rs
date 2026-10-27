@@ -249,6 +249,7 @@ pub struct GalleryService {
 
 impl GalleryService {
     pub fn new(config: AppConfig) -> Result<Self, ServiceError> {
+        vault_store::validate_key_storage(&config).map_err(vault_store_error)?;
         if !config.developer_mode
             && !config.allow_remote_mobile
             && !model_registry::is_loopback_host(&config.bind_host)
@@ -2325,6 +2326,14 @@ impl GalleryService {
             &self.config,
             &library_root,
             &quarantine,
+        )
+        .map_err(|error| ServiceError::Storage(error.to_string()))?;
+        vault_store::provision_vault_key_if_new(
+            &self.config,
+            &library_root,
+            vault.id,
+            vault.key_version,
+            vault_version_has_encrypted_history(&state, vault.id, vault.key_version),
         )
         .map_err(|error| ServiceError::Storage(error.to_string()))?;
         let blob_id = Uuid::new_v4();
@@ -5955,53 +5964,51 @@ impl GalleryService {
         let database_dir = export_root.join("database");
         let manifest_dir = export_root.join("manifests");
         let library_export_dir = export_root.join("library");
+        fs::create_dir_all(&database_dir).map_err(|err| ServiceError::Io(err.to_string()))?;
+        fs::create_dir_all(&manifest_dir).map_err(|err| ServiceError::Io(err.to_string()))?;
+        fs::create_dir_all(&library_export_dir).map_err(|err| ServiceError::Io(err.to_string()))?;
+
+        // Keep catalog mutations and media retirement out of the complete
+        // snapshot/inventory/copy window. Verification below uses this same state.
+        let mut state = self.state.write().await;
+        let entries = {
+            ensure_distributed_defaults(&mut state);
+            let changed = refresh_blob_records(&self.config, &mut state);
+            if changed {
+                self.persist_locked_state(&state)?;
+            }
+            let library_root = PathBuf::from(effective_library_root(&state, &self.config));
+            collect_backup_file_entries(
+                &state,
+                &library_root,
+                request.include_models,
+                &self.config,
+            )?
+        };
+
+        let protected_original_inventory = state
+            .protected_originals
+            .iter()
+            .map(|record| {
+                json!({
+                    "asset_id": record.asset_id,
+                    "object_id": record.object_id,
+                    "content_hash": record.content_hash,
+                    "bytes": record.bytes,
+                    "encrypted_hash": record.encrypted_hash,
+                    "chunk_count": record.chunk_count,
+                })
+            })
+            .collect::<Vec<_>>();
+
         let database_copy = database_dir.join(
             self.storage
                 .database_path
                 .file_name()
                 .unwrap_or_else(|| std::ffi::OsStr::new("gallery.sqlite3")),
         );
-        fs::create_dir_all(&database_dir).map_err(|err| ServiceError::Io(err.to_string()))?;
-        fs::create_dir_all(&manifest_dir).map_err(|err| ServiceError::Io(err.to_string()))?;
-        fs::create_dir_all(&library_export_dir).map_err(|err| ServiceError::Io(err.to_string()))?;
-
-        let (entries, protected_original_inventory) = {
-            let mut state = self.state.write().await;
-            ensure_distributed_defaults(&mut state);
-            let changed = refresh_blob_records(&self.config, &mut state);
-            if changed {
-                self.persist_locked_state(&state)?;
-            }
-            storage::checkpoint_database(&self.storage.database_path)
-                .map_err(|error| ServiceError::Storage(error.to_string()))?;
-            fs::copy(&self.storage.database_path, &database_copy)
-                .map_err(|error| ServiceError::Io(error.to_string()))?;
-            fs::File::open(&database_copy)
-                .and_then(|file| file.sync_all())
-                .map_err(|error| ServiceError::Io(error.to_string()))?;
-            let library_root = PathBuf::from(effective_library_root(&state, &self.config));
-            let entries = collect_backup_file_entries(
-                &state,
-                &library_root,
-                request.include_models,
-                &self.config,
-            )?;
-            let protected_inventory = state
-                .protected_originals
-                .iter()
-                .map(|record| {
-                    json!({
-                        "asset_id": record.asset_id,
-                        "object_id": record.object_id,
-                        "content_hash": record.content_hash,
-                        "bytes": record.bytes,
-                        "encrypted_hash": record.encrypted_hash,
-                        "chunk_count": record.chunk_count,
-                    })
-                })
-                .collect::<Vec<_>>();
-            (entries, protected_inventory)
-        };
+        security::snapshot_database(&self.storage.database_path, &database_copy)
+            .map_err(security_error)?;
 
         let mut media_files_copied = 0_usize;
         let mut vault_chunks_copied = 0_usize;
@@ -6057,13 +6064,10 @@ impl GalleryService {
             }));
         }
 
-        let verification = self
-            .verify_backup(BackupVerifyRequest {
-                export_root: Some(request.export_root.clone()),
-            })
-            .await?;
+        let mut verification = self.verify_backup_locked(&state)?;
         let database_copy_sha256 = imports::derive_content_hash_from_file(&database_copy)
             .map_err(|error| ServiceError::Io(error.to_string()))?;
+        verification.database_sha256 = Some(database_copy_sha256.clone());
         let manifest_path = manifest_dir.join("private-gallery-backup-manifest.json");
         let manifest = json!({
             "exported_at": Utc::now(),
@@ -6287,7 +6291,14 @@ impl GalleryService {
         if changed {
             self.persist_locked_state(&state)?;
         }
-        let library_root = PathBuf::from(effective_library_root(&state, &self.config));
+        self.verify_backup_locked(&state)
+    }
+
+    fn verify_backup_locked(
+        &self,
+        state: &LibraryState,
+    ) -> Result<BackupVerification, ServiceError> {
+        let library_root = PathBuf::from(effective_library_root(state, &self.config));
         let mut missing_asset_paths = Vec::new();
         let mut protected_originals_checked = 0_usize;
         let mut missing_protected_original_paths = Vec::new();
@@ -6316,7 +6327,7 @@ impl GalleryService {
                 .blob_records
                 .iter()
                 .find(|blob| blob.asset_id == asset.id && blob.tombstoned_at.is_none())
-                .map(|blob| encrypted_chunks_available(&state, blob.id, &library_root))
+                .map(|blob| encrypted_chunks_available(state, blob.id, &library_root))
                 .unwrap_or(false);
             if !path.exists()
                 && !encrypted_available
@@ -7763,6 +7774,22 @@ fn sync_parent_directory(_path: &Path) -> Result<(), ServiceError> {
     Ok(())
 }
 
+fn vault_version_has_encrypted_history(
+    state: &LibraryState,
+    vault_id: Uuid,
+    key_version: u32,
+) -> bool {
+    state.blob_records.iter().any(|blob| {
+        blob.vault_id == vault_id
+            && blob.encryption_key_version == key_version
+            && (!blob.encrypted_hash.starts_with("unsealed-")
+                || state
+                    .blob_chunks
+                    .iter()
+                    .any(|chunk| chunk.blob_id == blob.id && chunk.encrypted_bytes > 0))
+    })
+}
+
 // Best-effort repair used by read paths and startup. A seal failure must never
 // abort a read, but it is also never silent: `refresh_blob_records_impl` rolls
 // back any recoverable plaintext copy and the failure is logged here.
@@ -7851,15 +7878,26 @@ fn refresh_blob_records_impl(
         if blob_needs_local_seal(state, blob_id, &library_root) {
             let source_path = asset_file_path(&asset, &library_root);
             if source_path.is_file() {
-                match vault_store::seal_asset(
+                let has_encrypted_history =
+                    vault_version_has_encrypted_history(state, vault.id, vault.key_version);
+                match vault_store::provision_vault_key_if_new(
                     config,
                     &library_root,
                     vault.id,
                     vault.key_version,
-                    blob_id,
-                    &asset,
-                    &source_path,
-                ) {
+                    has_encrypted_history,
+                )
+                .and_then(|_| {
+                    vault_store::seal_asset(
+                        config,
+                        &library_root,
+                        vault.id,
+                        vault.key_version,
+                        blob_id,
+                        &asset,
+                        &source_path,
+                    )
+                }) {
                     Ok(sealed) => {
                         if let Some(blob) = state
                             .blob_records
@@ -15620,6 +15658,20 @@ mod tests {
 
     #[tokio::test]
     async fn ambiguous_managed_originals_are_quarantined_before_the_service_opens() {
+        check_quarantine_repair(true, false).await;
+    }
+
+    #[tokio::test]
+    async fn quarantine_repair_provisions_a_genuinely_new_destination_key() {
+        check_quarantine_repair(false, false).await;
+    }
+
+    #[tokio::test]
+    async fn quarantine_repair_refuses_a_lost_destination_key_without_retiring_ciphertext() {
+        check_quarantine_repair(false, true).await;
+    }
+
+    async fn check_quarantine_repair(simulate_interruption: bool, lose_destination_key: bool) {
         let runtime_root = temp_root("ambiguous-original-quarantine");
         let library_root = runtime_root.join("library");
         let source_root = runtime_root.join("source");
@@ -15957,61 +16009,124 @@ mod tests {
         fs::write(&quarantine_chunk_path, original_ciphertext)
             .expect("restore valid quarantine ciphertext");
 
-        // Model a process interruption after the encrypted destination blob and
-        // its database rows were saved, followed by rotation of the vault's
-        // current key version before the user retries repair.
+        if lose_destination_key {
+            crate::vault_store::provision_vault_key_if_new(
+                &config,
+                &library_root,
+                kids_vault.id,
+                kids_vault.key_version,
+                false,
+            )
+            .expect("initialize synthetic destination credential");
+            let key_path = config
+                .runtime_root
+                .join("security/vault-keys")
+                .join(format!(
+                    "vault-key:{}:v{}.key",
+                    kids_vault.id, kids_vault.key_version,
+                ));
+            fs::remove_file(&key_path).expect("simulate lost synthetic credential");
+            let before = chunks
+                .iter()
+                .map(|chunk| {
+                    let path = library_root.join(&chunk.local_path);
+                    (path.clone(), fs::read(path).expect("quarantine ciphertext"))
+                })
+                .collect::<Vec<_>>();
+            assert!(
+                restarted
+                    .repair_quarantined_original(
+                        imported.asset.id,
+                        QuarantineRepairRequest {
+                            target_vault_id: kids_vault.id,
+                            confirm: true
+                        },
+                    )
+                    .await
+                    .is_err()
+            );
+            assert!(
+                !key_path.exists(),
+                "repair must not replace an initialized missing key"
+            );
+            assert_eq!(restarted.quarantined_originals().await.len(), 1);
+            for (path, ciphertext) in before {
+                assert_eq!(fs::read(path).expect("preserved ciphertext"), ciphertext);
+            }
+            assert!(
+                !library_root
+                    .join("vaults")
+                    .join(kids_vault.id.to_string())
+                    .exists()
+            );
+            return;
+        }
         let pending_blob_id = Uuid::new_v4();
-        let pending_version = kids_vault.key_version;
-        let sealed = crate::vault_store::seal_asset_from_reader(
-            &config,
-            &library_root,
-            kids_vault.id,
-            pending_version,
-            pending_blob_id,
-            &imported.asset,
-            std::io::Cursor::new(original_bytes),
-        )
-        .expect("seal interrupted repair candidate");
-        let pending_chunks = sealed
-            .chunks
-            .iter()
-            .map(|chunk| BlobChunk {
-                id: Uuid::new_v4(),
-                blob_id: pending_blob_id,
-                chunk_index: chunk.chunk_index,
-                content_hash: chunk.content_hash.clone(),
-                encrypted_hash: chunk.encrypted_hash.clone(),
-                bytes: chunk.bytes,
-                encrypted_bytes: chunk.encrypted_bytes,
-                local_path: Some(chunk.local_path.clone()),
-                nonce_hex: Some(chunk.nonce_hex.clone()),
-                aad: Some(chunk.aad.clone()),
-            })
-            .collect::<Vec<_>>();
-        {
-            let mut state = restarted.state.write().await;
-            state.blob_records.push(BlobRecord {
-                id: pending_blob_id,
-                vault_id: kids_vault.id,
-                asset_id: imported.asset.id,
-                content_hash: protected.content_hash.clone(),
-                encrypted_hash: sealed.encrypted_hash,
-                bytes: protected.bytes,
-                chunk_count: pending_chunks.len() as u32,
-                encryption_key_version: pending_version,
-                created_at: Utc::now(),
-                tombstoned_at: None,
-            });
-            state.blob_chunks.extend(pending_chunks);
-            state
-                .vaults
-                .iter_mut()
-                .find(|vault| vault.id == kids_vault.id)
-                .expect("selected vault")
-                .key_version = pending_version + 1;
-            restarted
-                .persist_locked_state(&state)
-                .expect("persist interrupted repair before rotation");
+        if simulate_interruption {
+            // Model a process interruption after the encrypted destination blob and
+            // its database rows were saved, followed by rotation of the vault's
+            // current key version before the user retries repair.
+
+            let pending_version = kids_vault.key_version;
+            crate::vault_store::provision_vault_key_if_new(
+                &config,
+                &library_root,
+                kids_vault.id,
+                pending_version,
+                false,
+            )
+            .expect("explicitly provision synthetic interrupted-repair fixture");
+            let sealed = crate::vault_store::seal_asset_from_reader(
+                &config,
+                &library_root,
+                kids_vault.id,
+                pending_version,
+                pending_blob_id,
+                &imported.asset,
+                std::io::Cursor::new(original_bytes),
+            )
+            .expect("seal interrupted repair candidate");
+            let pending_chunks = sealed
+                .chunks
+                .iter()
+                .map(|chunk| BlobChunk {
+                    id: Uuid::new_v4(),
+                    blob_id: pending_blob_id,
+                    chunk_index: chunk.chunk_index,
+                    content_hash: chunk.content_hash.clone(),
+                    encrypted_hash: chunk.encrypted_hash.clone(),
+                    bytes: chunk.bytes,
+                    encrypted_bytes: chunk.encrypted_bytes,
+                    local_path: Some(chunk.local_path.clone()),
+                    nonce_hex: Some(chunk.nonce_hex.clone()),
+                    aad: Some(chunk.aad.clone()),
+                })
+                .collect::<Vec<_>>();
+            {
+                let mut state = restarted.state.write().await;
+                state.blob_records.push(BlobRecord {
+                    id: pending_blob_id,
+                    vault_id: kids_vault.id,
+                    asset_id: imported.asset.id,
+                    content_hash: protected.content_hash.clone(),
+                    encrypted_hash: sealed.encrypted_hash,
+                    bytes: protected.bytes,
+                    chunk_count: pending_chunks.len() as u32,
+                    encryption_key_version: pending_version,
+                    created_at: Utc::now(),
+                    tombstoned_at: None,
+                });
+                state.blob_chunks.extend(pending_chunks);
+                state
+                    .vaults
+                    .iter_mut()
+                    .find(|vault| vault.id == kids_vault.id)
+                    .expect("selected vault")
+                    .key_version = pending_version + 1;
+                restarted
+                    .persist_locked_state(&state)
+                    .expect("persist interrupted repair before rotation");
+            }
         }
         let repaired = restarted
             .repair_quarantined_original(
@@ -16025,7 +16140,9 @@ mod tests {
             .expect("retry repair after vault key rotation");
         assert!(repaired.repaired);
         assert_eq!(repaired.vault_id, kids_vault.id);
-        assert_eq!(repaired.blob_id, pending_blob_id);
+        if simulate_interruption {
+            assert_eq!(repaired.blob_id, pending_blob_id);
+        }
         assert!(restarted.quarantined_originals().await.is_empty());
         assert!(
             !config.runtime_root.join("quarantine-repair").exists(),
@@ -18267,6 +18384,50 @@ mod tests {
             .await
             .expect("remove asset");
         assert_eq!(removed.asset_ids, vec![other_asset]);
+    }
+
+    #[tokio::test]
+    async fn backup_export_includes_committed_wal_state_with_pinned_reader() {
+        let root = temp_root("backup-pinned-wal");
+        let config = AppConfig {
+            runtime_root: root.to_path_buf(),
+            ..AppConfig::default()
+        };
+        let service = GalleryService::new(config.clone()).expect("service");
+        let reader = crate::security::open_database(&config.database_path()).expect("reader");
+        reader
+            .execute_batch("BEGIN; SELECT count(*) FROM jobs;")
+            .expect("pin old snapshot");
+        let latest = service.index_people().await.expect("committed job");
+        assert!(PathBuf::from(format!("{}-wal", config.database_path().display())).is_file());
+        let backup = service
+            .export_backup(crate::domain::BackupExportRequest {
+                export_root: root.join("export").to_string_lossy().into_owned(),
+                include_models: false,
+            })
+            .await
+            .expect("export");
+        let exported =
+            rusqlite::Connection::open(&backup.database_copied_to).expect("exported catalog");
+        let found: i64 = exported
+            .query_row(
+                "SELECT count(*) FROM jobs WHERE id=?1",
+                [latest.id.to_string()],
+                |row| row.get(0),
+            )
+            .expect("job query");
+        assert_eq!(
+            found, 1,
+            "acknowledged WAL writes must be in recovery catalog"
+        );
+        assert_eq!(
+            backup.database_sha256,
+            imports::derive_content_hash_from_file(std::path::Path::new(
+                &backup.database_copied_to
+            ))
+            .ok()
+        );
+        reader.execute_batch("ROLLBACK").expect("reader closes");
     }
 
     #[tokio::test]

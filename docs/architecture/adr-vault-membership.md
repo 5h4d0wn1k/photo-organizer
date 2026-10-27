@@ -68,8 +68,9 @@ encrypted pre-migration backup with explicit treatment of writes made afterward.
 
 ## Remaining Work
 
-Wire authoritative ownership into ingestion, persistence, all mobile and sync
-routes, and repair. Verify populated-database upgrades, failure rollback,
+The PR wires explicit ownership through ingestion, persistence, mobile and sync
+routes, and repair; end-to-end acceptance is still incomplete. Verify
+populated-database upgrades, failure rollback,
 same-vault dedup, cross-vault independent identities and files, metadata edits,
 trash/purge isolation, restart, and historical-conflict quarantine before this
 ADR can be accepted as implemented. Explicit cross-vault sharing is a separate

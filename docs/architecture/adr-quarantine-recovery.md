@@ -15,12 +15,13 @@ key. The plaintext source is removed only after the ciphertext and metadata have
 been verified and persisted. This prevents startup from guessing a vault and
 sealing the original under the wrong vault key.
 
-The current quarantine key lives in the OS keyring (or an explicit development
-file override). Existing backup export copies quarantine ciphertext and
-metadata, but not that key. Existing restore stages a database and files; it
+The production quarantine key lives in the OS keyring. Plaintext file-key
+backends are forbidden; a synthetic file store exists only in unit-test builds.
+Existing backup export copies quarantine ciphertext and metadata, but not that key. Existing restore stages a database and files; it
 does not install quarantine keys on the destination device. Therefore a copied
-backup alone does not prove portable recovery. There is also no API that lets a
-user inspect quarantined originals or explicitly resolve their ownership.
+backup alone does not prove portable recovery. Local inventory and explicit
+same-device repair APIs are implemented; they do not establish cross-device
+key recovery.
 
 ## Decision
 
@@ -29,6 +30,9 @@ or backup operation may select a target vault automatically. Mobile sessions
 and remote sync peers cannot list or repair quarantine records.
 
 ### API contract
+
+Inventory and repair are implemented. The passphrase-based export and restore
+changes below are proposed acceptance requirements, not current API behavior.
 
 - `GET /quarantine/originals` returns a local inventory: asset/object IDs,
   display filename, media kind, expected plaintext byte count and SHA-256,
@@ -56,13 +60,15 @@ error strings, job details, audit payloads, and backup reports.
 
 1. Take the service write lock; reload the target and quarantine record from
    authoritative state. Require the exact user-supplied live target vault.
-2. Verify all quarantine descriptors and ciphertext hashes. Decrypt to a
-   unique, permission-restricted temporary file under a private staging
-   directory. While streaming, verify the full plaintext SHA-256 and byte count
-   against both asset and quarantine metadata. Never return bytes to an API
-   caller. Remove the temporary plaintext on every exit path.
-3. Create a fresh blob ID and seal the verified temporary source with the
-   selected vault's current key version. Use the normal vault blob path and
+2. Verify all quarantine descriptors and ciphertext hashes. Use a verified
+   reader to stream plaintext directly into the destination encryption, with
+   bounded zeroizing buffers. Verify the full plaintext SHA-256 and byte count
+   against both asset and quarantine metadata. Never write temporary plaintext
+   files or return plaintext bytes to an API caller.
+3. Explicitly provision the selected vault's current key version through the
+   guarded lifecycle API. Existing catalog/ciphertext history and initialization
+   markers forbid replacing a missing credential. Reader-based sealing only
+   loads existing keys. Create a fresh blob ID and use the normal vault path and
    namespace. Sync the chunk files and containing directories; verify ciphertext
    hashes, sizes, chunk ordering, and decrypt the new blob through the normal
    vault reader to a sink while rechecking plaintext hash/length.
@@ -106,8 +112,7 @@ resource-excessive parameters before deriving a key. It authenticates every
 wrap and verifies the restored quarantine ciphertext against the database
 metadata before declaring quarantine recovery available. A wrong passphrase or
 tampered wrap fails closed. The recovered object key is installed in the local
-OS keyring (or the explicitly configured development key store) only as part of
-the staged restore activation. Any failed restore must remove keys it created
+OS keyring only as part of the staged restore activation. Any failed restore must remove keys it created
 and preserve the source backup unchanged. Zeroize derived keys and passphrase
 buffers on success and failure.
 
@@ -126,7 +131,7 @@ fields nor new manifest versions: unsupported versions must fail with a clear,
 non-sensitive error.
 
 Do not delete quarantine data during rollout. Keep the existing device-local
-key path readable until successful verified repair or an explicit user purge.
+credential readable until successful verified repair or an explicit user purge.
 Do not auto-purge orphaned quarantine files or keys during startup.
 
 ## Required tests before implementation is accepted
@@ -165,7 +170,10 @@ quarantine retirement only after verifying the already-persisted normal blob.
   dedicated security review and cross-config restore tests.
 - Complete the fault-injection matrix for chunk fsync, state save, directory
   retirement, and keyring retirement; current tests cover invalid target,
-  confirmation, corrupt quarantine retry, successful repair, and idempotent
-  retry.
-- Make the route available only through the local administrator interface and
-  verify it cannot be reached through mobile or remote sync surfaces.
+  confirmation, corrupt quarantine retry, fresh-target provisioning, missing-key
+  refusal with unchanged quarantine, interrupted repair across a key-version
+  change, successful repair, and idempotent retry.
+- Keep local inventory and repair behind the desktop administrator boundary.
+  Router tests cover local inventory access plus remote and missing-connection
+  denial for inventory and repair. Complete paired-device and remote-sync
+  acceptance before the ADR is accepted.

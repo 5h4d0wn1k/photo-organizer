@@ -50,19 +50,28 @@
 #      So this gate exercises a JIT debug build. A device-only failure -- AOT
 #      snapshotting, the dylib embedded in App.framework, bitcode/signing
 #      flags, device-only plugins -- is invisible here.
-#   3. It proves nothing about App Store or TestFlight acceptance, and nothing
+#   3. It does not check the CPU architecture of the native daemon, only its
+#      Mach-O *platform* (see EXPECTED_PLATFORM / assert_macho_platform:
+#      `ios-simulator`). The workflow builds the simulator slice for
+#      `aarch64-apple-ios-sim`, and `macos-latest` is Apple silicon, so the pair
+#      is right today. On an Intel runner an arm64-sim daemon would pass this gate
+#      and then fail to load -- the platform would read `ios-simulator` in both
+#      cases, and that is the only thing compared. Recorded as a known gap rather
+#      than implied coverage: this gate proves the daemon is a simulator binary,
+#      not that it is the right simulator binary for the machine inspecting it.
+#   4. It proves nothing about App Store or TestFlight acceptance, and nothing
 #      about installation on a real iPhone.
-#   4. It is not real hardware: no real camera, no real Photos library, no real
+#   5. It is not real hardware: no real camera, no real Photos library, no real
 #      keychain under device lock, a different GPU/Metal path, and no memory or
 #      thermal pressure. The simulator is also much more permissive about
 #      sandbox/entitlement violations than a device is.
-#   5. The render check cannot distinguish the LaunchScreen storyboard from the
+#   6. The render check cannot distinguish the LaunchScreen storyboard from the
 #      app's own first frame. A launch storyboard is a complex, perfectly
 #      stable image, exactly like a real first frame, and separating them needs
 #      an accessibility/automation surface this gate does not have.
-#   6. Only one CPU slice is exercised per runner, and the *simulator* slice,
+#   7. Only one CPU slice is exercised per runner, and the *simulator* slice,
 #      never the device slice.
-#   7. MOST IMPORTANT -- **the app on iOS has no working backend at all.** The
+#   8. MOST IMPORTANT -- **the app on iOS has no working backend at all.** The
 #      release job copies the `galleryd` daemon into `Runner.app/Frameworks/race`
 #      (release.yml, "Package unsigned .app"), and this gate checks that file is
 #      present, executable, and carries the expected Mach-O slice. It cannot be
