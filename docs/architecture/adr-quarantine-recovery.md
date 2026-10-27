@@ -168,8 +168,14 @@ quarantine retirement only after verifying the already-persisted normal blob.
 
 - Portable passphrase-wrapped backup recovery as specified above, with a
   dedicated security review and cross-config restore tests.
-- Complete the fault-injection matrix for chunk fsync, state save, directory
-  retirement, and keyring retirement; current tests cover invalid target,
+- Unit tests inject one-shot failures at 11 repair boundaries around sealing,
+  catalog/namespace saves, directory/key retirement, and final inventory save.
+  Each case reopens from disk, verifies a readable copy, retries, and reopens
+  again to check bytes, one owner/entry/live target blob and unchanged synthetic
+  destination key. These are service interruption/error-boundary tests. Actual
+  database-write and chunk/directory fsync failures, abrupt process termination,
+  and power-loss durability still require separate acceptance. Existing tests
+  also cover invalid target,
   confirmation, corrupt quarantine retry, fresh-target provisioning, missing-key
   refusal with unchanged quarantine, interrupted repair across a key-version
   change, successful repair, and idempotent retry.

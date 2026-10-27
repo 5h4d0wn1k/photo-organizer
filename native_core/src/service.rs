@@ -238,6 +238,23 @@ pub struct OriginalBytesRange {
     pub bytes: Vec<u8>,
 }
 
+// Instance-scoped fault injection is compiled out of production builds.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QuarantineRepairFault {
+    AfterSeal,
+    BeforeCandidateSave,
+    AfterCandidateSave,
+    BeforeNamespaceSave,
+    AfterNamespaceSave,
+    BeforeDirectoryRetirement,
+    AfterDirectoryRetirement,
+    BeforeKeyRetirement,
+    AfterKeyRetirement,
+    BeforeInventorySave,
+    AfterInventorySave,
+}
+
 #[derive(Clone)]
 pub struct GalleryService {
     config: AppConfig,
@@ -245,6 +262,8 @@ pub struct GalleryService {
     state: Arc<RwLock<LibraryState>>,
     sync_runtime: Arc<sync_transport::SyncRuntime>,
     operational: Arc<AtomicBool>,
+    #[cfg(test)]
+    quarantine_repair_fault: Arc<std::sync::Mutex<Option<QuarantineRepairFault>>>,
 }
 
 impl GalleryService {
@@ -291,6 +310,8 @@ impl GalleryService {
             state,
             sync_runtime,
             operational: Arc::new(AtomicBool::new(true)),
+            #[cfg(test)]
+            quarantine_repair_fault: Arc::new(std::sync::Mutex::new(None)),
         })
     }
 
@@ -2159,6 +2180,24 @@ impl GalleryService {
             .collect()
     }
 
+    #[cfg(test)]
+    fn inject_quarantine_repair_fault(
+        &self,
+        point: QuarantineRepairFault,
+    ) -> Result<(), ServiceError> {
+        let mut pending = self
+            .quarantine_repair_fault
+            .lock()
+            .expect("repair fault lock");
+        if *pending == Some(point) {
+            *pending = None;
+            return Err(ServiceError::Storage(format!(
+                "injected quarantine repair failure: {point:?}"
+            )));
+        }
+        Ok(())
+    }
+
     /// Repair a quarantined managed original into exactly the caller-selected
     /// live vault. The quarantine remains until the new vault ciphertext has
     /// been durably saved and independently verified.
@@ -2349,6 +2388,8 @@ impl GalleryService {
             Ok(sealed) => sealed,
             Err(error) => return Err(ServiceError::Storage(error.to_string())),
         };
+        #[cfg(test)]
+        self.inject_quarantine_repair_fault(QuarantineRepairFault::AfterSeal)?;
         let target_chunks = sealed
             .chunks
             .iter()
@@ -2416,8 +2457,12 @@ impl GalleryService {
             .mobile_uploads
             .retain(|upload| upload.asset_id != Some(asset_id) || upload.vault_id == vault.id);
         ensure_single_live_asset_entry(&mut candidate, &asset, vault.id)?;
+        #[cfg(test)]
+        self.inject_quarantine_repair_fault(QuarantineRepairFault::BeforeCandidateSave)?;
         storage::save_state(&self.storage, &candidate.to_persisted())
             .map_err(|error| ServiceError::Storage(error.to_string()))?;
+        #[cfg(test)]
+        self.inject_quarantine_repair_fault(QuarantineRepairFault::AfterCandidateSave)?;
         *state = candidate;
         self.finish_quarantine_repair(
             &mut state,
@@ -2484,20 +2529,32 @@ impl GalleryService {
             candidate_asset.is_available = true;
         }
         ensure_single_live_asset_entry(&mut with_namespace, asset, vault.id)?;
+        #[cfg(test)]
+        self.inject_quarantine_repair_fault(QuarantineRepairFault::BeforeNamespaceSave)?;
         storage::save_state(&self.storage, &with_namespace.to_persisted())
             .map_err(|error| ServiceError::Storage(error.to_string()))?;
+        #[cfg(test)]
+        self.inject_quarantine_repair_fault(QuarantineRepairFault::AfterNamespaceSave)?;
         *state = with_namespace;
         // Retire the old copy only after the independent normal-reader check.
         // Keep its database inventory until filesystem and keyring cleanup
         // succeed so interrupted cleanup stays visible and safely retryable.
         let object_dir =
             library_root.join(format!("quarantine/managed-originals/{}", record.object_id));
+        #[cfg(test)]
+        self.inject_quarantine_repair_fault(QuarantineRepairFault::BeforeDirectoryRetirement)?;
         if object_dir.exists() {
             fs::remove_dir_all(&object_dir).map_err(|error| ServiceError::Io(error.to_string()))?;
             sync_parent_directory(&object_dir)?;
         }
+        #[cfg(test)]
+        self.inject_quarantine_repair_fault(QuarantineRepairFault::AfterDirectoryRetirement)?;
+        #[cfg(test)]
+        self.inject_quarantine_repair_fault(QuarantineRepairFault::BeforeKeyRetirement)?;
         original_quarantine::retire_managed_original_key(&self.config, record.object_id)
             .map_err(|error| ServiceError::Storage(error.to_string()))?;
+        #[cfg(test)]
+        self.inject_quarantine_repair_fault(QuarantineRepairFault::AfterKeyRetirement)?;
         let mut candidate = state.clone();
         candidate
             .protected_originals
@@ -2510,8 +2567,12 @@ impl GalleryService {
             candidate_asset.vault_id = Some(vault.id);
             candidate_asset.is_available = true;
         }
+        #[cfg(test)]
+        self.inject_quarantine_repair_fault(QuarantineRepairFault::BeforeInventorySave)?;
         storage::save_state(&self.storage, &candidate.to_persisted())
             .map_err(|error| ServiceError::Storage(error.to_string()))?;
+        #[cfg(test)]
+        self.inject_quarantine_repair_fault(QuarantineRepairFault::AfterInventorySave)?;
         *state = candidate;
         Ok(QuarantineRepairResult {
             asset_id: asset.id,
@@ -15658,20 +15719,44 @@ mod tests {
 
     #[tokio::test]
     async fn ambiguous_managed_originals_are_quarantined_before_the_service_opens() {
-        check_quarantine_repair(true, false).await;
+        check_quarantine_repair(true, false, None).await;
     }
 
     #[tokio::test]
     async fn quarantine_repair_provisions_a_genuinely_new_destination_key() {
-        check_quarantine_repair(false, false).await;
+        check_quarantine_repair(false, false, None).await;
     }
 
     #[tokio::test]
     async fn quarantine_repair_refuses_a_lost_destination_key_without_retiring_ciphertext() {
-        check_quarantine_repair(false, true).await;
+        check_quarantine_repair(false, true, None).await;
     }
 
-    async fn check_quarantine_repair(simulate_interruption: bool, lose_destination_key: bool) {
+    #[tokio::test]
+    async fn quarantine_repair_reopens_and_retries_at_every_persistence_and_retirement_boundary() {
+        use super::QuarantineRepairFault::*;
+        for point in [
+            AfterSeal,
+            BeforeCandidateSave,
+            AfterCandidateSave,
+            BeforeNamespaceSave,
+            AfterNamespaceSave,
+            BeforeDirectoryRetirement,
+            AfterDirectoryRetirement,
+            BeforeKeyRetirement,
+            AfterKeyRetirement,
+            BeforeInventorySave,
+            AfterInventorySave,
+        ] {
+            check_quarantine_repair(false, false, Some(point)).await;
+        }
+    }
+
+    async fn check_quarantine_repair(
+        simulate_interruption: bool,
+        lose_destination_key: bool,
+        fault: Option<super::QuarantineRepairFault>,
+    ) {
         let runtime_root = temp_root("ambiguous-original-quarantine");
         let library_root = runtime_root.join("library");
         let source_root = runtime_root.join("source");
@@ -16059,6 +16144,150 @@ mod tests {
                     .join(kids_vault.id.to_string())
                     .exists()
             );
+            return;
+        }
+        if let Some(point) = fault {
+            *restarted
+                .quarantine_repair_fault
+                .lock()
+                .expect("fault lock") = Some(point);
+            let error = restarted
+                .clone()
+                .repair_quarantined_original(
+                    imported.asset.id,
+                    QuarantineRepairRequest {
+                        target_vault_id: kids_vault.id,
+                        confirm: true,
+                    },
+                )
+                .await
+                .expect_err("injected boundary must fail");
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("injected quarantine repair failure: {point:?}")),
+                "{point:?}: {error}"
+            );
+            // This store is synthetic and exists only in cfg(test) builds.
+            let target_key_path = config
+                .runtime_root
+                .join("security/vault-keys")
+                .join(format!(
+                    "vault-key:{}:v{}.key",
+                    kids_vault.id, kids_vault.key_version,
+                ));
+            let target_key_before = zeroize::Zeroizing::new(
+                fs::read(&target_key_path).expect("synthetic initialized destination key"),
+            );
+            drop(restarted);
+            let reopened = GalleryService::new(config.clone())
+                .expect("reopen from persisted state after boundary failure");
+            let state = reopened.state.read().await;
+            let target = state.blob_records.iter().find(|blob| {
+                blob.asset_id == imported.asset.id
+                    && blob.vault_id == kids_vault.id
+                    && blob.tombstoned_at.is_none()
+            });
+            let persisted_target_id = target.map(|blob| blob.id);
+            if let Some(blob) = target {
+                let normal_chunks = state
+                    .blob_chunks
+                    .iter()
+                    .filter(|chunk| chunk.blob_id == blob.id)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                crate::vault_store::verify_blob_plaintext(
+                    &config,
+                    &library_root,
+                    kids_vault.id,
+                    blob.encryption_key_version,
+                    &normal_chunks,
+                    &protected.content_hash,
+                    protected.bytes,
+                )
+                .expect("persisted normal copy remains decryptable");
+            } else {
+                verify_protected_original(&config, &library_root, &protected, &chunks)
+                    .expect("uncommitted destination retains verified quarantine");
+            }
+            drop(state);
+            let repaired = reopened
+                .repair_quarantined_original(
+                    imported.asset.id,
+                    QuarantineRepairRequest {
+                        target_vault_id: kids_vault.id,
+                        confirm: true,
+                    },
+                )
+                .await
+                .expect("retry after reopen");
+            if let Some(id) = persisted_target_id {
+                assert_eq!(
+                    repaired.blob_id, id,
+                    "{point:?}: persisted target must be reused"
+                );
+            }
+            let target_key_after = zeroize::Zeroizing::new(
+                fs::read(&target_key_path).expect("preserved synthetic destination key"),
+            );
+            assert!(
+                target_key_before.as_slice() == target_key_after.as_slice(),
+                "{point:?}: retry must preserve the destination key"
+            );
+            assert!(reopened.quarantined_originals().await.is_empty());
+            assert_eq!(
+                reopened
+                    .asset_original_bytes(imported.asset.id)
+                    .await
+                    .expect("normal reader after retry")
+                    .1,
+                original_bytes
+            );
+            drop(reopened);
+            let final_service =
+                GalleryService::new(config.clone()).expect("reopen completed repair");
+            assert_eq!(
+                final_service
+                    .asset_original_bytes(imported.asset.id)
+                    .await
+                    .expect("persisted normal reader")
+                    .1,
+                original_bytes
+            );
+            let state = final_service.state.read().await;
+            assert_eq!(
+                state
+                    .assets
+                    .iter()
+                    .find(|item| item.id == imported.asset.id)
+                    .unwrap()
+                    .vault_id,
+                Some(kids_vault.id)
+            );
+            assert_eq!(
+                state
+                    .file_entries
+                    .iter()
+                    .filter(|entry| entry.asset_id == Some(imported.asset.id)
+                        && entry.trashed_at.is_none())
+                    .count(),
+                1
+            );
+            assert_eq!(
+                state
+                    .blob_records
+                    .iter()
+                    .filter(|blob| blob.asset_id == imported.asset.id
+                        && blob.vault_id == kids_vault.id
+                        && blob.tombstoned_at.is_none())
+                    .count(),
+                1
+            );
+            assert!(!has_vault_asset_membership(
+                &state,
+                personal_vault.id,
+                imported.asset.id
+            ));
             return;
         }
         let pending_blob_id = Uuid::new_v4();
