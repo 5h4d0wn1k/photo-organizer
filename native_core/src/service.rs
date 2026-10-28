@@ -6013,7 +6013,7 @@ impl GalleryService {
 
     pub async fn export_backup(
         &self,
-        request: BackupExportRequest,
+        mut request: BackupExportRequest,
     ) -> Result<BackupExportResult, ServiceError> {
         if request.export_root.trim().is_empty() {
             return Err(ServiceError::Invalid(
@@ -6138,10 +6138,19 @@ impl GalleryService {
         let database_copy_sha256 = imports::derive_content_hash_from_file(&database_copy)
             .map_err(|error| ServiceError::Io(error.to_string()))?;
         verification.database_sha256 = Some(database_copy_sha256.clone());
+        verify_recovery_payloads(
+            &self.config,
+            &PathBuf::from(effective_library_root(&state, &self.config)),
+            &state.blob_records,
+            &state.blob_chunks,
+            &state.protected_originals,
+            &state.protected_original_chunks,
+        )?;
         let manifest_path = manifest_dir.join("private-gallery-backup-manifest.json");
-        let manifest = json!({
+        let mut manifest = json!({
             "exported_at": Utc::now(),
-            "format_version": 2,
+            "format_version": if recovery_key_inventory.required_keys.is_empty() { 2 } else { 3 },
+            "recovery_bundle": null,
             "library_root": verification.library_root,
             "database_path": verification.database_path,
             "database_copied_to": database_copy,
@@ -6163,6 +6172,57 @@ impl GalleryService {
             "include_models": request.include_models,
             "local_only": true,
         });
+        let recovery_bundle = if recovery_key_inventory.required_keys.is_empty() {
+            None
+        } else {
+            let passphrase = zeroize::Zeroizing::new(request.recovery_passphrase.take().ok_or_else(|| ServiceError::Invalid("a recovery passphrase is required for encrypted backups (16 to 1024 bytes)".into()))?);
+            let mut material = Vec::new();
+            for identity in &recovery_key_inventory.required_keys {
+                use crate::recovery_inventory::RequiredRecoveryKey;
+                let key = match identity {
+                    RequiredRecoveryKey::Catalog { .. } => {
+                        security::export_catalog_recovery_key(&self.storage.database_path)
+                            .map_err(security_error)?
+                    }
+                    RequiredRecoveryKey::Vault {
+                        vault_id,
+                        key_version,
+                    } => vault_store::export_recovery_key(&self.config, *vault_id, *key_version)
+                        .map_err(vault_store_error)?,
+                    RequiredRecoveryKey::Quarantine { object_id, .. } => {
+                        original_quarantine::export_recovery_key(&self.config, *object_id)
+                            .map_err(|error| ServiceError::Storage(error.to_string()))?
+                    }
+                };
+                material.push(crate::recovery_bundle::KeyMaterial {
+                    identity: identity.clone(),
+                    key,
+                });
+            }
+            let catalog_material = material.iter().find(|material| {
+                matches!(
+                    material.identity,
+                    crate::recovery_inventory::RequiredRecoveryKey::Catalog { .. }
+                )
+            });
+            security::verify_recovery_catalog(
+                &database_copy,
+                catalog_material.map(|material| &*material.key),
+            )
+            .map_err(security_error)?;
+            let binding = recovery_manifest_digest(&manifest)?;
+            let inventory = recovery_key_inventory.clone();
+            Some(
+                tokio::task::spawn_blocking(move || {
+                    crate::recovery_bundle::wrap(&material, &passphrase, &binding, &inventory)
+                })
+                .await
+                .map_err(|_| ServiceError::Storage("recovery key wrapping task failed".into()))?
+                .map_err(|error| ServiceError::Invalid(error.to_string()))?,
+            )
+        };
+        manifest["recovery_bundle"] = serde_json::to_value(recovery_bundle)
+            .map_err(|_| ServiceError::Storage("recovery envelope serialization failed".into()))?;
         fs::write(
             &manifest_path,
             serde_json::to_string_pretty(&manifest)
@@ -6476,7 +6536,7 @@ impl GalleryService {
 
     pub async fn run_restore_backup(
         &self,
-        request: BackupRestoreRunRequest,
+        mut request: BackupRestoreRunRequest,
     ) -> Result<BackupRestoreRunResult, ServiceError> {
         if !request.confirmed {
             return Err(ServiceError::Invalid(
@@ -6507,6 +6567,24 @@ impl GalleryService {
             return Err(ServiceError::Invalid(
                 "backup manifest changed during restore admission; retry planning".to_string(),
             ));
+        }
+        if manifest
+            .get("format_version")
+            .and_then(|value| value.as_u64())
+            == Some(3)
+        {
+            let passphrase =
+                zeroize::Zeroizing::new(request.recovery_passphrase.take().ok_or_else(|| {
+                    ServiceError::Invalid("the recovery passphrase is required".into())
+                })?);
+            let config = self.config.clone();
+            let final_root = std::path::absolute(&request.restore_root)
+                .map_err(|error| ServiceError::Io(error.to_string()))?;
+            return tokio::task::spawn_blocking(move || {
+                restore_portable_backup(&config, &export_root, &final_root, manifest, passphrase)
+            })
+            .await
+            .map_err(|_| ServiceError::Storage("portable restore task failed".into()))?;
         }
         let restore_root = PathBuf::from(&request.restore_root);
         let database_target = PathBuf::from(&plan.database_target_path);
@@ -6627,6 +6705,7 @@ impl GalleryService {
             vault_chunks_copied,
             protected_original_chunks_copied,
             bytes_copied,
+            activated: false,
             ok: true,
             detail: "Unencrypted files staged without modifying the active library. This is a staging result, not activation of a recovered library.".to_string(),
         };
@@ -9775,6 +9854,548 @@ fn copy_restore_file_exclusively(source: &Path, destination: &Path) -> Result<u6
     copied.map_err(|error| ServiceError::Io(error.to_string()))
 }
 
+fn sync_recovery_tree(path: &Path) -> Result<(), ServiceError> {
+    for entry in fs::read_dir(path).map_err(|error| ServiceError::Io(error.to_string()))? {
+        let entry = entry.map_err(|error| ServiceError::Io(error.to_string()))?;
+        let kind = entry
+            .file_type()
+            .map_err(|error| ServiceError::Io(error.to_string()))?;
+        if kind.is_symlink() {
+            return Err(ServiceError::Invalid(
+                "recovery staging contains an unexpected link".into(),
+            ));
+        }
+        if kind.is_dir() {
+            sync_recovery_tree(&entry.path())?;
+        } else if kind.is_file() {
+            security::sync_file_contents(&entry.path()).map_err(security_error)?;
+        } else {
+            return Err(ServiceError::Invalid(
+                "recovery staging contains an unsupported file".into(),
+            ));
+        }
+    }
+    security::sync_directory(path).map_err(security_error)
+}
+
+fn publish_recovery_directory(stage: &Path, destination: &Path) -> Result<(), ServiceError> {
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    {
+        rustix::fs::renameat_with(
+            rustix::fs::CWD,
+            stage,
+            rustix::fs::CWD,
+            destination,
+            rustix::fs::RenameFlags::NOREPLACE,
+        )
+        .map_err(|error| ServiceError::Io(error.to_string()))
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        let source: Vec<u16> = stage.as_os_str().encode_wide().chain(Some(0)).collect();
+        let target: Vec<u16> = destination
+            .as_os_str()
+            .encode_wide()
+            .chain(Some(0))
+            .collect();
+        let moved = unsafe {
+            windows_sys::Win32::Storage::FileSystem::MoveFileExW(
+                source.as_ptr(),
+                target.as_ptr(),
+                windows_sys::Win32::Storage::FileSystem::MOVEFILE_WRITE_THROUGH,
+            )
+        };
+        if moved == 0 {
+            Err(ServiceError::Io(
+                std::io::Error::last_os_error().to_string(),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_vendor = "apple",
+        windows
+    )))]
+    {
+        let _ = (stage, destination);
+        Err(ServiceError::Invalid(
+            "durable recovery publication is unsupported on this platform".into(),
+        ))
+    }
+}
+
+fn recovery_manifest_digest(manifest: &serde_json::Value) -> Result<String, ServiceError> {
+    let mut public = manifest.clone();
+    public
+        .as_object_mut()
+        .ok_or_else(|| ServiceError::Invalid("recovery manifest must be an object".into()))?
+        .remove("recovery_bundle");
+    let encoded = serde_json::to_vec(&public)
+        .map_err(|_| ServiceError::Invalid("recovery manifest cannot be encoded".into()))?;
+    Ok(format!("{:x}", Sha256::digest(&encoded)))
+}
+
+fn parse_portable_recovery(
+    manifest: &serde_json::Value,
+) -> Result<
+    (
+        crate::recovery_inventory::RecoveryKeyInventory,
+        crate::recovery_bundle::RecoveryEnvelope,
+    ),
+    ServiceError,
+> {
+    let inventory =
+        serde_json::from_value(manifest.get("recovery_key_inventory").cloned().ok_or_else(
+            || ServiceError::Invalid("backup is missing its recovery inventory".into()),
+        )?)
+        .map_err(|_| ServiceError::Invalid("backup recovery inventory is invalid".into()))?;
+    let envelope =
+        serde_json::from_value(manifest.get("recovery_bundle").cloned().ok_or_else(|| {
+            ServiceError::Invalid("backup is missing its wrapped recovery keys".into())
+        })?)
+        .map_err(|_| ServiceError::Invalid("wrapped recovery keys are invalid".into()))?;
+    let hash = recovery_manifest_digest(manifest)?;
+    crate::recovery_bundle::validate_envelope(&envelope, &inventory, &hash)
+        .map_err(|error| ServiceError::Invalid(error.to_string()))?;
+    Ok((inventory, envelope))
+}
+
+fn verify_recovery_payloads(
+    config: &AppConfig,
+    root: &Path,
+    blobs: &[BlobRecord],
+    chunks: &[BlobChunk],
+    originals: &[ProtectedOriginal],
+    original_chunks: &[ProtectedOriginalChunk],
+) -> Result<(), ServiceError> {
+    for blob in blobs {
+        let local = chunks
+            .iter()
+            .filter(|chunk| chunk.blob_id == blob.id && chunk.local_path.is_some())
+            .cloned()
+            .collect::<Vec<_>>();
+        if local.is_empty() {
+            continue;
+        }
+        if local.len() != blob.chunk_count as usize {
+            return Err(ServiceError::Storage(
+                "backup contains an incomplete encrypted blob".into(),
+            ));
+        }
+        vault_store::verify_encrypted_chunk_files(root, &local)
+            .and_then(|_| {
+                vault_store::verify_blob_plaintext(
+                    config,
+                    root,
+                    blob.vault_id,
+                    blob.encryption_key_version,
+                    &local,
+                    &blob.content_hash,
+                    blob.bytes,
+                )
+            })
+            .map_err(vault_store_error)?;
+    }
+    for original in originals {
+        let local = original_chunks
+            .iter()
+            .filter(|chunk| chunk.asset_id == original.asset_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        verify_protected_original(config, root, original, &local)?;
+    }
+    Ok(())
+}
+
+fn restore_portable_backup(
+    source_config: &AppConfig,
+    export_root: &Path,
+    final_root: &Path,
+    manifest: serde_json::Value,
+    passphrase: zeroize::Zeroizing<String>,
+) -> Result<BackupRestoreRunResult, ServiceError> {
+    use crate::recovery_inventory::RequiredRecoveryKey;
+    let (inventory, envelope) = parse_portable_recovery(&manifest)?;
+    let hash = manifest["database_sha256"]
+        .as_str()
+        .ok_or_else(|| ServiceError::Invalid("missing catalog digest".into()))?;
+    // Authenticate all recovery material before any destination/provider mutation.
+    let binding = recovery_manifest_digest(&manifest)?;
+    let keys = crate::recovery_bundle::unwrap(&envelope, &passphrase, &binding, &inventory)
+        .map_err(|error| ServiceError::Invalid(error.to_string()))?;
+    let source_database = find_database_copy(export_root, source_config, Some(&manifest));
+    let catalog = keys
+        .iter()
+        .find(|material| matches!(material.identity, RequiredRecoveryKey::Catalog { .. }));
+    security::verify_recovery_catalog(&source_database, catalog.map(|material| &*material.key))
+        .map_err(security_error)?;
+    let parent = final_root
+        .parent()
+        .ok_or_else(|| ServiceError::Invalid("restore root has no parent".into()))?;
+    fs::create_dir_all(parent).map_err(|error| ServiceError::Io(error.to_string()))?;
+    let stage = parent.join(format!(".photo-organizer-restore-{}", Uuid::new_v4()));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&stage)
+            .map_err(|error| ServiceError::Io(error.to_string()))?;
+    }
+    #[cfg(not(unix))]
+    fs::create_dir(&stage).map_err(|error| ServiceError::Io(error.to_string()))?;
+    let database_name = source_database
+        .file_name()
+        .ok_or_else(|| ServiceError::Invalid("backup database filename is invalid".into()))?;
+    let mut config = source_config.clone();
+    config.runtime_root = stage.join("runtime");
+    config.library_root = stage.join("library");
+    config.database_filename = database_name.to_string_lossy().into_owned();
+    config.local_web_root = None;
+    config.allow_remote_mobile = false;
+    config.network_policy = crate::domain::NetworkPolicy::OfflineOnly;
+    let final_database = final_root.join("runtime/db").join(database_name);
+    let mut vault_leases = Vec::new();
+    let mut quarantine_leases = Vec::new();
+    let mut catalog_lease = None;
+    let mut published = false;
+    let result = (|| -> Result<BackupRestoreRunResult, ServiceError> {
+        copy_restore_file_exclusively(&source_database, &config.database_path())?;
+        if imports::derive_content_hash_from_file(&config.database_path())
+            .map_err(|error| ServiceError::Io(error.to_string()))?
+            != hash
+        {
+            return Err(ServiceError::Storage(
+                "restored catalog failed authentication binding".into(),
+            ));
+        }
+        security::verify_recovery_catalog(
+            &config.database_path(),
+            catalog.map(|material| &*material.key),
+        )
+        .map_err(security_error)?;
+        let files = manifest["files"]
+            .as_array()
+            .ok_or_else(|| ServiceError::Invalid("backup file inventory is invalid".into()))?;
+        let mut media_files_copied = 0;
+        let mut vault_chunks_copied = 0;
+        let mut protected_original_chunks_copied = 0;
+        let mut bytes_copied = fs::metadata(config.database_path())
+            .map_err(|error| ServiceError::Io(error.to_string()))?
+            .len();
+        for file in files {
+            let relative = file["restore_relative_path"]
+                .as_str()
+                .and_then(manifest_relative_path)
+                .ok_or_else(|| ServiceError::Invalid("unsafe restore file path".into()))?;
+            let source = file["backup_relative_path"]
+                .as_str()
+                .and_then(manifest_relative_path)
+                .ok_or_else(|| ServiceError::Invalid("unsafe backup file path".into()))?;
+            let kind = file["kind"]
+                .as_str()
+                .ok_or_else(|| ServiceError::Invalid("missing backup file kind".into()))?;
+            let allowed = match kind {
+                "vault_chunk" | "protected_original_chunk" | "managed_original" => {
+                    relative.starts_with("library")
+                }
+                "reference_original" => relative.starts_with("external-originals"),
+                "model_file" => relative.starts_with("models"),
+                _ => false,
+            };
+            if !allowed {
+                return Err(ServiceError::Invalid(
+                    "backup payload targets a reserved restore path".into(),
+                ));
+            }
+            let destination = stage.join(&relative);
+            let copied = copy_restore_file_exclusively(&export_root.join(source), &destination)?;
+            let actual = imports::derive_content_hash_from_file(&destination)
+                .map_err(|error| ServiceError::Io(error.to_string()))?;
+            if file["sha256"].as_str() != Some(actual.as_str()) {
+                return Err(ServiceError::Storage(
+                    "restored payload failed its hash check".into(),
+                ));
+            }
+            bytes_copied += copied;
+            match kind {
+                "vault_chunk" => vault_chunks_copied += 1,
+                "protected_original_chunk" => protected_original_chunks_copied += 1,
+                "model_file" => {}
+                _ => media_files_copied += 1,
+            }
+        }
+        // Inventory ordering is canonical, and each provider mutation lease is
+        // retained until the whole activation commits or rolls back.
+        for (index, material) in keys.iter().enumerate() {
+            match &material.identity {
+                RequiredRecoveryKey::Catalog { .. } => {
+                    catalog_lease = Some((
+                        index,
+                        security::activate_recovery_catalog_bound(
+                            &config,
+                            &material.key,
+                            &final_database,
+                        )
+                        .map_err(security_error)?,
+                    ))
+                }
+                RequiredRecoveryKey::Vault {
+                    vault_id,
+                    key_version,
+                } => vault_leases.push((
+                    index,
+                    *vault_id,
+                    *key_version,
+                    vault_store::install_recovery_key(
+                        &config,
+                        *vault_id,
+                        *key_version,
+                        &material.key,
+                    )
+                    .map_err(vault_store_error)?,
+                )),
+                RequiredRecoveryKey::Quarantine { object_id, .. } => quarantine_leases.push((
+                    index,
+                    *object_id,
+                    original_quarantine::install_recovery_key(&config, *object_id, &material.key)
+                        .map_err(|error| ServiceError::Storage(error.to_string()))?,
+                )),
+            }
+        }
+        let report = StorageBootstrapReport {
+            database_path: config.database_path(),
+        };
+        let mut restored = storage::load_state(&report)
+            .map_err(|error| ServiceError::Storage(error.to_string()))?;
+        let original_catalog_reference = inventory.required_keys.iter().find_map(|identity| {
+            if let RequiredRecoveryKey::Catalog { source_key_id } = identity {
+                Some(source_key_id.clone())
+            } else {
+                None
+            }
+        });
+        let actual_inventory = crate::recovery_inventory::build(
+            original_catalog_reference,
+            &restored.blob_records,
+            &restored.blob_chunks,
+            &restored.protected_originals,
+            &restored.protected_original_chunks,
+        )
+        .map_err(|error| ServiceError::Storage(error.into()))?;
+        if actual_inventory != inventory {
+            return Err(ServiceError::Invalid(
+                "recovery keys do not match the authenticated catalog".into(),
+            ));
+        }
+        for chunk in &restored.blob_chunks {
+            if let Some(path) = &chunk.local_path
+                && manifest_relative_path(path).is_none()
+            {
+                return Err(ServiceError::Invalid(
+                    "catalog contains unsafe encrypted chunk paths".into(),
+                ));
+            }
+        }
+        for asset in &restored.assets {
+            if asset.import_mode != ImportMode::Reference
+                && manifest_relative_path(&asset.relative_original_path).is_none()
+            {
+                return Err(ServiceError::Invalid(
+                    "catalog contains unsafe managed original paths".into(),
+                ));
+            }
+            if asset
+                .variants
+                .iter()
+                .any(|variant| manifest_relative_path(&variant.relative_path).is_none())
+            {
+                return Err(ServiceError::Invalid(
+                    "catalog contains unsafe variant paths".into(),
+                ));
+            }
+        }
+        verify_recovery_payloads(
+            &config,
+            &config.library_root,
+            &restored.blob_records,
+            &restored.blob_chunks,
+            &restored.protected_originals,
+            &restored.protected_original_chunks,
+        )?;
+        // Rebind only to this new library. Restored credentials never authorize
+        // stale clients or restart source-device jobs/watch-folder ingestion.
+        if let Some(settings) = restored.library_settings.as_mut() {
+            settings.library_root = final_root.join("library").to_string_lossy().into_owned();
+        }
+        for asset in &mut restored.assets {
+            if asset.import_mode == ImportMode::Reference {
+                let file = files
+                    .iter()
+                    .find(|file| {
+                        file["kind"] == "reference_original"
+                            && file["asset_id"] == asset.id.to_string()
+                    })
+                    .ok_or_else(|| {
+                        ServiceError::Invalid(
+                            "reference original is missing from recovery payload".into(),
+                        )
+                    })?;
+                let path = file["restore_relative_path"]
+                    .as_str()
+                    .and_then(manifest_relative_path)
+                    .ok_or_else(|| {
+                        ServiceError::Invalid("invalid reference restore path".into())
+                    })?;
+                let staged = stage.join(&path);
+                if imports::derive_content_hash_from_file(&staged)
+                    .map_err(|error| ServiceError::Io(error.to_string()))?
+                    != asset.content_hash
+                {
+                    return Err(ServiceError::Storage(
+                        "restored reference original does not match catalog".into(),
+                    ));
+                }
+                asset.source_path = final_root.join(path).to_string_lossy().into_owned();
+            } else {
+                let managed = config.library_root.join(&asset.relative_original_path);
+                if managed.is_file()
+                    && (fs::metadata(&managed)
+                        .map_err(|error| ServiceError::Io(error.to_string()))?
+                        .len()
+                        != asset.bytes
+                        || imports::derive_content_hash_from_file(&managed)
+                            .map_err(|error| ServiceError::Io(error.to_string()))?
+                            != asset.content_hash)
+                {
+                    return Err(ServiceError::Storage(
+                        "restored managed original does not match authenticated catalog".into(),
+                    ));
+                }
+                asset.source_path = String::new();
+            }
+        }
+        restored.watch_folders.clear();
+        restored.import_sessions.clear();
+        restored.mobile_sessions.clear();
+        restored.mobile_uploads.clear();
+        restored.pairings.clear();
+        restored.sync_sessions.clear();
+        restored.sync_transfers.clear();
+        restored.capability_grants.clear();
+        restored.vault_invites.clear();
+        for device in &mut restored.devices {
+            device.revoked_at = Some(Utc::now());
+        }
+        for member in &mut restored.vault_members {
+            member.revoked_at = Some(Utc::now());
+        }
+        for envelope in &mut restored.vault_key_envelopes {
+            envelope.revoked_at = Some(Utc::now());
+        }
+        let fresh_device = Uuid::new_v4();
+        restored.devices.push(DeviceIdentity {
+            id: fresh_device,
+            display_name: "Recovered device".into(),
+            platform: std::env::consts::OS.into(),
+            public_key: format!("local-device-key-pending-iroh-{fresh_device}"),
+            trust_level: DeviceTrustLevel::Trusted,
+            storage_profile: DeviceStorageProfile {
+                device_id: Some(fresh_device),
+                ..DeviceStorageProfile::default()
+            },
+            enrolled_at: Utc::now(),
+            last_seen_at: Some(Utc::now()),
+            revoked_at: None,
+        });
+        for vault in &restored.vaults {
+            restored.vault_members.push(VaultMember {
+                id: Uuid::new_v4(),
+                vault_id: vault.id,
+                device_id: fresh_device,
+                role: DeviceRole::Admin,
+                trust_level: DeviceTrustLevel::Trusted,
+                display_name: "Recovered device".into(),
+                added_at: Utc::now(),
+                revoked_at: None,
+            });
+        }
+        restored.blob_replicas.clear();
+        for job in &mut restored.jobs {
+            if matches!(
+                job.status,
+                crate::domain::JobStatus::Queued | crate::domain::JobStatus::Running
+            ) {
+                job.status = crate::domain::JobStatus::Failed;
+            }
+        }
+        storage::save_state(&report, &restored)
+            .map_err(|error| ServiceError::Storage(error.to_string()))?;
+        storage::checkpoint_database(&config.database_path())
+            .map_err(|error| ServiceError::Storage(error.to_string()))?;
+        security::verify_recovery_catalog(
+            &config.database_path(),
+            catalog.map(|material| &*material.key),
+        )
+        .map_err(security_error)?;
+        let result = BackupRestoreRunResult { restored_at: Utc::now(), restore_root: final_root.to_string_lossy().into_owned(), database_restored_to: final_database.to_string_lossy().into_owned(), media_files_copied, vault_chunks_copied, protected_original_chunks_copied, bytes_copied, activated: true, ok: true, detail: "Recovery activated and verified in a separate library. Start with the restored runtime and library paths; pair devices again and re-add watch folders explicitly.".into() };
+        fs::write(
+            stage.join("restore-report.json"),
+            serde_json::to_vec_pretty(&result)
+                .map_err(|_| ServiceError::Storage("restore report serialization failed".into()))?,
+        )
+        .map_err(|error| ServiceError::Io(error.to_string()))?;
+        // A failed publish cannot destroy nonempty user data.
+        if final_root.exists() {
+            fs::remove_dir(final_root).map_err(|error| ServiceError::Io(error.to_string()))?;
+        }
+        sync_recovery_tree(&stage)?;
+        security::sync_directory(parent).map_err(security_error)?;
+        publish_recovery_directory(&stage, final_root)?;
+        published = true;
+        security::sync_directory(parent).map_err(|_| ServiceError::Storage("recovered directory was published but its durability barrier failed; preserve the library and verify it before use".into()))?;
+        // Publication is the commit point; provider leases are released only
+        // after the complete directory and verified bound state are published.
+        Ok(result)
+    })();
+    if result.is_err() && !published {
+        let mut rollback_ok = true;
+        for (index, object, lease) in quarantine_leases.into_iter().rev() {
+            rollback_ok &= original_quarantine::rollback_recovery_key(
+                &config,
+                object,
+                &keys[index].key,
+                lease,
+            )
+            .is_ok();
+        }
+        for (index, vault, version, lease) in vault_leases.into_iter().rev() {
+            rollback_ok &= vault_store::rollback_recovery_key(
+                &config,
+                vault,
+                version,
+                &keys[index].key,
+                lease,
+            )
+            .is_ok();
+        }
+        if let Some((index, lease)) = catalog_lease {
+            rollback_ok &=
+                security::rollback_recovery_catalog(&config, &keys[index].key, lease).is_ok();
+        }
+        if rollback_ok {
+            let _ = fs::remove_dir_all(&stage);
+        } else {
+            return Err(ServiceError::Storage("restore failed and credential rollback needs recovery; private staging data was preserved".into()));
+        }
+    }
+    result
+}
+
 fn build_restore_plan(
     export_root: &str,
     restore_root: &str,
@@ -9846,10 +10467,25 @@ fn build_restore_plan(
             )),
         }
     }
-    if database_source.is_file() {
+    let activation_supported = if manifest_version == 3 {
+        match manifest
+            .as_ref()
+            .ok_or_else(|| ServiceError::Invalid("missing recovery manifest".into()))
+            .and_then(parse_portable_recovery)
+        {
+            Ok(_) => true,
+            Err(error) => {
+                missing_paths.push(error.to_string());
+                false
+            }
+        }
+    } else {
+        false
+    };
+    if database_source.is_file() && !activation_supported {
         missing_paths.extend(restore_key_activation_blockers(&database_source));
     }
-    if !(1..=2).contains(&manifest_version) {
+    if !(1..=3).contains(&manifest_version) {
         missing_paths.push("unsupported backup manifest version".to_string());
     }
     let database_name = database_source
@@ -9901,12 +10537,14 @@ fn build_restore_plan(
             .and_then(|value| value.as_array())
             .cloned()
             .unwrap_or_default();
-        if files.iter().any(|file| {
-            matches!(
-                file.get("kind").and_then(|kind| kind.as_str()),
-                Some("vault_chunk" | "protected_original_chunk")
-            )
-        }) {
+        if !activation_supported
+            && files.iter().any(|file| {
+                matches!(
+                    file.get("kind").and_then(|kind| kind.as_str()),
+                    Some("vault_chunk" | "protected_original_chunk")
+                )
+            })
+        {
             missing_paths.push("destination key activation is unavailable for encrypted media in this backup; preserve the backup and original device keys".to_string());
         }
         for file in files {
@@ -10124,6 +10762,8 @@ fn build_restore_plan(
         missing_paths,
         destination_conflicts,
         requires_confirmation: true,
+        requires_recovery_passphrase: activation_supported,
+        activation_supported,
         ok,
         detail,
     })
@@ -10191,8 +10831,17 @@ fn restore_key_activation_blockers(database: &Path) -> Vec<String> {
 
 fn read_backup_manifest(export_root: &Path) -> Result<serde_json::Value, ServiceError> {
     let manifest_path = backup_manifest_path(export_root);
-    let bytes = fs::read(&manifest_path).map_err(|err| ServiceError::Io(err.to_string()))?;
-    serde_json::from_slice(&bytes).map_err(|err| ServiceError::Storage(err.to_string()))
+    let mut bytes = Vec::new();
+    fs::File::open(&manifest_path)
+        .and_then(|file| file.take(16 * 1024 * 1024 + 1).read_to_end(&mut bytes))
+        .map_err(|error| ServiceError::Io(error.to_string()))?;
+    if bytes.len() > 16 * 1024 * 1024 {
+        return Err(ServiceError::Invalid(
+            "backup manifest exceeds the supported size".into(),
+        ));
+    }
+    serde_json::from_slice(&bytes)
+        .map_err(|_| ServiceError::Invalid("backup manifest is invalid".into()))
 }
 
 fn backup_manifest_path(export_root: &Path) -> PathBuf {
@@ -15484,6 +16133,206 @@ mod tests {
         let _ = service_b.stop_sync_network().await;
     }
 
+    #[tokio::test]
+    async fn portable_recovery_cold_launches_without_source_catalog_vault_or_quarantine_keys() {
+        let root = temp_root("portable-recovery-cold-launch");
+        let source_config = AppConfig {
+            runtime_root: root.join("source/runtime"),
+            library_root: root.join("source/library"),
+            ..AppConfig::default()
+        };
+        fs::create_dir_all(&source_config.library_root).unwrap();
+        let source = GalleryService::new(source_config.clone()).unwrap();
+        source
+            .update_library_settings(UpdateLibrarySettingsRequest {
+                library_root: source_config.library_root.to_string_lossy().into_owned(),
+                default_import_mode: ImportMode::Copy,
+                original_storage_policy: Some(OriginalStoragePolicy::EncryptedOnly),
+            })
+            .await
+            .unwrap();
+        let original = root.join("input.jpg");
+        let bytes = b"independent destination normal-reader proof";
+        fs::write(&original, bytes).unwrap();
+        let normal = source
+            .import_asset(ImportAssetRequest {
+                source_path: original.to_string_lossy().into_owned(),
+                original_filename: "input.jpg".into(),
+                media_kind: MediaKind::Photo,
+                mime_type: "image/jpeg".into(),
+                bytes: bytes.len() as u64,
+                content_hash: None,
+                captured_at: None,
+                place_hint: None,
+                import_mode: Some(ImportMode::Copy),
+            })
+            .await
+            .unwrap();
+        let ambiguous_input = root.join("ambiguous.jpg");
+        let ambiguous_bytes = b"independent quarantined original recovery proof";
+        fs::write(&ambiguous_input, ambiguous_bytes).unwrap();
+        let personal = source.vaults().await[0].clone();
+        let ambiguous = source
+            .import_asset_to_vault(
+                personal.id,
+                ImportAssetRequest {
+                    source_path: ambiguous_input.to_string_lossy().into_owned(),
+                    original_filename: "ambiguous.jpg".into(),
+                    media_kind: MediaKind::Photo,
+                    mime_type: "image/jpeg".into(),
+                    bytes: ambiguous_bytes.len() as u64,
+                    content_hash: None,
+                    captured_at: None,
+                    place_hint: None,
+                    import_mode: Some(ImportMode::Copy),
+                },
+            )
+            .await
+            .unwrap();
+        let other = source
+            .create_vault(CreateVaultRequest {
+                id: None,
+                name: "Other".into(),
+                storage_policy: None,
+            })
+            .await
+            .unwrap();
+        fs::write(
+            source_config
+                .library_root
+                .join(&ambiguous.asset.relative_original_path),
+            ambiguous_bytes,
+        )
+        .unwrap();
+        {
+            let mut state = source.state.write().await;
+            let mut entry = state
+                .file_entries
+                .iter()
+                .find(|entry| entry.asset_id == Some(ambiguous.asset.id))
+                .unwrap()
+                .clone();
+            entry.id = Uuid::new_v4();
+            entry.vault_id = other.id;
+            entry.parent_id = root_file_entry_id(&state, other.id);
+            state.file_entries.push(entry);
+            state
+                .assets
+                .iter_mut()
+                .find(|asset| asset.id == ambiguous.asset.id)
+                .unwrap()
+                .is_available = true;
+            source.persist_locked_state(&state).unwrap();
+        }
+        drop(source);
+        let source = GalleryService::new(source_config.clone()).unwrap();
+        assert_eq!(source.quarantined_originals().await.len(), 1);
+        source
+            .activate_encryption(crate::domain::EncryptionActivationRequest {
+                confirmed: true,
+                backup_root: None,
+            })
+            .await
+            .unwrap();
+        let export_root = root.join("backup");
+        let password = "a unique synthetic recovery passphrase";
+        source
+            .export_backup(crate::domain::BackupExportRequest {
+                export_root: export_root.to_string_lossy().into_owned(),
+                include_models: false,
+                recovery_passphrase: Some(password.into()),
+            })
+            .await
+            .unwrap();
+        let manifest_before = fs::read(backup_manifest_path(&export_root)).unwrap();
+        drop(source);
+        // Only synthetic test stores are removed; production credentials are
+        // never touched. The receiving service has a separate runtime/store.
+        fs::remove_dir_all(source_config.runtime_root.join("security")).unwrap();
+        let receiver = GalleryService::new(AppConfig {
+            runtime_root: root.join("receiver/runtime"),
+            library_root: root.join("receiver/library"),
+            ..AppConfig::default()
+        })
+        .unwrap();
+        let destination = root.join("restored");
+        let plan = receiver
+            .plan_restore_backup(crate::domain::BackupRestorePlanRequest {
+                export_root: export_root.to_string_lossy().into_owned(),
+                restore_root: destination.to_string_lossy().into_owned(),
+            })
+            .await
+            .unwrap();
+        assert!(plan.ok, "{plan:?}");
+        assert!(plan.requires_recovery_passphrase && plan.activation_supported);
+        assert!(
+            receiver
+                .run_restore_backup(crate::domain::BackupRestoreRunRequest {
+                    export_root: export_root.to_string_lossy().into_owned(),
+                    restore_root: destination.to_string_lossy().into_owned(),
+                    confirmed: true,
+                    recovery_passphrase: Some("wrong synthetic passphrase".into())
+                })
+                .await
+                .is_err()
+        );
+        assert!(!destination.exists());
+        assert!(
+            receiver
+                .run_restore_backup(crate::domain::BackupRestoreRunRequest {
+                    export_root: export_root.to_string_lossy().into_owned(),
+                    restore_root: destination.to_string_lossy().into_owned(),
+                    confirmed: true,
+                    recovery_passphrase: Some(password.into())
+                })
+                .await
+                .unwrap()
+                .ok
+        );
+        let recovered = GalleryService::new(AppConfig {
+            runtime_root: destination.join("runtime"),
+            library_root: destination.join("library"),
+            ..AppConfig::default()
+        })
+        .expect("cold launch independently restored library");
+        assert_eq!(
+            recovered.library_settings().await.unwrap().library_root,
+            destination.join("library").to_string_lossy()
+        );
+        assert_eq!(
+            recovered
+                .asset_original_bytes(normal.asset.id)
+                .await
+                .unwrap()
+                .1,
+            bytes
+        );
+        assert_eq!(recovered.quarantined_originals().await.len(), 1);
+        recovered
+            .repair_quarantined_original(
+                ambiguous.asset.id,
+                QuarantineRepairRequest {
+                    target_vault_id: personal.id,
+                    confirm: true,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            recovered
+                .asset_original_bytes(ambiguous.asset.id)
+                .await
+                .unwrap()
+                .1,
+            ambiguous_bytes
+        );
+        assert!(recovered.state.read().await.mobile_sessions.is_empty());
+        assert_eq!(
+            fs::read(backup_manifest_path(&export_root)).unwrap(),
+            manifest_before
+        );
+    }
+
     #[test]
     fn restore_copy_never_overwrites_and_cleans_only_its_own_failed_copy() {
         let root = temp_root("exclusive-restore-copy");
@@ -15511,6 +16360,7 @@ mod tests {
         let export_root = root.join("export");
         service
             .export_backup(crate::domain::BackupExportRequest {
+                recovery_passphrase: Some("synthetic recovery passphrase".to_string()),
                 export_root: export_root.to_string_lossy().into_owned(),
                 include_models: false,
             })
@@ -15530,6 +16380,7 @@ mod tests {
         );
         let result = service
             .run_restore_backup(crate::domain::BackupRestoreRunRequest {
+                recovery_passphrase: None,
                 export_root: request.export_root,
                 restore_root: request.restore_root,
                 confirmed: true,
@@ -15563,7 +16414,7 @@ mod tests {
                 .any(|cause| cause.contains("destination key activation"))
         );
         manifest["files"] = serde_json::json!([]);
-        manifest["format_version"] = serde_json::json!(3);
+        manifest["format_version"] = serde_json::json!(4);
         fs::write(
             backup_manifest_path(&export_root),
             serde_json::to_vec(&manifest).unwrap(),
@@ -15604,6 +16455,7 @@ mod tests {
         let export_root = root.join("export");
         let exported = service
             .export_backup(crate::domain::BackupExportRequest {
+                recovery_passphrase: Some("synthetic recovery passphrase".to_string()),
                 export_root: export_root.to_string_lossy().into_owned(),
                 include_models: false,
             })
@@ -15623,6 +16475,14 @@ mod tests {
                 .unwrap()
                 .starts_with("library-")
         );
+        let mut legacy = read_backup_manifest(&export_root).unwrap();
+        legacy["format_version"] = serde_json::json!(2);
+        legacy.as_object_mut().unwrap().remove("recovery_bundle");
+        fs::write(
+            backup_manifest_path(&export_root),
+            serde_json::to_vec(&legacy).unwrap(),
+        )
+        .unwrap();
         let restore_root = root.join("unactivated-restore");
         let plan = service
             .plan_restore_backup(crate::domain::BackupRestorePlanRequest {
@@ -15643,6 +16503,7 @@ mod tests {
         assert!(
             service
                 .run_restore_backup(crate::domain::BackupRestoreRunRequest {
+                    recovery_passphrase: None,
                     export_root: export_root.to_string_lossy().into_owned(),
                     restore_root: restore_root.to_string_lossy().into_owned(),
                     confirmed: true,
@@ -15712,6 +16573,7 @@ mod tests {
         let export_root = runtime_root.join("backup-export");
         let export = service
             .export_backup(crate::domain::BackupExportRequest {
+                recovery_passphrase: Some("synthetic recovery passphrase".to_string()),
                 export_root: export_root.to_string_lossy().to_string(),
                 include_models: false,
             })
@@ -15730,6 +16592,14 @@ mod tests {
             && key["vault_id"] == vault.id.to_string()
             && key["key_version"] == vault.key_version));
 
+        let mut legacy = read_backup_manifest(&export_root).unwrap();
+        legacy["format_version"] = serde_json::json!(2);
+        legacy.as_object_mut().unwrap().remove("recovery_bundle");
+        fs::write(
+            backup_manifest_path(&export_root),
+            serde_json::to_vec(&legacy).unwrap(),
+        )
+        .unwrap();
         let blocked_plan = service
             .plan_restore_backup(crate::domain::BackupRestorePlanRequest {
                 export_root: export_root.to_string_lossy().to_string(),
@@ -15765,6 +16635,7 @@ mod tests {
         assert!(
             service
                 .run_restore_backup(crate::domain::BackupRestoreRunRequest {
+                    recovery_passphrase: None,
                     export_root: export_root.to_string_lossy().into_owned(),
                     restore_root: restore_root.to_string_lossy().into_owned(),
                     confirmed: true,
@@ -16199,176 +17070,186 @@ mod tests {
         ));
         drop(state);
 
-        let verification = restarted
-            .verify_backup(crate::domain::BackupVerifyRequest { export_root: None })
-            .await
-            .expect("verify quarantined original backup inputs");
-        assert!(verification.ok, "{verification:?}");
-        assert_eq!(verification.protected_originals_checked, 1);
-        let export_root = runtime_root.join("protected-original-backup");
-        let backup = restarted
-            .export_backup(crate::domain::BackupExportRequest {
-                export_root: export_root.to_string_lossy().to_string(),
-                include_models: false,
-            })
-            .await
-            .expect("export protected original ciphertext");
-        assert!(backup.ok, "{backup:?}");
-        assert_eq!(backup.protected_original_chunks_copied, 1);
-        let manifest = read_backup_manifest(&export_root).expect("backup manifest");
-        assert!(
-            manifest["recovery_key_inventory"]["required_keys"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|key| {
-                    key["kind"] == "quarantine"
-                        && key["object_id"] == protected.object_id.to_string()
-                        && key["asset_id"] == imported.asset.id.to_string()
-                        && key["key_version"] == 1
+        if fault.is_none() {
+            let verification = restarted
+                .verify_backup(crate::domain::BackupVerifyRequest { export_root: None })
+                .await
+                .expect("verify quarantined original backup inputs");
+            assert!(verification.ok, "{verification:?}");
+            assert_eq!(verification.protected_originals_checked, 1);
+            let export_root = runtime_root.join("protected-original-backup");
+            let backup = restarted
+                .export_backup(crate::domain::BackupExportRequest {
+                    recovery_passphrase: Some("synthetic recovery passphrase".to_string()),
+                    export_root: export_root.to_string_lossy().to_string(),
+                    include_models: false,
                 })
-        );
-        assert!(
-            manifest["files"]
+                .await
+                .expect("export protected original ciphertext");
+            assert!(backup.ok, "{backup:?}");
+            assert_eq!(backup.protected_original_chunks_copied, 1);
+            let mut manifest = read_backup_manifest(&export_root).expect("backup manifest");
+            manifest["format_version"] = serde_json::json!(2);
+            manifest.as_object_mut().unwrap().remove("recovery_bundle");
+            fs::write(
+                backup_manifest_path(&export_root),
+                serde_json::to_vec(&manifest).unwrap(),
+            )
+            .unwrap();
+            assert!(
+                manifest["recovery_key_inventory"]["required_keys"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|key| {
+                        key["kind"] == "quarantine"
+                            && key["object_id"] == protected.object_id.to_string()
+                            && key["asset_id"] == imported.asset.id.to_string()
+                            && key["key_version"] == 1
+                    })
+            );
+            assert!(
+                manifest["files"]
+                    .as_array()
+                    .expect("files")
+                    .iter()
+                    .any(|file| file["kind"] == "protected_original_chunk")
+            );
+
+            let restore_root = temp_root("protected-original-restore");
+            let plan = restarted
+                .plan_restore_backup(crate::domain::BackupRestorePlanRequest {
+                    export_root: export_root.to_string_lossy().to_string(),
+                    restore_root: restore_root.to_string_lossy().to_string(),
+                })
+                .await
+                .expect("plan protected-original restore");
+            assert!(
+                !plan.ok,
+                "quarantine keys are not installed at the destination"
+            );
+            assert!(
+                plan.missing_paths
+                    .iter()
+                    .any(|cause| cause.contains("destination key activation"))
+            );
+            assert_eq!(plan.protected_original_chunks_available, 1);
+
+            let manifest_path = backup_manifest_path(&export_root);
+            let mut manifest_without_inventory = manifest.clone();
+            manifest_without_inventory["protected_originals"] = serde_json::json!([]);
+            fs::write(
+                &manifest_path,
+                serde_json::to_vec_pretty(&manifest_without_inventory)
+                    .expect("serialize manifest without inventory"),
+            )
+            .expect("remove protected inventory from manifest");
+            let omitted_inventory_plan = restarted
+                .plan_restore_backup(crate::domain::BackupRestorePlanRequest {
+                    export_root: export_root.to_string_lossy().to_string(),
+                    restore_root: runtime_root
+                        .join("protected-original-omitted-inventory-restore")
+                        .to_string_lossy()
+                        .to_string(),
+                })
+                .await
+                .expect("plan with omitted protected-original inventory");
+            assert!(!omitted_inventory_plan.ok);
+            assert!(
+                omitted_inventory_plan
+                    .missing_paths
+                    .iter()
+                    .any(|path| path.contains("no matching metadata"))
+            );
+            fs::write(
+                &manifest_path,
+                serde_json::to_vec_pretty(&manifest).expect("serialize original manifest"),
+            )
+            .expect("restore protected-original inventory");
+
+            let mut manifest_without_database_hash = manifest.clone();
+            manifest_without_database_hash
+                .as_object_mut()
+                .expect("manifest object")
+                .remove("database_sha256");
+            fs::write(
+                &manifest_path,
+                serde_json::to_vec_pretty(&manifest_without_database_hash)
+                    .expect("serialize manifest without database hash"),
+            )
+            .expect("remove database hash from manifest");
+            let missing_database_hash_plan = restarted
+                .plan_restore_backup(crate::domain::BackupRestorePlanRequest {
+                    export_root: export_root.to_string_lossy().to_string(),
+                    restore_root: runtime_root
+                        .join("protected-original-missing-db-hash-restore")
+                        .to_string_lossy()
+                        .to_string(),
+                })
+                .await
+                .expect("plan with missing database hash");
+            assert!(!missing_database_hash_plan.ok);
+            assert!(
+                missing_database_hash_plan
+                    .missing_paths
+                    .iter()
+                    .any(|path| path.contains("database_sha256"))
+            );
+            fs::write(
+                &manifest_path,
+                serde_json::to_vec_pretty(&manifest).expect("serialize original manifest"),
+            )
+            .expect("restore database hash");
+
+            assert!(
+                restarted
+                    .run_restore_backup(crate::domain::BackupRestoreRunRequest {
+                        recovery_passphrase: None,
+                        export_root: export_root.to_string_lossy().into_owned(),
+                        restore_root: restore_root.to_string_lossy().into_owned(),
+                        confirmed: true,
+                    })
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                fs::read_dir(&restore_root).unwrap().count(),
+                0,
+                "unavailable destination quarantine keys must fail before writes"
+            );
+            verify_protected_original(&config, &library_root, &protected, &chunks)
+                .expect("failed restore preserves the original recoverable copy");
+
+            let protected_manifest_entry = manifest["files"]
                 .as_array()
                 .expect("files")
                 .iter()
-                .any(|file| file["kind"] == "protected_original_chunk")
-        );
-
-        let restore_root = temp_root("protected-original-restore");
-        let plan = restarted
-            .plan_restore_backup(crate::domain::BackupRestorePlanRequest {
-                export_root: export_root.to_string_lossy().to_string(),
-                restore_root: restore_root.to_string_lossy().to_string(),
-            })
-            .await
-            .expect("plan protected-original restore");
-        assert!(
-            !plan.ok,
-            "quarantine keys are not installed at the destination"
-        );
-        assert!(
-            plan.missing_paths
-                .iter()
-                .any(|cause| cause.contains("destination key activation"))
-        );
-        assert_eq!(plan.protected_original_chunks_available, 1);
-
-        let manifest_path = backup_manifest_path(&export_root);
-        let mut manifest_without_inventory = manifest.clone();
-        manifest_without_inventory["protected_originals"] = serde_json::json!([]);
-        fs::write(
-            &manifest_path,
-            serde_json::to_vec_pretty(&manifest_without_inventory)
-                .expect("serialize manifest without inventory"),
-        )
-        .expect("remove protected inventory from manifest");
-        let omitted_inventory_plan = restarted
-            .plan_restore_backup(crate::domain::BackupRestorePlanRequest {
-                export_root: export_root.to_string_lossy().to_string(),
-                restore_root: runtime_root
-                    .join("protected-original-omitted-inventory-restore")
-                    .to_string_lossy()
-                    .to_string(),
-            })
-            .await
-            .expect("plan with omitted protected-original inventory");
-        assert!(!omitted_inventory_plan.ok);
-        assert!(
-            omitted_inventory_plan
-                .missing_paths
-                .iter()
-                .any(|path| path.contains("no matching metadata"))
-        );
-        fs::write(
-            &manifest_path,
-            serde_json::to_vec_pretty(&manifest).expect("serialize original manifest"),
-        )
-        .expect("restore protected-original inventory");
-
-        let mut manifest_without_database_hash = manifest.clone();
-        manifest_without_database_hash
-            .as_object_mut()
-            .expect("manifest object")
-            .remove("database_sha256");
-        fs::write(
-            &manifest_path,
-            serde_json::to_vec_pretty(&manifest_without_database_hash)
-                .expect("serialize manifest without database hash"),
-        )
-        .expect("remove database hash from manifest");
-        let missing_database_hash_plan = restarted
-            .plan_restore_backup(crate::domain::BackupRestorePlanRequest {
-                export_root: export_root.to_string_lossy().to_string(),
-                restore_root: runtime_root
-                    .join("protected-original-missing-db-hash-restore")
-                    .to_string_lossy()
-                    .to_string(),
-            })
-            .await
-            .expect("plan with missing database hash");
-        assert!(!missing_database_hash_plan.ok);
-        assert!(
-            missing_database_hash_plan
-                .missing_paths
-                .iter()
-                .any(|path| path.contains("database_sha256"))
-        );
-        fs::write(
-            &manifest_path,
-            serde_json::to_vec_pretty(&manifest).expect("serialize original manifest"),
-        )
-        .expect("restore database hash");
-
-        assert!(
-            restarted
-                .run_restore_backup(crate::domain::BackupRestoreRunRequest {
-                    export_root: export_root.to_string_lossy().into_owned(),
-                    restore_root: restore_root.to_string_lossy().into_owned(),
-                    confirmed: true,
+                .find(|file| file["kind"] == "protected_original_chunk")
+                .expect("protected chunk manifest entry");
+            let backup_chunk = export_root.join(
+                protected_manifest_entry["backup_relative_path"]
+                    .as_str()
+                    .expect("backup path"),
+            );
+            fs::write(&backup_chunk, b"corrupted encrypted chunk").expect("corrupt backup chunk");
+            let corrupted_plan = restarted
+                .plan_restore_backup(crate::domain::BackupRestorePlanRequest {
+                    export_root: export_root.to_string_lossy().to_string(),
+                    restore_root: runtime_root
+                        .join("protected-original-corrupt-restore")
+                        .to_string_lossy()
+                        .to_string(),
                 })
                 .await
-                .is_err()
-        );
-        assert_eq!(
-            fs::read_dir(&restore_root).unwrap().count(),
-            0,
-            "unavailable destination quarantine keys must fail before writes"
-        );
-        verify_protected_original(&config, &library_root, &protected, &chunks)
-            .expect("failed restore preserves the original recoverable copy");
-
-        let protected_manifest_entry = manifest["files"]
-            .as_array()
-            .expect("files")
-            .iter()
-            .find(|file| file["kind"] == "protected_original_chunk")
-            .expect("protected chunk manifest entry");
-        let backup_chunk = export_root.join(
-            protected_manifest_entry["backup_relative_path"]
-                .as_str()
-                .expect("backup path"),
-        );
-        fs::write(&backup_chunk, b"corrupted encrypted chunk").expect("corrupt backup chunk");
-        let corrupted_plan = restarted
-            .plan_restore_backup(crate::domain::BackupRestorePlanRequest {
-                export_root: export_root.to_string_lossy().to_string(),
-                restore_root: runtime_root
-                    .join("protected-original-corrupt-restore")
-                    .to_string_lossy()
-                    .to_string(),
-            })
-            .await
-            .expect("plan corrupted protected-original restore");
-        assert!(!corrupted_plan.ok);
-        assert!(
-            corrupted_plan
-                .missing_paths
-                .iter()
-                .any(|path| path.contains("hash mismatch"))
-        );
-
+                .expect("plan corrupted protected-original restore");
+            assert!(!corrupted_plan.ok);
+            assert!(
+                corrupted_plan
+                    .missing_paths
+                    .iter()
+                    .any(|path| path.contains("hash mismatch"))
+            );
+        }
         let second_restart = GalleryService::new(config.clone()).expect("reload protected state");
         assert_eq!(
             second_restart.state.read().await.protected_originals[0].asset_id,
@@ -18978,6 +19859,7 @@ mod tests {
         assert!(PathBuf::from(format!("{}-wal", config.database_path().display())).is_file());
         let backup = service
             .export_backup(crate::domain::BackupExportRequest {
+                recovery_passphrase: Some("synthetic recovery passphrase".to_string()),
                 export_root: root.join("export").to_string_lossy().into_owned(),
                 include_models: false,
             })
@@ -19032,6 +19914,7 @@ mod tests {
         let export_root = runtime_root.join("backup-export");
         let export = service
             .export_backup(crate::domain::BackupExportRequest {
+                recovery_passphrase: Some("synthetic recovery passphrase".to_string()),
                 export_root: export_root.to_string_lossy().to_string(),
                 include_models: false,
             })

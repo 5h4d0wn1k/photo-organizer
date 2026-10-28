@@ -20,6 +20,7 @@ abstract class GalleryRepository {
   Future<BackupExportResult> exportBackup({
     required String exportRoot,
     bool includeModels,
+    String? recoveryPassphrase,
   });
   Future<SupportBundleExportResult> exportSupportBundle({
     required String exportRoot,
@@ -33,6 +34,7 @@ abstract class GalleryRepository {
     required String exportRoot,
     required String restoreRoot,
     bool confirmed,
+    String? recoveryPassphrase,
   });
   Future<LibrarySettings> saveLibrarySettings(LibrarySettingsDraft draft);
   Future<List<Vault>> fetchVaults();

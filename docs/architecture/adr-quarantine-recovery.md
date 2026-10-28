@@ -2,14 +2,14 @@
 
 ## Status
 
-Partially implemented in PR #123: local inventory and explicit same-device
-repair are implemented, including verified decrypt/reseal and retry handling.
-Portable backup key wrapping is not implemented and remains a release blocker.
-Restore planning and execution fail closed for encrypted catalogs or encrypted
-vault/quarantine payloads before destination writes, because destination key
-activation and path rebinding are not implemented. Export still preserves those
-files; a verified copy is not a usable recovered library. Unencrypted catalogs
-without encrypted media can be staged, without claiming activation.
+Implemented on the PR #123 branch, pending terminal hosted CI and remaining
+release acceptance. Format-3 exports protect catalog, required vault-version,
+and quarantine keys with an explicit recovery passphrase. Restore authenticates
+before destination writes, installs keys with collision-safe leases, verifies
+catalog/media, rebinds paths, and publishes a separate recovered library.
+Legacy encrypted backups without wrapped recovery keys remain blocked; their
+source files and credentials must be preserved. This is not a stable-release
+or cross-platform hardware acceptance claim.
 
 ## Context
 
@@ -19,16 +19,12 @@ key. The plaintext source is removed only after the ciphertext and metadata have
 been verified and persisted. This prevents startup from guessing a vault and
 sealing the original under the wrong vault key.
 
-The production quarantine key lives in the OS keyring. Plaintext file-key
-backends are forbidden; a synthetic file store exists only in unit-test builds.
-Existing backup export copies quarantine ciphertext and metadata, but not that key. Existing restore stages a database and files; it
-does not install quarantine keys on the destination device. Therefore a copied
-backup alone does not prove portable recovery. Local inventory and explicit
-same-device repair APIs are implemented; they do not establish cross-device
-key recovery. The existing backup test previously decrypted copied quarantine
-with the original configuration, which proved ciphertext preservation rather
-than independent destination recovery. The restore admission tests now require
-refusal without destination writes and preserve the original recoverable copy.
+Production keys stay in the OS keyring. Synthetic file stores exist only in
+unit tests. Earlier restore tests decrypted staged ciphertext with the original
+configuration and therefore did not prove independent recovery. The new
+acceptance test removes all synthetic source credentials before restore and
+cold-launches the destination; a separate production harness runs export and
+restore under independent Secret Service sessions and HOME directories.
 
 ## Decision
 
@@ -38,8 +34,10 @@ and remote sync peers cannot list or repair quarantine records.
 
 ### API contract
 
-Inventory and repair are implemented. The passphrase-based export and restore
-changes below are proposed acceptance requirements, not current API behavior.
+Inventory, repair and passphrase-based portable recovery are implemented on the
+branch. `recovery_passphrase` is request-only, omitted during serialization,
+redacted in Debug and zeroized on backend drop. Flutter obscures and clears
+inputs but cannot guarantee erasure of immutable runtime strings.
 
 - `GET /quarantine/originals` returns a local inventory: asset/object IDs,
   display filename, media kind, expected plaintext byte count and SHA-256,
@@ -51,8 +49,8 @@ changes below are proposed acceptance requirements, not current API behavior.
   vault. Missing, stale, or conflicting IDs fail closed. The response reports
   only success/failure and resulting asset/blob IDs; errors and logs must not
   include plaintext, passphrases, or keys.
-- `POST /backup/export` accepts an optional recovery passphrase. If one or more
-  quarantine records are included, export requires a passphrase. The passphrase
+- `POST /backup/export` accepts `recovery_passphrase`. If catalog, vault or
+  quarantine keys are required, export requires 16–1024 exact UTF-8 bytes. The passphrase
   is never persisted, logged, or returned.
 - `POST /backup/restore/run` accepts the recovery passphrase when the manifest
   contains wrapped quarantine keys. A wrong or missing passphrase fails before
@@ -105,12 +103,14 @@ as part of the repair.
 
 ### Portable backup key wrapping
 
-For each included quarantine object, export reads its key from the local keyring
-and wraps it only in memory for the export. Use Argon2id with fixed, versioned
+For every required catalog, historical/current included vault version and
+quarantine object, export reads the existing key and wraps it only in memory.
+A missing initialized credential is an error; no replacement is generated. Use Argon2id with fixed, versioned
 parameters (initial profile: 256 MiB memory, 3 iterations, one lane, 32-byte
 output), a fresh random 16-byte salt per backup, and ChaCha20-Poly1305 with a
-fresh random 12-byte nonce. Authenticated associated data binds the wrap to the
-backup format version, object ID, and asset ID. Store only the algorithm and
+fresh random 12-byte nonce. Authenticated associated data binds the fixed profile/header, canonical full
+manifest digest and canonical inventory digest. The authenticated manifest
+includes the catalog digest, payload paths/kinds/hashes and key identities. Store only the algorithm and
 parameter profile identifiers, salt, nonce, and wrapped ciphertext in the
 manifest. Never put raw object keys or the passphrase in the manifest.
 
@@ -123,14 +123,18 @@ OS keyring only as part of the staged restore activation. Any failed restore mus
 and preserve the source backup unchanged. Zeroize derived keys and passphrase
 buffers on success and failure.
 
-The KDF and AEAD crates, profile constants, manifest schema, keyring install,
-activation rollback, and restore UX require security review before implementation.
-Changing the profile later requires versioned parsing and compatibility tests.
+RustCrypto Argon2 and ChaCha20-Poly1305 implement the fixed profile. KDF calls
+run on blocking workers under a shared mutex, bounding concurrent 256 MiB
+allocations. Parsing limits manifests to 16 MiB and recovery keys to 4096;
+unsupported profiles are rejected before derivation. Decrypted buffers and key
+buffers zeroize; binary payload capacity is reserved before raw keys are written.
+Changing the profile requires versioned parsing and compatibility tests.
 
 ## Compatibility and rollout
 
-The inventory and repair API can be additive. Backup format version must be
-incremented when wrapped keys are introduced. Older backups with quarantine
+Inventory and repair remain additive. Backups with wrapped keys use format 3;
+format 1/2 ciphertext-only backups retain fail-closed admission. Unencrypted
+legacy backups can still be staged without claiming activation. Older backups with quarantine
 ciphertext but no wrapped key remain valid for same-device recovery only; the
 new restore flow must state that portability is unavailable instead of
 pretending the object is recoverable. Older clients ignore neither new required
@@ -171,42 +175,37 @@ version. Never downgrade by deleting wrapped keys or quarantine files. If a
 repair crashes after the owner transaction commits, retry must complete
 quarantine retirement only after verifying the already-persisted normal blob.
 
-## Remaining work
+## Remaining acceptance
 
-- Portable passphrase-wrapped backup recovery as specified above, with a
-  dedicated security review and cross-config restore tests. The complete bundle
-  must include the SQLCipher catalog key/state binding, every required vault key
-  version, and quarantine keys. Activation must remap restored library paths,
-  verify all ciphertext with destination credentials, handle existing-key
-  collisions, and roll back only credentials created by that restore. Wrapping
-  only quarantine keys does not satisfy this requirement.
-- Unit tests inject one-shot failures at 11 repair boundaries around sealing,
-  catalog/namespace saves, directory/key retirement, and final inventory save.
-  Each case reopens from disk, verifies a readable copy, retries, and reopens
-  again to check bytes, one owner/entry/live target blob and unchanged synthetic
-  destination key. These are service interruption/error-boundary tests. Actual
-  database-write and chunk/directory fsync failures, abrupt process termination,
-  and power-loss durability still require separate acceptance. Existing tests
-  also cover invalid target,
-  confirmation, corrupt quarantine retry, fresh-target provisioning, missing-key
-  refusal with unchanged quarantine, interrupted repair across a key-version
-  change, successful repair, and idempotent retry.
-- Keep local inventory and repair behind the desktop administrator boundary.
-  Router tests cover local inventory access plus remote and missing-connection
-  denial for inventory and repair. Complete paired-device and remote-sync
-  acceptance before the ADR is accepted.
+- Terminal current-head CI, including the production two-session Secret Service
+  harness, and final independent review of the integrated delivery.
+- Real DB-write/fsync/process-termination/power-loss fault injection beyond the
+  eleven service interruption boundaries and runtime-error rollback tests.
+- Physical devices, native signing/upgrades and cross-platform OS-keychain
+  behavior remain part of #98. A Linux Secret Service test is not device or
+  Windows/macOS/iOS keychain acceptance.
+- Interrupted private staging directories are preserved if credential rollback
+  cannot be established. Never remove them or preexisting credentials blindly.
+
+Destination activation clears bearer/pairing sessions, watch folders and stale
+pending jobs; old device/member rows are revoked, preserving history/foreign
+keys, and a fresh local device is created. Re-pair devices and explicitly re-add
+watch folders. The destination library never continues writing the source path.
+A parent durability failure after directory publication preserves destination
+credentials and the recovered tree for verification rather than rolling them
+back under a published library.
 
 ## Required-key coverage metadata
 
-Format-2 backup manifests may include an additive `recovery_key_inventory`
+Format-2/3 backup manifests may include an additive `recovery_key_inventory`
 (version 1). It records only source catalog credential identity, vault UUID/key
 version pairs for locally included chunks (including tombstoned history), and
 quarantine object/asset/key-version identities. References are deterministic and
 deduplicated; orphan/ambiguous records and unsupported quarantine key versions
 fail export. It contains no key bytes, passphrases, nonce/AAD or wrapped keys.
 
-This advisory inventory is preparation for #223, not evidence that credentials
-exist, are wrapped, or can be installed on another device. Restore admission
-continues to inspect the actual catalog and encrypted manifest entries and must
-not trust this inventory to enable encrypted restoration. Existing format-2
+The advisory inventory alone is not evidence of key availability or activation.
+Format 3 requires an authenticated recovery envelope covering exactly that
+inventory; restore recomputes coverage from the authenticated catalog before
+normal-reader verification and publication. Existing format-2
 backups without the field remain supported under the same admission rules.

@@ -1,3 +1,5 @@
+import 'dart:convert';
+
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
 
@@ -38,6 +40,7 @@ class SettingsScreen extends StatefulWidget {
   final Future<BackupExportResult> Function({
     required String exportRoot,
     bool includeModels,
+    String? recoveryPassphrase,
   })
   onExportBackup;
   final Future<SupportBundleExportResult> Function({
@@ -54,6 +57,7 @@ class SettingsScreen extends StatefulWidget {
     required String exportRoot,
     required String restoreRoot,
     bool confirmed,
+    String? recoveryPassphrase,
   })
   onRunRestoreBackup;
   final Future<void> Function(LibrarySettingsDraft draft) onSaveSettings;
@@ -70,6 +74,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
   late final TextEditingController _watchFolderController;
   late final TextEditingController _backupRootController;
   late final TextEditingController _restoreRootController;
+  final _backupPassphraseController = TextEditingController();
+  final _backupPassphraseConfirmationController = TextEditingController();
+  final _restorePassphraseController = TextEditingController();
   late final TextEditingController _modelIdController;
   late final TextEditingController _modelPathController;
   late final TextEditingController _modelHashController;
@@ -121,6 +128,12 @@ class _SettingsScreenState extends State<SettingsScreen> {
     _watchFolderController.dispose();
     _backupRootController.dispose();
     _restoreRootController.dispose();
+    _backupPassphraseController.clear();
+    _backupPassphraseConfirmationController.clear();
+    _restorePassphraseController.clear();
+    _backupPassphraseController.dispose();
+    _backupPassphraseConfirmationController.dispose();
+    _restorePassphraseController.dispose();
     _modelIdController.dispose();
     _modelPathController.dispose();
     _modelHashController.dispose();
@@ -147,8 +160,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
       if (!mounted) {
         return;
       }
-      ScaffoldMessenger.of(context)
-          .showSnackBar(SnackBar(content: Text('$error')));
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('$error')));
     } finally {
       if (mounted) {
         setState(() => _savingSettings = false);
@@ -178,14 +192,16 @@ class _SettingsScreenState extends State<SettingsScreen> {
         return;
       }
       _watchFolderController.clear();
-      ScaffoldMessenger.of(context)
-          .showSnackBar(const SnackBar(content: Text('Watch folder added.')));
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('Watch folder added.')));
     } catch (error) {
       if (!mounted) {
         return;
       }
-      ScaffoldMessenger.of(context)
-          .showSnackBar(SnackBar(content: Text('$error')));
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('$error')));
     } finally {
       if (mounted) {
         setState(() => _savingWatchFolder = false);
@@ -236,8 +252,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
       if (!mounted) {
         return;
       }
-      ScaffoldMessenger.of(context)
-          .showSnackBar(SnackBar(content: Text('$error')));
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('$error')));
     } finally {
       if (mounted) {
         setState(() => _importingModel = false);
@@ -268,8 +285,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
       if (!mounted) {
         return;
       }
-      ScaffoldMessenger.of(context)
-          .showSnackBar(SnackBar(content: Text('$error')));
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('$error')));
     } finally {
       if (mounted) {
         setState(() => _verifyingModel = false);
@@ -302,8 +320,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
       if (!mounted) {
         return;
       }
-      ScaffoldMessenger.of(context)
-          .showSnackBar(SnackBar(content: Text('$error')));
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('$error')));
     } finally {
       if (mounted) {
         setState(() => _verifyingBackup = false);
@@ -320,9 +339,26 @@ class _SettingsScreenState extends State<SettingsScreen> {
       return;
     }
 
+    final passphrase = _backupPassphraseController.text;
+    final confirmation = _backupPassphraseConfirmationController.text;
+    if (passphrase != confirmation) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('The recovery passphrases do not match.')),
+      );
+      return;
+    }
+    if (passphrase.isNotEmpty && !_validRecoveryPassphrase(passphrase)) {
+      _showPassphraseLengthError();
+      return;
+    }
+    _backupPassphraseController.clear();
+    _backupPassphraseConfirmationController.clear();
     setState(() => _exportingBackup = true);
     try {
-      final result = await widget.onExportBackup(exportRoot: exportRoot);
+      final result = await widget.onExportBackup(
+        exportRoot: exportRoot,
+        recoveryPassphrase: passphrase.isEmpty ? null : passphrase,
+      );
       if (!mounted) {
         return;
       }
@@ -336,12 +372,17 @@ class _SettingsScreenState extends State<SettingsScreen> {
           ),
         ),
       );
-    } catch (error) {
+    } catch (_) {
       if (!mounted) {
         return;
       }
-      ScaffoldMessenger.of(context)
-          .showSnackBar(SnackBar(content: Text('$error')));
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+            'Backup export failed. Check the export path and recovery passphrase.',
+          ),
+        ),
+      );
     } finally {
       if (mounted) {
         setState(() => _exportingBackup = false);
@@ -381,8 +422,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
       if (!mounted) {
         return;
       }
-      ScaffoldMessenger.of(context)
-          .showSnackBar(SnackBar(content: Text('$error')));
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('$error')));
     } finally {
       if (mounted) {
         setState(() => _exportingSupportBundle = false);
@@ -423,8 +465,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
       if (!mounted) {
         return;
       }
-      ScaffoldMessenger.of(context)
-          .showSnackBar(SnackBar(content: Text('$error')));
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('$error')));
     } finally {
       if (mounted) {
         setState(() => _planningRestore = false);
@@ -442,12 +485,28 @@ class _SettingsScreenState extends State<SettingsScreen> {
       return;
     }
 
+    final passphrase = _restorePassphraseController.text;
+    if ((_restorePlan?.requiresRecoveryPassphrase ?? false) &&
+        passphrase.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Enter the recovery passphrase for this backup.'),
+        ),
+      );
+      return;
+    }
+    if (passphrase.isNotEmpty && !_validRecoveryPassphrase(passphrase)) {
+      _showPassphraseLengthError();
+      return;
+    }
+    _restorePassphraseController.clear();
     setState(() => _runningRestore = true);
     try {
       final result = await widget.onRunRestoreBackup(
         exportRoot: exportRoot,
         restoreRoot: restoreRoot,
         confirmed: true,
+        recoveryPassphrase: passphrase.isEmpty ? null : passphrase,
       );
       if (!mounted) {
         return;
@@ -456,23 +515,60 @@ class _SettingsScreenState extends State<SettingsScreen> {
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
           content: Text(
-            result.ok
-                ? 'Restore staged for review.'
-                : 'Restore finished with warnings.',
+            result.ok ? result.detail : 'Restore finished with warnings.',
           ),
         ),
       );
-    } catch (error) {
+    } catch (_) {
       if (!mounted) {
         return;
       }
-      ScaffoldMessenger.of(context)
-          .showSnackBar(SnackBar(content: Text('$error')));
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+            'Restore failed. Check the backup, destination path and recovery passphrase.',
+          ),
+        ),
+      );
     } finally {
       if (mounted) {
         setState(() => _runningRestore = false);
       }
     }
+  }
+
+  bool _validRecoveryPassphrase(String passphrase) {
+    final length = utf8.encode(passphrase).length;
+    return length >= 16 && length <= 1024;
+  }
+
+  void _showPassphraseLengthError() {
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(
+        content: Text('Use a recovery passphrase of 16 to 1024 UTF-8 bytes.'),
+      ),
+    );
+  }
+
+  Widget _recoveryPassphraseField({
+    required String label,
+    required TextEditingController controller,
+    String? helperText,
+  }) {
+    return TextField(
+      controller: controller,
+      obscureText: true,
+      autocorrect: false,
+      enableSuggestions: false,
+      enableIMEPersonalizedLearning: false,
+      keyboardType: TextInputType.visiblePassword,
+      decoration: InputDecoration(
+        labelText: label,
+        border: const OutlineInputBorder(),
+        helperText: helperText,
+        helperMaxLines: 3,
+      ),
+    );
   }
 
   @override
@@ -586,7 +682,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 ),
                 const SizedBox(height: 12),
                 const Text(
-                  'This verifies the encrypted database, managed originals, encrypted vault chunks, and installed model files. Export preserves local backup files. Encrypted restores remain blocked until destination recovery keys can be installed and verified. Unencrypted restores stage files in a separate folder without modifying the active library.',
+                  'This verifies the encrypted database, managed originals, encrypted vault chunks, and installed model files. Use a recovery passphrase to protect the keys needed to restore encrypted media on another device. Keep it somewhere safe: a forgotten passphrase cannot be recovered. Restore uses a separate empty folder and verifies recovery before reporting success.',
                 ),
                 const SizedBox(height: 16),
                 TextField(
@@ -599,13 +695,33 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   ),
                 ),
                 const SizedBox(height: 12),
+                _recoveryPassphraseField(
+                  label: 'Backup recovery passphrase',
+                  controller: _backupPassphraseController,
+                  helperText:
+                      'Use at least 16 UTF-8 bytes. Never reuse an account password.',
+                ),
+                const SizedBox(height: 12),
+                _recoveryPassphraseField(
+                  label: 'Confirm backup recovery passphrase',
+                  controller: _backupPassphraseConfirmationController,
+                ),
+                const SizedBox(height: 12),
                 TextField(
                   controller: _restoreRootController,
                   decoration: const InputDecoration(
                     labelText: 'Restore staging path',
                     border: OutlineInputBorder(),
-                    helperText: 'Use an empty folder outside the active library/runtime.',
+                    helperText:
+                        'Use an empty folder outside the active library/runtime.',
                   ),
+                ),
+                const SizedBox(height: 12),
+                _recoveryPassphraseField(
+                  label: 'Restore recovery passphrase',
+                  controller: _restorePassphraseController,
+                  helperText:
+                      'Enter the passphrase used when this backup was exported.',
                 ),
                 const SizedBox(height: 12),
                 Wrap(
@@ -630,7 +746,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                               child: CircularProgressIndicator(strokeWidth: 2),
                             )
                           : const Icon(Icons.backup_outlined),
-                      label: const Text('Export restorable backup'),
+                      label: const Text('Export backup'),
                     ),
                     OutlinedButton.icon(
                       onPressed: _exportingSupportBundle
@@ -666,7 +782,11 @@ class _SettingsScreenState extends State<SettingsScreen> {
                               child: CircularProgressIndicator(strokeWidth: 2),
                             )
                           : const Icon(Icons.restore_page_outlined),
-                      label: const Text('Stage restore'),
+                      label: Text(
+                        _restorePlan?.activationSupported == true
+                            ? 'Restore and verify'
+                            : 'Stage restore',
+                      ),
                     ),
                   ],
                 ),
@@ -710,7 +830,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   const EmptyStatePanel(
                     icon: Icons.fact_check_outlined,
                     title: 'Release readiness unavailable',
-                    message: 'This daemon did not report platform release evidence. Treat all platform releases as incomplete until the checklist is recorded.',
+                    message:
+                        'This daemon did not report platform release evidence. Treat all platform releases as incomplete until the checklist is recorded.',
                   )
                 else
                   _PlatformReleaseReadinessPanel(
@@ -736,7 +857,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   const EmptyStatePanel(
                     icon: Icons.workspace_premium_outlined,
                     title: 'Entitlement status unavailable',
-                    message: 'Local library access remains available while this daemon version or connection does not report entitlement state.',
+                    message:
+                        'Local library access remains available while this daemon version or connection does not report entitlement state.',
                   )
                 else
                   _EntitlementStatusPanel(
@@ -760,7 +882,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   const EmptyStatePanel(
                     icon: Icons.manage_history_outlined,
                     title: 'No admin events recorded yet',
-                    message: 'Successful vault, device, sync, and storage actions will appear here after the daemon records them locally.',
+                    message:
+                        'Successful vault, device, sync, and storage actions will appear here after the daemon records them locally.',
                   )
                 else
                   _AuditLogPanel(events: auditEvents, formatter: formatter),
@@ -781,7 +904,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   const EmptyStatePanel(
                     icon: Icons.folder_copy_outlined,
                     title: 'No watch folders yet',
-                    message: 'The library can still import one-off folders and removable drives. Add stable desktop folders here when you want the daemon to remember them.',
+                    message:
+                        'The library can still import one-off folders and removable drives. Add stable desktop folders here when you want the daemon to remember them.',
                   )
                 else
                   for (final folder in watchFolders)
@@ -855,7 +979,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   const EmptyStatePanel(
                     icon: Icons.shield_outlined,
                     title: 'Privacy status unavailable',
-                    message: 'The daemon may be older than this client. The app still uses the loopback API endpoint by default.',
+                    message:
+                        'The daemon may be older than this client. The app still uses the loopback API endpoint by default.',
                   )
                 else ...[
                   ListTile(
@@ -958,7 +1083,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   const EmptyStatePanel(
                     icon: Icons.memory_outlined,
                     title: 'ML runtime status unavailable',
-                    message: 'The daemon did not return Python sidecar status. Faces, scenes, and semantic search remain blocked.',
+                    message:
+                        'The daemon did not return Python sidecar status. Faces, scenes, and semantic search remain blocked.',
                   )
                 else
                   _ModelRuntimePanel(status: runtimeStatus),
@@ -968,7 +1094,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   decoration: const InputDecoration(
                     labelText: 'Model id',
                     border: OutlineInputBorder(),
-                    helperText: 'Example: scrfd-face-detector, arcface-embedding, scene-classifier-onnx',
+                    helperText:
+                        'Example: scrfd-face-detector, arcface-embedding, scene-classifier-onnx',
                   ),
                 ),
                 const SizedBox(height: 12),
@@ -977,7 +1104,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   decoration: const InputDecoration(
                     labelText: 'Local model file path',
                     border: OutlineInputBorder(),
-                    helperText: 'Use a reviewed local file only. The app verifies the hash before install.',
+                    helperText:
+                        'Use a reviewed local file only. The app verifies the hash before install.',
                   ),
                 ),
                 const SizedBox(height: 12),
@@ -986,7 +1114,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   decoration: const InputDecoration(
                     labelText: 'Expected SHA-256',
                     border: OutlineInputBorder(),
-                    helperText: 'Required. Wrong hashes are rejected and the model is not installed.',
+                    helperText:
+                        'Required. Wrong hashes are rejected and the model is not installed.',
                   ),
                 ),
                 const SizedBox(height: 12),
@@ -1025,7 +1154,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   const EmptyStatePanel(
                     icon: Icons.model_training_outlined,
                     title: 'No approved local models installed',
-                    message: 'Faces, scenes, and semantic search stay unavailable until reviewed models are installed. OCR can use the local Tesseract CLI after encryption is active.',
+                    message:
+                        'Faces, scenes, and semantic search stay unavailable until reviewed models are installed. OCR can use the local Tesseract CLI after encryption is active.',
                   )
                 else
                   for (final model in models)
@@ -1629,7 +1759,9 @@ class _BackupRestoreRunPanel extends StatelessWidget {
   Widget build(BuildContext context) {
     return _BackupResultCard(
       ok: result.ok,
-      title: result.ok ? 'Restore staged' : 'Restore warnings found',
+      title: result.ok
+          ? (result.activated ? 'Recovery verified' : 'Restore staged')
+          : 'Restore warnings found',
       lines: [
         result.detail,
         'Restore root: ${result.restoreRoot}',

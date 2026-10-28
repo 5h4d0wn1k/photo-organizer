@@ -221,10 +221,12 @@ class ResilientGalleryRepository implements GalleryRepository {
   Future<BackupExportResult> exportBackup({
     required String exportRoot,
     bool includeModels = true,
+    String? recoveryPassphrase,
   }) {
     return _delegate.exportBackup(
       exportRoot: exportRoot,
       includeModels: includeModels,
+      recoveryPassphrase: recoveryPassphrase,
     );
   }
 
@@ -255,11 +257,13 @@ class ResilientGalleryRepository implements GalleryRepository {
     required String exportRoot,
     required String restoreRoot,
     bool confirmed = true,
+    String? recoveryPassphrase,
   }) {
     return _delegate.runRestoreBackup(
       exportRoot: exportRoot,
       restoreRoot: restoreRoot,
       confirmed: confirmed,
+      recoveryPassphrase: recoveryPassphrase,
     );
   }
 

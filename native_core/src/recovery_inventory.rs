@@ -2,13 +2,13 @@
 //! This is coverage metadata, not wrapped key material or proof of activation.
 use std::collections::{BTreeMap, BTreeSet};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::domain::{BlobChunk, BlobRecord, ProtectedOriginal, ProtectedOriginalChunk};
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum RequiredRecoveryKey {
     Catalog {
         source_key_id: String,
@@ -24,10 +24,11 @@ pub(crate) enum RequiredRecoveryKey {
     },
 }
 
-#[derive(Debug, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct RecoveryKeyInventory {
-    version: u32,
-    required_keys: BTreeSet<RequiredRecoveryKey>,
+    pub(crate) version: u32,
+    pub(crate) required_keys: BTreeSet<RequiredRecoveryKey>,
 }
 
 pub(crate) fn build(

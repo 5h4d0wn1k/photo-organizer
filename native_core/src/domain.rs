@@ -1793,11 +1793,26 @@ pub struct BackupVerifyRequest {
     pub export_root: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
 pub struct BackupExportRequest {
     pub export_root: String,
     #[serde(default)]
     pub include_models: bool,
+    #[serde(default, skip_serializing)]
+    pub recovery_passphrase: Option<String>,
+}
+impl std::fmt::Debug for BackupExportRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BackupExportRequest")
+            .field("recovery_passphrase", &"[REDACTED]")
+            .finish_non_exhaustive()
+    }
+}
+impl Drop for BackupExportRequest {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.recovery_passphrase.zeroize();
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1888,15 +1903,34 @@ pub struct BackupRestorePlan {
     pub missing_paths: Vec<String>,
     pub destination_conflicts: Vec<String>,
     pub requires_confirmation: bool,
+    #[serde(default)]
+    pub requires_recovery_passphrase: bool,
+    #[serde(default)]
+    pub activation_supported: bool,
     pub ok: bool,
     pub detail: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
 pub struct BackupRestoreRunRequest {
     pub export_root: String,
     pub restore_root: String,
     pub confirmed: bool,
+    #[serde(default, skip_serializing)]
+    pub recovery_passphrase: Option<String>,
+}
+impl std::fmt::Debug for BackupRestoreRunRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BackupRestoreRunRequest")
+            .field("recovery_passphrase", &"[REDACTED]")
+            .finish_non_exhaustive()
+    }
+}
+impl Drop for BackupRestoreRunRequest {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.recovery_passphrase.zeroize();
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1909,6 +1943,8 @@ pub struct BackupRestoreRunResult {
     #[serde(default)]
     pub protected_original_chunks_copied: usize,
     pub bytes_copied: u64,
+    #[serde(default)]
+    pub activated: bool,
     pub ok: bool,
     pub detail: String,
 }

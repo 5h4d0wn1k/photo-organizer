@@ -576,6 +576,216 @@ fn lock_provider_key_at(root: &Path, stem: &str) -> Result<fs::File, VaultStoreE
     Ok(lock)
 }
 
+/// Shared provider lock for recovery and ordinary credential mutations.
+/// Readers never take it, so a recovery lease can validate normal readers.
+pub(crate) fn recovery_provider_lock(
+    config: &AppConfig,
+    stem: &str,
+) -> Result<fs::File, VaultStoreError> {
+    #[cfg(test)]
+    let root = {
+        let runtime = if config.runtime_root.is_absolute() {
+            config.runtime_root.clone()
+        } else {
+            std::env::current_dir()
+                .map_err(io_error)?
+                .join(&config.runtime_root)
+        };
+        runtime.join("security/recovery-provider-locks")
+    };
+    #[cfg(not(test))]
+    let root = {
+        let _ = config;
+        provider_lock_root()?
+    };
+    lock_provider_key_at(&root, stem)
+}
+
+/// Caller holds the provider mutation lease and has proved the credential is
+/// absent. A provider may return an error after persisting: resolve that case
+/// by readback, deleting only the exact key created by this invocation.
+pub(crate) fn write_recovery_credential(
+    expected: &[u8; 32],
+    save: impl FnOnce() -> keyring::Result<()>,
+    read: impl FnOnce() -> keyring::Result<String>,
+    delete: impl FnOnce() -> keyring::Result<()>,
+) -> Result<(), VaultStoreError> {
+    if save().is_ok() {
+        return Ok(());
+    }
+    match read() {
+        Err(keyring::Error::NoEntry) => Err(VaultStoreError::KeyStorage("recovery credential write failed".into())),
+        Ok(value) => {
+            let actual = decode_hex_32(&Zeroizing::new(value)).map_err(|_| VaultStoreError::KeyStorage("recovery credential write failed and secure storage needs recovery".into()))?;
+            if !crate::service::constant_time_eq(actual.as_ref(), expected) {
+                return Err(VaultStoreError::KeyStorage("recovery credential write failed and secure storage needs recovery".into()));
+            }
+            delete().map_err(|_| VaultStoreError::KeyStorage("recovery credential write failed and credential rollback needs recovery".into()))?;
+            Err(VaultStoreError::KeyStorage("recovery credential write failed; newly created credential was rolled back".into()))
+        }
+        Err(_) => Err(VaultStoreError::KeyStorage("recovery credential write failed and secure storage status is uncertain; exact-key recovery is required".into())),
+    }
+}
+
+pub(crate) struct RecoveryKeyInstall {
+    _lock: fs::File,
+    created: bool,
+}
+
+pub(crate) fn export_recovery_key(
+    config: &AppConfig,
+    vault_id: Uuid,
+    version: u32,
+) -> Result<Zeroizing<[u8; 32]>, VaultStoreError> {
+    if version == 0 {
+        return Err(VaultStoreError::Invalid(
+            "invalid recovery key version".into(),
+        ));
+    }
+    load_existing_vault_key(config, vault_id, version)
+}
+
+pub(crate) fn install_recovery_key(
+    config: &AppConfig,
+    vault_id: Uuid,
+    version: u32,
+    key: &[u8; 32],
+) -> Result<RecoveryKeyInstall, VaultStoreError> {
+    validate_key_storage(config)?;
+    if version == 0 {
+        return Err(VaultStoreError::Invalid(
+            "invalid recovery key version".into(),
+        ));
+    }
+    let stem = format!("{vault_id}-v{version}");
+    let lock = recovery_provider_lock(config, &stem)?;
+    let id = key_reference(vault_id, version);
+    let encoded = Zeroizing::new(hex_string(key));
+    #[cfg(test)]
+    let created = {
+        let path = file_key_path(config, &id);
+        match fs::read_to_string(&path) {
+            Ok(value) => {
+                let existing = decode_hex_32(Zeroizing::new(value).trim())?;
+                if !crate::service::constant_time_eq(existing.as_ref(), key) {
+                    return Err(VaultStoreError::KeyStorage(
+                        "recovery key conflicts with an existing vault credential".into(),
+                    ));
+                }
+                false
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                fs::create_dir_all(path.parent().expect("key parent")).map_err(io_error)?;
+                let mut opts = fs::OpenOptions::new();
+                opts.write(true).create_new(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    opts.mode(0o600);
+                }
+                let mut file = opts.open(&path).map_err(io_error)?;
+                if let Err(error) = file
+                    .write_all(encoded.as_bytes())
+                    .and_then(|_| file.sync_all())
+                {
+                    let _ = fs::remove_file(&path);
+                    return Err(io_error(error));
+                }
+                true
+            }
+            Err(error) => return Err(io_error(error)),
+        }
+    };
+    #[cfg(not(test))]
+    let created = {
+        let entry = keyring::Entry::new(KEYRING_SERVICE, &id)
+            .map_err(|error| VaultStoreError::KeyStorage(error.to_string()))?;
+        match entry.get_password() {
+            Ok(value) => {
+                let existing = decode_hex_32(&Zeroizing::new(value))?;
+                if !crate::service::constant_time_eq(existing.as_ref(), key) {
+                    return Err(VaultStoreError::KeyStorage(
+                        "recovery key conflicts with an existing vault credential".into(),
+                    ));
+                }
+                false
+            }
+            Err(keyring::Error::NoEntry) => {
+                write_recovery_credential(
+                    key,
+                    || entry.set_password(&encoded),
+                    || entry.get_password(),
+                    || entry.delete_credential(),
+                )?;
+                true
+            }
+            Err(error) => return Err(VaultStoreError::KeyStorage(error.to_string())),
+        }
+    };
+    // Keep lifecycle history even if a later restore operation fails. Exact-key
+    // recovery may retry; random provisioning must never replace this version.
+    let markers = config
+        .runtime_root
+        .join("security/vault-key-initialization");
+    if let Err(error) = fs::create_dir_all(&markers)
+        .map_err(io_error)
+        .and_then(|_| {
+            write_key_marker(
+                &markers.join(format!("{stem}.initialized")),
+                KeyMarkerState::Initialized,
+            )
+        })
+    {
+        let lease = RecoveryKeyInstall {
+            _lock: lock,
+            created,
+        };
+        rollback_recovery_key(config, vault_id, version, key, lease)?;
+        return Err(error);
+    }
+    #[cfg(not(test))]
+    if let Err(error) = write_key_marker(
+        &provider_lock_root()?.join(format!("{stem}.initialized")),
+        KeyMarkerState::Initialized,
+    ) {
+        let lease = RecoveryKeyInstall {
+            _lock: lock,
+            created,
+        };
+        rollback_recovery_key(config, vault_id, version, key, lease)?;
+        return Err(error);
+    }
+    Ok(RecoveryKeyInstall {
+        _lock: lock,
+        created,
+    })
+}
+
+pub(crate) fn rollback_recovery_key(
+    config: &AppConfig,
+    vault_id: Uuid,
+    version: u32,
+    key: &[u8; 32],
+    lease: RecoveryKeyInstall,
+) -> Result<(), VaultStoreError> {
+    if !lease.created {
+        return Ok(());
+    }
+    let current = load_existing_vault_key(config, vault_id, version)?;
+    if !crate::service::constant_time_eq(current.as_ref(), key) {
+        return Err(VaultStoreError::KeyStorage(
+            "refusing to remove a changed recovery credential".into(),
+        ));
+    }
+    #[cfg(test)]
+    fs::remove_file(file_key_path(config, &key_reference(vault_id, version))).map_err(io_error)?;
+    #[cfg(not(test))]
+    keyring::Entry::new(KEYRING_SERVICE, &key_reference(vault_id, version))
+        .and_then(|entry| entry.delete_credential())
+        .map_err(|error| VaultStoreError::KeyStorage(error.to_string()))?;
+    Ok(())
+}
+
 fn prepare_key_version(
     marker: &Path,
     has_history: bool,
@@ -676,7 +886,7 @@ fn load_or_create_key_from_keyring(
     save: impl FnOnce(&str) -> keyring::Result<()>,
 ) -> Result<Zeroizing<[u8; 32]>, VaultStoreError> {
     match stored {
-        Ok(value) => decode_hex_32(&value),
+        Ok(value) => decode_hex_32(&Zeroizing::new(value)),
         Err(keyring::Error::NoEntry) => {
             let key = random_key();
             let encoded = hex_string(key.as_ref());
@@ -703,7 +913,7 @@ fn load_existing_vault_key(
         let entry = keyring::Entry::new(KEYRING_SERVICE, &key_id)
             .map_err(|err| VaultStoreError::KeyStorage(err.to_string()))?;
         match entry.get_password() {
-            Ok(value) => decode_hex_32(&value),
+            Ok(value) => decode_hex_32(&Zeroizing::new(value)),
             Err(_) => Err(VaultStoreError::KeyStorage(format!(
                 "vault key {key_id} is missing or OS keychain is unavailable; exact-key recovery is required"
             ))),
@@ -722,7 +932,7 @@ fn load_existing_file_key(
             "vault key {key_id} is missing"
         )));
     }
-    let value = fs::read_to_string(path).map_err(io_error)?;
+    let value = Zeroizing::new(fs::read_to_string(path).map_err(io_error)?);
     decode_hex_32(value.trim())
 }
 
@@ -783,11 +993,13 @@ fn hex_string(bytes: impl AsRef<[u8]>) -> String {
 }
 
 fn decode_hex_32(value: &str) -> Result<Zeroizing<[u8; 32]>, VaultStoreError> {
-    let bytes = decode_hex(value)?;
-    let array: [u8; 32] = bytes
-        .try_into()
-        .map_err(|_| VaultStoreError::Invalid("expected 32-byte key".to_string()))?;
-    Ok(Zeroizing::new(array))
+    let bytes = Zeroizing::new(decode_hex(value)?);
+    if bytes.len() != 32 {
+        return Err(VaultStoreError::Invalid("expected 32-byte key".into()));
+    }
+    let mut key = Zeroizing::new([0_u8; 32]);
+    key.copy_from_slice(&bytes);
+    Ok(key)
 }
 
 fn decode_hex_12(value: &str) -> Result<[u8; 12], VaultStoreError> {
@@ -827,6 +1039,90 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         let marker = root.join("initialized");
         (root, marker)
+    }
+
+    #[test]
+    fn recovery_provider_error_after_persist_rolls_back_only_exact_new_material() {
+        use std::cell::RefCell;
+        let stored = RefCell::new(None::<String>);
+        let key = Zeroizing::new([12_u8; 32]);
+        let result = write_recovery_credential(
+            &key,
+            || {
+                *stored.borrow_mut() = Some(hex_string(key.as_ref()));
+                Err(keyring::Error::NoEntry)
+            },
+            || stored.borrow().clone().ok_or(keyring::Error::NoEntry),
+            || {
+                stored.borrow_mut().take();
+                Ok(())
+            },
+        );
+        assert!(result.is_err());
+        assert!(stored.borrow().is_none());
+        let removed = RefCell::new(false);
+        let result = write_recovery_credential(
+            &key,
+            || Err(keyring::Error::NoEntry),
+            || Ok(hex_string([13_u8; 32])),
+            || {
+                *removed.borrow_mut() = true;
+                Ok(())
+            },
+        );
+        assert!(result.is_err());
+        assert!(
+            !*removed.borrow(),
+            "an unexpected existing value is never removed"
+        );
+        let result = write_recovery_credential(
+            &key,
+            || Err(keyring::Error::NoEntry),
+            || {
+                Err(keyring::Error::NoStorageAccess(Box::new(
+                    std::io::Error::other("provider unavailable"),
+                )))
+            },
+            || {
+                *removed.borrow_mut() = true;
+                Ok(())
+            },
+        );
+        assert!(result.is_err());
+        assert!(
+            !*removed.borrow(),
+            "unreadable credentials are never guessed or deleted"
+        );
+    }
+
+    #[test]
+    fn recovery_key_leases_reject_collisions_and_preserve_preexisting_credentials() {
+        let root = crate::test_support::TestTempDir::new("vault-recovery-lease");
+        let config = AppConfig {
+            runtime_root: root.join("runtime"),
+            ..AppConfig::default()
+        };
+        let vault = Uuid::new_v4();
+        let key = Zeroizing::new([9_u8; 32]);
+        assert!(export_recovery_key(&config, vault, 1).is_err());
+        let first = install_recovery_key(&config, vault, 1, &key).unwrap();
+        assert!(crate::service::constant_time_eq(
+            export_recovery_key(&config, vault, 1).unwrap().as_ref(),
+            key.as_ref()
+        ));
+        drop(first);
+        assert!(install_recovery_key(&config, vault, 1, &[8_u8; 32]).is_err());
+        let reuse = install_recovery_key(&config, vault, 1, &key).unwrap();
+        rollback_recovery_key(&config, vault, 1, &key, reuse).unwrap();
+        assert!(
+            export_recovery_key(&config, vault, 1).is_ok(),
+            "rollback cannot delete a preexisting credential"
+        );
+        let new_vault = Uuid::new_v4();
+        let created = install_recovery_key(&config, new_vault, 1, &key).unwrap();
+        rollback_recovery_key(&config, new_vault, 1, &key, created).unwrap();
+        assert!(export_recovery_key(&config, new_vault, 1).is_err());
+        assert!(install_recovery_key(&config, new_vault, 0, &key).is_err());
     }
 
     #[test]

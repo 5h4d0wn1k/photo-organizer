@@ -325,6 +325,7 @@ class _FakeSearchRepository implements GalleryRepository {
   Future<BackupExportResult> exportBackup({
     required String exportRoot,
     bool includeModels = true,
+    String? recoveryPassphrase,
   }) {
     throw UnimplementedError();
   }
@@ -350,6 +351,7 @@ class _FakeSearchRepository implements GalleryRepository {
     required String exportRoot,
     required String restoreRoot,
     bool confirmed = true,
+    String? recoveryPassphrase,
   }) {
     throw UnimplementedError();
   }

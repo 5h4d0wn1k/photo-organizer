@@ -442,6 +442,7 @@ pub fn retire_managed_original_key(
     object_id: Uuid,
 ) -> Result<(), QuarantineError> {
     let key_id = format!("{KEY_ID_PREFIX}{object_id}");
+    let _provider_lock = quarantine_provider_lock(config, object_id)?;
     #[cfg(test)]
     return match fs::remove_file(file_key_path(config, &key_id)) {
         Ok(()) => Ok(()),
@@ -624,6 +625,7 @@ fn load_or_create_object_key(
     object_id: Uuid,
 ) -> Result<Zeroizing<[u8; 32]>, QuarantineError> {
     let key_id = format!("{KEY_ID_PREFIX}{object_id}");
+    let _provider_lock = quarantine_provider_lock(config, object_id)?;
     #[cfg(test)]
     return load_or_create_file_key(config, &key_id);
     #[cfg(not(test))]
@@ -635,7 +637,7 @@ fn load_or_create_object_key(
         let entry = keyring::Entry::new(KEYRING_SERVICE, &key_id)
             .map_err(|error| QuarantineError::KeyStorage(error.to_string()))?;
         match entry.get_password() {
-            Ok(value) => decode_key(&value),
+            Ok(value) => decode_key(&Zeroizing::new(value)),
             Err(keyring::Error::NoEntry) => {
                 let key = random_key();
                 entry
@@ -648,6 +650,132 @@ fn load_or_create_object_key(
     }
 }
 
+fn quarantine_provider_lock(
+    config: &AppConfig,
+    object_id: Uuid,
+) -> Result<fs::File, QuarantineError> {
+    crate::vault_store::recovery_provider_lock(config, &format!("quarantine-{object_id}")).map_err(
+        |_| QuarantineError::KeyStorage("quarantine credential lock is unavailable".into()),
+    )
+}
+
+pub(crate) struct RecoveryKeyInstall {
+    _lock: fs::File,
+    created: bool,
+}
+
+pub(crate) fn export_recovery_key(
+    config: &AppConfig,
+    object_id: Uuid,
+) -> Result<Zeroizing<[u8; 32]>, QuarantineError> {
+    load_existing_object_key(config, object_id)
+}
+
+pub(crate) fn install_recovery_key(
+    config: &AppConfig,
+    object_id: Uuid,
+    key: &[u8; 32],
+) -> Result<RecoveryKeyInstall, QuarantineError> {
+    validate_backend_selection(std::env::var_os("PRIVATE_GALLERY_VAULT_KEY_STORAGE").as_deref())?;
+    let lock = quarantine_provider_lock(config, object_id)?;
+    let id = format!("{KEY_ID_PREFIX}{object_id}");
+    let encoded = Zeroizing::new(hex_string(key));
+    #[cfg(test)]
+    let created = {
+        let path = file_key_path(config, &id);
+        match fs::read_to_string(&path) {
+            Ok(value) => {
+                let existing = decode_key(Zeroizing::new(value).trim())?;
+                if !crate::service::constant_time_eq(existing.as_ref(), key) {
+                    return Err(QuarantineError::KeyStorage(
+                        "recovery key conflicts with an existing quarantine credential".into(),
+                    ));
+                }
+                false
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                fs::create_dir_all(path.parent().expect("key parent")).map_err(io_error)?;
+                let mut opts = OpenOptions::new();
+                opts.write(true).create_new(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    opts.mode(0o600);
+                }
+                let mut file = opts.open(&path).map_err(io_error)?;
+                if let Err(error) = file
+                    .write_all(encoded.as_bytes())
+                    .and_then(|_| file.sync_all())
+                {
+                    let _ = fs::remove_file(&path);
+                    return Err(io_error(error));
+                }
+                true
+            }
+            Err(error) => return Err(io_error(error)),
+        }
+    };
+    #[cfg(not(test))]
+    let created = {
+        let entry = keyring::Entry::new(KEYRING_SERVICE, &id)
+            .map_err(|error| QuarantineError::KeyStorage(error.to_string()))?;
+        match entry.get_password() {
+            Ok(value) => {
+                let existing = decode_key(&Zeroizing::new(value))?;
+                if !crate::service::constant_time_eq(existing.as_ref(), key) {
+                    return Err(QuarantineError::KeyStorage(
+                        "recovery key conflicts with an existing quarantine credential".into(),
+                    ));
+                }
+                false
+            }
+            Err(keyring::Error::NoEntry) => {
+                crate::vault_store::write_recovery_credential(
+                    key,
+                    || entry.set_password(&encoded),
+                    || entry.get_password(),
+                    || entry.delete_credential(),
+                )
+                .map_err(|error| QuarantineError::KeyStorage(error.to_string()))?;
+                true
+            }
+            Err(error) => return Err(QuarantineError::KeyStorage(error.to_string())),
+        }
+    };
+    Ok(RecoveryKeyInstall {
+        _lock: lock,
+        created,
+    })
+}
+
+pub(crate) fn rollback_recovery_key(
+    config: &AppConfig,
+    object_id: Uuid,
+    key: &[u8; 32],
+    lease: RecoveryKeyInstall,
+) -> Result<(), QuarantineError> {
+    if !lease.created {
+        return Ok(());
+    }
+    let current = load_existing_object_key(config, object_id)?;
+    if !crate::service::constant_time_eq(current.as_ref(), key) {
+        return Err(QuarantineError::KeyStorage(
+            "refusing to remove a changed quarantine credential".into(),
+        ));
+    }
+    #[cfg(test)]
+    fs::remove_file(file_key_path(
+        config,
+        &format!("{KEY_ID_PREFIX}{object_id}"),
+    ))
+    .map_err(io_error)?;
+    #[cfg(not(test))]
+    keyring::Entry::new(KEYRING_SERVICE, &format!("{KEY_ID_PREFIX}{object_id}"))
+        .and_then(|entry| entry.delete_credential())
+        .map_err(|error| QuarantineError::KeyStorage(error.to_string()))?;
+    Ok(())
+}
+
 fn load_existing_object_key(
     config: &AppConfig,
     object_id: Uuid,
@@ -655,7 +783,8 @@ fn load_existing_object_key(
     let key_id = format!("{KEY_ID_PREFIX}{object_id}");
     #[cfg(test)]
     {
-        let value = fs::read_to_string(file_key_path(config, &key_id)).map_err(io_error)?;
+        let value =
+            Zeroizing::new(fs::read_to_string(file_key_path(config, &key_id)).map_err(io_error)?);
         decode_key(value.trim())
     }
     #[cfg(not(test))]
@@ -666,9 +795,11 @@ fn load_existing_object_key(
         )?;
         let entry = keyring::Entry::new(KEYRING_SERVICE, &key_id)
             .map_err(|error| QuarantineError::KeyStorage(error.to_string()))?;
-        let value = entry
-            .get_password()
-            .map_err(|error| QuarantineError::KeyStorage(error.to_string()))?;
+        let value = Zeroizing::new(
+            entry
+                .get_password()
+                .map_err(|error| QuarantineError::KeyStorage(error.to_string()))?,
+        );
         decode_key(&value)
     }
 }
@@ -752,11 +883,13 @@ fn validate_hash(value: &str) -> Result<(), QuarantineError> {
 }
 
 fn decode_key(value: &str) -> Result<Zeroizing<[u8; 32]>, QuarantineError> {
-    let bytes = decode_hex(value)?;
-    let array: [u8; 32] = bytes
-        .try_into()
-        .map_err(|_| QuarantineError::Invalid("expected 32-byte key".to_string()))?;
-    Ok(Zeroizing::new(array))
+    let bytes = Zeroizing::new(decode_hex(value)?);
+    if bytes.len() != 32 {
+        return Err(QuarantineError::Invalid("expected 32-byte key".into()));
+    }
+    let mut key = Zeroizing::new([0_u8; 32]);
+    key.copy_from_slice(&bytes);
+    Ok(key)
 }
 
 fn random_key() -> Zeroizing<[u8; 32]> {
@@ -973,6 +1106,29 @@ mod tests {
 
     fn hash(bytes: &[u8]) -> String {
         sha256_hex(bytes)
+    }
+
+    #[test]
+    fn recovery_key_leases_preserve_equal_keys_and_rollback_only_created_keys() {
+        let root = crate::test_support::TestTempDir::new("quarantine-recovery-lease");
+        let config = test_config(&root);
+        let object = Uuid::new_v4();
+        let key = Zeroizing::new([7_u8; 32]);
+        assert!(export_recovery_key(&config, object).is_err());
+        let first = install_recovery_key(&config, object, &key).unwrap();
+        assert!(crate::service::constant_time_eq(
+            export_recovery_key(&config, object).unwrap().as_ref(),
+            key.as_ref()
+        ));
+        drop(first);
+        assert!(install_recovery_key(&config, object, &[6_u8; 32]).is_err());
+        let reuse = install_recovery_key(&config, object, &key).unwrap();
+        rollback_recovery_key(&config, object, &key, reuse).unwrap();
+        assert!(export_recovery_key(&config, object).is_ok());
+        let other = Uuid::new_v4();
+        let created = install_recovery_key(&config, other, &key).unwrap();
+        rollback_recovery_key(&config, other, &key, created).unwrap();
+        assert!(export_recovery_key(&config, other).is_err());
     }
 
     #[test]

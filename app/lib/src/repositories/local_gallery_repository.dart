@@ -296,10 +296,12 @@ class LocalGalleryRepository implements GalleryRepository {
   Future<BackupExportResult> exportBackup({
     required String exportRoot,
     bool includeModels = true,
+    String? recoveryPassphrase,
   }) {
     return _apiClient.exportBackup(
       exportRoot: exportRoot,
       includeModels: includeModels,
+      recoveryPassphrase: recoveryPassphrase,
     );
   }
 
@@ -330,11 +332,13 @@ class LocalGalleryRepository implements GalleryRepository {
     required String exportRoot,
     required String restoreRoot,
     bool confirmed = true,
+    String? recoveryPassphrase,
   }) {
     return _apiClient.runRestoreBackup(
       exportRoot: exportRoot,
       restoreRoot: restoreRoot,
       confirmed: confirmed,
+      recoveryPassphrase: recoveryPassphrase,
     );
   }
 

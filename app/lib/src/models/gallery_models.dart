@@ -631,9 +631,9 @@ class ModelRuntimeStatus {
       pythonExecutable: json['python_executable'] as String? ?? 'python3',
       pythonVersion: json['python_version'] as String?,
       offlineReady: json['offline_ready'] as bool? ?? false,
-      dependencies: _readList(json['dependencies'])
-          .map((item) => ModelRuntimeDependency.fromJson(item))
-          .toList(),
+      dependencies: _readList(
+        json['dependencies'],
+      ).map((item) => ModelRuntimeDependency.fromJson(item)).toList(),
       detail: json['detail'] as String? ?? 'Runtime status unavailable.',
     );
   }
@@ -692,9 +692,9 @@ class PrivacyStatus {
       telemetryEnabled: json['telemetry_enabled'] as bool? ?? false,
       analyticsEnabled: json['analytics_enabled'] as bool? ?? false,
       cloudAiEnabled: json['cloud_ai_enabled'] as bool? ?? false,
-      installedModels: _readList(json['installed_models'])
-          .map((item) => ModelArtifact.fromJson(item))
-          .toList(),
+      installedModels: _readList(
+        json['installed_models'],
+      ).map((item) => ModelArtifact.fromJson(item)).toList(),
       localOnlyDisclosure:
           json['local_only_disclosure'] as String? ??
           'Photos and generated intelligence stay local.',
@@ -1210,9 +1210,9 @@ class PlatformReleaseSurfaceReadiness {
         json['status'] as String?,
       ),
       distribution: json['distribution'] as String? ?? '',
-      evidence: _readList(json['evidence'])
-          .map((item) => PlatformReleaseEvidence.fromJson(item))
-          .toList(),
+      evidence: _readList(
+        json['evidence'],
+      ).map((item) => PlatformReleaseEvidence.fromJson(item)).toList(),
       blockers: _readStringList(json['blockers']),
       nextStep: json['next_step'] as String? ?? '',
     );
@@ -1243,9 +1243,9 @@ class PlatformReleaseReadinessResponse {
       .length;
 
   factory PlatformReleaseReadinessResponse.fromJson(Map<String, dynamic> json) {
-    final surfaces = _readList(json['surfaces'])
-        .map((item) => PlatformReleaseSurfaceReadiness.fromJson(item))
-        .toList();
+    final surfaces = _readList(
+      json['surfaces'],
+    ).map((item) => PlatformReleaseSurfaceReadiness.fromJson(item)).toList();
     return PlatformReleaseReadinessResponse(
       generatedAt: _readDateTime(json['generated_at']),
       overallStatus: PlatformReleaseReadinessStatusX.fromJson(
@@ -1496,6 +1496,8 @@ class BackupRestorePlan {
     required this.requiresConfirmation,
     required this.ok,
     required this.detail,
+    this.requiresRecoveryPassphrase = false,
+    this.activationSupported = false,
   });
 
   final DateTime? checkedAt;
@@ -1512,6 +1514,8 @@ class BackupRestorePlan {
   final bool requiresConfirmation;
   final bool ok;
   final String detail;
+  final bool requiresRecoveryPassphrase;
+  final bool activationSupported;
 
   factory BackupRestorePlan.fromJson(Map<String, dynamic> json) {
     return BackupRestorePlan(
@@ -1532,6 +1536,9 @@ class BackupRestorePlan {
       requiresConfirmation: json['requires_confirmation'] as bool? ?? true,
       ok: json['ok'] as bool? ?? false,
       detail: json['detail'] as String? ?? '',
+      requiresRecoveryPassphrase:
+          json['requires_recovery_passphrase'] as bool? ?? false,
+      activationSupported: json['activation_supported'] as bool? ?? false,
     );
   }
 }
@@ -1545,6 +1552,7 @@ class BackupRestoreRunResult {
     required this.vaultChunksCopied,
     required this.protectedOriginalChunksCopied,
     required this.bytesCopied,
+    this.activated = false,
     required this.ok,
     required this.detail,
   });
@@ -1556,6 +1564,7 @@ class BackupRestoreRunResult {
   final int vaultChunksCopied;
   final int protectedOriginalChunksCopied;
   final int bytesCopied;
+  final bool activated;
   final bool ok;
   final String detail;
 
@@ -1569,6 +1578,7 @@ class BackupRestoreRunResult {
       protectedOriginalChunksCopied:
           (json['protected_original_chunks_copied'] as num?)?.toInt() ?? 0,
       bytesCopied: (json['bytes_copied'] as num?)?.toInt() ?? 0,
+      activated: json['activated'] as bool? ?? false,
       ok: json['ok'] as bool? ?? false,
       detail: json['detail'] as String? ?? '',
     );
@@ -2253,29 +2263,29 @@ class MobileWorkspaceSnapshot {
               rawSession.map((key, value) => MapEntry(key.toString(), value)),
             )
           : MobileSession.fromJson(const <String, dynamic>{}),
-      sessions: _readList(json['sessions'])
-          .map((item) => MobileSession.fromJson(item))
-          .toList(),
+      sessions: _readList(
+        json['sessions'],
+      ).map((item) => MobileSession.fromJson(item)).toList(),
       timeline: rawTimeline is Map
           ? TimelineResponse.fromJson(
               rawTimeline.map((key, value) => MapEntry(key.toString(), value)),
             )
           : TimelineResponse.fromJson(const <String, dynamic>{}),
-      albums: _readList(json['albums'])
-          .map((item) => Album.fromJson(item))
-          .toList(),
-      people: _readList(json['people'])
-          .map((item) => PersonCluster.fromJson(item))
-          .toList(),
-      places: _readList(json['places'])
-          .map((item) => PlaceCluster.fromJson(item))
-          .toList(),
-      events: _readList(json['events'])
-          .map((item) => EventCluster.fromJson(item))
-          .toList(),
-      jobs: _readList(json['jobs'])
-          .map((item) => JobRecord.fromJson(item))
-          .toList(),
+      albums: _readList(
+        json['albums'],
+      ).map((item) => Album.fromJson(item)).toList(),
+      people: _readList(
+        json['people'],
+      ).map((item) => PersonCluster.fromJson(item)).toList(),
+      places: _readList(
+        json['places'],
+      ).map((item) => PlaceCluster.fromJson(item)).toList(),
+      events: _readList(
+        json['events'],
+      ).map((item) => EventCluster.fromJson(item)).toList(),
+      jobs: _readList(
+        json['jobs'],
+      ).map((item) => JobRecord.fromJson(item)).toList(),
       vaultStatus: rawVaultStatus is Map
           ? VaultStatus.fromJson(
               rawVaultStatus.map(
@@ -2283,9 +2293,9 @@ class MobileWorkspaceSnapshot {
               ),
             )
           : VaultStatus.fromJson(const <String, dynamic>{}),
-      devices: _readList(json['devices'])
-          .map((item) => DeviceIdentity.fromJson(item))
-          .toList(),
+      devices: _readList(
+        json['devices'],
+      ).map((item) => DeviceIdentity.fromJson(item)).toList(),
       syncNetwork: rawSyncNetwork is Map
           ? SyncNetworkStatus.fromJson(
               rawSyncNetwork.map(
@@ -2377,9 +2387,9 @@ class MobileReplicaAssignment {
       assetId: json['asset_id']?.toString() ?? '',
       encryptedHash: json['encrypted_hash'] as String? ?? '',
       bytesTotal: (json['bytes_total'] as num?)?.toInt() ?? 0,
-      chunks: _readList(json['chunks'])
-          .map(MobileReplicaChunkDescriptor.fromJson)
-          .toList(),
+      chunks: _readList(
+        json['chunks'],
+      ).map(MobileReplicaChunkDescriptor.fromJson).toList(),
     );
   }
 }
@@ -2407,9 +2417,9 @@ class MobileStoragePlan {
               rawDevice.map((key, value) => MapEntry(key.toString(), value)),
             )
           : DeviceIdentity.fromJson(const <String, dynamic>{}),
-      assignments: _readList(json['assignments'])
-          .map(MobileReplicaAssignment.fromJson)
-          .toList(),
+      assignments: _readList(
+        json['assignments'],
+      ).map(MobileReplicaAssignment.fromJson).toList(),
       detail: json['detail'] as String? ?? '',
     );
   }
@@ -2612,20 +2622,20 @@ class SyncPlan {
       generatedAt:
           _readDateTime(json['generated_at']) ?? DateTime.now().toUtc(),
       vaultIds: _readStringList(json['vault_ids']),
-      transfers: _readList(json['transfers'])
-          .map((item) => SyncTransfer.fromJson(item))
-          .toList(),
-      conflicts: _readList(json['conflicts'])
-          .map((item) => SyncConflict.fromJson(item))
-          .toList(),
+      transfers: _readList(
+        json['transfers'],
+      ).map((item) => SyncTransfer.fromJson(item)).toList(),
+      conflicts: _readList(
+        json['conflicts'],
+      ).map((item) => SyncConflict.fromJson(item)).toList(),
       underReplicatedBlobIds: _readStringList(
         json['under_replicated_blob_ids'],
       ),
       policySatisfied: json['policy_satisfied'] as bool? ?? false,
       detail: json['detail'] as String? ?? '',
-      executionResults: _readList(json['execution_results'])
-          .map((item) => SyncTransferExecutionResult.fromJson(item))
-          .toList(),
+      executionResults: _readList(
+        json['execution_results'],
+      ).map((item) => SyncTransferExecutionResult.fromJson(item)).toList(),
     );
   }
 }
@@ -2758,12 +2768,12 @@ class VaultStatus {
               rawVault.map((key, value) => MapEntry(key.toString(), value)),
             )
           : Vault.fromJson(const <String, dynamic>{}),
-      members: _readList(json['members'])
-          .map((item) => VaultMember.fromJson(item))
-          .toList(),
-      devices: _readList(json['devices'])
-          .map((item) => DeviceIdentity.fromJson(item))
-          .toList(),
+      members: _readList(
+        json['members'],
+      ).map((item) => VaultMember.fromJson(item)).toList(),
+      devices: _readList(
+        json['devices'],
+      ).map((item) => DeviceIdentity.fromJson(item)).toList(),
       assetsTotal: (json['assets_total'] as num?)?.toInt() ?? 0,
       blobsTotal: (json['blobs_total'] as num?)?.toInt() ?? 0,
       localAvailableAssets:
@@ -2899,12 +2909,12 @@ class VaultFileTreeResponse {
     return VaultFileTreeResponse(
       vaultId: json['vault_id']?.toString(),
       rootEntryIds: _readStringList(json['root_entry_ids']),
-      entries: _readList(json['entries'])
-          .map((item) => VaultFileEntry.fromJson(item))
-          .toList(),
-      devices: _readList(json['devices'])
-          .map((item) => VaultFileDeviceSummary.fromJson(item))
-          .toList(),
+      entries: _readList(
+        json['entries'],
+      ).map((item) => VaultFileEntry.fromJson(item)).toList(),
+      devices: _readList(
+        json['devices'],
+      ).map((item) => VaultFileDeviceSummary.fromJson(item)).toList(),
     );
   }
 }
@@ -3244,9 +3254,9 @@ class Asset {
               ),
             )
           : null,
-      variants: _readList(json['variants'])
-          .map((item) => AssetVariant.fromJson(item))
-          .toList(),
+      variants: _readList(
+        json['variants'],
+      ).map((item) => AssetVariant.fromJson(item)).toList(),
     );
   }
 }
@@ -3505,9 +3515,9 @@ class TimelineBucket {
   final int totalAssets;
 
   factory TimelineBucket.fromJson(Map<String, dynamic> json) {
-    final assets = _readList(json['assets'])
-        .map((item) => Asset.fromJson(item))
-        .toList();
+    final assets = _readList(
+      json['assets'],
+    ).map((item) => Asset.fromJson(item)).toList();
     return TimelineBucket(
       label: json['label'] as String? ?? 'Untitled bucket',
       assetIds: _readStringList(json['asset_ids']),
@@ -3574,9 +3584,9 @@ class TimelineResponse {
   }
 
   factory TimelineResponse.fromJson(Map<String, dynamic> json) {
-    final buckets = _readList(json['buckets'])
-        .map((item) => TimelineBucket.fromJson(item))
-        .toList();
+    final buckets = _readList(
+      json['buckets'],
+    ).map((item) => TimelineBucket.fromJson(item)).toList();
     return TimelineResponse(
       buckets: buckets,
       nextCursor: json['next_cursor'] as String?,
@@ -3734,18 +3744,18 @@ class SearchResponse {
 
     return SearchResponse(
       query: SearchQuery.fromJson(queryMap),
-      assets: _readList(json['assets'])
-          .map((item) => Asset.fromJson(item))
-          .toList(),
-      people: _readList(json['people'])
-          .map((item) => PersonCluster.fromJson(item))
-          .toList(),
-      places: _readList(json['places'])
-          .map((item) => PlaceCluster.fromJson(item))
-          .toList(),
-      events: _readList(json['events'])
-          .map((item) => EventCluster.fromJson(item))
-          .toList(),
+      assets: _readList(
+        json['assets'],
+      ).map((item) => Asset.fromJson(item)).toList(),
+      people: _readList(
+        json['people'],
+      ).map((item) => PersonCluster.fromJson(item)).toList(),
+      places: _readList(
+        json['places'],
+      ).map((item) => PlaceCluster.fromJson(item)).toList(),
+      events: _readList(
+        json['events'],
+      ).map((item) => EventCluster.fromJson(item)).toList(),
     );
   }
 }
@@ -4127,9 +4137,9 @@ class ImportSession {
       .fold<int>(0, (sum, candidate) => sum + candidate.bytes);
 
   factory ImportSession.fromJson(Map<String, dynamic> json) {
-    final candidates = _readList(json['candidates'])
-        .map((item) => ImportCandidate.fromJson(item))
-        .toList();
+    final candidates = _readList(
+      json['candidates'],
+    ).map((item) => ImportCandidate.fromJson(item)).toList();
     final unsupportedFilePaths = _readStringList(
       json['unsupported_file_paths'],
     );
@@ -4257,9 +4267,9 @@ class DuplicateReviewSummary {
       protectedBytes: (json['protected_bytes'] as num?)?.toInt() ?? 0,
       sessionsWithDuplicates:
           (json['sessions_with_duplicates'] as num?)?.toInt() ?? 0,
-      entries: _readList(json['entries'])
-          .map((item) => DuplicateReviewEntry.fromJson(item))
-          .toList(),
+      entries: _readList(
+        json['entries'],
+      ).map((item) => DuplicateReviewEntry.fromJson(item)).toList(),
       privacyDetail:
           json['privacy_detail'] as String? ??
           'Duplicate review is computed locally.',
@@ -4344,9 +4354,9 @@ class LibraryStatus {
 
     return LibraryStatus(
       settings: settings,
-      watchFolders: _readList(json['watch_folders'])
-          .map((item) => WatchFolder.fromJson(item))
-          .toList(),
+      watchFolders: _readList(
+        json['watch_folders'],
+      ).map((item) => WatchFolder.fromJson(item)).toList(),
       isInitialized: json['is_initialized'] as bool? ?? settings != null,
     );
   }

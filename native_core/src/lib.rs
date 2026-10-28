@@ -9,6 +9,7 @@ pub mod model_registry;
 pub mod ocr;
 pub mod original_quarantine;
 pub mod people;
+pub(crate) mod recovery_bundle;
 pub(crate) mod recovery_inventory;
 pub mod search;
 pub mod security;

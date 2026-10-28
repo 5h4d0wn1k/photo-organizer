@@ -1191,7 +1191,7 @@ fn replace_file_then(
     publish()
 }
 
-fn sync_file_contents(path: &Path) -> Result<(), SecurityError> {
+pub(crate) fn sync_file_contents(path: &Path) -> Result<(), SecurityError> {
     let file = fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -1266,14 +1266,14 @@ fn atomic_rename_file(_source: &Path, _destination: &Path) -> Result<(), Securit
 }
 
 #[cfg(all(unix, not(target_vendor = "apple")))]
-fn sync_directory(parent: &Path) -> Result<(), SecurityError> {
+pub(crate) fn sync_directory(parent: &Path) -> Result<(), SecurityError> {
     fs::File::open(parent)
         .and_then(|dir| dir.sync_all())
         .map_err(io_error)
 }
 
 #[cfg(target_vendor = "apple")]
-fn sync_directory(parent: &Path) -> Result<(), SecurityError> {
+pub(crate) fn sync_directory(parent: &Path) -> Result<(), SecurityError> {
     let directory = fs::File::open(parent).map_err(io_error)?;
     // Apple documents F_FULLFSYNC for file contents, but does not promise that
     // it commits directory-entry changes. Use the available directory fsync;
@@ -1283,7 +1283,7 @@ fn sync_directory(parent: &Path) -> Result<(), SecurityError> {
 }
 
 #[cfg(windows)]
-fn sync_directory(_parent: &Path) -> Result<(), SecurityError> {
+pub(crate) fn sync_directory(_parent: &Path) -> Result<(), SecurityError> {
     // atomic_rename_file requests MOVEFILE_WRITE_THROUGH. Windows exposes no
     // portable directory-handle flush here; startup reconciliation verifies
     // the database contents against the stored key and state.
@@ -1291,7 +1291,7 @@ fn sync_directory(_parent: &Path) -> Result<(), SecurityError> {
 }
 
 #[cfg(not(any(unix, windows)))]
-fn sync_directory(_parent: &Path) -> Result<(), SecurityError> {
+pub(crate) fn sync_directory(_parent: &Path) -> Result<(), SecurityError> {
     Err(SecurityError::Io(
         "durable directory synchronization is unsupported on this platform".to_string(),
     ))
@@ -1452,6 +1452,15 @@ fn state_path_for_database_path(database_path: &Path) -> Result<PathBuf, Securit
 }
 
 fn store_key(config: &AppConfig, key_id: &str, key_hex: &str) -> Result<String, SecurityError> {
+    let _lock = catalog_provider_lock(config, key_id)?;
+    store_key_unlocked(config, key_id, key_hex)
+}
+
+fn store_key_unlocked(
+    config: &AppConfig,
+    key_id: &str,
+    key_hex: &str,
+) -> Result<String, SecurityError> {
     validate_key_hex(key_hex)?;
     #[cfg(test)]
     {
@@ -1539,6 +1548,266 @@ fn key_file_path(runtime_root: &Path, key_id: &str) -> PathBuf {
         .join(format!("{key_id}.key"))
 }
 
+pub(crate) struct RecoveryCatalogInstall {
+    _lock: fs::File,
+    key_id: String,
+    created_key: bool,
+    created_state: bool,
+}
+
+fn catalog_provider_lock(config: &AppConfig, id: &str) -> Result<fs::File, SecurityError> {
+    crate::vault_store::recovery_provider_lock(config, &format!("catalog-{id}"))
+        .map_err(|_| SecurityError::KeyStorage("catalog credential lock is unavailable".into()))
+}
+
+fn decode_recovery_key(value: &str) -> Result<Zeroizing<[u8; 32]>, SecurityError> {
+    validate_key_hex(value)?;
+    let mut key = Zeroizing::new([0_u8; 32]);
+    for (position, byte) in key.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&value[position * 2..position * 2 + 2], 16).map_err(|_| {
+            SecurityError::KeyStorage("invalid recovery credential encoding".into())
+        })?;
+    }
+    Ok(key)
+}
+
+pub(crate) fn export_catalog_recovery_key(
+    path: &Path,
+) -> Result<Zeroizing<[u8; 32]>, SecurityError> {
+    let state = read_state_for_database_path(path)?.ok_or_else(|| {
+        SecurityError::KeyStorage("catalog recovery key identity is unavailable".into())
+    })?;
+    if !state.database_encrypted {
+        return Err(SecurityError::KeyStorage("catalog is not encrypted".into()));
+    }
+    let encoded = Zeroizing::new(load_key_for_state(path, &state)?);
+    decode_recovery_key(&encoded)
+}
+
+/// Validate a standalone snapshot without creating recovery files or WAL sidecars.
+pub(crate) fn verify_recovery_catalog(
+    path: &Path,
+    key: Option<&[u8; 32]>,
+) -> Result<(), SecurityError> {
+    let path = path
+        .to_str()
+        .ok_or_else(|| SecurityError::Invalid("catalog path encoding is unsupported".into()))?;
+    let escaped = path
+        .as_bytes()
+        .iter()
+        .map(|byte| {
+            if byte.is_ascii_alphanumeric() || b"/-._~".contains(byte) {
+                (*byte as char).to_string()
+            } else {
+                format!("%{byte:02X}")
+            }
+        })
+        .collect::<String>();
+    let connection = Connection::open_with_flags(
+        format!("file:{escaped}?immutable=1"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+    )
+    .map_err(database_error)?;
+    if let Some(key) = key {
+        key_connection(&connection, &Zeroizing::new(hex_string(key)))?;
+    }
+    let integrity: String = connection
+        .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+        .map_err(database_error)?;
+    let version: i64 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .map_err(database_error)?;
+    let foreign_errors = connection
+        .prepare("PRAGMA foreign_key_check")
+        .map_err(database_error)?
+        .exists([])
+        .map_err(database_error)?;
+    if integrity != "ok" || version != 24 || foreign_errors {
+        return Err(SecurityError::Database(
+            "recovery catalog integrity/schema validation failed".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn read_catalog_recovery_key(
+    config: &AppConfig,
+    id: &str,
+) -> Result<Option<Zeroizing<[u8; 32]>>, SecurityError> {
+    #[cfg(test)]
+    {
+        match fs::read_to_string(key_file_path(&config.runtime_root, id)) {
+            Ok(value) => decode_recovery_key(Zeroizing::new(value).trim()).map(Some),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(io_error(error)),
+        }
+    }
+    #[cfg(not(test))]
+    {
+        let _ = config;
+        let entry = keyring::Entry::new(KEYRING_SERVICE, id)
+            .map_err(|error| SecurityError::KeyStorage(error.to_string()))?;
+        match entry.get_password() {
+            Ok(value) => decode_recovery_key(&Zeroizing::new(value)).map(Some),
+            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(error) => Err(SecurityError::KeyStorage(error.to_string())),
+        }
+    }
+}
+
+fn delete_catalog_recovery_key(config: &AppConfig, id: &str) -> Result<(), SecurityError> {
+    #[cfg(test)]
+    {
+        let path = key_file_path(&config.runtime_root, id);
+        fs::remove_file(&path).map_err(io_error)?;
+        sync_directory(path.parent().expect("key parent"))?;
+    }
+    #[cfg(not(test))]
+    {
+        let _ = config;
+        keyring::Entry::new(KEYRING_SERVICE, id)
+            .and_then(|entry| entry.delete_credential())
+            .map_err(|error| SecurityError::KeyStorage(error.to_string()))?;
+    }
+    Ok(())
+}
+
+fn publish_recovery_state(
+    config: &AppConfig,
+    state: &EncryptionStateFile,
+) -> Result<(), (SecurityError, bool)> {
+    let path = state_path(config);
+    let parent = path.parent().expect("state parent");
+    fs::create_dir_all(parent).map_err(|error| (io_error(error), false))?;
+    let temporary = parent.join(format!(".recovery-state-{}", Uuid::new_v4()));
+    let mut published = false;
+    let result = (|| {
+        let raw = serde_json::to_vec(state)
+            .map_err(|_| SecurityError::Invalid("cannot encode recovery state".into()))?;
+        let mut file = open_temp_for_write(&temporary, None)?;
+        file.write_all(&raw).map_err(io_error)?;
+        sync_file(&file)?;
+        drop(file);
+        // Atomic no-replace publication: never overwrite a state file which
+        // appeared after inspection, including a dangling symlink.
+        fs::hard_link(&temporary, &path).map_err(io_error)?;
+        published = true;
+        sync_directory(parent)
+    })();
+    let _ = fs::remove_file(&temporary);
+    result.map_err(|error| (error, published))
+}
+
+#[cfg(test)]
+pub(crate) fn activate_recovery_catalog(
+    config: &AppConfig,
+    key: &[u8; 32],
+) -> Result<RecoveryCatalogInstall, SecurityError> {
+    activate_recovery_catalog_bound(config, key, &config.database_path())
+}
+
+pub(crate) fn activate_recovery_catalog_bound(
+    config: &AppConfig,
+    key: &[u8; 32],
+    binding_database_path: &Path,
+) -> Result<RecoveryCatalogInstall, SecurityError> {
+    verify_recovery_catalog(&config.database_path(), Some(key))?;
+    let id = key_id_for_path(binding_database_path);
+    let lock = catalog_provider_lock(config, &id)?;
+    let existing_state = read_state(config)?;
+    if let Some(state) = &existing_state
+        && (state.key_id != id || !state.database_encrypted || !state.derived_data_encrypted)
+    {
+        return Err(SecurityError::KeyStorage(
+            "destination catalog encryption state conflicts with recovery".into(),
+        ));
+    }
+    let existing = read_catalog_recovery_key(config, &id)?;
+    let created_key = existing.is_none();
+    if let Some(existing) = existing
+        && !constant_time_eq(existing.as_ref(), key)
+    {
+        return Err(SecurityError::KeyStorage(
+            "recovery key conflicts with an existing catalog credential".into(),
+        ));
+    }
+    let encoded = Zeroizing::new(hex_string(key));
+    #[cfg(test)]
+    let storage_name = "test_file_key_store";
+    #[cfg(not(test))]
+    let storage_name = "os_keychain";
+    if let Some(state) = &existing_state
+        && state.key_storage != storage_name
+    {
+        return Err(SecurityError::KeyStorage(
+            "destination catalog key storage conflicts with recovery".into(),
+        ));
+    }
+    if created_key && let Err(error) = store_key_unlocked(config, &id, &encoded) {
+        if read_catalog_recovery_key(config, &id)?
+            .is_some_and(|stored| constant_time_eq(stored.as_ref(), key))
+        {
+            delete_catalog_recovery_key(config, &id)?;
+        }
+        return Err(error);
+    }
+    let mut lease = RecoveryCatalogInstall {
+        _lock: lock,
+        key_id: id.clone(),
+        created_key,
+        created_state: false,
+    };
+    if existing_state.is_none() {
+        let state = EncryptionStateFile {
+            database_encrypted: true,
+            derived_data_encrypted: true,
+            key_id: id,
+            key_storage: storage_name.into(),
+            activated_at: Utc::now(),
+            backup_path: String::new(),
+        };
+        // A failure after link publication must still be owned by rollback.
+        if let Err((error, published)) = publish_recovery_state(config, &state) {
+            lease.created_state = published;
+            rollback_recovery_catalog(config, key, lease)?;
+            return Err(error);
+        }
+        lease.created_state = true;
+    }
+    Ok(lease)
+}
+
+pub(crate) fn rollback_recovery_catalog(
+    config: &AppConfig,
+    key: &[u8; 32],
+    lease: RecoveryCatalogInstall,
+) -> Result<(), SecurityError> {
+    let matches_key = read_catalog_recovery_key(config, &lease.key_id)?
+        .is_some_and(|current| constant_time_eq(current.as_ref(), key));
+    if (lease.created_key || lease.created_state) && !matches_key {
+        return Err(SecurityError::KeyStorage(
+            "refusing to remove changed catalog recovery material".into(),
+        ));
+    }
+    if lease.created_state {
+        let state = read_state(config)?.ok_or_else(|| {
+            SecurityError::KeyStorage("created catalog recovery state is missing".into())
+        })?;
+        if state.key_id != lease.key_id {
+            return Err(SecurityError::KeyStorage(
+                "refusing to remove changed catalog recovery state".into(),
+            ));
+        }
+        let path = state_path(config);
+        fs::remove_file(&path).map_err(io_error)?;
+        sync_directory(path.parent().expect("state parent"))?;
+    }
+    if lease.created_key {
+        delete_catalog_recovery_key(config, &lease.key_id)?;
+    }
+    Ok(())
+}
+
 fn key_id_for_path(database_path: &Path) -> String {
     let mut hasher = Sha256::new();
     hasher.update(database_path.to_string_lossy().as_bytes());
@@ -1595,6 +1864,54 @@ pub fn database_sha256(path: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn catalog_recovery_rebinds_final_identity_and_rolls_back_only_its_creations() {
+        let root = crate::test_support::TestTempDir::new("catalog-recovery-lease");
+        let source = AppConfig {
+            runtime_root: root.join("source/runtime"),
+            library_root: root.join("source/library"),
+            ..AppConfig::default()
+        };
+        crate::storage::bootstrap_storage(&source).unwrap();
+        activate_encryption(&source).unwrap();
+        let key = export_catalog_recovery_key(&source.database_path()).unwrap();
+        let staging = AppConfig {
+            runtime_root: root.join("staging/runtime"),
+            library_root: root.join("staging/library"),
+            ..AppConfig::default()
+        };
+        fs::create_dir_all(staging.database_path().parent().unwrap()).unwrap();
+        snapshot_database(&source.database_path(), &staging.database_path()).unwrap();
+        let final_database = root.join("final/runtime/db/gallery.sqlite3");
+        assert!(verify_recovery_catalog(&staging.database_path(), Some(&[3_u8; 32])).is_err());
+        let first = activate_recovery_catalog_bound(&staging, &key, &final_database).unwrap();
+        assert_eq!(
+            read_state(&staging).unwrap().unwrap().key_id,
+            key_id_for_path(&final_database)
+        );
+        assert!(open_database(&staging.database_path()).is_ok());
+        drop(first);
+        let reused = activate_recovery_catalog_bound(&staging, &key, &final_database).unwrap();
+        rollback_recovery_catalog(&staging, &key, reused).unwrap();
+        assert!(open_database(&staging.database_path()).is_ok());
+        let second = AppConfig {
+            runtime_root: root.join("other/runtime"),
+            library_root: root.join("other/library"),
+            ..AppConfig::default()
+        };
+        fs::create_dir_all(second.database_path().parent().unwrap()).unwrap();
+        snapshot_database(&source.database_path(), &second.database_path()).unwrap();
+        let created = activate_recovery_catalog(&second, &key).unwrap();
+        rollback_recovery_catalog(&second, &key, created).unwrap();
+        assert!(read_state(&second).unwrap().is_none());
+        assert!(
+            read_catalog_recovery_key(&second, &key_id_for_path(&second.database_path()))
+                .unwrap()
+                .is_none()
+        );
+        verify_recovery_catalog(&source.database_path(), Some(&key)).unwrap();
+    }
+
     #[test]
     fn backup_key_reference_requires_readable_header_and_encrypted_state() {
         let root = crate::test_support::TestTempDir::new("backup-key-ref");
