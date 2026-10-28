@@ -17086,7 +17086,7 @@ mod tests {
                 })
                 .await
                 .expect("export protected original ciphertext");
-            assert!(backup.ok, "{backup:?}");
+            assert!(backup.ok, "backup verification must succeed");
             assert_eq!(backup.protected_original_chunks_copied, 1);
             let mut manifest = read_backup_manifest(&export_root).expect("backup manifest");
             manifest["format_version"] = serde_json::json!(2);

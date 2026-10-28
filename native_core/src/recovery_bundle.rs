@@ -13,7 +13,7 @@ use std::{
 use argon2::{Algorithm, Argon2, Params, Version};
 use chacha20poly1305::{
     ChaCha20Poly1305, Key, Nonce,
-    aead::{AeadInPlace, KeyInit, OsRng, rand_core::RngCore},
+    aead::{AeadCore, AeadInPlace, KeyInit, OsRng},
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -163,21 +163,22 @@ pub(crate) fn wrap(
         plaintext.extend_from_slice(&identity_bytes);
         plaintext.extend_from_slice(key.as_ref());
     }
-    let mut salt = [0_u8; 16];
-    let mut nonce = [0_u8; 12];
-    OsRng.fill_bytes(&mut salt);
-    OsRng.fill_bytes(&mut nonce);
+    // Construct entropy directly from the cryptographic RNG rather than a
+    // constant buffer later mutated in place. The salt uses 128 fresh bits.
+    let random_salt = ChaCha20Poly1305::generate_key(&mut OsRng);
+    let salt = &random_salt[..16];
+    let nonce = ChaCha20Poly1305::generate_nonce(&mut OsRng);
     let mut envelope = RecoveryEnvelope {
         version: VERSION,
         kdf_profile: KDF_PROFILE.into(),
-        salt_hex: hex(&salt),
+        salt_hex: hex(salt),
         nonce_hex: hex(&nonce),
         backup_sha256: backup_sha256.into(),
         inventory_sha256: hex(&Sha256::digest(&inventory_bytes)),
         ciphertext_hex: String::new(),
     };
     let associated_data = aad(&envelope, &inventory_bytes)?;
-    let derived = derive_key(passphrase, &salt)?;
+    let derived = derive_key(passphrase, salt)?;
     ChaCha20Poly1305::new(Key::from_slice(derived.as_ref()))
         .encrypt_in_place(Nonce::from_slice(&nonce), &associated_data, &mut *plaintext)
         .map_err(|_| RecoveryBundleError::Authentication)?;
