@@ -951,6 +951,26 @@ fn write_encryption_settings_row(config: &AppConfig) -> Result<(), SecurityError
     Ok(())
 }
 
+/// Return only a catalog credential identity; never read or serialize key bytes.
+pub(crate) fn backup_catalog_key_reference(path: &Path) -> Result<Option<String>, SecurityError> {
+    let mut header = [0_u8; 16];
+    fs::File::open(path)
+        .and_then(|mut file| file.read_exact(&mut header))
+        .map_err(io_error)?;
+    if &header == b"SQLite format 3\0" {
+        return Ok(None);
+    }
+    let state = read_state_for_database_path(path)?.ok_or_else(|| {
+        SecurityError::KeyStorage("encrypted catalog has no recovery key identity".into())
+    })?;
+    if !state.database_encrypted || state.key_id.is_empty() {
+        return Err(SecurityError::KeyStorage(
+            "encrypted catalog recovery key identity is invalid".into(),
+        ));
+    }
+    Ok(Some(state.key_id))
+}
+
 /// Capture a standalone SQLite snapshot, including committed WAL pages, using
 /// the existing database key. Never create a replacement key or overwrite a
 /// previous backup. Callers serialize application state/media copying separately.
@@ -1575,6 +1595,27 @@ pub fn database_sha256(path: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn backup_key_reference_requires_readable_header_and_encrypted_state() {
+        let root = crate::test_support::TestTempDir::new("backup-key-ref");
+        let database = root.join("runtime/db/catalog.sqlite3");
+        assert!(super::backup_catalog_key_reference(&database).is_err());
+        fs::create_dir_all(database.parent().unwrap()).unwrap();
+        fs::write(&database, b"short").unwrap();
+        assert!(super::backup_catalog_key_reference(&database).is_err());
+        fs::write(&database, [0_u8; 16]).unwrap();
+        assert!(super::backup_catalog_key_reference(&database).is_err());
+        assert!(
+            !root.join("runtime/security").exists(),
+            "identity inspection must not create recovery state"
+        );
+        fs::write(&database, b"SQLite format 3\0").unwrap();
+        assert_eq!(
+            super::backup_catalog_key_reference(&database).unwrap(),
+            None
+        );
+    }
+
     fn test_config(name: &str) -> (AppConfig, crate::test_support::TestTempDir) {
         let root = crate::test_support::TestTempDir::new(&format!("security-{name}"));
         let config = AppConfig {

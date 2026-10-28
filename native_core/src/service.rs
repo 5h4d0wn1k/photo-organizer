@@ -6070,6 +6070,15 @@ impl GalleryService {
         );
         security::snapshot_database(&self.storage.database_path, &database_copy)
             .map_err(security_error)?;
+        let recovery_key_inventory = crate::recovery_inventory::build(
+            security::backup_catalog_key_reference(&self.storage.database_path)
+                .map_err(security_error)?,
+            &state.blob_records,
+            &state.blob_chunks,
+            &state.protected_originals,
+            &state.protected_original_chunks,
+        )
+        .map_err(|error| ServiceError::Storage(error.to_string()))?;
 
         let mut media_files_copied = 0_usize;
         let mut vault_chunks_copied = 0_usize;
@@ -6146,6 +6155,7 @@ impl GalleryService {
             "vault_chunks_copied": vault_chunks_copied,
             "protected_original_chunks_copied": protected_original_chunks_copied,
             "protected_originals": protected_original_inventory,
+            "recovery_key_inventory": recovery_key_inventory,
             "bytes_copied": bytes_copied,
             "model_files_checked": verification.model_files_checked,
             "missing_model_paths": verification.missing_model_paths,
@@ -15600,6 +15610,19 @@ mod tests {
             .await
             .expect("encrypted snapshot export");
         let snapshot = fs::read(&exported.database_copied_to).expect("snapshot");
+        let inventory_manifest = read_backup_manifest(&export_root).unwrap();
+        let keys = inventory_manifest["recovery_key_inventory"]["required_keys"]
+            .as_array()
+            .unwrap();
+        assert_eq!(inventory_manifest["recovery_key_inventory"]["version"], 1);
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0]["kind"], "catalog");
+        assert!(
+            keys[0]["source_key_id"]
+                .as_str()
+                .unwrap()
+                .starts_with("library-")
+        );
         let restore_root = root.join("unactivated-restore");
         let plan = service
             .plan_restore_backup(crate::domain::BackupRestorePlanRequest {
@@ -15698,6 +15721,14 @@ mod tests {
         assert_eq!(export.media_files_copied, 0);
         assert!(export.vault_chunks_copied >= 1);
         assert!(find_pgblob(&export_root.join("library")).is_some());
+        let inventory_manifest = read_backup_manifest(&export_root).unwrap();
+        let keys = inventory_manifest["recovery_key_inventory"]["required_keys"]
+            .as_array()
+            .unwrap();
+        let vault = service.vaults().await[0].clone();
+        assert!(keys.iter().any(|key| key["kind"] == "vault"
+            && key["vault_id"] == vault.id.to_string()
+            && key["key_version"] == vault.key_version));
 
         let blocked_plan = service
             .plan_restore_backup(crate::domain::BackupRestorePlanRequest {
@@ -16185,6 +16216,18 @@ mod tests {
         assert!(backup.ok, "{backup:?}");
         assert_eq!(backup.protected_original_chunks_copied, 1);
         let manifest = read_backup_manifest(&export_root).expect("backup manifest");
+        assert!(
+            manifest["recovery_key_inventory"]["required_keys"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|key| {
+                    key["kind"] == "quarantine"
+                        && key["object_id"] == protected.object_id.to_string()
+                        && key["asset_id"] == imported.asset.id.to_string()
+                        && key["key_version"] == 1
+                })
+        );
         assert!(
             manifest["files"]
                 .as_array()

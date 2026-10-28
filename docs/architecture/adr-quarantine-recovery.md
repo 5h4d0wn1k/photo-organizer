@@ -195,3 +195,18 @@ quarantine retirement only after verifying the already-persisted normal blob.
   Router tests cover local inventory access plus remote and missing-connection
   denial for inventory and repair. Complete paired-device and remote-sync
   acceptance before the ADR is accepted.
+
+## Required-key coverage metadata
+
+Format-2 backup manifests may include an additive `recovery_key_inventory`
+(version 1). It records only source catalog credential identity, vault UUID/key
+version pairs for locally included chunks (including tombstoned history), and
+quarantine object/asset/key-version identities. References are deterministic and
+deduplicated; orphan/ambiguous records and unsupported quarantine key versions
+fail export. It contains no key bytes, passphrases, nonce/AAD or wrapped keys.
+
+This advisory inventory is preparation for #223, not evidence that credentials
+exist, are wrapped, or can be installed on another device. Restore admission
+continues to inspect the actual catalog and encrypted manifest entries and must
+not trust this inventory to enable encrypted restoration. Existing format-2
+backups without the field remain supported under the same admission rules.
