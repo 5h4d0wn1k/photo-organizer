@@ -112,3 +112,20 @@ Shared markers also prevent a fresh runtime from regenerating an initialized
 credential after key loss. Instances
 sharing the OS credential store must use the same OS user application directory;
 changing HOME/LOCALAPPDATA is not a supported way to isolate a shared key store.
+
+### Hidden location and image previews
+
+“Hide exact GPS” removes precise coordinates from app projections, search, Places,
+correction-history responses, and sync metadata. Automatic photo previews also
+render a new image in memory without embedded EXIF, XMP, IPTC, or copied ICC
+metadata; full-size desktop previews and authenticated mobile previews use the
+same boundary. Preview responses use `Cache-Control: no-store`. Private renders
+are bounded before original reads and do not create plaintext preview files.
+
+This action preserves the private catalog coordinates and original bytes so the
+user can unhide them. Explicit original downloads and exports still contain any
+metadata present in the source; hiding is not metadata deletion. Private preview
+rendering currently supports static JPEG and PNG, preserves orientation and PNG
+alpha/16-bit samples, and normalizes supported ICC profiles to sRGB. Unsupported
+formats or color descriptions fail with an error rather than return unsanitized
+original bytes.

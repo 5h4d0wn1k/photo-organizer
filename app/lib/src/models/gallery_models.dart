@@ -1276,16 +1276,21 @@ class EncryptionStatus {
     required this.keyStorage,
     required this.sensitiveIndexingAllowed,
     required this.warning,
+    this.available = true,
   });
 
+  final bool available;
   final bool databaseEncrypted;
   final bool derivedDataEncrypted;
   final String? keyStorage;
   final bool sensitiveIndexingAllowed;
   final String warning;
 
+  bool? get databaseEncryptionState => available ? databaseEncrypted : null;
+
   const EncryptionStatus.unavailable()
-    : databaseEncrypted = false,
+    : available = false,
+      databaseEncrypted = false,
       derivedDataEncrypted = false,
       keyStorage = null,
       sensitiveIndexingAllowed = false,
@@ -1294,6 +1299,7 @@ class EncryptionStatus {
   factory EncryptionStatus.fromJson(Map<String, dynamic> json) {
     return EncryptionStatus(
       databaseEncrypted: json['database_encrypted'] as bool? ?? false,
+      available: json['database_encrypted'] is bool,
       derivedDataEncrypted: json['derived_data_encrypted'] as bool? ?? false,
       keyStorage: json['key_storage'] as String?,
       sensitiveIndexingAllowed:

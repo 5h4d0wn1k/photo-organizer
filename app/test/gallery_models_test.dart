@@ -2,6 +2,19 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:private_gallery_app/src/models/gallery_models.dart';
 
 void main() {
+  test('unavailable encryption response remains unknown', () {
+    expect(
+      const EncryptionStatus.unavailable().databaseEncryptionState,
+      isNull,
+    );
+    expect(EncryptionStatus.fromJson({}).databaseEncryptionState, isNull);
+    expect(
+      EncryptionStatus.fromJson({
+        'database_encrypted': false,
+      }).databaseEncryptionState,
+      isFalse,
+    );
+  });
   test(
     'restore plan recovery flags default safely and parse supported activation',
     () {

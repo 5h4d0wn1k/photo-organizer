@@ -2837,6 +2837,16 @@ mod tests {
         }
     }
 
+    #[test]
+    fn sync_envelope_carries_encrypted_blob_data_without_asset_metadata() {
+        let value = serde_json::to_value(envelope(vec![chunk(0, 10, 11)]))
+            .expect("serialize transfer envelope");
+        assert!(value.get("blob").is_some());
+        assert!(value.get("chunks").is_some());
+        assert!(value.get("metadata").is_none());
+        assert!(value.get("geo").is_none());
+    }
+
     fn authorized_state() -> LibraryState {
         let now = Utc::now();
         let vault_id = Uuid::from_u128(1);

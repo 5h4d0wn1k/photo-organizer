@@ -682,7 +682,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 ),
                 const SizedBox(height: 12),
                 const Text(
-                  'This verifies the encrypted database, managed originals, encrypted vault chunks, and installed model files. Use a recovery passphrase to protect the keys needed to restore encrypted media on another device. Keep it somewhere safe: a forgotten passphrase cannot be recovered. Restore uses a separate empty folder and verifies recovery before reporting success.',
+                  'This checks the catalog database, managed originals, vault chunks, and installed model files for backup readiness. A restorable backup preserves the full catalog, including exact coordinates hidden from app features, and may include originals with GPS metadata. Keep the destination private. If database encryption is off, the catalog copy is not protected at rest. Use a recovery passphrase to protect the keys needed to restore encrypted media on another device. Keep it somewhere safe: a forgotten passphrase cannot be recovered. Restore uses a separate empty folder without modifying the active library and verifies recovery before reporting success.',
                 ),
                 const SizedBox(height: 16),
                 TextField(

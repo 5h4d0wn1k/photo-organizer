@@ -2365,6 +2365,7 @@ dependencies = [
  "iroh",
  "keyring",
  "libc",
+ "moxcms",
  "nom-exif",
  "reqwest 0.12.28",
  "rusqlite",

@@ -782,6 +782,21 @@ pub struct GeoTag {
     pub exact_hidden: bool,
 }
 
+impl GeoTag {
+    /// Coordinates explicitly hidden by the user stay in the encrypted catalog,
+    /// but must not participate in public metadata or derived views.
+    pub fn visible(&self) -> Option<&Self> {
+        (!self.exact_hidden).then_some(self)
+    }
+}
+
+fn serialize_visible_geo<S>(geo: &Option<GeoTag>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    geo.as_ref().and_then(GeoTag::visible).serialize(serializer)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CameraInfo {
     pub make: Option<String>,
@@ -798,6 +813,7 @@ pub struct AssetMetadata {
     pub width: Option<u32>,
     pub height: Option<u32>,
     pub camera: Option<CameraInfo>,
+    #[serde(serialize_with = "serialize_visible_geo")]
     pub geo: Option<GeoTag>,
     pub sidecar_title: Option<String>,
     pub sidecar_description: Option<String>,
