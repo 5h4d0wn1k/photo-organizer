@@ -16135,6 +16135,62 @@ mod tests {
 
     #[tokio::test]
     async fn portable_recovery_cold_launches_without_source_catalog_vault_or_quarantine_keys() {
+        async fn pair_phone(
+            service: &GalleryService,
+            vault_id: Uuid,
+            name: &str,
+        ) -> crate::domain::MobilePairResponse {
+            let pairing = service
+                .create_pairing_session(CreatePairingSessionRequest {
+                    device_name: name.into(),
+                    platform: "android".into(),
+                    vault_id: Some(vault_id),
+                })
+                .await
+                .unwrap();
+            let paired = service
+                .pair_mobile_device(MobilePairRequest {
+                    pairing_token: pairing.pairing_token,
+                    device_name: name.into(),
+                    platform: "android".into(),
+                    vault_id: None,
+                    storage_profile: None,
+                })
+                .await
+                .unwrap();
+            assert_eq!(paired.session.vault_id, vault_id);
+            paired
+        }
+
+        async fn assert_scoped_reader(
+            service: &GalleryService,
+            token: &str,
+            vault_id: Uuid,
+            own_asset: Uuid,
+            own_bytes: &[u8],
+            other_asset: Uuid,
+        ) {
+            assert_eq!(
+                service.mobile_session_status(token).await.unwrap().vault_id,
+                vault_id
+            );
+            let assets = service.mobile_assets(token).await.unwrap();
+            assert!(assets.iter().any(|asset| asset.asset_id == own_asset));
+            assert!(assets.iter().all(|asset| asset.asset_id != other_asset));
+            assert_eq!(
+                service
+                    .mobile_original_bytes(token, own_asset)
+                    .await
+                    .unwrap()
+                    .1,
+                own_bytes
+            );
+            assert!(matches!(
+                service.mobile_original_bytes(token, other_asset).await,
+                Err(super::ServiceError::NotFound(_))
+            ));
+        }
+
         let root = temp_root("portable-recovery-cold-launch");
         let source_config = AppConfig {
             runtime_root: root.join("source/runtime"),
@@ -16197,6 +16253,26 @@ mod tests {
             })
             .await
             .unwrap();
+        let other_input = root.join("other.jpg");
+        let other_bytes = b"separate vault recovery permission proof";
+        fs::write(&other_input, other_bytes).unwrap();
+        let other_asset = source
+            .import_asset_to_vault(
+                other.id,
+                ImportAssetRequest {
+                    source_path: other_input.to_string_lossy().into_owned(),
+                    original_filename: "other.jpg".into(),
+                    media_kind: MediaKind::Photo,
+                    mime_type: "image/jpeg".into(),
+                    bytes: other_bytes.len() as u64,
+                    content_hash: None,
+                    captured_at: None,
+                    place_hint: None,
+                    import_mode: Some(ImportMode::Copy),
+                },
+            )
+            .await
+            .unwrap();
         fs::write(
             source_config
                 .library_root
@@ -16234,6 +16310,46 @@ mod tests {
             })
             .await
             .unwrap();
+        // Populate real authorization records so recovery's revocation checks
+        // cannot pass merely because the source library had no paired devices.
+        let source_personal = pair_phone(&source, personal.id, "Source personal phone").await;
+        let source_other = pair_phone(&source, other.id, "Source other phone").await;
+        let pending = source
+            .create_pairing_session(CreatePairingSessionRequest {
+                device_name: "Pending source phone".into(),
+                platform: "android".into(),
+                vault_id: Some(personal.id),
+            })
+            .await
+            .unwrap();
+        for (paired, vault, own, content, foreign) in [
+            (
+                &source_personal,
+                personal.id,
+                normal.asset.id,
+                bytes.as_slice(),
+                other_asset.asset.id,
+            ),
+            (
+                &source_other,
+                other.id,
+                other_asset.asset.id,
+                other_bytes.as_slice(),
+                normal.asset.id,
+            ),
+        ] {
+            assert_scoped_reader(&source, &paired.bearer_token, vault, own, content, foreign).await;
+        }
+        {
+            let state = source.state.read().await;
+            assert_eq!(state.mobile_sessions.len(), 2);
+            assert!(
+                state
+                    .pairings
+                    .iter()
+                    .any(|pairing| { pairing.id == pending.id && pairing.approved_at.is_none() })
+            );
+        }
         let export_root = root.join("backup");
         let password = "a unique synthetic recovery passphrase";
         source
@@ -16289,12 +16405,13 @@ mod tests {
                 .unwrap()
                 .ok
         );
-        let recovered = GalleryService::new(AppConfig {
+        let recovered_config = AppConfig {
             runtime_root: destination.join("runtime"),
             library_root: destination.join("library"),
             ..AppConfig::default()
-        })
-        .expect("cold launch independently restored library");
+        };
+        let mut recovered = GalleryService::new(recovered_config.clone())
+            .expect("cold launch independently restored library");
         assert_eq!(
             recovered.library_settings().await.unwrap().library_root,
             destination.join("library").to_string_lossy()
@@ -16326,7 +16443,91 @@ mod tests {
                 .1,
             ambiguous_bytes
         );
-        assert!(recovered.state.read().await.mobile_sessions.is_empty());
+        {
+            let state = recovered.state.read().await;
+            assert!(state.mobile_sessions.is_empty());
+            assert!(state.pairings.is_empty());
+            for old in [&source_personal, &source_other] {
+                assert!(
+                    state.devices.iter().any(|device| {
+                        device.id == old.device.id && device.revoked_at.is_some()
+                    })
+                );
+                let members = state
+                    .vault_members
+                    .iter()
+                    .filter(|member| member.device_id == old.device.id)
+                    .collect::<Vec<_>>();
+                assert!(!members.is_empty());
+                assert!(members.iter().all(|member| member.revoked_at.is_some()));
+            }
+        }
+        let recovered_personal =
+            pair_phone(&recovered, personal.id, "Recovered personal phone").await;
+        let recovered_other = pair_phone(&recovered, other.id, "Recovered other phone").await;
+        // Check both the first cold launch and persistence after a second
+        // restart: old authorizations stay invalid while new scope survives.
+        for restarted in [false, true] {
+            for old in [&source_personal, &source_other] {
+                assert!(
+                    recovered
+                        .mobile_session_status(&old.bearer_token)
+                        .await
+                        .is_err()
+                );
+                assert!(recovered.mobile_assets(&old.bearer_token).await.is_err());
+                assert!(
+                    recovered
+                        .mobile_original_bytes(&old.bearer_token, normal.asset.id)
+                        .await
+                        .is_err()
+                );
+            }
+            assert!(
+                recovered
+                    .pair_mobile_device(MobilePairRequest {
+                        pairing_token: pending.pairing_token.clone(),
+                        device_name: "Pending source phone".into(),
+                        platform: "android".into(),
+                        vault_id: None,
+                        storage_profile: None,
+                    })
+                    .await
+                    .is_err()
+            );
+            for (paired, vault, own, content, foreign) in [
+                (
+                    &recovered_personal,
+                    personal.id,
+                    normal.asset.id,
+                    bytes.as_slice(),
+                    other_asset.asset.id,
+                ),
+                (
+                    &recovered_other,
+                    other.id,
+                    other_asset.asset.id,
+                    other_bytes.as_slice(),
+                    normal.asset.id,
+                ),
+            ] {
+                assert_scoped_reader(
+                    &recovered,
+                    &paired.bearer_token,
+                    vault,
+                    own,
+                    content,
+                    foreign,
+                )
+                .await;
+            }
+            if !restarted {
+                // Release the service before reopening the same recovered
+                // catalog; no source credentials are available to either run.
+                drop(recovered);
+                recovered = GalleryService::new(recovered_config.clone()).unwrap();
+            }
+        }
         assert_eq!(
             fs::read(backup_manifest_path(&export_root)).unwrap(),
             manifest_before
