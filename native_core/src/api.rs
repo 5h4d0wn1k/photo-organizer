@@ -998,7 +998,14 @@ async fn mobile_asset_preview(
     let (mime_type, bytes) = state.service.mobile_preview_bytes(&token, asset_id).await?;
     let content_type = HeaderValue::from_str(&mime_type)
         .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream"));
-    Ok(([(CONTENT_TYPE, content_type)], bytes).into_response())
+    Ok((
+        [
+            (CONTENT_TYPE, content_type),
+            (CACHE_CONTROL, HeaderValue::from_static("no-store")),
+        ],
+        bytes,
+    )
+        .into_response())
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1456,7 +1463,10 @@ async fn asset_preview(
     Query(query): Query<AssetPreviewQuery>,
 ) -> Result<Response, ApiError> {
     let (mime_type, bytes) = if query.full_size {
-        state.service.asset_original_bytes(asset_id).await?
+        state
+            .service
+            .asset_full_size_preview_bytes(asset_id)
+            .await?
     } else {
         state.service.asset_preview_bytes(asset_id).await?
     };
@@ -2119,8 +2129,8 @@ mod tests {
         let source = root.join("photo.jpg");
         // Deliberately no derived preview: this exercises the encrypted original
         // fallback that file-based desktop rendering cannot read.
-        let original = b"private-encrypted-photo-preview";
-        fs::write(&source, original).expect("source");
+        let original = crate::preview_privacy::gps_jpeg();
+        fs::write(&source, &original).expect("source");
         let service = std::sync::Arc::new(
             crate::GalleryService::new(crate::AppConfig {
                 library_root: library.clone(),
@@ -2168,7 +2178,9 @@ mod tests {
             .await
             .expect("listener");
         let address = listener.local_addr().expect("address");
-        let app = super::router(super::AppState { service });
+        let app = super::router(super::AppState {
+            service: service.clone(),
+        });
         let server = tokio::spawn(async move {
             axum::serve(
                 listener,
@@ -2240,6 +2252,90 @@ mod tests {
             detail.bytes().await.expect("detail bytes").as_ref(),
             original
         );
+        let place = service
+            .places()
+            .await
+            .into_iter()
+            .find(|place| place.asset_ids.contains(&imported.asset.id))
+            .expect("GPS place");
+        service
+            .correct_place(
+                place.id,
+                crate::domain::CorrectPlaceRequest {
+                    label: "Hidden".into(),
+                    latitude: None,
+                    longitude: None,
+                    hide_exact_gps: Some(true),
+                    reason: None,
+                },
+            )
+            .await
+            .expect("hide GPS");
+        // Even a legacy cache containing camera metadata must be sanitized.
+        fs::write(&thumbnail_path, &original).expect("legacy GPS thumbnail");
+        for suffix in ["preview", "preview?full_size=true"] {
+            let response = client
+                .get(format!(
+                    "http://{address}/assets/{}/{suffix}",
+                    imported.asset.id
+                ))
+                .send()
+                .await
+                .expect("hidden preview");
+            assert_eq!(response.status(), reqwest::StatusCode::OK);
+            assert_eq!(response.headers()["content-type"], "image/png");
+            assert_eq!(response.headers()["cache-control"], "no-store");
+            let bytes = response.bytes().await.unwrap();
+            let mut decoder = image::ImageReader::new(std::io::Cursor::new(&bytes))
+                .with_guessed_format()
+                .unwrap()
+                .into_decoder()
+                .unwrap();
+            use image::ImageDecoder;
+            assert!(decoder.exif_metadata().unwrap().is_none());
+            assert_eq!(decoder.dimensions(), (20, 40));
+        }
+        let pairing = service
+            .create_pairing_session(crate::domain::CreatePairingSessionRequest {
+                device_name: "Privacy phone".into(),
+                platform: "android".into(),
+                vault_id: None,
+            })
+            .await
+            .unwrap();
+        let paired = service
+            .pair_mobile_device(crate::domain::MobilePairRequest {
+                pairing_token: pairing.pairing_token,
+                device_name: "Privacy phone".into(),
+                platform: "android".into(),
+                vault_id: None,
+                storage_profile: None,
+            })
+            .await
+            .unwrap();
+        let mobile_url = format!(
+            "http://{address}/mobile/assets/{}/preview",
+            imported.asset.id
+        );
+        let denied = client.get(&mobile_url).send().await.unwrap();
+        assert_eq!(denied.status(), reqwest::StatusCode::BAD_REQUEST);
+        let allowed = client
+            .get(&mobile_url)
+            .bearer_auth(&paired.bearer_token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(allowed.status(), reqwest::StatusCode::OK);
+        assert_eq!(allowed.headers()["content-type"], "image/png");
+        assert_eq!(allowed.headers()["cache-control"], "no-store");
+        let bytes = allowed.bytes().await.unwrap();
+        use image::ImageDecoder;
+        let mut decoder = image::ImageReader::new(std::io::Cursor::new(&bytes))
+            .with_guessed_format()
+            .unwrap()
+            .into_decoder()
+            .unwrap();
+        assert!(decoder.exif_metadata().unwrap().is_none());
         let missing = client
             .get(format!(
                 "http://{address}/assets/{}/preview",

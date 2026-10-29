@@ -1802,7 +1802,22 @@ impl GalleryService {
         &self,
         asset_id: Uuid,
     ) -> Result<(String, Vec<u8>), ServiceError> {
-        let fallback_to_original = {
+        self.asset_preview_bytes_with_size(asset_id, false).await
+    }
+
+    pub async fn asset_full_size_preview_bytes(
+        &self,
+        asset_id: Uuid,
+    ) -> Result<(String, Vec<u8>), ServiceError> {
+        self.asset_preview_bytes_with_size(asset_id, true).await
+    }
+
+    async fn asset_preview_bytes_with_size(
+        &self,
+        asset_id: Uuid,
+        full_size: bool,
+    ) -> Result<(String, Vec<u8>), ServiceError> {
+        let (hidden_photo, allow_original, cached) = {
             let mut state = self.state.write().await;
             ensure_distributed_defaults(&mut state);
             refresh_blob_records(&self.config, &mut state);
@@ -1816,35 +1831,77 @@ impl GalleryService {
             if target_vault_for_asset(&state, asset_id).is_none() {
                 return Err(ServiceError::NotFound(format!("asset {asset_id}")));
             }
-            let variant = asset
-                .variants
-                .iter()
-                .find(|variant| variant.kind == VariantKind::Thumbnail)
-                .or_else(|| {
-                    asset
-                        .variants
-                        .iter()
-                        .find(|variant| variant.kind == VariantKind::Preview)
-                })
-                .cloned();
-            if let Some(variant) = variant {
-                let path = library_root.join(&variant.relative_path);
-                if path.is_file() {
-                    return fs::read(&path)
-                        .map(|bytes| (variant.mime_type, bytes))
-                        .map_err(|err| ServiceError::Io(err.to_string()));
+            let photo = matches!(asset.media_kind, MediaKind::Photo);
+            let hidden = photo
+                && asset
+                    .metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.geo.as_ref())
+                    .is_some_and(|geo| geo.exact_hidden);
+            let mut cached = None;
+            if !full_size {
+                let variant = asset
+                    .variants
+                    .iter()
+                    .find(|variant| variant.kind == VariantKind::Thumbnail)
+                    .or_else(|| {
+                        asset
+                            .variants
+                            .iter()
+                            .find(|variant| variant.kind == VariantKind::Preview)
+                    });
+                if let Some(variant) = variant {
+                    let path = library_root.join(&variant.relative_path);
+                    if path.is_file() {
+                        cached = Some((variant.mime_type.clone(), path));
+                    }
                 }
             }
             self.persist_locked_state(&state)?;
-            matches!(asset.media_kind, MediaKind::Photo)
+            (hidden, photo || full_size, cached)
         };
-        if fallback_to_original {
-            self.asset_original_bytes(asset_id).await
+        // Bound private rendering before reading/decrypting an original. A grid
+        // burst must not retain many full-resolution buffers while awaiting workers.
+        static PRIVATE_PREVIEW_SLOTS: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> =
+            std::sync::OnceLock::new();
+        let private_slot = if hidden_photo {
+            Some(
+                PRIVATE_PREVIEW_SLOTS
+                    .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(1)))
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .map_err(|_| {
+                        ServiceError::Storage("private preview renderer unavailable".into())
+                    })?,
+            )
         } else {
-            Err(ServiceError::NotFound(format!(
+            None
+        };
+        let (mime, bytes) = if let Some((mime, path)) = cached {
+            let bytes = fs::read(path).map_err(|error| ServiceError::Io(error.to_string()))?;
+            (mime, bytes)
+        } else if allow_original {
+            self.asset_original_bytes(asset_id).await?
+        } else {
+            return Err(ServiceError::NotFound(format!(
                 "preview for asset {asset_id}"
-            )))
+            )));
+        };
+        if !hidden_photo {
+            return Ok((mime, bytes));
         }
+        // Only a newly rendered derivative crosses the automatic preview boundary.
+        // Original/download APIs remain explicit byte-preserving operations.
+        let private = tokio::task::spawn_blocking(move || {
+            // Keep the permit until decoding ends even if the HTTP request is cancelled.
+            let _slot = private_slot;
+            crate::preview_privacy::sanitize_hidden_photo(&bytes)
+        })
+        .await
+        .map_err(|_| ServiceError::Storage("private preview rendering failed".into()))?
+        .map_err(ServiceError::Invalid)?;
+        Ok(("image/png".into(), private))
     }
 
     pub async fn file_tree(
@@ -4325,12 +4382,24 @@ impl GalleryService {
         let library_root = PathBuf::from(library_root);
         for asset in &mut state.assets {
             let source_path = asset_file_path(asset, &library_root);
+            let previously_hidden_geo = asset
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.geo.as_ref())
+                .filter(|geo| geo.exact_hidden)
+                .cloned();
             let extracted = metadata::extract_media_metadata(&source_path, &[], asset.captured_at);
             asset.captured_at = extracted.captured_at;
-            if asset.place_hint.is_none() {
+            if previously_hidden_geo.is_none() && asset.place_hint.is_none() {
                 asset.place_hint = metadata::coarse_place_label(&extracted);
             }
-            asset.metadata = Some(extracted.into_asset_metadata(asset.id));
+            let mut rebuilt_metadata = extracted.into_asset_metadata(asset.id);
+            preserve_hidden_geo(
+                previously_hidden_geo,
+                &mut asset.place_hint,
+                &mut rebuilt_metadata.geo,
+            );
+            asset.metadata = Some(rebuilt_metadata);
         }
         refresh_derived_views(&mut state);
         let job = completed_job(
@@ -5245,6 +5314,7 @@ impl GalleryService {
         }
 
         let mut state = self.state.write().await;
+        let hide_coordinates_in_history = request.hide_exact_gps.unwrap_or(true);
         let (asset_ids, correction) = {
             let place = state
                 .places
@@ -5253,8 +5323,16 @@ impl GalleryService {
                 .ok_or_else(|| ServiceError::NotFound(format!("place {place_id}")))?;
             let previous = json!({
                 "label": place.label,
-                "centroid_latitude": place.centroid_latitude,
-                "centroid_longitude": place.centroid_longitude,
+                "centroid_latitude": if hide_coordinates_in_history {
+                    None
+                } else {
+                    place.centroid_latitude
+                },
+                "centroid_longitude": if hide_coordinates_in_history {
+                    None
+                } else {
+                    place.centroid_longitude
+                },
             });
             place.label = request.label.trim().to_string();
             place.centroid_latitude = request.latitude.or(place.centroid_latitude);
@@ -5268,8 +5346,8 @@ impl GalleryService {
                 previous_json: previous,
                 applied_json: json!({
                     "label": request.label.trim(),
-                    "latitude": request.latitude,
-                    "longitude": request.longitude,
+                    "latitude": if hide_coordinates_in_history { None } else { request.latitude },
+                    "longitude": if hide_coordinates_in_history { None } else { request.longitude },
                     "hide_exact_gps": request.hide_exact_gps,
                     "reason": request.reason,
                 }),
@@ -5277,6 +5355,30 @@ impl GalleryService {
             };
             (place.asset_ids.clone(), correction)
         };
+        if hide_coordinates_in_history {
+            for entry in state.corrections.iter_mut().filter(|entry| {
+                entry.kind == CorrectionKind::CorrectPlace && entry.place_id == Some(place_id)
+            }) {
+                redact_json_coordinate_fields(
+                    &mut entry.previous_json,
+                    &[
+                        "latitude",
+                        "longitude",
+                        "centroid_latitude",
+                        "centroid_longitude",
+                    ],
+                );
+                redact_json_coordinate_fields(
+                    &mut entry.applied_json,
+                    &[
+                        "latitude",
+                        "longitude",
+                        "centroid_latitude",
+                        "centroid_longitude",
+                    ],
+                );
+            }
+        }
         state.corrections.push(correction);
 
         for asset in &mut state.assets {
@@ -12153,15 +12255,80 @@ fn safely_move_candidate(
 
 fn refresh_derived_views(state: &mut LibraryState) {
     refresh_asset_availability(state);
+    // Older versions retained automatically generated GPS labels after hiding.
+    // Drop only those derived labels; explicit user place names remain usable.
+    for asset in &mut state.assets {
+        if let Some(geo) = asset
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.geo.as_ref())
+            && geo.exact_hidden
+            && asset.place_hint.as_deref() == Some(&gps_place_hint(geo.latitude, geo.longitude))
+        {
+            asset.place_hint = None;
+        }
+    }
     state.places = derive_places(&state.assets, &state.places);
     state.events = derive_events(&state.assets, &state.places, &state.events);
+}
+
+fn gps_place_hint(latitude: f64, longitude: f64) -> String {
+    format!(
+        "GPS {:.2}, {:.2}",
+        (latitude * 100.0).round() / 100.0,
+        (longitude * 100.0).round() / 100.0,
+    )
+}
+
+fn redact_json_coordinate_fields(value: &mut serde_json::Value, fields: &[&str]) {
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+    for field in fields {
+        if object.contains_key(*field) {
+            object.insert((*field).to_string(), serde_json::Value::Null);
+        }
+    }
+}
+
+fn preserve_hidden_geo(
+    previously_hidden_geo: Option<crate::domain::GeoTag>,
+    place_hint: &mut Option<String>,
+    rebuilt_geo: &mut Option<crate::domain::GeoTag>,
+) {
+    let Some(previously_hidden_geo) = previously_hidden_geo else {
+        return;
+    };
+
+    if place_hint.as_deref()
+        == Some(&gps_place_hint(
+            previously_hidden_geo.latitude,
+            previously_hidden_geo.longitude,
+        ))
+    {
+        *place_hint = None;
+    }
+
+    match rebuilt_geo {
+        Some(geo) => geo.exact_hidden = true,
+        None => *rebuilt_geo = Some(previously_hidden_geo),
+    }
 }
 
 fn refresh_missing_derived_views(state: &mut LibraryState) {
     if state.assets.is_empty() {
         return;
     }
-    if state.places.is_empty() || state.events.is_empty() {
+    if state.places.is_empty()
+        || state.events.is_empty()
+        || state.assets.iter().any(|asset| {
+            asset
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.geo.as_ref())
+                .is_some_and(|geo| geo.exact_hidden)
+        })
+    {
         refresh_derived_views(state);
     }
 }
@@ -12226,7 +12393,12 @@ fn derive_places(assets: &[crate::domain::Asset], existing: &[PlaceCluster]) -> 
                 .entry(place_hint.trim().to_string())
                 .or_default()
                 .push(asset.id);
-            if let Some(geo) = asset.metadata.as_ref().and_then(|value| value.geo.as_ref()) {
+            if let Some(geo) = asset
+                .metadata
+                .as_ref()
+                .and_then(|value| value.geo.as_ref())
+                .and_then(crate::domain::GeoTag::visible)
+            {
                 coords
                     .entry(place_hint.trim().to_string())
                     .or_default()
@@ -12332,13 +12504,13 @@ mod tests {
         config::AppConfig,
         domain::{
             AssetAvailabilityState, BlobChunk, BlobRecord, BlobReplica, CorrectDateRequest,
-            CorrectPlaceRequest, CreateAlbumRequest, CreateDeviceRequest, CreateFileFolderRequest,
-            CreateManualPersonRequest, CreatePairingSessionRequest, CreateSmartFolderRequest,
-            CreateVaultRequest, DeviceRole, DeviceStorageProfile, DeviceTrustLevel,
-            EncryptionActivationRequest, EnrollDeviceRequest, EntitlementCacheStatus,
-            EntitlementEffectiveStatus, EntitlementLimits, EntitlementRelayPriority,
-            EntitlementTier, FileOrganizationHints, ImportAssetRequest, ImportMode,
-            ImportSourceKind, MediaKind, MetadataSource, MobilePairRequest,
+            CorrectPlaceRequest, CorrectionKind, CreateAlbumRequest, CreateDeviceRequest,
+            CreateFileFolderRequest, CreateManualPersonRequest, CreatePairingSessionRequest,
+            CreateSmartFolderRequest, CreateVaultRequest, DeviceRole, DeviceStorageProfile,
+            DeviceTrustLevel, EncryptionActivationRequest, EnrollDeviceRequest,
+            EntitlementCacheStatus, EntitlementEffectiveStatus, EntitlementLimits,
+            EntitlementRelayPriority, EntitlementTier, FileOrganizationHints, ImportAssetRequest,
+            ImportMode, ImportSourceKind, MediaKind, MetadataSource, MobilePairRequest,
             MobileReplicaChunkReport, MobileReplicaReportRequest,
             MobileStorageProfileUpdateRequest, MobileUpload, MobileUploadRequest,
             MobileUploadStatus, ModelImportRequest, ModelInstallRequest, MoveFileEntryRequest,
@@ -12701,6 +12873,162 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hidden_gps_previews_strip_embedded_metadata_without_changing_originals() {
+        use crate::domain::{OriginalStoragePolicy, VariantKind};
+        use image::ImageDecoder;
+        let root = temp_root("hidden-gps-previews");
+        let library = root.join("library");
+        let source = root.join("camera.jpg");
+        let original = crate::preview_privacy::gps_jpeg();
+        fs::write(&source, &original).unwrap();
+        let service = GalleryService::new(AppConfig {
+            runtime_root: root.join("runtime"),
+            library_root: library.clone(),
+            ..AppConfig::default()
+        })
+        .unwrap();
+        service
+            .update_library_settings(UpdateLibrarySettingsRequest {
+                library_root: library.to_string_lossy().into_owned(),
+                default_import_mode: ImportMode::Copy,
+                original_storage_policy: Some(OriginalStoragePolicy::EncryptedOnly),
+            })
+            .await
+            .unwrap();
+        let imported = service
+            .import_asset(ImportAssetRequest {
+                source_path: source.to_string_lossy().into_owned(),
+                original_filename: "camera.jpg".into(),
+                media_kind: MediaKind::Photo,
+                mime_type: "image/jpeg".into(),
+                bytes: original.len() as u64,
+                content_hash: None,
+                captured_at: None,
+                place_hint: None,
+                import_mode: Some(ImportMode::Copy),
+            })
+            .await
+            .unwrap();
+        assert!(
+            service
+                .state
+                .read()
+                .await
+                .assets
+                .iter()
+                .find(|asset| asset.id == imported.asset.id)
+                .unwrap()
+                .metadata
+                .as_ref()
+                .unwrap()
+                .geo
+                .is_some(),
+            "fixture must contain real camera GPS"
+        );
+        let place_id = service
+            .places()
+            .await
+            .into_iter()
+            .find(|place| place.asset_ids.contains(&imported.asset.id))
+            .expect("GPS asset must have a place")
+            .id;
+        service
+            .correct_place(
+                place_id,
+                crate::domain::CorrectPlaceRequest {
+                    label: "Private place".into(),
+                    latitude: None,
+                    longitude: None,
+                    hide_exact_gps: Some(true),
+                    reason: None,
+                },
+            )
+            .await
+            .unwrap();
+        let thumbnail = service
+            .state
+            .read()
+            .await
+            .assets
+            .iter()
+            .find(|asset| asset.id == imported.asset.id)
+            .unwrap()
+            .variants
+            .iter()
+            .find(|variant| variant.kind == VariantKind::Thumbnail)
+            .unwrap()
+            .relative_path
+            .clone();
+        assert!(
+            !library.join(&thumbnail).exists(),
+            "exercise encrypted original fallback first"
+        );
+        for (mime, bytes) in [
+            service
+                .asset_preview_bytes(imported.asset.id)
+                .await
+                .unwrap(),
+            service
+                .asset_full_size_preview_bytes(imported.asset.id)
+                .await
+                .unwrap(),
+        ] {
+            assert_eq!(mime, "image/png");
+            let mut decoder = image::ImageReader::new(std::io::Cursor::new(&bytes))
+                .with_guessed_format()
+                .unwrap()
+                .into_decoder()
+                .unwrap();
+            assert!(decoder.exif_metadata().unwrap().is_none());
+            assert!(decoder.xmp_metadata().unwrap().is_none());
+            assert_eq!(decoder.dimensions(), (20, 40));
+            assert_ne!(bytes, original);
+        }
+        assert!(
+            !library.join(&thumbnail).exists(),
+            "automatic private rendering writes no plaintext cache"
+        );
+        // Imported/legacy cached thumbnails may themselves carry original EXIF.
+        let cached = library.join(&thumbnail);
+        fs::create_dir_all(cached.parent().unwrap()).unwrap();
+        fs::write(&cached, &original).unwrap();
+        let (mime, bytes) = service
+            .asset_preview_bytes(imported.asset.id)
+            .await
+            .unwrap();
+        assert_eq!(mime, "image/png");
+        let mut decoder = image::ImageReader::new(std::io::Cursor::new(&bytes))
+            .with_guessed_format()
+            .unwrap()
+            .into_decoder()
+            .unwrap();
+        assert!(decoder.exif_metadata().unwrap().is_none());
+        assert_eq!(
+            fs::read(&cached).unwrap(),
+            original,
+            "legacy source cache is not rewritten"
+        );
+        fs::write(&cached, b"invalid private preview").unwrap();
+        assert!(
+            service
+                .asset_preview_bytes(imported.asset.id)
+                .await
+                .is_err(),
+            "decode failure must not fall back to raw metadata-bearing bytes"
+        );
+        assert_eq!(
+            service
+                .asset_original_bytes(imported.asset.id)
+                .await
+                .unwrap()
+                .1,
+            original,
+            "explicit original download preserves camera bytes"
+        );
+        assert_eq!(fs::read(&source).unwrap(), original);
+    }
+
+    #[tokio::test]
     async fn support_bundle_exports_redacted_local_diagnostics() {
         let runtime_root = temp_root("support-bundle");
         let sensitive_library_root = runtime_root.join("library-alex-private-tax-photos");
@@ -12735,6 +13063,39 @@ mod tests {
             .await
             .expect("entitlement");
 
+        let source = runtime_root.join("hidden-location.jpg");
+        fs::write(&source, b"photo with hidden exact location").expect("write source");
+        let imported = service
+            .import_asset(ImportAssetRequest {
+                source_path: source.to_string_lossy().to_string(),
+                original_filename: "hidden-location.jpg".to_string(),
+                media_kind: MediaKind::Photo,
+                mime_type: "image/jpeg".to_string(),
+                bytes: 32,
+                content_hash: None,
+                captured_at: Some(Utc::now()),
+                place_hint: None,
+                import_mode: Some(ImportMode::Copy),
+            })
+            .await
+            .expect("import location asset");
+        {
+            let mut state = service.state.write().await;
+            let metadata = state
+                .assets
+                .iter_mut()
+                .find(|asset| asset.id == imported.asset.id)
+                .and_then(|asset| asset.metadata.as_mut())
+                .expect("imported asset metadata");
+            metadata.geo = Some(crate::domain::GeoTag {
+                latitude: 43.1234567,
+                longitude: -79.7654321,
+                altitude_meters: None,
+                source: MetadataSource::Embedded,
+                exact_hidden: true,
+            });
+        }
+
         let result = service
             .export_support_bundle(SupportBundleExportRequest {
                 export_root: support_root.to_string_lossy().to_string(),
@@ -12757,6 +13118,8 @@ mod tests {
         assert!(!bundle_text.contains(sensitive_library_root.to_string_lossy().as_ref()));
         assert!(!bundle_text.contains("library-alex-private-tax-photos"));
         assert!(!bundle_text.contains("\"database_path\":"));
+        assert!(!bundle_text.contains("43.1234567"));
+        assert!(!bundle_text.contains("-79.7654321"));
         assert!(bundle_text.contains("private_data_excluded"));
         assert!(bundle_text.contains("account_identifier_redacted"));
         assert!(bundle_text.contains("release_readiness"));
@@ -12897,7 +13260,7 @@ mod tests {
         );
         assert!(service.mobile_session_status("wrong-token").await.is_err());
 
-        let bytes = b"mobile original bytes".to_vec();
+        let bytes = crate::preview_privacy::gps_jpeg();
         let reserved = service
             .reserve_mobile_upload(
                 &paired.bearer_token,
@@ -12943,6 +13306,31 @@ mod tests {
             .expect("receive duplicate");
         assert_eq!(duplicate.asset_id, Some(asset_id));
 
+        {
+            let mut state = service.state.write().await;
+            let metadata = state
+                .assets
+                .iter_mut()
+                .find(|asset| asset.id == asset_id)
+                .and_then(|asset| asset.metadata.as_mut())
+                .expect("uploaded asset metadata");
+            metadata.geo = Some(crate::domain::GeoTag {
+                latitude: 43.1234567,
+                longitude: -79.7654321,
+                altitude_meters: None,
+                source: MetadataSource::Embedded,
+                exact_hidden: true,
+            });
+        }
+        let metadata = service
+            .asset_metadata(asset_id)
+            .await
+            .expect("hidden asset metadata");
+        assert_eq!(
+            serde_json::to_value(metadata).expect("serialize asset metadata")["geo"],
+            serde_json::Value::Null
+        );
+
         let mobile_tree = service
             .mobile_file_tree(&paired.bearer_token, false)
             .await
@@ -12981,6 +13369,11 @@ mod tests {
         assert!(workspace.capabilities.can_upload_camera_roll);
         assert!(workspace.capabilities.can_download_originals);
         assert!(!workspace.capabilities.can_manage_storage);
+        let workspace_json = serde_json::to_value(&workspace).expect("serialize workspace");
+        assert_eq!(
+            workspace_json["timeline"]["buckets"][0]["assets"][0]["metadata"]["geo"],
+            serde_json::Value::Null
+        );
 
         let search = service
             .mobile_search(
@@ -13009,6 +13402,11 @@ mod tests {
             .expect("mobile search");
         assert_eq!(search.assets.len(), 1);
         assert_eq!(search.assets[0].id, asset_id);
+        assert_eq!(
+            serde_json::to_value(&search).expect("serialize mobile search")["assets"][0]["metadata"]
+                ["geo"],
+            serde_json::Value::Null
+        );
 
         let device_search = service
             .mobile_search(
@@ -13068,8 +13466,16 @@ mod tests {
             .mobile_preview_bytes(&paired.bearer_token, asset_id)
             .await
             .expect("download preview");
-        assert_eq!(preview_mime_type, "image/jpeg");
-        assert_eq!(preview, bytes);
+        assert_eq!(preview_mime_type, "image/png");
+        assert_ne!(preview, bytes);
+        use image::ImageDecoder;
+        let mut decoder = image::ImageReader::new(std::io::Cursor::new(&preview))
+            .with_guessed_format()
+            .unwrap()
+            .into_decoder()
+            .unwrap();
+        assert!(decoder.exif_metadata().unwrap().is_none());
+        assert_eq!(decoder.dimensions(), (20, 40));
 
         let reopened = GalleryService::new(config).expect("reopen service");
         let active_sessions = reopened
@@ -17271,6 +17677,23 @@ mod tests {
         ));
         drop(state);
 
+        if simulate_interruption {
+            // A stale or regenerated preview must not bypass unresolved ownership.
+            let cached = library_root.join(&imported.asset.variants[0].relative_path);
+            fs::create_dir_all(cached.parent().unwrap()).unwrap();
+            fs::write(&cached, b"legacy cached private thumbnail").unwrap();
+            assert!(matches!(
+                restarted.asset_preview_bytes(imported.asset.id).await,
+                Err(super::ServiceError::NotFound(_))
+            ));
+            assert!(matches!(
+                restarted
+                    .asset_full_size_preview_bytes(imported.asset.id)
+                    .await,
+                Err(super::ServiceError::NotFound(_))
+            ));
+        }
+
         if fault.is_none() {
             let verification = restarted
                 .verify_backup(crate::domain::BackupVerifyRequest { export_root: None })
@@ -19848,15 +20271,16 @@ mod tests {
         let source_root = runtime_root.join("source");
         fs::create_dir_all(&source_root).expect("source dir");
         fs::write(source_root.join("a.jpg"), b"image-a").expect("write file");
+        fs::write(source_root.join("b.jpg"), b"image-b").expect("write second file");
         let corrected_at = chrono::DateTime::parse_from_rfc3339("2024-02-03T04:05:06Z")
             .expect("date")
             .with_timezone(&Utc);
 
-        let service = GalleryService::new(AppConfig {
+        let config = AppConfig {
             runtime_root: runtime_root.to_path_buf(),
             ..AppConfig::default()
-        })
-        .expect("service");
+        };
+        let service = GalleryService::new(config.clone()).expect("service");
         service
             .update_library_settings(UpdateLibrarySettingsRequest {
                 library_root: library_root.to_string_lossy().to_string(),
@@ -19870,7 +20294,7 @@ mod tests {
                 target_vault_id: None,
                 source_path: source_root.to_string_lossy().to_string(),
                 source_kind: ImportSourceKind::Folder,
-                recursive: false,
+                recursive: true,
                 import_mode: Some(ImportMode::Reference),
                 add_as_watch_folder: false,
                 place_hint: Some("Old place".to_string()),
@@ -19895,15 +20319,35 @@ mod tests {
             .await
             .expect("correct date");
         assert_eq!(metadata.captured_at_source, MetadataSource::Manual);
-        assert_eq!(
-            service.timeline().await.buckets[0].assets[0].captured_at,
-            corrected_at
+        assert!(
+            service
+                .timeline()
+                .await
+                .buckets
+                .iter()
+                .flat_map(|bucket| &bucket.assets)
+                .any(|asset| asset.id == asset_id && asset.captured_at == corrected_at)
         );
 
         let place_id = service.places().await[0].id;
-        let place = service
+        let visible_place = service
             .correct_place(
                 place_id,
+                CorrectPlaceRequest {
+                    label: "Old place".to_string(),
+                    latitude: Some(12.34),
+                    longitude: Some(56.78),
+                    hide_exact_gps: Some(false),
+                    reason: None,
+                },
+            )
+            .await
+            .expect("set visible place coordinates");
+        assert_eq!(visible_place.centroid_latitude, Some(12.34));
+        assert_eq!(visible_place.centroid_longitude, Some(56.78));
+        let place = service
+            .correct_place(
+                visible_place.id,
                 CorrectPlaceRequest {
                     label: "Home".to_string(),
                     latitude: Some(12.34),
@@ -19915,7 +20359,177 @@ mod tests {
             .await
             .expect("correct place");
         assert_eq!(place.label, "Home");
+        assert_eq!(place.asset_ids.len(), 2);
+        assert_eq!(place.centroid_latitude, None);
+        assert_eq!(place.centroid_longitude, None);
+        let correction_history = service.state.read().await.corrections.clone();
+        let place_corrections = correction_history
+            .iter()
+            .filter(|entry| {
+                entry.kind == CorrectionKind::CorrectPlace && entry.place_id == Some(place.id)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(place_corrections.len(), 2);
+        for correction in place_corrections {
+            assert!(correction.applied_json["latitude"].is_null());
+            assert!(correction.applied_json["longitude"].is_null());
+            assert!(correction.previous_json["centroid_latitude"].is_null());
+            assert!(correction.previous_json["centroid_longitude"].is_null());
+        }
         assert_eq!(service.places().await[0].label, "Home");
+        let assets = service
+            .place_assets(place.id)
+            .await
+            .expect("hidden-place assets");
+        assert_eq!(assets.len(), 2);
+        for asset in &assets {
+            assert_eq!(
+                serde_json::to_value(asset).expect("serialize asset")["metadata"]["geo"],
+                serde_json::Value::Null
+            );
+        }
+
+        let hidden_search = service
+            .search(SearchQuery {
+                text: None,
+                people: None,
+                places: Some("Home".to_string()),
+                events: None,
+                workspace: None,
+                client: None,
+                project: None,
+                topic: None,
+                source_folder: None,
+                device: None,
+                media_kind: None,
+                tags: None,
+                favorite: None,
+                from_date: None,
+                to_date: None,
+                include_archived: false,
+                limit: None,
+            })
+            .await;
+        assert_eq!(hidden_search.assets.len(), 2);
+        for asset in &hidden_search.assets {
+            assert_eq!(
+                serde_json::to_value(asset).expect("serialize search asset")["metadata"]["geo"],
+                serde_json::Value::Null
+            );
+        }
+        let serialized_timeline =
+            serde_json::to_value(service.timeline().await).expect("serialize timeline projection");
+        assert!(
+            serialized_timeline["buckets"]
+                .as_array()
+                .expect("timeline buckets")
+                .iter()
+                .flat_map(|bucket| bucket["assets"].as_array().expect("bucket assets"))
+                .all(|asset| asset["metadata"]["geo"].is_null())
+        );
+
+        let previous_hidden_geo = assets[0]
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.geo.as_ref())
+            .expect("hidden local geo remains in memory")
+            .clone();
+        let mut newly_extracted_geo = previous_hidden_geo.clone();
+        newly_extracted_geo.latitude = 13.34;
+        newly_extracted_geo.exact_hidden = false;
+        let mut stale_gps_label = Some(super::gps_place_hint(
+            previous_hidden_geo.latitude,
+            previous_hidden_geo.longitude,
+        ));
+        let mut rebuilt_geo = Some(newly_extracted_geo);
+        super::preserve_hidden_geo(
+            Some(previous_hidden_geo),
+            &mut stale_gps_label,
+            &mut rebuilt_geo,
+        );
+        assert_eq!(stale_gps_label, None);
+        assert_eq!(rebuilt_geo.as_ref().map(|geo| geo.latitude), Some(13.34));
+        assert!(rebuilt_geo.is_some_and(|geo| geo.exact_hidden));
+
+        service.rebuild_metadata().await.expect("rebuild metadata");
+        let place_after_rebuild = service
+            .places()
+            .await
+            .into_iter()
+            .find(|place| place.label == "Home")
+            .expect("place after metadata rebuild");
+        assert_eq!(place_after_rebuild.centroid_latitude, None);
+        assert_eq!(place_after_rebuild.centroid_longitude, None);
+        let assets_after_rebuild = service
+            .place_assets(place_after_rebuild.id)
+            .await
+            .expect("assets after metadata rebuild");
+        assert_eq!(assets_after_rebuild.len(), 2);
+        for asset in &assets_after_rebuild {
+            assert_eq!(
+                serde_json::to_value(asset).expect("serialize rebuilt asset")["metadata"]["geo"],
+                serde_json::Value::Null
+            );
+        }
+
+        let restarted = GalleryService::new(config).expect("restart service");
+        let place_after_restart = restarted
+            .places()
+            .await
+            .into_iter()
+            .find(|place| place.label == "Home")
+            .expect("persisted place");
+        assert_eq!(place_after_restart.centroid_latitude, None);
+        assert_eq!(place_after_restart.centroid_longitude, None);
+        let assets_after_restart = restarted
+            .place_assets(place_after_restart.id)
+            .await
+            .expect("persisted hidden-place assets");
+        assert_eq!(assets_after_restart.len(), 2);
+        for asset in &assets_after_restart {
+            assert_eq!(
+                serde_json::to_value(asset).expect("serialize persisted asset")["metadata"]["geo"],
+                serde_json::Value::Null
+            );
+        }
+
+        restarted
+            .rebuild_metadata()
+            .await
+            .expect("rebuild after restart");
+        let place_after_restart_rebuild = restarted
+            .places()
+            .await
+            .into_iter()
+            .find(|place| place.label == "Home")
+            .expect("hidden place after post-restart rebuild");
+        assert_eq!(place_after_restart_rebuild.centroid_latitude, None);
+        assert_eq!(place_after_restart_rebuild.centroid_longitude, None);
+
+        let visible_place = restarted
+            .correct_place(
+                place_after_restart_rebuild.id,
+                CorrectPlaceRequest {
+                    label: "Home".to_string(),
+                    latitude: None,
+                    longitude: None,
+                    hide_exact_gps: Some(false),
+                    reason: Some("show exact GPS again".to_string()),
+                },
+            )
+            .await
+            .expect("unhide exact GPS");
+        assert!(visible_place.centroid_latitude.is_some());
+        assert!(visible_place.centroid_longitude.is_some());
+        let visible_assets = restarted
+            .place_assets(visible_place.id)
+            .await
+            .expect("assets after unhide");
+        for asset in &visible_assets {
+            let serialized = serde_json::to_value(asset).expect("serialize visible asset");
+            assert!(serialized["metadata"]["geo"]["latitude"].is_number());
+            assert!(serialized["metadata"]["geo"]["longitude"].is_number());
+        }
     }
 
     #[tokio::test]
