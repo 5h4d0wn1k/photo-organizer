@@ -4,6 +4,7 @@ version = "0.0.1"
 edition = "2024"
 
 [dependencies]
+argon2 = { version = "0.6", default-features = false, features = ["alloc", "zeroize"] }
 axum = { version = "0.8", features = ["macros"] }
 cap-std = "4"
 fs2 = "0.4"
@@ -26,6 +27,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["serde", "v4"] }
 zeroize = "1"
 image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "webp", "gif", "pnm"] }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }

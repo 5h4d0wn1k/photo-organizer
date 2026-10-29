@@ -1,3 +1,5 @@
+import 'dart:convert';
+
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
 
@@ -38,6 +40,7 @@ class SettingsScreen extends StatefulWidget {
   final Future<BackupExportResult> Function({
     required String exportRoot,
     bool includeModels,
+    String? recoveryPassphrase,
   })
   onExportBackup;
   final Future<SupportBundleExportResult> Function({
@@ -54,6 +57,7 @@ class SettingsScreen extends StatefulWidget {
     required String exportRoot,
     required String restoreRoot,
     bool confirmed,
+    String? recoveryPassphrase,
   })
   onRunRestoreBackup;
   final Future<void> Function(LibrarySettingsDraft draft) onSaveSettings;
@@ -70,6 +74,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
   late final TextEditingController _watchFolderController;
   late final TextEditingController _backupRootController;
   late final TextEditingController _restoreRootController;
+  final _backupPassphraseController = TextEditingController();
+  final _backupPassphraseConfirmationController = TextEditingController();
+  final _restorePassphraseController = TextEditingController();
   late final TextEditingController _modelIdController;
   late final TextEditingController _modelPathController;
   late final TextEditingController _modelHashController;
@@ -121,6 +128,12 @@ class _SettingsScreenState extends State<SettingsScreen> {
     _watchFolderController.dispose();
     _backupRootController.dispose();
     _restoreRootController.dispose();
+    _backupPassphraseController.clear();
+    _backupPassphraseConfirmationController.clear();
+    _restorePassphraseController.clear();
+    _backupPassphraseController.dispose();
+    _backupPassphraseConfirmationController.dispose();
+    _restorePassphraseController.dispose();
     _modelIdController.dispose();
     _modelPathController.dispose();
     _modelHashController.dispose();
@@ -326,9 +339,26 @@ class _SettingsScreenState extends State<SettingsScreen> {
       return;
     }
 
+    final passphrase = _backupPassphraseController.text;
+    final confirmation = _backupPassphraseConfirmationController.text;
+    if (passphrase != confirmation) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('The recovery passphrases do not match.')),
+      );
+      return;
+    }
+    if (passphrase.isNotEmpty && !_validRecoveryPassphrase(passphrase)) {
+      _showPassphraseLengthError();
+      return;
+    }
+    _backupPassphraseController.clear();
+    _backupPassphraseConfirmationController.clear();
     setState(() => _exportingBackup = true);
     try {
-      final result = await widget.onExportBackup(exportRoot: exportRoot);
+      final result = await widget.onExportBackup(
+        exportRoot: exportRoot,
+        recoveryPassphrase: passphrase.isEmpty ? null : passphrase,
+      );
       if (!mounted) {
         return;
       }
@@ -342,13 +372,17 @@ class _SettingsScreenState extends State<SettingsScreen> {
           ),
         ),
       );
-    } catch (error) {
+    } catch (_) {
       if (!mounted) {
         return;
       }
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text('$error')));
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+            'Backup export failed. Check the export path and recovery passphrase.',
+          ),
+        ),
+      );
     } finally {
       if (mounted) {
         setState(() => _exportingBackup = false);
@@ -451,12 +485,28 @@ class _SettingsScreenState extends State<SettingsScreen> {
       return;
     }
 
+    final passphrase = _restorePassphraseController.text;
+    if ((_restorePlan?.requiresRecoveryPassphrase ?? false) &&
+        passphrase.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Enter the recovery passphrase for this backup.'),
+        ),
+      );
+      return;
+    }
+    if (passphrase.isNotEmpty && !_validRecoveryPassphrase(passphrase)) {
+      _showPassphraseLengthError();
+      return;
+    }
+    _restorePassphraseController.clear();
     setState(() => _runningRestore = true);
     try {
       final result = await widget.onRunRestoreBackup(
         exportRoot: exportRoot,
         restoreRoot: restoreRoot,
         confirmed: true,
+        recoveryPassphrase: passphrase.isEmpty ? null : passphrase,
       );
       if (!mounted) {
         return;
@@ -465,24 +515,60 @@ class _SettingsScreenState extends State<SettingsScreen> {
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
           content: Text(
-            result.ok
-                ? 'Restore staged for review.'
-                : 'Restore finished with warnings.',
+            result.ok ? result.detail : 'Restore finished with warnings.',
           ),
         ),
       );
-    } catch (error) {
+    } catch (_) {
       if (!mounted) {
         return;
       }
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text('$error')));
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+            'Restore failed. Check the backup, destination path and recovery passphrase.',
+          ),
+        ),
+      );
     } finally {
       if (mounted) {
         setState(() => _runningRestore = false);
       }
     }
+  }
+
+  bool _validRecoveryPassphrase(String passphrase) {
+    final length = utf8.encode(passphrase).length;
+    return length >= 16 && length <= 1024;
+  }
+
+  void _showPassphraseLengthError() {
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(
+        content: Text('Use a recovery passphrase of 16 to 1024 UTF-8 bytes.'),
+      ),
+    );
+  }
+
+  Widget _recoveryPassphraseField({
+    required String label,
+    required TextEditingController controller,
+    String? helperText,
+  }) {
+    return TextField(
+      controller: controller,
+      obscureText: true,
+      autocorrect: false,
+      enableSuggestions: false,
+      enableIMEPersonalizedLearning: false,
+      keyboardType: TextInputType.visiblePassword,
+      decoration: InputDecoration(
+        labelText: label,
+        border: const OutlineInputBorder(),
+        helperText: helperText,
+        helperMaxLines: 3,
+      ),
+    );
   }
 
   @override
@@ -596,7 +682,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 ),
                 const SizedBox(height: 12),
                 const Text(
-                  'This checks the catalog database, managed originals, vault chunks, and installed model files for backup readiness. A restorable backup preserves the full catalog, including exact coordinates hidden from app features, and may include originals with GPS metadata. Keep the destination private. If database encryption is off, the catalog copy is not protected at rest. Restore stages into a separate folder without modifying the active library.',
+                  'This checks the catalog database, managed originals, vault chunks, and installed model files for backup readiness. A restorable backup preserves the full catalog, including exact coordinates hidden from app features, and may include originals with GPS metadata. Keep the destination private. If database encryption is off, the catalog copy is not protected at rest. Use a recovery passphrase to protect the keys needed to restore encrypted media on another device. Keep it somewhere safe: a forgotten passphrase cannot be recovered. Restore uses a separate empty folder without modifying the active library and verifies recovery before reporting success.',
                 ),
                 const SizedBox(height: 16),
                 TextField(
@@ -609,6 +695,18 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   ),
                 ),
                 const SizedBox(height: 12),
+                _recoveryPassphraseField(
+                  label: 'Backup recovery passphrase',
+                  controller: _backupPassphraseController,
+                  helperText:
+                      'Use at least 16 UTF-8 bytes. Never reuse an account password.',
+                ),
+                const SizedBox(height: 12),
+                _recoveryPassphraseField(
+                  label: 'Confirm backup recovery passphrase',
+                  controller: _backupPassphraseConfirmationController,
+                ),
+                const SizedBox(height: 12),
                 TextField(
                   controller: _restoreRootController,
                   decoration: const InputDecoration(
@@ -617,6 +715,13 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     helperText:
                         'Use an empty folder outside the active library/runtime.',
                   ),
+                ),
+                const SizedBox(height: 12),
+                _recoveryPassphraseField(
+                  label: 'Restore recovery passphrase',
+                  controller: _restorePassphraseController,
+                  helperText:
+                      'Enter the passphrase used when this backup was exported.',
                 ),
                 const SizedBox(height: 12),
                 Wrap(
@@ -641,7 +746,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                               child: CircularProgressIndicator(strokeWidth: 2),
                             )
                           : const Icon(Icons.backup_outlined),
-                      label: const Text('Export restorable backup'),
+                      label: const Text('Export backup'),
                     ),
                     OutlinedButton.icon(
                       onPressed: _exportingSupportBundle
@@ -677,7 +782,11 @@ class _SettingsScreenState extends State<SettingsScreen> {
                               child: CircularProgressIndicator(strokeWidth: 2),
                             )
                           : const Icon(Icons.restore_page_outlined),
-                      label: const Text('Stage restore'),
+                      label: Text(
+                        _restorePlan?.activationSupported == true
+                            ? 'Restore and verify'
+                            : 'Stage restore',
+                      ),
                     ),
                   ],
                 ),
@@ -1393,18 +1502,27 @@ class _BackupVerificationPanel extends StatelessWidget {
         'Library: ${result.libraryRoot}',
         'Assets checked: ${result.assetsChecked}',
         'Missing assets: ${result.missingAssetPaths.length}',
+        'Missing protected originals: ${result.missingProtectedOriginalPaths.length}',
         'Encrypted vault chunks checked: ${result.vaultChunksChecked}',
         'Missing encrypted chunks: ${result.missingVaultChunkPaths.length}',
+        'Protected originals checked: ${result.protectedOriginalsChecked}',
+        'Missing protected originals: ${result.missingProtectedOriginalPaths.length}',
         'Model files checked: ${result.modelFilesChecked}',
         'Missing model files: ${result.missingModelPaths.length}',
         if (result.databaseSha256 != null)
           'Database SHA-256: ${result.databaseSha256}',
+        ...result.missingProtectedOriginalPaths
+            .take(5)
+            .map((path) => 'Missing protected original: $path'),
         ...result.missingAssetPaths
             .take(5)
             .map((path) => 'Missing asset: $path'),
         ...result.missingVaultChunkPaths
             .take(5)
             .map((path) => 'Missing encrypted chunk: $path'),
+        ...result.missingProtectedOriginalPaths
+            .take(5)
+            .map((path) => 'Missing protected original: $path'),
         ...result.missingModelPaths
             .take(5)
             .map((path) => 'Missing model: $path'),
@@ -1563,6 +1681,7 @@ class _BackupExportPanel extends StatelessWidget {
         'Assets checked: ${result.assetsChecked}',
         'Media files copied: ${result.mediaFilesCopied}',
         'Encrypted vault chunks copied: ${result.vaultChunksCopied}',
+        'Protected original chunks copied: ${result.protectedOriginalChunksCopied}',
         'Bytes copied: ${result.bytesCopied}',
         'Missing assets: ${result.missingAssetPaths.length}',
         'Model files checked: ${result.modelFilesChecked}',
@@ -1621,6 +1740,7 @@ class _BackupRestorePlanPanel extends StatelessWidget {
         'Database target: ${result.databaseTargetPath}',
         'Media files available: ${result.mediaFilesAvailable}',
         'Encrypted vault chunks available: ${result.vaultChunksAvailable}',
+        'Protected original chunks available: ${result.protectedOriginalChunksAvailable}',
         'Missing paths: ${result.missingPaths.length}',
         'Destination conflicts: ${result.destinationConflicts.length}',
         ...result.missingPaths.take(5).map((path) => 'Missing: $path'),
@@ -1639,13 +1759,16 @@ class _BackupRestoreRunPanel extends StatelessWidget {
   Widget build(BuildContext context) {
     return _BackupResultCard(
       ok: result.ok,
-      title: result.ok ? 'Restore staged' : 'Restore warnings found',
+      title: result.ok
+          ? (result.activated ? 'Recovery verified' : 'Restore staged')
+          : 'Restore warnings found',
       lines: [
         result.detail,
         'Restore root: ${result.restoreRoot}',
         'Database restored to: ${result.databaseRestoredTo}',
         'Media files copied: ${result.mediaFilesCopied}',
         'Encrypted vault chunks copied: ${result.vaultChunksCopied}',
+        'Protected original chunks copied: ${result.protectedOriginalChunksCopied}',
         'Bytes copied: ${result.bytesCopied}',
       ],
     );

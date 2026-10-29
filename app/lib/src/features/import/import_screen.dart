@@ -31,14 +31,9 @@ class ImportOutcome {
 }
 
 class _ImportScreenState extends State<ImportScreen> {
-  static const String _recommendedSourceRoot =
-      '/mnt/windows/transfer/Ok/Photos/Unfiltered';
-  static const String _recommendedVideoRoot = '/mnt/windows/transfer/Ok/video';
-  static const String _recommendedAudioRoot = '/mnt/windows/transfer/Ok/Audio';
-
   late final TextEditingController _sourcePathController;
   late final TextEditingController _placeHintController;
-  ImportMode _importMode = ImportMode.move;
+  late ImportMode _importMode;
   ImportSourceKind _importSource = ImportSourceKind.folder;
   bool _addAsWatchFolder = false;
   bool _recursive = true;
@@ -47,6 +42,8 @@ class _ImportScreenState extends State<ImportScreen> {
   ImportSession? _session;
   ImportSession? _committedSession;
   List<ImportSession> _recentSessions = const [];
+  List<Vault> _vaults = const [];
+  String? _targetVaultId;
   Set<String> _selectedCandidateIds = <String>{};
   String? _error;
 
@@ -54,8 +51,9 @@ class _ImportScreenState extends State<ImportScreen> {
   void initState() {
     super.initState();
     _importMode = widget.defaultImportMode;
-    _sourcePathController = TextEditingController(text: _recommendedSourceRoot);
+    _sourcePathController = TextEditingController();
     _placeHintController = TextEditingController();
+    _loadVaults();
     _loadRecentSessions();
   }
 
@@ -72,6 +70,10 @@ class _ImportScreenState extends State<ImportScreen> {
       setState(() => _error = 'Enter a folder or removable-drive path first.');
       return;
     }
+    if (_vaults.isEmpty || _targetVaultId == null) {
+      setState(() => _error = 'Choose which vault will receive these files.');
+      return;
+    }
 
     setState(() {
       _busy = true;
@@ -85,6 +87,7 @@ class _ImportScreenState extends State<ImportScreen> {
         ImportScanRequest(
           sourcePath: sourcePath,
           sourceKind: _importSource,
+          targetVaultId: _targetVaultId,
           importMode: _importMode,
           addAsWatchFolder: _addAsWatchFolder,
           placeHint: _placeHintController.text.trim().isEmpty
@@ -149,6 +152,7 @@ class _ImportScreenState extends State<ImportScreen> {
         ImportCommitRequest(
           sessionId: session.id,
           candidateIds: _selectedCandidateIds.toList(),
+          targetVaultId: _targetVaultId,
           importMode: _importMode,
         ),
       );
@@ -183,6 +187,24 @@ class _ImportScreenState extends State<ImportScreen> {
     }
   }
 
+  Future<void> _loadVaults() async {
+    try {
+      final vaults = await widget.repository.fetchVaults();
+      if (!mounted) return;
+      setState(() {
+        _vaults = vaults;
+        if (vaults.length == 1) {
+          _targetVaultId = vaults.single.id;
+        } else if (_targetVaultId != null &&
+            !vaults.any((vault) => vault.id == _targetVaultId)) {
+          _targetVaultId = null;
+        }
+      });
+    } catch (error) {
+      if (mounted) setState(() => _error = 'Could not load vaults: $error');
+    }
+  }
+
   int _selectedNonDuplicateCount(ImportSession session) {
     return session.candidates
         .where(
@@ -213,22 +235,6 @@ class _ImportScreenState extends State<ImportScreen> {
         .fold<int>(0, (sum, candidate) => sum + candidate.sidecarPaths.length);
   }
 
-  void _applyPreset(_ImportPreset preset) {
-    setState(() {
-      _sourcePathController.text = preset.path;
-      _placeHintController.text = preset.placeHint;
-      _importMode = preset.importMode;
-      _importSource = ImportSourceKind.folder;
-      _addAsWatchFolder = preset.addAsWatchFolder;
-      _recursive = true;
-      _moveConfirmed = false;
-      _session = null;
-      _committedSession = null;
-      _selectedCandidateIds = <String>{};
-      _error = null;
-    });
-  }
-
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
@@ -255,8 +261,6 @@ class _ImportScreenState extends State<ImportScreen> {
               'Scan is read-only. Move mode verifies file hashes before the old path is removed, keeps matching JSON sidecars with files, and avoids creating a duplicate archive.',
               style: theme.textTheme.bodyLarge,
             ),
-            const SizedBox(height: 16),
-            _OrganizedArchivePanel(onSelect: _applyPreset),
             const SizedBox(height: 16),
             Card(
               color: theme.colorScheme.primaryContainer,
@@ -300,13 +304,52 @@ class _ImportScreenState extends State<ImportScreen> {
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
+                    if (_vaults.length > 1) ...[
+                      DropdownButtonFormField<String>(
+                        initialValue: _targetVaultId,
+                        decoration: const InputDecoration(
+                          labelText: 'Import into vault',
+                          helperText:
+                              'A vault controls which paired devices can see these files.',
+                          border: OutlineInputBorder(),
+                        ),
+                        items: [
+                          for (final vault in _vaults)
+                            DropdownMenuItem(
+                              value: vault.id,
+                              child: Text(vault.name),
+                            ),
+                        ],
+                        onChanged: _busy || _committedSession != null
+                            ? null
+                            : (value) {
+                                setState(() {
+                                  _targetVaultId = value;
+                                  _session = null;
+                                  _selectedCandidateIds = <String>{};
+                                  _moveConfirmed = false;
+                                  _error = null;
+                                });
+                              },
+                      ),
+                      const SizedBox(height: 16),
+                    ] else if (_vaults.length == 1) ...[
+                      InputDecorator(
+                        decoration: const InputDecoration(
+                          labelText: 'Import into vault',
+                          border: OutlineInputBorder(),
+                        ),
+                        child: Text(_vaults.single.name),
+                      ),
+                      const SizedBox(height: 16),
+                    ],
                     Text('Scan source', style: theme.textTheme.titleLarge),
                     const SizedBox(height: 16),
                     TextField(
                       controller: _sourcePathController,
                       decoration: const InputDecoration(
                         labelText: 'Source path',
-                        hintText: _recommendedSourceRoot,
+                        hintText: 'Enter a folder path on this device',
                         border: OutlineInputBorder(),
                       ),
                     ),
@@ -536,108 +579,6 @@ class _ImportScreenState extends State<ImportScreen> {
                 },
               ),
             ],
-          ],
-        ),
-      ),
-    );
-  }
-}
-
-class _ImportPreset {
-  const _ImportPreset({
-    required this.title,
-    required this.description,
-    required this.path,
-    required this.placeHint,
-    required this.importMode,
-    required this.addAsWatchFolder,
-  });
-
-  final String title;
-  final String description;
-  final String path;
-  final String placeHint;
-  final ImportMode importMode;
-  final bool addAsWatchFolder;
-}
-
-class _OrganizedArchivePanel extends StatelessWidget {
-  const _OrganizedArchivePanel({required this.onSelect});
-
-  final void Function(_ImportPreset preset) onSelect;
-
-  static const _presets = [
-    _ImportPreset(
-      title: 'Index organized photos',
-      description:
-          'Reference the cleaned Unfiltered photo library in place without moving it again.',
-      path: _ImportScreenState._recommendedSourceRoot,
-      placeHint: 'Local organized photos',
-      importMode: ImportMode.reference,
-      addAsWatchFolder: true,
-    ),
-    _ImportPreset(
-      title: 'Index organized videos',
-      description:
-          'Reference the verified video folder separately, keeping video files under Ok/video.',
-      path: _ImportScreenState._recommendedVideoRoot,
-      placeHint: 'Local organized videos',
-      importMode: ImportMode.reference,
-      addAsWatchFolder: true,
-    ),
-    _ImportPreset(
-      title: 'Index organized audio',
-      description:
-          'Reference verified audio files as first-class vault files alongside photos and videos.',
-      path: _ImportScreenState._recommendedAudioRoot,
-      placeHint: 'Local organized audio',
-      importMode: ImportMode.reference,
-      addAsWatchFolder: true,
-    ),
-  ];
-
-  @override
-  Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-
-    return Card(
-      color: theme.colorScheme.tertiaryContainer,
-      child: Padding(
-        padding: const EdgeInsets.all(20),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text(
-              'Index your organized archive',
-              style: theme.textTheme.titleLarge,
-            ),
-            const SizedBox(height: 8),
-            const Text(
-              'Use these presets after local cleanup. They reference files in place, so the app can build timeline/search metadata without duplicating or moving the cleaned folders.',
-            ),
-            const SizedBox(height: 16),
-            Wrap(
-              spacing: 12,
-              runSpacing: 12,
-              children: [
-                for (final preset in _presets)
-                  Tooltip(
-                    message: preset.description,
-                    child: FilledButton.tonalIcon(
-                      onPressed: () => onSelect(preset),
-                      icon: Icon(
-                        preset.path == _ImportScreenState._recommendedVideoRoot
-                            ? Icons.video_library_outlined
-                            : preset.path ==
-                                  _ImportScreenState._recommendedAudioRoot
-                            ? Icons.audio_file_outlined
-                            : Icons.photo_library_outlined,
-                      ),
-                      label: Text(preset.title),
-                    ),
-                  ),
-              ],
-            ),
           ],
         ),
       ),

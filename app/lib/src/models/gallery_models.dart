@@ -1350,6 +1350,8 @@ class BackupVerification {
     required this.missingAssetPaths,
     required this.vaultChunksChecked,
     required this.missingVaultChunkPaths,
+    required this.protectedOriginalsChecked,
+    required this.missingProtectedOriginalPaths,
     required this.modelFilesChecked,
     required this.missingModelPaths,
     required this.ok,
@@ -1363,6 +1365,8 @@ class BackupVerification {
   final List<String> missingAssetPaths;
   final int vaultChunksChecked;
   final List<String> missingVaultChunkPaths;
+  final int protectedOriginalsChecked;
+  final List<String> missingProtectedOriginalPaths;
   final int modelFilesChecked;
   final List<String> missingModelPaths;
   final bool ok;
@@ -1378,6 +1382,11 @@ class BackupVerification {
       vaultChunksChecked: (json['vault_chunks_checked'] as num?)?.toInt() ?? 0,
       missingVaultChunkPaths: _readStringList(
         json['missing_vault_chunk_paths'],
+      ),
+      protectedOriginalsChecked:
+          (json['protected_originals_checked'] as num?)?.toInt() ?? 0,
+      missingProtectedOriginalPaths: _readStringList(
+        json['missing_protected_original_paths'],
       ),
       modelFilesChecked: (json['model_files_checked'] as num?)?.toInt() ?? 0,
       missingModelPaths: _readStringList(json['missing_model_paths']),
@@ -1395,8 +1404,10 @@ class BackupExportResult {
     required this.databaseSha256,
     required this.assetsChecked,
     required this.missingAssetPaths,
+    required this.missingProtectedOriginalPaths,
     required this.mediaFilesCopied,
     required this.vaultChunksCopied,
+    required this.protectedOriginalChunksCopied,
     required this.bytesCopied,
     required this.modelFilesChecked,
     required this.missingModelPaths,
@@ -1410,8 +1421,10 @@ class BackupExportResult {
   final String? databaseSha256;
   final int assetsChecked;
   final List<String> missingAssetPaths;
+  final List<String> missingProtectedOriginalPaths;
   final int mediaFilesCopied;
   final int vaultChunksCopied;
+  final int protectedOriginalChunksCopied;
   final int bytesCopied;
   final int modelFilesChecked;
   final List<String> missingModelPaths;
@@ -1426,8 +1439,13 @@ class BackupExportResult {
       databaseSha256: json['database_sha256'] as String?,
       assetsChecked: (json['assets_checked'] as num?)?.toInt() ?? 0,
       missingAssetPaths: _readStringList(json['missing_asset_paths']),
+      missingProtectedOriginalPaths: _readStringList(
+        json['missing_protected_original_paths'],
+      ),
       mediaFilesCopied: (json['media_files_copied'] as num?)?.toInt() ?? 0,
       vaultChunksCopied: (json['vault_chunks_copied'] as num?)?.toInt() ?? 0,
+      protectedOriginalChunksCopied:
+          (json['protected_original_chunks_copied'] as num?)?.toInt() ?? 0,
       bytesCopied: (json['bytes_copied'] as num?)?.toInt() ?? 0,
       modelFilesChecked: (json['model_files_checked'] as num?)?.toInt() ?? 0,
       missingModelPaths: _readStringList(json['missing_model_paths']),
@@ -1478,11 +1496,14 @@ class BackupRestorePlan {
     required this.databaseTargetPath,
     required this.mediaFilesAvailable,
     required this.vaultChunksAvailable,
+    required this.protectedOriginalChunksAvailable,
     required this.missingPaths,
     required this.destinationConflicts,
     required this.requiresConfirmation,
     required this.ok,
     required this.detail,
+    this.requiresRecoveryPassphrase = false,
+    this.activationSupported = false,
   });
 
   final DateTime? checkedAt;
@@ -1493,11 +1514,14 @@ class BackupRestorePlan {
   final String databaseTargetPath;
   final int mediaFilesAvailable;
   final int vaultChunksAvailable;
+  final int protectedOriginalChunksAvailable;
   final List<String> missingPaths;
   final List<String> destinationConflicts;
   final bool requiresConfirmation;
   final bool ok;
   final String detail;
+  final bool requiresRecoveryPassphrase;
+  final bool activationSupported;
 
   factory BackupRestorePlan.fromJson(Map<String, dynamic> json) {
     return BackupRestorePlan(
@@ -1511,11 +1535,16 @@ class BackupRestorePlan {
           (json['media_files_available'] as num?)?.toInt() ?? 0,
       vaultChunksAvailable:
           (json['vault_chunks_available'] as num?)?.toInt() ?? 0,
+      protectedOriginalChunksAvailable:
+          (json['protected_original_chunks_available'] as num?)?.toInt() ?? 0,
       missingPaths: _readStringList(json['missing_paths']),
       destinationConflicts: _readStringList(json['destination_conflicts']),
       requiresConfirmation: json['requires_confirmation'] as bool? ?? true,
       ok: json['ok'] as bool? ?? false,
       detail: json['detail'] as String? ?? '',
+      requiresRecoveryPassphrase:
+          json['requires_recovery_passphrase'] as bool? ?? false,
+      activationSupported: json['activation_supported'] as bool? ?? false,
     );
   }
 }
@@ -1527,7 +1556,9 @@ class BackupRestoreRunResult {
     required this.databaseRestoredTo,
     required this.mediaFilesCopied,
     required this.vaultChunksCopied,
+    required this.protectedOriginalChunksCopied,
     required this.bytesCopied,
+    this.activated = false,
     required this.ok,
     required this.detail,
   });
@@ -1537,7 +1568,9 @@ class BackupRestoreRunResult {
   final String databaseRestoredTo;
   final int mediaFilesCopied;
   final int vaultChunksCopied;
+  final int protectedOriginalChunksCopied;
   final int bytesCopied;
+  final bool activated;
   final bool ok;
   final String detail;
 
@@ -1548,7 +1581,10 @@ class BackupRestoreRunResult {
       databaseRestoredTo: json['database_restored_to'] as String? ?? '',
       mediaFilesCopied: (json['media_files_copied'] as num?)?.toInt() ?? 0,
       vaultChunksCopied: (json['vault_chunks_copied'] as num?)?.toInt() ?? 0,
+      protectedOriginalChunksCopied:
+          (json['protected_original_chunks_copied'] as num?)?.toInt() ?? 0,
       bytesCopied: (json['bytes_copied'] as num?)?.toInt() ?? 0,
+      activated: json['activated'] as bool? ?? false,
       ok: json['ok'] as bool? ?? false,
       detail: json['detail'] as String? ?? '',
     );
@@ -4038,6 +4074,7 @@ class ImportCandidate {
 class ImportSession {
   const ImportSession({
     required this.id,
+    this.targetVaultId,
     required this.sourceKind,
     required this.sourcePath,
     required this.importMode,
@@ -4066,6 +4103,7 @@ class ImportSession {
   });
 
   final String id;
+  final String? targetVaultId;
   final ImportSourceKind sourceKind;
   final String sourcePath;
   final ImportMode importMode;
@@ -4128,6 +4166,7 @@ class ImportSession {
 
     return ImportSession(
       id: json['id'].toString(),
+      targetVaultId: json['target_vault_id'] as String?,
       sourceKind: ImportSourceKindX.fromJson(json['source_kind'] as String?),
       sourcePath: json['source_path'] as String? ?? '',
       importMode: ImportModeX.fromJson(json['import_mode'] as String?),
@@ -4248,6 +4287,7 @@ class ImportScanRequest {
   const ImportScanRequest({
     required this.sourcePath,
     required this.sourceKind,
+    this.targetVaultId,
     required this.importMode,
     required this.addAsWatchFolder,
     required this.placeHint,
@@ -4256,6 +4296,7 @@ class ImportScanRequest {
 
   final String sourcePath;
   final ImportSourceKind sourceKind;
+  final String? targetVaultId;
   final ImportMode importMode;
   final bool addAsWatchFolder;
   final String? placeHint;
@@ -4265,6 +4306,7 @@ class ImportScanRequest {
     return {
       'source_path': sourcePath,
       'source_kind': sourceKind.wireValue,
+      if (targetVaultId != null) 'target_vault_id': targetVaultId,
       'import_mode': importMode.wireValue,
       'add_as_watch_folder': addAsWatchFolder,
       'recursive': recursive,
@@ -4278,17 +4320,20 @@ class ImportCommitRequest {
   const ImportCommitRequest({
     required this.sessionId,
     required this.candidateIds,
+    this.targetVaultId,
     required this.importMode,
   });
 
   final String sessionId;
   final List<String> candidateIds;
+  final String? targetVaultId;
   final ImportMode importMode;
 
   Map<String, dynamic> toJson() {
     return {
       'session_id': sessionId,
       'selected_candidate_ids': candidateIds,
+      if (targetVaultId != null) 'target_vault_id': targetVaultId,
       'import_mode': importMode.wireValue,
     };
   }

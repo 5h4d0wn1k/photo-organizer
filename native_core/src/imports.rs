@@ -450,15 +450,23 @@ pub fn build_imported_asset(request: ImportAssetRequest) -> (Asset, JobRecord) {
         }
     });
     let import_mode = request.import_mode.unwrap_or(ImportMode::Copy);
+    let asset_id = Uuid::new_v4();
+    let owned_root = format!("assets/{asset_id}");
     let relative_original_path = match import_mode {
-        ImportMode::Copy => derive_asset_storage_path(&content_hash, &request.original_filename),
+        ImportMode::Copy => format!(
+            "{owned_root}/original/{}",
+            sanitize_filename(&request.original_filename)
+        ),
         ImportMode::Reference => request.source_path.clone(),
         ImportMode::Move => {
-            derive_managed_original_path(&content_hash, &request.original_filename, captured_at)
+            format!(
+                "{owned_root}/original/{}",
+                sanitize_filename(&request.original_filename)
+            )
         }
     };
-    let preview_path = format!("variants/previews/{content_hash}.jpg");
-    let thumbnail_path = format!("variants/thumbs/{content_hash}.webp");
+    let preview_path = format!("{owned_root}/variants/preview.jpg");
+    let thumbnail_path = format!("{owned_root}/variants/thumbnail.webp");
 
     let preview = AssetVariant {
         id: Uuid::new_v4(),
@@ -487,7 +495,8 @@ pub fn build_imported_asset(request: ImportAssetRequest) -> (Asset, JobRecord) {
     };
 
     let asset = Asset {
-        id: Uuid::new_v4(),
+        id: asset_id,
+        vault_id: None,
         original_filename: request.original_filename,
         relative_original_path,
         source_path: request.source_path,
@@ -630,6 +639,7 @@ where
 
     let mut session = ImportSession {
         id: session_id,
+        target_vault_id: request.target_vault_id,
         source_kind: request.source_kind,
         source_path: request.source_path.clone(),
         import_mode,
@@ -727,6 +737,38 @@ mod tests {
     }
 
     #[test]
+    fn new_managed_assets_own_paths_even_with_identical_bytes_and_vaults() {
+        let request = crate::domain::ImportAssetRequest {
+            source_path: "/source/photo.jpg".into(),
+            original_filename: "photo.jpg".into(),
+            media_kind: MediaKind::Photo,
+            mime_type: "image/jpeg".into(),
+            bytes: 5,
+            captured_at: None,
+            place_hint: None,
+            import_mode: Some(ImportMode::Copy),
+            content_hash: Some("ab".repeat(32)),
+        };
+        let (mut first, _) = super::build_imported_asset(request.clone());
+        let (mut same_vault, _) = super::build_imported_asset(request.clone());
+        let (mut other_vault, _) = super::build_imported_asset(request);
+        let owner = uuid::Uuid::new_v4();
+        first.vault_id = Some(owner);
+        same_vault.vault_id = Some(owner);
+        other_vault.vault_id = Some(uuid::Uuid::new_v4());
+        assert_eq!(first.content_hash, other_vault.content_hash);
+        for asset in [&same_vault, &other_vault] {
+            assert_ne!(first.id, asset.id);
+            assert_ne!(first.relative_original_path, asset.relative_original_path);
+            for (left, right) in first.variants.iter().zip(&asset.variants) {
+                assert_ne!(left.relative_path, right.relative_path);
+                assert!(right.relative_path.contains(&asset.id.to_string()));
+            }
+        }
+        assert!(first.relative_original_path.contains(&first.id.to_string()));
+    }
+
+    #[test]
     fn content_address_path_uses_hash_prefixes() {
         let hash = "4f6f1c99f9850f1de7447efb233e2f4ec2d6cf0bc59d1b24fd3fd703f4f8d8c6";
         let path = derive_asset_storage_path(hash, "trip.mov");
@@ -801,6 +843,7 @@ mod tests {
         fs::create_dir_all(&project_dir).expect("project dir");
         fs::write(project_dir.join("proposal.pdf"), b"pdf").expect("write pdf");
         let request = ScanImportSourceRequest {
+            target_vault_id: None,
             source_path: root.to_string_lossy().to_string(),
             source_kind: ImportSourceKind::Folder,
             recursive: true,
@@ -829,6 +872,7 @@ mod tests {
         let root = temp_dir("scan");
         fs::write(root.join("a.jpg"), b"image").expect("write image");
         let request = ScanImportSourceRequest {
+            target_vault_id: None,
             source_path: root.to_string_lossy().to_string(),
             source_kind: ImportSourceKind::Folder,
             recursive: false,
@@ -855,6 +899,7 @@ mod tests {
         fs::write(library_root.join("thumbs.db"), b"managed unsupported")
             .expect("write managed unsupported");
         let request = ScanImportSourceRequest {
+            target_vault_id: None,
             source_path: root.to_string_lossy().to_string(),
             source_kind: ImportSourceKind::Folder,
             recursive: true,
@@ -887,6 +932,7 @@ mod tests {
         fs::write(takeout.join("duplicate.jpg"), b"duplicate").expect("write takeout image");
 
         let request = ScanImportSourceRequest {
+            target_vault_id: None,
             source_path: root.to_string_lossy().to_string(),
             source_kind: ImportSourceKind::Folder,
             recursive: true,
@@ -919,6 +965,7 @@ mod tests {
         .expect("write sidecar");
 
         let request = ScanImportSourceRequest {
+            target_vault_id: None,
             source_path: root.to_string_lossy().to_string(),
             source_kind: ImportSourceKind::Folder,
             recursive: true,
@@ -955,6 +1002,7 @@ mod tests {
         .expect("write sidecar");
 
         let request = ScanImportSourceRequest {
+            target_vault_id: None,
             source_path: root.to_string_lossy().to_string(),
             source_kind: ImportSourceKind::Folder,
             recursive: true,

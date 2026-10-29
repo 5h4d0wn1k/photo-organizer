@@ -47,6 +47,8 @@ jobs:
           done
       - name: Verify production vault keys round-trip through Secret Service
         run: bash scripts/test_vault_keyring_e2e.sh
+      - name: Verify portable recovery across independent Secret Service sessions
+        run: bash scripts/test_portable_recovery_e2e.sh
 
   encryption-durability:
     name: Encryption durability (${{ matrix.os }})

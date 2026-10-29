@@ -1020,6 +1020,7 @@ mod tests {
         let id = Uuid::new_v4();
         Asset {
             id,
+            vault_id: None,
             original_filename: filename.to_string(),
             relative_original_path: filename.to_string(),
             source_path: format!("/source/{filename}"),

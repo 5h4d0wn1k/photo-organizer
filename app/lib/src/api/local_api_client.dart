@@ -702,11 +702,13 @@ class LocalApiClient {
   Future<BackupExportResult> exportBackup({
     required String exportRoot,
     bool includeModels = true,
+    String? recoveryPassphrase,
   }) async {
     final response = await _postObject('/backup/export', {
       'export_root': exportRoot,
       'include_models': includeModels,
-    });
+      'recovery_passphrase': ?recoveryPassphrase,
+    }, timeout: _heavyReadTimeout);
     return BackupExportResult.fromJson(response);
   }
 
@@ -736,12 +738,14 @@ class LocalApiClient {
     required String exportRoot,
     required String restoreRoot,
     bool confirmed = true,
+    String? recoveryPassphrase,
   }) async {
     final response = await _postObject('/backup/restore/run', {
       'export_root': exportRoot,
       'restore_root': restoreRoot,
       'confirmed': confirmed,
-    });
+      'recovery_passphrase': ?recoveryPassphrase,
+    }, timeout: _heavyReadTimeout);
     return BackupRestoreRunResult.fromJson(response);
   }
 

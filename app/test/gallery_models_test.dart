@@ -15,6 +15,20 @@ void main() {
       isFalse,
     );
   });
+  test(
+    'restore plan recovery flags default safely and parse supported activation',
+    () {
+      final legacy = BackupRestorePlan.fromJson({});
+      expect(legacy.requiresRecoveryPassphrase, isFalse);
+      expect(legacy.activationSupported, isFalse);
+      final portable = BackupRestorePlan.fromJson({
+        'requires_recovery_passphrase': true,
+        'activation_supported': true,
+      });
+      expect(portable.requiresRecoveryPassphrase, isTrue);
+      expect(portable.activationSupported, isTrue);
+    },
+  );
 
   test('parses local admin audit event payloads', () {
     final event = AuditEvent.fromJson({
