@@ -259,6 +259,65 @@ pub struct BlobChunk {
     pub aad: Option<String>,
 }
 
+/// Device-local encrypted copy retained while an asset's vault membership is
+/// ambiguous or points only to removed vaults. These records are never synced
+/// and do not grant normal vault access.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ProtectedOriginal {
+    pub asset_id: Uuid,
+    pub object_id: Uuid,
+    pub content_hash: String,
+    pub bytes: u64,
+    pub encrypted_hash: String,
+    pub chunk_count: u32,
+    pub key_version: u32,
+    pub reason: String,
+    pub source_removed: bool,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ProtectedOriginalChunk {
+    pub id: Uuid,
+    pub asset_id: Uuid,
+    pub chunk_index: u32,
+    pub content_hash: String,
+    pub encrypted_hash: String,
+    pub bytes: u64,
+    pub encrypted_bytes: u64,
+    pub local_path: String,
+    pub nonce_hex: String,
+    pub aad: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct QuarantinedOriginalSummary {
+    pub asset_id: Uuid,
+    pub object_id: Uuid,
+    pub filename: String,
+    pub media_kind: MediaKind,
+    pub content_hash: String,
+    pub bytes: u64,
+    pub reason: String,
+    pub source_removed: bool,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct QuarantineRepairRequest {
+    pub target_vault_id: Uuid,
+    pub confirm: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct QuarantineRepairResult {
+    pub asset_id: Uuid,
+    pub vault_id: Uuid,
+    pub blob_id: Uuid,
+    pub repaired: bool,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ReplicaHealth {
@@ -654,6 +713,9 @@ pub struct AssetVariant {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Asset {
     pub id: Uuid,
+    /// Authoritative owner; unresolved legacy assets have no vault access.
+    #[serde(default)]
+    pub vault_id: Option<Uuid>,
     pub original_filename: String,
     pub relative_original_path: String,
     pub source_path: String,
@@ -1086,6 +1148,8 @@ pub struct ImportCandidate {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ImportSession {
     pub id: Uuid,
+    #[serde(default)]
+    pub target_vault_id: Option<Uuid>,
     pub source_kind: ImportSourceKind,
     pub source_path: String,
     pub import_mode: ImportMode,
@@ -1729,11 +1793,26 @@ pub struct BackupVerifyRequest {
     pub export_root: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
 pub struct BackupExportRequest {
     pub export_root: String,
     #[serde(default)]
     pub include_models: bool,
+    #[serde(default, skip_serializing)]
+    pub recovery_passphrase: Option<String>,
+}
+impl std::fmt::Debug for BackupExportRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BackupExportRequest")
+            .field("recovery_passphrase", &"[REDACTED]")
+            .finish_non_exhaustive()
+    }
+}
+impl Drop for BackupExportRequest {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.recovery_passphrase.zeroize();
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1748,6 +1827,10 @@ pub struct BackupVerification {
     pub vault_chunks_checked: usize,
     #[serde(default)]
     pub missing_vault_chunk_paths: Vec<String>,
+    #[serde(default)]
+    pub protected_originals_checked: usize,
+    #[serde(default)]
+    pub missing_protected_original_paths: Vec<String>,
     pub model_files_checked: usize,
     pub missing_model_paths: Vec<String>,
     pub ok: bool,
@@ -1763,9 +1846,13 @@ pub struct BackupExportResult {
     pub assets_checked: usize,
     pub missing_asset_paths: Vec<String>,
     #[serde(default)]
+    pub missing_protected_original_paths: Vec<String>,
+    #[serde(default)]
     pub media_files_copied: usize,
     #[serde(default)]
     pub vault_chunks_copied: usize,
+    #[serde(default)]
+    pub protected_original_chunks_copied: usize,
     #[serde(default)]
     pub bytes_copied: u64,
     pub model_files_checked: usize,
@@ -1811,18 +1898,39 @@ pub struct BackupRestorePlan {
     pub database_target_path: String,
     pub media_files_available: usize,
     pub vault_chunks_available: usize,
+    #[serde(default)]
+    pub protected_original_chunks_available: usize,
     pub missing_paths: Vec<String>,
     pub destination_conflicts: Vec<String>,
     pub requires_confirmation: bool,
+    #[serde(default)]
+    pub requires_recovery_passphrase: bool,
+    #[serde(default)]
+    pub activation_supported: bool,
     pub ok: bool,
     pub detail: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
 pub struct BackupRestoreRunRequest {
     pub export_root: String,
     pub restore_root: String,
     pub confirmed: bool,
+    #[serde(default, skip_serializing)]
+    pub recovery_passphrase: Option<String>,
+}
+impl std::fmt::Debug for BackupRestoreRunRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BackupRestoreRunRequest")
+            .field("recovery_passphrase", &"[REDACTED]")
+            .finish_non_exhaustive()
+    }
+}
+impl Drop for BackupRestoreRunRequest {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.recovery_passphrase.zeroize();
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1832,7 +1940,11 @@ pub struct BackupRestoreRunResult {
     pub database_restored_to: String,
     pub media_files_copied: usize,
     pub vault_chunks_copied: usize,
+    #[serde(default)]
+    pub protected_original_chunks_copied: usize,
     pub bytes_copied: u64,
+    #[serde(default)]
+    pub activated: bool,
     pub ok: bool,
     pub detail: String,
 }
@@ -1947,6 +2059,8 @@ pub struct CreateWatchFolderRequest {
 pub struct ScanImportSourceRequest {
     pub source_path: String,
     pub source_kind: ImportSourceKind,
+    #[serde(default)]
+    pub target_vault_id: Option<Uuid>,
     pub recursive: bool,
     pub import_mode: Option<ImportMode>,
     pub add_as_watch_folder: bool,
@@ -1958,6 +2072,8 @@ pub struct CommitImportSessionRequest {
     pub session_id: Uuid,
     #[serde(alias = "candidate_ids")]
     pub selected_candidate_ids: Vec<Uuid>,
+    #[serde(default)]
+    pub target_vault_id: Option<Uuid>,
     pub import_mode: Option<ImportMode>,
     pub add_as_watch_folder: Option<bool>,
 }

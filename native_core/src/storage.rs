@@ -16,14 +16,15 @@ use crate::{
         EntitlementCache, EventCluster, FaceTemplate, FeedbackEvent, FileOrganizationHints, GeoTag,
         ImportCandidate, ImportMode, ImportSession, JobLog, JobRecord, LibrarySettings, MediaKind,
         MetadataSource, MobileSession, MobileUpload, MobileUploadStatus, ModelProvenance, OcrBlock,
-        OriginalStoragePolicy, PersonCluster, PlaceCluster, RelayEndpoint, SceneTag, SearchQuery,
-        SmartFolder, SyncConflict, SyncSession, SyncTransfer, Vault, VaultFileEntry, VaultInvite,
-        VaultKeyEnvelope, VaultMember, WatchFolder,
+        OriginalStoragePolicy, PersonCluster, PlaceCluster, ProtectedOriginal,
+        ProtectedOriginalChunk, RelayEndpoint, SceneTag, SearchQuery, SmartFolder, SyncConflict,
+        SyncSession, SyncTransfer, Vault, VaultFileEntry, VaultInvite, VaultKeyEnvelope,
+        VaultMember, WatchFolder,
     },
     security,
 };
 
-const SCHEMA_VERSION: i64 = 21;
+const SCHEMA_VERSION: i64 = 24;
 
 fn sql_u64(row: &rusqlite::Row, index: usize) -> rusqlite::Result<u64> {
     let value: i64 = row.get(index)?;
@@ -59,6 +60,8 @@ pub struct PersistedLibraryState {
     pub vault_members: Vec<VaultMember>,
     pub blob_records: Vec<BlobRecord>,
     pub blob_chunks: Vec<BlobChunk>,
+    pub protected_originals: Vec<ProtectedOriginal>,
+    pub protected_original_chunks: Vec<ProtectedOriginalChunk>,
     pub blob_replicas: Vec<BlobReplica>,
     pub sync_transfers: Vec<SyncTransfer>,
     pub sync_conflicts: Vec<SyncConflict>,
@@ -97,6 +100,20 @@ pub fn bootstrap_storage(config: &AppConfig) -> Result<StorageBootstrapReport, r
     Ok(StorageBootstrapReport {
         database_path: db_path,
     })
+}
+
+pub fn checkpoint_database(path: &Path) -> Result<(), rusqlite::Error> {
+    let connection = open_connection(path)?;
+    let busy = connection.query_row("PRAGMA wal_checkpoint(FULL)", [], |row| {
+        let busy: i64 = row.get(0)?;
+        let _log_frames: i64 = row.get(1)?;
+        let _checkpointed_frames: i64 = row.get(2)?;
+        Ok(busy)
+    })?;
+    if busy != 0 {
+        return Err(rusqlite::Error::InvalidQuery);
+    }
+    Ok(())
 }
 
 fn migrate_schema(connection: &Connection, from_version: i64) -> Result<(), rusqlite::Error> {
@@ -242,7 +259,127 @@ fn migrate_schema(connection: &Connection, from_version: i64) -> Result<(), rusq
         record_migration(connection, 21, "pairing_tokens_hashed_at_rest")?;
     }
 
+    if from_version < 22 {
+        add_column_if_missing(
+            connection,
+            "import_sessions",
+            "target_vault_id",
+            "target_vault_id TEXT",
+        )?;
+        record_migration(connection, 22, "import_sessions_target_vault")?;
+    }
+
+    if from_version < 23 {
+        connection.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS protected_originals (
+              asset_id TEXT PRIMARY KEY,
+              object_id TEXT NOT NULL UNIQUE,
+              content_hash TEXT NOT NULL,
+              bytes INTEGER NOT NULL,
+              encrypted_hash TEXT NOT NULL,
+              chunk_count INTEGER NOT NULL,
+              key_version INTEGER NOT NULL,
+              reason TEXT NOT NULL,
+              source_removed INTEGER NOT NULL DEFAULT 0,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS protected_original_chunks (
+              id TEXT PRIMARY KEY,
+              asset_id TEXT NOT NULL,
+              chunk_index INTEGER NOT NULL,
+              content_hash TEXT NOT NULL,
+              encrypted_hash TEXT NOT NULL,
+              bytes INTEGER NOT NULL,
+              encrypted_bytes INTEGER NOT NULL,
+              local_path TEXT NOT NULL,
+              nonce_hex TEXT NOT NULL,
+              aad TEXT NOT NULL,
+              UNIQUE(asset_id, chunk_index),
+              FOREIGN KEY(asset_id) REFERENCES protected_originals(asset_id) ON DELETE CASCADE
+            );
+            "#,
+        )?;
+        record_migration(connection, 23, "device_local_protected_originals")?;
+    }
+
+    if from_version < 24 {
+        migrate_asset_vault_ownership(connection)?;
+    }
+
     connection.pragma_update(None, "user_version", SCHEMA_VERSION)
+}
+
+/// Rebuild rather than renaming the old table: dependent foreign keys must
+/// keep referring to `assets`, and dropping the old table must not cascade.
+fn migrate_asset_vault_ownership(connection: &Connection) -> rusqlite::Result<()> {
+    let foreign_keys: bool =
+        connection.pragma_query_value(None, "foreign_keys", |row| row.get(0))?;
+    connection.pragma_update(None, "foreign_keys", false)?;
+    let result = (|| {
+        let transaction = connection.unchecked_transaction()?;
+        add_column_if_missing(&transaction, "assets", "vault_id", "vault_id TEXT")?;
+        transaction.execute_batch(
+            r#"
+            CREATE TABLE assets_v24 (
+              id TEXT PRIMARY KEY,
+              original_filename TEXT NOT NULL,
+              relative_original_path TEXT NOT NULL,
+              source_path TEXT NOT NULL,
+              content_hash TEXT NOT NULL,
+              media_kind TEXT NOT NULL,
+              import_mode TEXT NOT NULL,
+              bytes INTEGER NOT NULL,
+              mime_type TEXT NOT NULL,
+              captured_at TEXT NOT NULL,
+              imported_at TEXT NOT NULL,
+              archived INTEGER NOT NULL DEFAULT 0,
+              favorite INTEGER NOT NULL DEFAULT 0,
+              is_available INTEGER NOT NULL DEFAULT 1,
+              place_hint TEXT,
+              vault_id TEXT,
+              UNIQUE(vault_id, content_hash)
+            );
+            INSERT INTO assets_v24 SELECT id, original_filename, relative_original_path,
+              source_path, content_hash, media_kind, import_mode, bytes, mime_type,
+              captured_at, imported_at, archived, favorite, is_available, place_hint,
+              vault_id FROM assets;
+            -- Every source of legacy membership must agree, including dangling
+            -- references. Never choose a live vault by discarding contrary evidence.
+            WITH evidence AS (
+              SELECT asset_id, vault_id FROM blob_records WHERE tombstoned_at IS NULL
+              UNION SELECT asset_id, vault_id FROM mobile_uploads
+                WHERE asset_id IS NOT NULL AND status = 'completed'
+              UNION SELECT asset_id, vault_id FROM vault_file_entries
+                WHERE asset_id IS NOT NULL AND trashed_at IS NULL
+            ), owners AS (
+              SELECT asset_id, MIN(vault_id) AS vault_id FROM evidence
+              GROUP BY asset_id HAVING COUNT(DISTINCT vault_id) = 1
+            )
+            UPDATE assets_v24 SET vault_id = (
+              SELECT owners.vault_id FROM owners JOIN vaults ON vaults.id = owners.vault_id
+              WHERE owners.asset_id = assets_v24.id
+            ) WHERE vault_id IS NULL;
+            DROP TABLE assets;
+            ALTER TABLE assets_v24 RENAME TO assets;
+        "#,
+        )?;
+        // Run before commit so any dangling child reference rolls back the rebuild.
+        let violations: i64 =
+            transaction.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })?;
+        if violations != 0 {
+            return Err(rusqlite::Error::InvalidQuery);
+        }
+        record_migration(&transaction, 24, "explicit_asset_vault_ownership")?;
+        transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        transaction.commit()
+    })();
+    // Restore the caller's enforcement setting on both success and failure.
+    let restored = connection.pragma_update(None, "foreign_keys", foreign_keys);
+    result.and(restored)
 }
 
 fn hash_pairing_token_column(token: &str) -> String {
@@ -395,6 +532,8 @@ pub fn load_state(
     let vault_members = load_vault_members(&connection)?;
     let blob_records = load_blob_records(&connection)?;
     let blob_chunks = load_blob_chunks(&connection)?;
+    let protected_originals = load_protected_originals(&connection)?;
+    let protected_original_chunks = load_protected_original_chunks(&connection)?;
     let blob_replicas = load_blob_replicas(&connection)?;
     let sync_transfers = load_sync_transfers_v2(&connection)?;
     let sync_conflicts = load_sync_conflicts(&connection)?;
@@ -432,6 +571,8 @@ pub fn load_state(
         vault_members,
         blob_records,
         blob_chunks,
+        protected_originals,
+        protected_original_chunks,
         blob_replicas,
         sync_transfers,
         sync_conflicts,
@@ -479,6 +620,8 @@ pub fn save_state(
         DELETE FROM sync_conflicts;
         DELETE FROM sync_transfers;
         DELETE FROM blob_replicas;
+        DELETE FROM protected_original_chunks;
+        DELETE FROM protected_originals;
         DELETE FROM blob_chunks;
         DELETE FROM blob_records;
         DELETE FROM vault_file_entries;
@@ -566,8 +709,8 @@ pub fn save_state(
               archived,
               favorite,
               is_available,
-              place_hint
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+              place_hint, vault_id
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
             "#,
             params![
                 asset.id.to_string(),
@@ -585,6 +728,7 @@ pub fn save_state(
                 asset.favorite,
                 asset.is_available,
                 asset.place_hint,
+                asset.vault_id.map(|id| id.to_string()),
             ],
         )?;
 
@@ -1080,6 +1224,53 @@ pub fn save_state(
         )?;
     }
 
+    for protected in &state.protected_originals {
+        transaction.execute(
+            r#"
+            INSERT INTO protected_originals (
+              asset_id, object_id, content_hash, bytes, encrypted_hash, chunk_count, key_version,
+              reason, source_removed, created_at, updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+            "#,
+            params![
+                protected.asset_id.to_string(),
+                protected.object_id.to_string(),
+                protected.content_hash,
+                u64_to_sql(protected.bytes)?,
+                protected.encrypted_hash,
+                protected.chunk_count,
+                protected.key_version,
+                protected.reason,
+                protected.source_removed,
+                protected.created_at.to_rfc3339(),
+                protected.updated_at.to_rfc3339(),
+            ],
+        )?;
+    }
+
+    for chunk in &state.protected_original_chunks {
+        transaction.execute(
+            r#"
+            INSERT INTO protected_original_chunks (
+              id, asset_id, chunk_index, content_hash, encrypted_hash, bytes,
+              encrypted_bytes, local_path, nonce_hex, aad
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+            "#,
+            params![
+                chunk.id.to_string(),
+                chunk.asset_id.to_string(),
+                chunk.chunk_index,
+                chunk.content_hash,
+                chunk.encrypted_hash,
+                u64_to_sql(chunk.bytes)?,
+                u64_to_sql(chunk.encrypted_bytes)?,
+                chunk.local_path,
+                chunk.nonce_hex,
+                chunk.aad,
+            ],
+        )?;
+    }
+
     for replica in &state.blob_replicas {
         transaction.execute(
             r#"
@@ -1324,8 +1515,8 @@ pub fn save_state(
               id, source_kind, source_path, import_mode, add_as_watch_folder, status,
               created_at, completed_at, place_hint, imported_asset_ids_json, duplicate_asset_ids_json,
               moved_asset_ids_json, skipped_duplicate_ids_json, failed_candidate_ids_json,
-              sidecars_moved, unsupported_file_paths_json
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+              sidecars_moved, unsupported_file_paths_json, target_vault_id
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
             "#,
             params![
                 session.id.to_string(),
@@ -1344,6 +1535,7 @@ pub fn save_state(
                 uuid_vec_json(&session.failed_candidate_ids)?,
                 session.sidecars_moved as i64,
                 string_vec_json(&session.unsupported_file_paths)?,
+                session.target_vault_id.map(|id| id.to_string()),
             ],
         )?;
 
@@ -1536,7 +1728,7 @@ fn load_assets(
         r#"
         SELECT id, original_filename, relative_original_path, source_path, content_hash,
                media_kind, import_mode, bytes, mime_type, captured_at, imported_at,
-               archived, favorite, is_available, place_hint
+               archived, favorite, is_available, place_hint, vault_id
         FROM assets
         ORDER BY captured_at DESC
         "#,
@@ -1548,6 +1740,10 @@ fn load_assets(
         let source_path: String = row.get(3)?;
         let mut asset = Asset {
             id,
+            vault_id: row
+                .get::<_, Option<String>>(15)?
+                .map(|id| parse_uuid(&id))
+                .transpose()?,
             original_filename: row.get(1)?,
             relative_original_path: relative_original_path.clone(),
             source_path: source_path.clone(),
@@ -2188,6 +2384,63 @@ fn load_blob_chunks(connection: &Connection) -> Result<Vec<BlobChunk>, rusqlite:
     rows.collect()
 }
 
+fn load_protected_originals(
+    connection: &Connection,
+) -> Result<Vec<ProtectedOriginal>, rusqlite::Error> {
+    let mut statement = connection.prepare(
+        r#"
+        SELECT asset_id, object_id, content_hash, bytes, encrypted_hash, chunk_count,
+               key_version, reason, source_removed, created_at, updated_at
+        FROM protected_originals
+        ORDER BY created_at ASC
+        "#,
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok(ProtectedOriginal {
+            asset_id: parse_uuid(&row.get::<_, String>(0)?)?,
+            object_id: parse_uuid(&row.get::<_, String>(1)?)?,
+            content_hash: row.get(2)?,
+            bytes: sql_u64(row, 3)?,
+            encrypted_hash: row.get(4)?,
+            chunk_count: row.get(5)?,
+            key_version: row.get(6)?,
+            reason: row.get(7)?,
+            source_removed: row.get(8)?,
+            created_at: parse_datetime(&row.get::<_, String>(9)?)?,
+            updated_at: parse_datetime(&row.get::<_, String>(10)?)?,
+        })
+    })?;
+    rows.collect()
+}
+
+fn load_protected_original_chunks(
+    connection: &Connection,
+) -> Result<Vec<ProtectedOriginalChunk>, rusqlite::Error> {
+    let mut statement = connection.prepare(
+        r#"
+        SELECT id, asset_id, chunk_index, content_hash, encrypted_hash, bytes,
+               encrypted_bytes, local_path, nonce_hex, aad
+        FROM protected_original_chunks
+        ORDER BY asset_id ASC, chunk_index ASC
+        "#,
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok(ProtectedOriginalChunk {
+            id: parse_uuid(&row.get::<_, String>(0)?)?,
+            asset_id: parse_uuid(&row.get::<_, String>(1)?)?,
+            chunk_index: row.get(2)?,
+            content_hash: row.get(3)?,
+            encrypted_hash: row.get(4)?,
+            bytes: sql_u64(row, 5)?,
+            encrypted_bytes: sql_u64(row, 6)?,
+            local_path: row.get(7)?,
+            nonce_hex: row.get(8)?,
+            aad: row.get(9)?,
+        })
+    })?;
+    rows.collect()
+}
+
 fn load_blob_replicas(connection: &Connection) -> Result<Vec<BlobReplica>, rusqlite::Error> {
     let mut statement = connection.prepare(
         r#"
@@ -2561,7 +2814,7 @@ fn load_import_sessions(connection: &Connection) -> Result<Vec<ImportSession>, r
         SELECT id, source_kind, source_path, import_mode, add_as_watch_folder, status, created_at,
                completed_at, place_hint, imported_asset_ids_json, duplicate_asset_ids_json,
                moved_asset_ids_json, skipped_duplicate_ids_json, failed_candidate_ids_json,
-               sidecars_moved, unsupported_file_paths_json
+               sidecars_moved, unsupported_file_paths_json, target_vault_id
         FROM import_sessions
         ORDER BY created_at DESC
         "#,
@@ -2588,6 +2841,10 @@ fn load_import_sessions(connection: &Connection) -> Result<Vec<ImportSession>, r
             failed_candidate_ids: parse_uuid_vec(&row.get::<_, String>(13)?)?,
             sidecars_moved: row.get::<_, i64>(14)? as usize,
             unsupported_file_paths: parse_string_vec(&row.get::<_, String>(15)?)?,
+            target_vault_id: row
+                .get::<_, Option<String>>(16)?
+                .map(|value| parse_uuid(&value))
+                .transpose()?,
             selected_candidate_count: 0,
             selected_bytes: 0,
             duplicate_count: 0,
@@ -2844,12 +3101,14 @@ where
 mod tests {
     use chrono::Utc;
     use rusqlite::Connection;
+    use uuid::Uuid;
 
     use crate::{
         config::AppConfig,
         domain::{
             EntitlementCache, EntitlementCacheStatus, EntitlementLimits, EntitlementRelayPriority,
-            EntitlementTier, ImportMode, LibrarySettings, OriginalStoragePolicy,
+            EntitlementTier, ImportMode, LibrarySettings, OriginalStoragePolicy, ProtectedOriginal,
+            ProtectedOriginalChunk,
         },
     };
 
@@ -2860,6 +3119,151 @@ mod tests {
 
     fn temp_runtime_root() -> crate::test_support::TestTempDir {
         crate::test_support::TestTempDir::new("storage")
+    }
+
+    fn legacy_owner_fixture(connection: &Connection) {
+        connection.execute_batch(r#"
+            PRAGMA foreign_keys = ON;
+            CREATE TABLE assets (
+              id TEXT PRIMARY KEY, original_filename TEXT NOT NULL,
+              relative_original_path TEXT NOT NULL, source_path TEXT NOT NULL,
+              content_hash TEXT NOT NULL UNIQUE, media_kind TEXT NOT NULL,
+              import_mode TEXT NOT NULL, bytes INTEGER NOT NULL, mime_type TEXT NOT NULL,
+              captured_at TEXT NOT NULL, imported_at TEXT NOT NULL,
+              archived INTEGER NOT NULL DEFAULT 0, favorite INTEGER NOT NULL DEFAULT 0,
+              is_available INTEGER NOT NULL DEFAULT 1, place_hint TEXT
+            );
+            CREATE TABLE vaults (id TEXT PRIMARY KEY);
+            CREATE TABLE blob_records (asset_id TEXT, vault_id TEXT, tombstoned_at TEXT);
+            CREATE TABLE mobile_uploads (asset_id TEXT, vault_id TEXT, status TEXT);
+            CREATE TABLE vault_file_entries (asset_id TEXT, vault_id TEXT, trashed_at TEXT);
+            CREATE TABLE child_metadata (asset_id TEXT REFERENCES assets(id) ON DELETE CASCADE, note TEXT);
+            CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, name TEXT, applied_at TEXT);
+            INSERT INTO vaults VALUES ('vault-a'), ('vault-b');
+            INSERT INTO assets VALUES
+              ('stable-id', 'photo.jpg', 'objects/old/photo.jpg', '/source/photo.jpg',
+               'same-bytes', 'photo', 'copy', 5, 'image/jpeg', '2026-01-01', '2026-01-01', 0, 1, 1, 'Home'),
+              ('ambiguous-id', 'private.jpg', 'originals/old/private.jpg', '/source/private.jpg',
+               'private-bytes', 'photo', 'copy', 7, 'image/jpeg', '2026-01-01', '2026-01-01', 0, 0, 1, NULL),
+              ('unassigned-id', 'new.jpg', 'objects/old/new.jpg', '/source/new.jpg',
+               'unassigned-bytes', 'photo', 'copy', 3, 'image/jpeg', '2026-01-01', '2026-01-01', 0, 0, 1, NULL);
+            INSERT INTO child_metadata VALUES ('stable-id', 'keep identity and metadata');
+            INSERT INTO blob_records VALUES ('stable-id', 'vault-a', NULL), ('ambiguous-id', 'vault-a', NULL);
+            INSERT INTO vault_file_entries VALUES ('stable-id', 'vault-a', NULL);
+            INSERT INTO mobile_uploads VALUES ('stable-id', 'vault-a', 'completed'), ('ambiguous-id', 'vault-b', 'completed');
+            PRAGMA user_version = 23;
+        "#).expect("populated old schema");
+    }
+
+    #[test]
+    fn asset_owner_migration_preserves_populated_database_and_scopes_hashes() {
+        let root = temp_runtime_root();
+        let path = root.join("migration.sqlite3");
+        let connection = Connection::open(&path).expect("fixture database");
+        legacy_owner_fixture(&connection);
+        super::migrate_asset_vault_ownership(&connection).expect("migrate populated database");
+        assert!(
+            connection
+                .pragma_query_value(None, "foreign_keys", |row| row.get::<_, bool>(0))
+                .unwrap()
+        );
+        let stable: (String, String, String, String) = connection.query_row(
+            "SELECT id, relative_original_path, source_path, vault_id FROM assets WHERE id = 'stable-id'", [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))).unwrap();
+        assert_eq!(
+            stable,
+            (
+                "stable-id".into(),
+                "objects/old/photo.jpg".into(),
+                "/source/photo.jpg".into(),
+                "vault-a".into()
+            )
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT note FROM child_metadata", [], |row| row
+                    .get::<_, String>(0))
+                .unwrap(),
+            "keep identity and metadata"
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT count(*) FROM assets WHERE vault_id IS NULL",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            2
+        );
+        // Same bytes in another vault are legal, but duplicate identities in
+        // one vault are rejected by the database rather than only by the UI.
+        connection.execute("INSERT INTO assets SELECT 'second-vault-id', original_filename, relative_original_path, source_path, content_hash, media_kind, import_mode, bytes, mime_type, captured_at, imported_at, archived, favorite, is_available, place_hint, 'vault-b' FROM assets WHERE id = 'stable-id'", []).unwrap();
+        assert!(connection.execute("INSERT INTO assets SELECT 'duplicate-id', original_filename, relative_original_path, source_path, content_hash, media_kind, import_mode, bytes, mime_type, captured_at, imported_at, archived, favorite, is_available, place_hint, 'vault-a' FROM assets WHERE id = 'stable-id'", []).is_err());
+        drop(connection);
+        let reopened = Connection::open(&path).unwrap();
+        assert_eq!(
+            reopened
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            24
+        );
+        assert_eq!(
+            reopened
+                .query_row("SELECT count(*) FROM assets", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            4
+        );
+        assert_eq!(
+            reopened
+                .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn asset_owner_migration_failure_rolls_back_and_restores_foreign_keys() {
+        let connection = Connection::open_in_memory().unwrap();
+        legacy_owner_fixture(&connection);
+        connection
+            .pragma_update(None, "foreign_keys", false)
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO child_metadata VALUES ('missing-id', 'invalid old reference')",
+                [],
+            )
+            .unwrap();
+        connection
+            .pragma_update(None, "foreign_keys", true)
+            .unwrap();
+        assert!(super::migrate_asset_vault_ownership(&connection).is_err());
+        assert!(
+            connection
+                .pragma_query_value(None, "foreign_keys", |row| row.get::<_, bool>(0))
+                .unwrap()
+        );
+        assert_eq!(
+            connection
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            23
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT count(*) FROM assets", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            3
+        );
+        assert!(
+            connection.prepare("SELECT vault_id FROM assets").is_err(),
+            "column addition must roll back with the rebuild"
+        );
     }
 
     #[test]
@@ -2981,6 +3385,89 @@ mod tests {
     }
 
     #[test]
+    fn schema_v21_migration_adds_import_session_target_vault() {
+        let runtime_root = temp_runtime_root();
+        let config = AppConfig {
+            runtime_root: runtime_root.as_ref().to_path_buf(),
+            ..AppConfig::default()
+        };
+        bootstrap_storage(&config).expect("bootstrap current schema");
+        let connection = Connection::open(config.database_path()).expect("open database");
+        connection
+            .execute_batch(
+                "ALTER TABLE import_sessions DROP COLUMN target_vault_id;
+                 DELETE FROM schema_migrations WHERE version = 22;
+                 PRAGMA user_version = 21;",
+            )
+            .expect("restore v21 schema fixture");
+        drop(connection);
+
+        bootstrap_storage(&config).expect("migrate v21 database");
+        let connection = Connection::open(config.database_path()).expect("reopen database");
+        let has_target_vault = connection
+            .prepare("PRAGMA table_info(import_sessions)")
+            .expect("prepare table info")
+            .query_map([], |row| row.get::<_, String>(1))
+            .expect("read columns")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect columns")
+            .iter()
+            .any(|column| column == "target_vault_id");
+        assert!(has_target_vault);
+        let version: i64 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("read migrated schema version");
+        assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn protected_original_metadata_and_chunks_round_trip() {
+        let runtime_root = temp_runtime_root();
+        let config = AppConfig {
+            runtime_root: runtime_root.as_ref().to_path_buf(),
+            ..AppConfig::default()
+        };
+        let report = bootstrap_storage(&config).expect("bootstrap storage");
+        let now = Utc::now();
+        let asset_id = Uuid::new_v4();
+        let object_id = Uuid::new_v4();
+        let protected = ProtectedOriginal {
+            asset_id,
+            object_id,
+            content_hash: "a".repeat(64),
+            bytes: 4,
+            encrypted_hash: "b".repeat(64),
+            chunk_count: 1,
+            key_version: 1,
+            reason: "conflicting_live_vault_associations".to_string(),
+            source_removed: false,
+            created_at: now,
+            updated_at: now,
+        };
+        let chunk = ProtectedOriginalChunk {
+            id: Uuid::new_v4(),
+            asset_id,
+            chunk_index: 0,
+            content_hash: "a".repeat(64),
+            encrypted_hash: "b".repeat(64),
+            bytes: 4,
+            encrypted_bytes: 20,
+            local_path: format!("quarantine/managed-originals/{object_id}/00000000.qblob"),
+            nonce_hex: "00".repeat(12),
+            aad: "local-quarantine-aad".to_string(),
+        };
+        let state = PersistedLibraryState {
+            protected_originals: vec![protected.clone()],
+            protected_original_chunks: vec![chunk.clone()],
+            ..PersistedLibraryState::default()
+        };
+        save_state(&report, &state).expect("save protected original");
+        let loaded = load_state(&report).expect("load protected original");
+        assert_eq!(loaded.protected_originals, vec![protected]);
+        assert_eq!(loaded.protected_original_chunks, vec![chunk]);
+    }
+
+    #[test]
     fn migration_allows_opaque_blob_records_without_local_asset_metadata() {
         let runtime_root = temp_runtime_root();
         let config = AppConfig {
@@ -2994,7 +3481,16 @@ mod tests {
             .execute_batch(
                 r#"
                 PRAGMA foreign_keys = ON;
-                CREATE TABLE assets (id TEXT PRIMARY KEY);
+                CREATE TABLE assets (
+                  id TEXT PRIMARY KEY, original_filename TEXT NOT NULL,
+                  relative_original_path TEXT NOT NULL, source_path TEXT NOT NULL,
+                  content_hash TEXT NOT NULL, media_kind TEXT NOT NULL,
+                  import_mode TEXT NOT NULL, bytes INTEGER NOT NULL,
+                  mime_type TEXT NOT NULL, captured_at TEXT NOT NULL,
+                  imported_at TEXT NOT NULL, archived INTEGER NOT NULL DEFAULT 0,
+                  favorite INTEGER NOT NULL DEFAULT 0,
+                  is_available INTEGER NOT NULL DEFAULT 1, place_hint TEXT
+                );
                 CREATE TABLE vaults (id TEXT PRIMARY KEY);
                 CREATE TABLE device_identities (id TEXT PRIMARY KEY);
                 CREATE TABLE blob_records (
