@@ -9,6 +9,7 @@ help:
 	@echo "  test               cargo test (Rust workspace)"
 	@echo "  iroh-interop-test  mixed-version Iroh 0.98.2/1.x verified sync transfer test"
 	@echo "  check              scripts/dev-check.sh (Rust + Flutter + release gate when available)"
+	@echo "  workspace-status   offline worktree and branch inventory"
 	@echo "  deps               install the hash-pinned test dependencies (scripts/requirements-test.txt)"
 	@echo "  audit              cargo audit"
 	@echo "  flutter-analyze    flutter analyze (app/)"
@@ -111,6 +112,7 @@ test:
 
 iroh-interop-test:
 	bash scripts/tests/iroh_mixed_version_sync_test.sh
+	bash scripts/tests/iroh_historical_app_test.sh
 
 check:
 	./scripts/dev-check.sh
@@ -171,3 +173,9 @@ canary-mutations:
 project-board-mutations:
 	bash scripts/tests/project_board_refs_mutation_test.sh
 	bash scripts/tests/project_board_workflow_mutation_test.sh
+.PHONY: workspace-status workspace-status-test
+workspace-status:
+	python3 scripts/workspace_status.py
+
+workspace-status-test:
+	python3 -m unittest discover -s scripts/tests -p 'workspace_status_test.py'

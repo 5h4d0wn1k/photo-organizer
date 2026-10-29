@@ -88,6 +88,7 @@ mod tests {
     fn asset(name: &str, hour: u32, place_hint: Option<&str>) -> Asset {
         Asset {
             id: Uuid::new_v4(),
+            vault_id: None,
             original_filename: name.to_string(),
             relative_original_path: name.to_string(),
             source_path: format!("/tmp/{name}"),

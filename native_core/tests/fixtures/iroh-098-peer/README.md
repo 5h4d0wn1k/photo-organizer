@@ -8,7 +8,7 @@ production 1.x sync runtime. It does not build or run the historical 0.98.2
 Photo Organizer application; full old-app/new-app compatibility remains an
 open acceptance gate.
 
-The peer binds only to `127.0.0.1`, disables relays, refuses non-loopback client
+The peer binds only to `127.0.0.1`, disables relays and all hosted address lookup services, refuses non-loopback client
 targets, and applies 15-second network operation timeouts. Key material is read
 from a test-only file and is never printed. Its `Cargo.lock` is intentionally
 local to this nested crate; the old dependency graph must not enter the main

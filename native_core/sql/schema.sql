@@ -21,7 +21,7 @@ CREATE TABLE IF NOT EXISTS assets (
   original_filename TEXT NOT NULL,
   relative_original_path TEXT NOT NULL,
   source_path TEXT NOT NULL,
-  content_hash TEXT NOT NULL UNIQUE,
+  content_hash TEXT NOT NULL,
   media_kind TEXT NOT NULL,
   import_mode TEXT NOT NULL,
   bytes INTEGER NOT NULL,
@@ -31,7 +31,9 @@ CREATE TABLE IF NOT EXISTS assets (
   archived INTEGER NOT NULL DEFAULT 0,
   favorite INTEGER NOT NULL DEFAULT 0,
   is_available INTEGER NOT NULL DEFAULT 1,
-  place_hint TEXT
+  place_hint TEXT,
+  vault_id TEXT,
+  UNIQUE(vault_id, content_hash)
 );
 
 CREATE TABLE IF NOT EXISTS asset_manual_tags (
@@ -314,6 +316,35 @@ CREATE TABLE IF NOT EXISTS blob_chunks (
   FOREIGN KEY(blob_id) REFERENCES blob_records(id) ON DELETE CASCADE
 );
 
+CREATE TABLE IF NOT EXISTS protected_originals (
+  asset_id TEXT PRIMARY KEY,
+  object_id TEXT NOT NULL UNIQUE,
+  content_hash TEXT NOT NULL,
+  bytes INTEGER NOT NULL,
+  encrypted_hash TEXT NOT NULL,
+  chunk_count INTEGER NOT NULL,
+  key_version INTEGER NOT NULL,
+  reason TEXT NOT NULL,
+  source_removed INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS protected_original_chunks (
+  id TEXT PRIMARY KEY,
+  asset_id TEXT NOT NULL,
+  chunk_index INTEGER NOT NULL,
+  content_hash TEXT NOT NULL,
+  encrypted_hash TEXT NOT NULL,
+  bytes INTEGER NOT NULL,
+  encrypted_bytes INTEGER NOT NULL,
+  local_path TEXT NOT NULL,
+  nonce_hex TEXT NOT NULL,
+  aad TEXT NOT NULL,
+  UNIQUE(asset_id, chunk_index),
+  FOREIGN KEY(asset_id) REFERENCES protected_originals(asset_id) ON DELETE CASCADE
+);
+
 CREATE TABLE IF NOT EXISTS blob_replicas (
   id TEXT PRIMARY KEY,
   blob_id TEXT NOT NULL,
@@ -485,7 +516,8 @@ CREATE TABLE IF NOT EXISTS import_sessions (
   skipped_duplicate_ids_json TEXT NOT NULL DEFAULT '[]',
   failed_candidate_ids_json TEXT NOT NULL DEFAULT '[]',
   sidecars_moved INTEGER NOT NULL DEFAULT 0,
-  unsupported_file_paths_json TEXT NOT NULL DEFAULT '[]'
+  unsupported_file_paths_json TEXT NOT NULL DEFAULT '[]',
+  target_vault_id TEXT
 );
 
 CREATE TABLE IF NOT EXISTS import_candidates (

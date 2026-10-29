@@ -9,6 +9,33 @@ import 'package:private_gallery_app/src/api/local_api_client.dart';
 import 'package:private_gallery_app/src/models/gallery_models.dart';
 
 void main() {
+  test(
+    'recovery requests preserve passphrases, omit absent values and allow KDF time',
+    () async {
+      final transport = _RecoveryJsonClient();
+      final client = LocalApiClient(
+        httpClient: transport,
+        defaultTimeout: const Duration(milliseconds: 1),
+        heavyReadTimeout: const Duration(seconds: 1),
+      );
+      const secret = '  exact recovery passphrase  ';
+      await client.exportBackup(
+        exportRoot: '/backup',
+        recoveryPassphrase: secret,
+      );
+      await client.runRestoreBackup(
+        exportRoot: '/backup',
+        restoreRoot: '/restore',
+        recoveryPassphrase: secret,
+      );
+      await client.exportBackup(exportRoot: '/plain');
+      expect(transport.payloads[0]['recovery_passphrase'], secret);
+      expect(transport.payloads[1]['recovery_passphrase'], secret);
+      expect(transport.payloads[1]['confirmed'], isTrue);
+      expect(transport.payloads[2].containsKey('recovery_passphrase'), isFalse);
+    },
+  );
+
   test('uses a longer timeout for large timeline reads', () async {
     final client = LocalApiClient(
       httpClient: _DelayedJsonClient(
@@ -2033,4 +2060,21 @@ Map<String, Object?> _eventJson(List<String> assetIds) {
     'created_at': '2026-05-13T06:00:00Z',
     'rebuildable': true,
   };
+}
+
+class _RecoveryJsonClient extends http.BaseClient {
+  final payloads = <Map<String, dynamic>>[];
+  @override
+  Future<http.StreamedResponse> send(http.BaseRequest request) async {
+    payloads.add(
+      jsonDecode(await request.finalize().bytesToString())
+          as Map<String, dynamic>,
+    );
+    await Future<void>.delayed(const Duration(milliseconds: 10));
+    return http.StreamedResponse(
+      Stream.value(utf8.encode('{"ok":true}')),
+      200,
+      headers: {'content-type': 'application/json'},
+    );
+  }
 }

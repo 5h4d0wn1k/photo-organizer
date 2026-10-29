@@ -1,9 +1,8 @@
-import 'dart:io';
-
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
 
 import '../models/gallery_models.dart';
+import 'desktop_asset_preview.dart';
 
 class AssetGrid extends StatelessWidget {
   const AssetGrid({
@@ -56,7 +55,6 @@ class AssetGrid extends StatelessWidget {
                 asset.metadata?.width != null && asset.metadata?.height != null
                 ? '${asset.metadata!.width}x${asset.metadata!.height}'
                 : null;
-            final previewPath = _previewPath(asset);
             final selected = selectedAssetIds.contains(asset.id);
             final canSelect =
                 selectionEnabled && onAssetSelectionToggled != null;
@@ -91,13 +89,16 @@ class AssetGrid extends StatelessWidget {
                     child: Stack(
                       fit: StackFit.expand,
                       children: [
-                        if (previewPath != null)
-                          Image.file(
-                            File(previewPath),
-                            fit: BoxFit.cover,
-                            errorBuilder: (_, _, _) =>
-                                const SizedBox.shrink(),
+                        DesktopAssetPreview(
+                          asset: asset,
+                          fallback: Center(
+                            child: Icon(
+                              kindIcon,
+                              color: Colors.white54,
+                              size: 48,
+                            ),
                           ),
+                        ),
                         DecoratedBox(
                           decoration: BoxDecoration(
                             gradient: LinearGradient(
@@ -167,8 +168,6 @@ class AssetGrid extends StatelessWidget {
                                   _AssetBadge(
                                     label: _assetKindLabel(asset.mediaKind),
                                   ),
-                                  if (previewPath != null)
-                                    const _AssetBadge(label: 'local preview'),
                                 ],
                               ),
                               const SizedBox(height: 4),
@@ -222,27 +221,6 @@ class AssetGrid extends StatelessWidget {
         );
       },
     );
-  }
-
-  String? _previewPath(Asset asset) {
-    if (asset.mediaKind != 'photo' || !asset.isAvailable) {
-      return null;
-    }
-    if (asset.importMode == ImportMode.reference) {
-      return asset.sourcePath.isEmpty ? null : asset.sourcePath;
-    }
-    final root = libraryRoot;
-    if (root == null || root.isEmpty || asset.relativeOriginalPath.isEmpty) {
-      return null;
-    }
-    final separator = root.endsWith('/') || root.endsWith('\\')
-        ? ''
-        : Platform.pathSeparator;
-    final relative = asset.relativeOriginalPath.replaceFirst(
-      RegExp(r'^[\\/]+'),
-      '',
-    );
-    return '$root$separator$relative';
   }
 }
 

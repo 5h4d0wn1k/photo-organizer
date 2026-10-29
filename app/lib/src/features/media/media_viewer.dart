@@ -1,10 +1,9 @@
-import 'dart:io';
-
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
 
 import '../../models/gallery_models.dart';
 import '../../widgets/app_ui.dart';
+import '../../widgets/desktop_asset_preview.dart';
 
 typedef AssetAvailabilityAction =
     Future<AssetAvailability> Function(String assetId);
@@ -105,7 +104,6 @@ class MediaViewer extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    final previewPath = _previewPath(asset, libraryRoot);
     final metadata = asset.metadata;
     final dimensions = metadata?.width != null && metadata?.height != null
         ? '${metadata!.width} x ${metadata.height}'
@@ -177,7 +175,7 @@ class MediaViewer extends StatelessWidget {
             LayoutBuilder(
               builder: (context, constraints) {
                 final wide = constraints.maxWidth >= 840;
-                final preview = _PreviewPane(asset: asset, path: previewPath);
+                final preview = _PreviewPane(asset: asset);
                 final details = _DetailsPane(
                   rows: [
                     AppMetadataRow(label: 'Kind', value: asset.mediaKind),
@@ -511,10 +509,9 @@ class _AvailabilityPaneState extends State<_AvailabilityPane> {
 }
 
 class _PreviewPane extends StatelessWidget {
-  const _PreviewPane({required this.asset, required this.path});
+  const _PreviewPane({required this.asset});
 
   final Asset asset;
-  final String? path;
 
   @override
   Widget build(BuildContext context) {
@@ -530,14 +527,13 @@ class _PreviewPane extends StatelessWidget {
           child: Stack(
             fit: StackFit.expand,
             children: [
-              if (path != null)
-                Image.file(
-                  File(path!),
-                  fit: BoxFit.contain,
-                  errorBuilder: (_, _, _) => _PreviewFallback(asset: asset),
-                )
-              else
-                _PreviewFallback(asset: asset),
+              DesktopAssetPreview(
+                asset: asset,
+                fit: BoxFit.contain,
+                decodeWidth: 2048,
+                fullSize: true,
+                fallback: _PreviewFallback(asset: asset),
+              ),
               Positioned(
                 left: 12,
                 bottom: 12,
@@ -739,25 +735,4 @@ IconData _availabilityIcon(AssetAvailabilityState state) {
     AssetAvailabilityState.corrupt => Icons.gpp_bad_outlined,
     AssetAvailabilityState.transferPending => Icons.sync_outlined,
   };
-}
-
-String? _previewPath(Asset asset, String? libraryRoot) {
-  if (asset.mediaKind != 'photo' || !asset.isAvailable) {
-    return null;
-  }
-  if (asset.importMode == ImportMode.reference) {
-    return asset.sourcePath.isEmpty ? null : asset.sourcePath;
-  }
-  final root = libraryRoot;
-  if (root == null || root.isEmpty || asset.relativeOriginalPath.isEmpty) {
-    return null;
-  }
-  final separator = root.endsWith('/') || root.endsWith('\\')
-      ? ''
-      : Platform.pathSeparator;
-  final relative = asset.relativeOriginalPath.replaceFirst(
-    RegExp(r'^[\\/]+'),
-    '',
-  );
-  return '$root$separator$relative';
 }

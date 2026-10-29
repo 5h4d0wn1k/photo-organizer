@@ -235,10 +235,15 @@ async fn bind_endpoint(key_file: &Path) -> Result<Endpoint> {
         .secret_key(load_secret_key(key_file)?)
         .alpns(vec![ALPN.to_vec()])
         .relay_mode(RelayMode::Disabled)
+        .clear_address_lookup()
         .clear_ip_transports()
         .bind_addr("127.0.0.1:0")?
         .bind()
         .await?;
+    if !endpoint.address_lookup()?.is_empty() {
+        endpoint.close().await;
+        return Err("hermetic fixture has hosted address lookup services".into());
+    }
     let addresses = direct_addresses(&endpoint);
     if addresses.is_empty()
         || addresses

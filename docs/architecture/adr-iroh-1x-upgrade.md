@@ -84,6 +84,35 @@ independent fixture implementation, not the historical Photo Organizer
 0.98.2 application. Therefore this is useful contract-regression evidence but
 does not close the old-app/new-app acceptance gate or issue #122.
 
+A second gate, `scripts/tests/iroh_historical_app_test.sh`, now builds the
+unchanged production daemon from frozen pre-upgrade main commit
+`663c67c5a5650e923f20474963ae8df2bf884592` (Iroh 0.98.2) and the current
+daemon. Both role placements exercise the actual HTTP import, enrollment,
+`run_sync`, eviction, pin, Pull and original-read APIs. The gate checks persisted
+completed transfer proof and ciphertext hashes, restarts the source before
+eviction, and boots the historical node's existing enrolled runtime with the
+current daemon to check identity and peer preservation. A separate example
+sets only fixture-local roles/capacity before enrollment and inspects databases
+while stopped; it does not implement transport or manufacture transfer proof.
+Each device uses an independent temporary Secret Service. The harness starts
+those services outside the root-mapped user namespace because GNOME Keyring
+cannot drop capabilities there; each bus uses only a Unix socket under the
+temporary test root. A nested user namespace restores the caller's numerical
+UID for libdbus authentication. The application daemons remain in a private
+Linux network namespace with no external route, preventing the unchanged
+historical application's discovery from contacting hosted infrastructure.
+Cancellation forwards termination to the coordinator, which stops all daemon
+groups before temporary identities, keyrings, databases and media are removed.
+Both role placements passed locally on 2026-10-29, verifying 225280 original
+bytes per case and one encrypted chunk with preserved historical identity.
+The gate is required by the Rust service CI job; acceptance still requires
+successful hosted execution of the final PR revision.
+
+Offline-only current endpoints and hermetic fixture endpoints explicitly clear
+all address lookup services as well as disabling relay transport. N0's preset
+otherwise retains its hosted publisher and resolvers after relay disablement.
+The endpoint regression test inspects actual configured lookup services.
+
 ## Tradeoffs
 
 - The new dependency tree contains no Hickory packages and no known
@@ -111,11 +140,13 @@ does not close the old-app/new-app acceptance gate or issue #122.
    `load_or_create_secret_key` path, produces the enrolled device's existing
    endpoint identity, and remains paired through a real endpoint descriptor.
    Use only test keys and isolated runtime roots.
-3. Keep the current fixture test as wire-contract regression coverage. Add a
-   hermetic test that runs the historical Photo Organizer implementation linked
-   to Iroh 0.98.2 against the current production implementation linked to Iroh
-   1.x. Verify Push and Pull, encrypted chunk hashes, persisted replica health,
-   and completed transfer state in both directions.
+3. Keep the fixture as wire-contract regression coverage and run
+   `scripts/tests/iroh_historical_app_test.sh` for the historical/current
+   application gate. Verify both role placements, persisted remote proof before
+   eviction, encrypted chunk hashes, exact original restoration and enrolled
+   identity preservation. The gate fails if network namespaces, Secret Service
+   or the immutable historical source are unavailable; it has no public-network
+   or file-key fallback.
 4. Keep issue #122 open until that old-app/new-app test passes. Do not describe
    the migration as fully accepted or close the issue based on a cloned peer.
 5. Explain that relay behavior may differ from direct connectivity during
