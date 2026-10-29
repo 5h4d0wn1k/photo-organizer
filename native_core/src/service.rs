@@ -236,6 +236,7 @@ pub struct GalleryService {
 
 impl GalleryService {
     pub fn new(config: AppConfig) -> Result<Self, ServiceError> {
+        vault_store::validate_key_storage(&config).map_err(vault_store_error)?;
         if !config.developer_mode
             && !config.allow_remote_mobile
             && !model_registry::is_loopback_host(&config.bind_host)
@@ -1742,7 +1743,22 @@ impl GalleryService {
         &self,
         asset_id: Uuid,
     ) -> Result<(String, Vec<u8>), ServiceError> {
-        let fallback_to_original = {
+        self.asset_preview_bytes_with_size(asset_id, false).await
+    }
+
+    pub async fn asset_full_size_preview_bytes(
+        &self,
+        asset_id: Uuid,
+    ) -> Result<(String, Vec<u8>), ServiceError> {
+        self.asset_preview_bytes_with_size(asset_id, true).await
+    }
+
+    async fn asset_preview_bytes_with_size(
+        &self,
+        asset_id: Uuid,
+        full_size: bool,
+    ) -> Result<(String, Vec<u8>), ServiceError> {
+        let (hidden_photo, allow_original, cached) = {
             let mut state = self.state.write().await;
             ensure_distributed_defaults(&mut state);
             refresh_blob_records(&self.config, &mut state);
@@ -1753,35 +1769,77 @@ impl GalleryService {
                 .find(|asset| asset.id == asset_id)
                 .cloned()
                 .ok_or_else(|| ServiceError::NotFound(format!("asset {asset_id}")))?;
-            let variant = asset
-                .variants
-                .iter()
-                .find(|variant| variant.kind == VariantKind::Thumbnail)
-                .or_else(|| {
-                    asset
-                        .variants
-                        .iter()
-                        .find(|variant| variant.kind == VariantKind::Preview)
-                })
-                .cloned();
-            if let Some(variant) = variant {
-                let path = library_root.join(&variant.relative_path);
-                if path.is_file() {
-                    return fs::read(&path)
-                        .map(|bytes| (variant.mime_type, bytes))
-                        .map_err(|err| ServiceError::Io(err.to_string()));
+            let photo = matches!(asset.media_kind, MediaKind::Photo);
+            let hidden = photo
+                && asset
+                    .metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.geo.as_ref())
+                    .is_some_and(|geo| geo.exact_hidden);
+            let mut cached = None;
+            if !full_size {
+                let variant = asset
+                    .variants
+                    .iter()
+                    .find(|variant| variant.kind == VariantKind::Thumbnail)
+                    .or_else(|| {
+                        asset
+                            .variants
+                            .iter()
+                            .find(|variant| variant.kind == VariantKind::Preview)
+                    });
+                if let Some(variant) = variant {
+                    let path = library_root.join(&variant.relative_path);
+                    if path.is_file() {
+                        cached = Some((variant.mime_type.clone(), path));
+                    }
                 }
             }
             self.persist_locked_state(&state)?;
-            matches!(asset.media_kind, MediaKind::Photo)
+            (hidden, photo || full_size, cached)
         };
-        if fallback_to_original {
-            self.asset_original_bytes(asset_id).await
+        // Bound private rendering before reading/decrypting an original. A grid
+        // burst must not retain many full-resolution buffers while awaiting workers.
+        static PRIVATE_PREVIEW_SLOTS: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> =
+            std::sync::OnceLock::new();
+        let private_slot = if hidden_photo {
+            Some(
+                PRIVATE_PREVIEW_SLOTS
+                    .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(1)))
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .map_err(|_| {
+                        ServiceError::Storage("private preview renderer unavailable".into())
+                    })?,
+            )
         } else {
-            Err(ServiceError::NotFound(format!(
+            None
+        };
+        let (mime, bytes) = if let Some((mime, path)) = cached {
+            let bytes = fs::read(path).map_err(|error| ServiceError::Io(error.to_string()))?;
+            (mime, bytes)
+        } else if allow_original {
+            self.asset_original_bytes(asset_id).await?
+        } else {
+            return Err(ServiceError::NotFound(format!(
                 "preview for asset {asset_id}"
-            )))
+            )));
+        };
+        if !hidden_photo {
+            return Ok((mime, bytes));
         }
+        // Only a newly rendered derivative crosses the automatic preview boundary.
+        // Original/download APIs remain explicit byte-preserving operations.
+        let private = tokio::task::spawn_blocking(move || {
+            // Keep the permit until decoding ends even if the HTTP request is cancelled.
+            let _slot = private_slot;
+            crate::preview_privacy::sanitize_hidden_photo(&bytes)
+        })
+        .await
+        .map_err(|_| ServiceError::Storage("private preview rendering failed".into()))?
+        .map_err(ServiceError::Invalid)?;
+        Ok(("image/png".into(), private))
     }
 
     pub async fn file_tree(
@@ -5415,8 +5473,10 @@ impl GalleryService {
         fs::create_dir_all(&manifest_dir).map_err(|err| ServiceError::Io(err.to_string()))?;
         fs::create_dir_all(&library_export_dir).map_err(|err| ServiceError::Io(err.to_string()))?;
 
+        // Keep catalog mutations and media retirement out of the complete
+        // snapshot/inventory/copy window. Verification below uses this same state.
+        let mut state = self.state.write().await;
         let entries = {
-            let mut state = self.state.write().await;
             ensure_distributed_defaults(&mut state);
             let changed = refresh_blob_records(&self.config, &mut state);
             if changed {
@@ -5437,8 +5497,8 @@ impl GalleryService {
                 .file_name()
                 .unwrap_or_else(|| std::ffi::OsStr::new("gallery.sqlite3")),
         );
-        fs::copy(&self.storage.database_path, &database_copy)
-            .map_err(|err| ServiceError::Io(err.to_string()))?;
+        security::snapshot_database(&self.storage.database_path, &database_copy)
+            .map_err(security_error)?;
 
         let mut media_files_copied = 0_usize;
         let mut vault_chunks_copied = 0_usize;
@@ -5471,11 +5531,11 @@ impl GalleryService {
             }));
         }
 
-        let verification = self
-            .verify_backup(BackupVerifyRequest {
-                export_root: Some(request.export_root.clone()),
-            })
-            .await?;
+        let mut verification = self.verify_backup_locked(&state)?;
+        verification.database_sha256 = Some(
+            imports::derive_content_hash_from_file(&database_copy)
+                .map_err(|error| ServiceError::Io(error.to_string()))?,
+        );
         let manifest_path = manifest_dir.join("private-gallery-backup-manifest.json");
         let manifest = json!({
             "exported_at": Utc::now(),
@@ -5690,7 +5750,14 @@ impl GalleryService {
         if changed {
             self.persist_locked_state(&state)?;
         }
-        let library_root = PathBuf::from(effective_library_root(&state, &self.config));
+        self.verify_backup_locked(&state)
+    }
+
+    fn verify_backup_locked(
+        &self,
+        state: &LibraryState,
+    ) -> Result<BackupVerification, ServiceError> {
+        let library_root = PathBuf::from(effective_library_root(state, &self.config));
         let mut missing_asset_paths = Vec::new();
         for asset in &state.assets {
             let path = asset_file_path(asset, &library_root);
@@ -5698,7 +5765,7 @@ impl GalleryService {
                 .blob_records
                 .iter()
                 .find(|blob| blob.asset_id == asset.id && blob.tombstoned_at.is_none())
-                .map(|blob| encrypted_chunks_available(&state, blob.id, &library_root))
+                .map(|blob| encrypted_chunks_available(state, blob.id, &library_root))
                 .unwrap_or(false);
             if !path.exists() && !encrypted_available {
                 missing_asset_paths.push(path.to_string_lossy().to_string());
@@ -6522,15 +6589,33 @@ fn refresh_blob_records_impl(
         if blob_needs_local_seal(state, blob_id, &library_root) {
             let source_path = asset_file_path(&asset, &library_root);
             if source_path.is_file() {
-                match vault_store::seal_asset(
+                let has_encrypted_history = state.blob_records.iter().any(|blob| {
+                    blob.vault_id == vault.id
+                        && blob.encryption_key_version == vault.key_version
+                        && (!blob.encrypted_hash.starts_with("unsealed-")
+                            || state
+                                .blob_chunks
+                                .iter()
+                                .any(|chunk| chunk.blob_id == blob.id && chunk.encrypted_bytes > 0))
+                });
+                match vault_store::provision_vault_key_if_new(
                     config,
                     &library_root,
                     vault.id,
                     vault.key_version,
-                    blob_id,
-                    &asset,
-                    &source_path,
-                ) {
+                    has_encrypted_history,
+                )
+                .and_then(|_| {
+                    vault_store::seal_asset(
+                        config,
+                        &library_root,
+                        vault.id,
+                        vault.key_version,
+                        blob_id,
+                        &asset,
+                        &source_path,
+                    )
+                }) {
                     Ok(sealed) => {
                         if let Some(blob) = state
                             .blob_records
@@ -10129,6 +10214,162 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hidden_gps_previews_strip_embedded_metadata_without_changing_originals() {
+        use crate::domain::{OriginalStoragePolicy, VariantKind};
+        use image::ImageDecoder;
+        let root = temp_root("hidden-gps-previews");
+        let library = root.join("library");
+        let source = root.join("camera.jpg");
+        let original = crate::preview_privacy::gps_jpeg();
+        fs::write(&source, &original).unwrap();
+        let service = GalleryService::new(AppConfig {
+            runtime_root: root.join("runtime"),
+            library_root: library.clone(),
+            ..AppConfig::default()
+        })
+        .unwrap();
+        service
+            .update_library_settings(UpdateLibrarySettingsRequest {
+                library_root: library.to_string_lossy().into_owned(),
+                default_import_mode: ImportMode::Copy,
+                original_storage_policy: Some(OriginalStoragePolicy::EncryptedOnly),
+            })
+            .await
+            .unwrap();
+        let imported = service
+            .import_asset(ImportAssetRequest {
+                source_path: source.to_string_lossy().into_owned(),
+                original_filename: "camera.jpg".into(),
+                media_kind: MediaKind::Photo,
+                mime_type: "image/jpeg".into(),
+                bytes: original.len() as u64,
+                content_hash: None,
+                captured_at: None,
+                place_hint: None,
+                import_mode: Some(ImportMode::Copy),
+            })
+            .await
+            .unwrap();
+        assert!(
+            service
+                .state
+                .read()
+                .await
+                .assets
+                .iter()
+                .find(|asset| asset.id == imported.asset.id)
+                .unwrap()
+                .metadata
+                .as_ref()
+                .unwrap()
+                .geo
+                .is_some(),
+            "fixture must contain real camera GPS"
+        );
+        let place_id = service
+            .places()
+            .await
+            .into_iter()
+            .find(|place| place.asset_ids.contains(&imported.asset.id))
+            .expect("GPS asset must have a place")
+            .id;
+        service
+            .correct_place(
+                place_id,
+                crate::domain::CorrectPlaceRequest {
+                    label: "Private place".into(),
+                    latitude: None,
+                    longitude: None,
+                    hide_exact_gps: Some(true),
+                    reason: None,
+                },
+            )
+            .await
+            .unwrap();
+        let thumbnail = service
+            .state
+            .read()
+            .await
+            .assets
+            .iter()
+            .find(|asset| asset.id == imported.asset.id)
+            .unwrap()
+            .variants
+            .iter()
+            .find(|variant| variant.kind == VariantKind::Thumbnail)
+            .unwrap()
+            .relative_path
+            .clone();
+        assert!(
+            !library.join(&thumbnail).exists(),
+            "exercise encrypted original fallback first"
+        );
+        for (mime, bytes) in [
+            service
+                .asset_preview_bytes(imported.asset.id)
+                .await
+                .unwrap(),
+            service
+                .asset_full_size_preview_bytes(imported.asset.id)
+                .await
+                .unwrap(),
+        ] {
+            assert_eq!(mime, "image/png");
+            let mut decoder = image::ImageReader::new(std::io::Cursor::new(&bytes))
+                .with_guessed_format()
+                .unwrap()
+                .into_decoder()
+                .unwrap();
+            assert!(decoder.exif_metadata().unwrap().is_none());
+            assert!(decoder.xmp_metadata().unwrap().is_none());
+            assert_eq!(decoder.dimensions(), (20, 40));
+            assert_ne!(bytes, original);
+        }
+        assert!(
+            !library.join(&thumbnail).exists(),
+            "automatic private rendering writes no plaintext cache"
+        );
+        // Imported/legacy cached thumbnails may themselves carry original EXIF.
+        let cached = library.join(&thumbnail);
+        fs::create_dir_all(cached.parent().unwrap()).unwrap();
+        fs::write(&cached, &original).unwrap();
+        let (mime, bytes) = service
+            .asset_preview_bytes(imported.asset.id)
+            .await
+            .unwrap();
+        assert_eq!(mime, "image/png");
+        let mut decoder = image::ImageReader::new(std::io::Cursor::new(&bytes))
+            .with_guessed_format()
+            .unwrap()
+            .into_decoder()
+            .unwrap();
+        assert!(decoder.exif_metadata().unwrap().is_none());
+        assert_eq!(
+            fs::read(&cached).unwrap(),
+            original,
+            "legacy source cache is not rewritten"
+        );
+        fs::write(&cached, b"invalid private preview").unwrap();
+        assert!(
+            service
+                .asset_preview_bytes(imported.asset.id)
+                .await
+                .is_err(),
+            "decode failure must not fall back to raw metadata-bearing bytes"
+        );
+        assert_eq!(
+            service
+                .asset_original_bytes(imported.asset.id)
+                .await
+                .unwrap()
+                .1,
+            original,
+            "explicit original download preserves camera bytes"
+        );
+        assert_eq!(fs::read(&source).unwrap(), original);
+    }
+
+    #[tokio::test]
     async fn support_bundle_exports_redacted_local_diagnostics() {
         let runtime_root = temp_root("support-bundle");
         let sensitive_library_root = runtime_root.join("library-alex-private-tax-photos");
@@ -10360,7 +10601,7 @@ mod tests {
         );
         assert!(service.mobile_session_status("wrong-token").await.is_err());
 
-        let bytes = b"mobile original bytes".to_vec();
+        let bytes = crate::preview_privacy::gps_jpeg();
         let reserved = service
             .reserve_mobile_upload(
                 &paired.bearer_token,
@@ -10566,8 +10807,16 @@ mod tests {
             .mobile_preview_bytes(&paired.bearer_token, asset_id)
             .await
             .expect("download preview");
-        assert_eq!(preview_mime_type, "image/jpeg");
-        assert_eq!(preview, bytes);
+        assert_eq!(preview_mime_type, "image/png");
+        assert_ne!(preview, bytes);
+        use image::ImageDecoder;
+        let mut decoder = image::ImageReader::new(std::io::Cursor::new(&preview))
+            .with_guessed_format()
+            .unwrap()
+            .into_decoder()
+            .unwrap();
+        assert!(decoder.exif_metadata().unwrap().is_none());
+        assert_eq!(decoder.dimensions(), (20, 40));
 
         let reopened = GalleryService::new(config).expect("reopen service");
         let active_sessions = reopened
@@ -15012,6 +15261,50 @@ mod tests {
             .await
             .expect("remove asset");
         assert_eq!(removed.asset_ids, vec![other_asset]);
+    }
+
+    #[tokio::test]
+    async fn backup_export_includes_committed_wal_state_with_pinned_reader() {
+        let root = temp_root("backup-pinned-wal");
+        let config = AppConfig {
+            runtime_root: root.to_path_buf(),
+            ..AppConfig::default()
+        };
+        let service = GalleryService::new(config.clone()).expect("service");
+        let reader = crate::security::open_database(&config.database_path()).expect("reader");
+        reader
+            .execute_batch("BEGIN; SELECT count(*) FROM jobs;")
+            .expect("pin old snapshot");
+        let latest = service.index_people().await.expect("committed job");
+        assert!(PathBuf::from(format!("{}-wal", config.database_path().display())).is_file());
+        let backup = service
+            .export_backup(crate::domain::BackupExportRequest {
+                export_root: root.join("export").to_string_lossy().into_owned(),
+                include_models: false,
+            })
+            .await
+            .expect("export");
+        let exported =
+            rusqlite::Connection::open(&backup.database_copied_to).expect("exported catalog");
+        let found: i64 = exported
+            .query_row(
+                "SELECT count(*) FROM jobs WHERE id=?1",
+                [latest.id.to_string()],
+                |row| row.get(0),
+            )
+            .expect("job query");
+        assert_eq!(
+            found, 1,
+            "acknowledged WAL writes must be in recovery catalog"
+        );
+        assert_eq!(
+            backup.database_sha256,
+            imports::derive_content_hash_from_file(std::path::Path::new(
+                &backup.database_copied_to
+            ))
+            .ok()
+        );
+        reader.execute_batch("ROLLBACK").expect("reader closes");
     }
 
     #[tokio::test]

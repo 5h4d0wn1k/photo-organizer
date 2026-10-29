@@ -8,6 +8,7 @@ pub mod ml_sidecar;
 pub mod model_registry;
 pub mod ocr;
 pub mod people;
+pub(crate) mod preview_privacy;
 pub mod search;
 pub mod security;
 pub mod service;

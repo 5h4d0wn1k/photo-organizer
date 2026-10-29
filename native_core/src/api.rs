@@ -185,6 +185,7 @@ pub fn router(state: AppState) -> Router {
         .route("/assets/{asset_id}/flags", post(update_asset_flags))
         .route("/assets/{asset_id}/tags", post(update_asset_tags))
         .route("/assets/{asset_id}/original", get(asset_original))
+        .route("/assets/{asset_id}/preview", get(asset_preview))
         .route("/assets/{asset_id}/availability", get(asset_availability))
         .route("/assets/{asset_id}/pin-local", post(pin_local_asset))
         .route("/assets/{asset_id}/evict-local", post(evict_local_asset))
@@ -337,7 +338,7 @@ fn is_desktop_api_client(remote: Option<SocketAddr>, headers: &HeaderMap) -> boo
     }
     remote
         .map(|address| address.ip().is_loopback())
-        .unwrap_or(true)
+        .unwrap_or(false)
 }
 
 fn has_tailscale_serve_identity(headers: &HeaderMap) -> bool {
@@ -972,7 +973,14 @@ async fn mobile_asset_preview(
     let (mime_type, bytes) = state.service.mobile_preview_bytes(&token, asset_id).await?;
     let content_type = HeaderValue::from_str(&mime_type)
         .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream"));
-    Ok(([(CONTENT_TYPE, content_type)], bytes).into_response())
+    Ok((
+        [
+            (CONTENT_TYPE, content_type),
+            (CACHE_CONTROL, HeaderValue::from_static("no-store")),
+        ],
+        bytes,
+    )
+        .into_response())
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1383,6 +1391,41 @@ async fn asset_availability(
     Path(asset_id): Path<Uuid>,
 ) -> Result<Json<crate::domain::AssetAvailability>, ApiError> {
     Ok(Json(state.service.asset_availability(asset_id).await?))
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct AssetPreviewQuery {
+    #[serde(default)]
+    full_size: bool,
+}
+
+async fn asset_preview(
+    State(state): State<AppState>,
+    Path(asset_id): Path<Uuid>,
+    Query(query): Query<AssetPreviewQuery>,
+) -> Result<Response, ApiError> {
+    let (mime_type, bytes) = if query.full_size {
+        state
+            .service
+            .asset_full_size_preview_bytes(asset_id)
+            .await?
+    } else {
+        state.service.asset_preview_bytes(asset_id).await?
+    };
+    let content_type = HeaderValue::from_str(&mime_type)
+        .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream"));
+    let mut response = response_with_body(
+        StatusCode::OK,
+        content_type,
+        None,
+        Some(bytes.len() as u64),
+        bytes,
+    )?;
+    // Decrypted media may be displayed in memory, never retained by HTTP caches.
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    Ok(response)
 }
 
 async fn asset_original(
@@ -1979,6 +2022,277 @@ mod tests {
         assert!(is_public_remote_route("/local-web/main.dart.js"));
         assert!(!is_public_remote_route("/library/status"));
         assert!(!is_public_remote_route("/assets/asset-1/original"));
+        assert!(!is_public_remote_route("/assets/asset-1/preview"));
+        assert!(!is_desktop_api_client(None, &HeaderMap::new()));
+    }
+
+    // Exercise the complete router over HTTP, using the same ConnectInfo
+    // integration as galleryd, so an unregistered route cannot pass this test.
+    #[tokio::test]
+    async fn desktop_preview_decrypts_encrypted_only_photo_without_http_caching() {
+        let root = crate::test_support::TestTempDir::new("desktop-preview");
+        let library = root.join("library");
+        let source = root.join("photo.jpg");
+        // Deliberately no derived preview: this exercises the encrypted original
+        // fallback that file-based desktop rendering cannot read.
+        let original = crate::preview_privacy::gps_jpeg();
+        fs::write(&source, &original).expect("source");
+        let service = std::sync::Arc::new(
+            crate::GalleryService::new(crate::AppConfig {
+                library_root: library.clone(),
+                runtime_root: root.join("runtime"),
+                ..crate::AppConfig::default()
+            })
+            .expect("service"),
+        );
+        service
+            .update_library_settings(crate::domain::UpdateLibrarySettingsRequest {
+                library_root: library.to_string_lossy().into_owned(),
+                default_import_mode: crate::domain::ImportMode::Copy,
+                original_storage_policy: Some(crate::domain::OriginalStoragePolicy::EncryptedOnly),
+            })
+            .await
+            .expect("encrypted-only library settings");
+        let imported = service
+            .import_asset(crate::domain::ImportAssetRequest {
+                source_path: source.to_string_lossy().into_owned(),
+                original_filename: "photo.jpg".to_string(),
+                media_kind: crate::domain::MediaKind::Photo,
+                mime_type: "image/jpeg".to_string(),
+                bytes: original.len() as u64,
+                content_hash: None,
+                captured_at: None,
+                place_hint: None,
+                import_mode: Some(crate::domain::ImportMode::Copy),
+            })
+            .await
+            .expect("encrypted import");
+        assert!(
+            !library
+                .join(&imported.asset.relative_original_path)
+                .exists()
+        );
+        assert!(
+            imported
+                .asset
+                .variants
+                .iter()
+                .all(|variant| !library.join(&variant.relative_path).exists()),
+            "fixture must use encrypted original fallback, not a derived file"
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let address = listener.local_addr().expect("address");
+        let app = super::router(super::AppState {
+            service: service.clone(),
+        });
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .expect("serve");
+        });
+        let client = reqwest::Client::new();
+        let response = client
+            .get(format!(
+                "http://{address}/assets/{}/preview",
+                imported.asset.id
+            ))
+            .send()
+            .await
+            .expect("preview response");
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(response.headers()["content-type"], "image/jpeg");
+        assert_eq!(response.headers()["cache-control"], "no-store");
+        assert_eq!(
+            response.bytes().await.expect("preview bytes").as_ref(),
+            original
+        );
+        let thumbnail = imported
+            .asset
+            .variants
+            .iter()
+            .find(|variant| variant.kind == crate::domain::VariantKind::Thumbnail)
+            .expect("thumbnail metadata");
+        let thumbnail_path = library.join(&thumbnail.relative_path);
+        fs::create_dir_all(thumbnail_path.parent().expect("parent")).expect("directory");
+        fs::write(&thumbnail_path, b"small-thumbnail").expect("thumbnail");
+        let small = client
+            .get(format!(
+                "http://{address}/assets/{}/preview",
+                imported.asset.id
+            ))
+            .send()
+            .await
+            .expect("small preview");
+        assert_eq!(
+            small.bytes().await.expect("small bytes").as_ref(),
+            b"small-thumbnail"
+        );
+        let detail = client
+            .get(format!(
+                "http://{address}/assets/{}/preview?full_size=true",
+                imported.asset.id
+            ))
+            .send()
+            .await
+            .expect("detail preview");
+        assert_eq!(detail.headers()["cache-control"], "no-store");
+        assert_eq!(
+            detail.bytes().await.expect("detail bytes").as_ref(),
+            original
+        );
+        let place = service
+            .places()
+            .await
+            .into_iter()
+            .find(|place| place.asset_ids.contains(&imported.asset.id))
+            .expect("GPS place");
+        service
+            .correct_place(
+                place.id,
+                crate::domain::CorrectPlaceRequest {
+                    label: "Hidden".into(),
+                    latitude: None,
+                    longitude: None,
+                    hide_exact_gps: Some(true),
+                    reason: None,
+                },
+            )
+            .await
+            .expect("hide GPS");
+        // Even a legacy cache containing camera metadata must be sanitized.
+        fs::write(&thumbnail_path, &original).expect("legacy GPS thumbnail");
+        for suffix in ["preview", "preview?full_size=true"] {
+            let response = client
+                .get(format!(
+                    "http://{address}/assets/{}/{suffix}",
+                    imported.asset.id
+                ))
+                .send()
+                .await
+                .expect("hidden preview");
+            assert_eq!(response.status(), reqwest::StatusCode::OK);
+            assert_eq!(response.headers()["content-type"], "image/png");
+            assert_eq!(response.headers()["cache-control"], "no-store");
+            let bytes = response.bytes().await.unwrap();
+            let mut decoder = image::ImageReader::new(std::io::Cursor::new(&bytes))
+                .with_guessed_format()
+                .unwrap()
+                .into_decoder()
+                .unwrap();
+            use image::ImageDecoder;
+            assert!(decoder.exif_metadata().unwrap().is_none());
+            assert_eq!(decoder.dimensions(), (20, 40));
+        }
+        let pairing = service
+            .create_pairing_session(crate::domain::CreatePairingSessionRequest {
+                device_name: "Privacy phone".into(),
+                platform: "android".into(),
+                vault_id: None,
+            })
+            .await
+            .unwrap();
+        let paired = service
+            .pair_mobile_device(crate::domain::MobilePairRequest {
+                pairing_token: pairing.pairing_token,
+                device_name: "Privacy phone".into(),
+                platform: "android".into(),
+                vault_id: None,
+                storage_profile: None,
+            })
+            .await
+            .unwrap();
+        let mobile_url = format!(
+            "http://{address}/mobile/assets/{}/preview",
+            imported.asset.id
+        );
+        let denied = client.get(&mobile_url).send().await.unwrap();
+        assert_eq!(denied.status(), reqwest::StatusCode::BAD_REQUEST);
+        let allowed = client
+            .get(&mobile_url)
+            .bearer_auth(&paired.bearer_token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(allowed.status(), reqwest::StatusCode::OK);
+        assert_eq!(allowed.headers()["content-type"], "image/png");
+        assert_eq!(allowed.headers()["cache-control"], "no-store");
+        let bytes = allowed.bytes().await.unwrap();
+        use image::ImageDecoder;
+        let mut decoder = image::ImageReader::new(std::io::Cursor::new(&bytes))
+            .with_guessed_format()
+            .unwrap()
+            .into_decoder()
+            .unwrap();
+        assert!(decoder.exif_metadata().unwrap().is_none());
+        let missing = client
+            .get(format!(
+                "http://{address}/assets/{}/preview",
+                uuid::Uuid::new_v4()
+            ))
+            .send()
+            .await
+            .expect("missing response");
+        assert_eq!(missing.status(), reqwest::StatusCode::NOT_FOUND);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn desktop_preview_rejects_remote_and_missing_connection_context() {
+        let root = crate::test_support::TestTempDir::new("desktop-preview-boundary");
+        let service = std::sync::Arc::new(
+            crate::GalleryService::new(crate::AppConfig {
+                library_root: root.join("library"),
+                runtime_root: root.join("runtime"),
+                ..crate::AppConfig::default()
+            })
+            .expect("service"),
+        );
+        for connection in [
+            None,
+            Some("10.0.0.20:4821".parse::<SocketAddr>().expect("remote")),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("listener");
+            let address = listener.local_addr().expect("address");
+            let mut app = super::router(super::AppState {
+                service: service.clone(),
+            });
+            if let Some(connection) = connection {
+                app = app.layer(axum::Extension(axum::extract::ConnectInfo(connection)));
+            }
+            // Intentionally omit connection injection for the None case.
+            let server = tokio::spawn(async move {
+                axum::serve(listener, app.into_make_service())
+                    .await
+                    .expect("serve");
+            });
+            let response = reqwest::get(format!(
+                "http://{address}/assets/{}/preview",
+                uuid::Uuid::new_v4()
+            ))
+            .await
+            .expect("response");
+            assert_eq!(
+                response.status(),
+                reqwest::StatusCode::FORBIDDEN,
+                "{connection:?}"
+            );
+            // Public health remains available when management routes are denied.
+            assert_eq!(
+                reqwest::get(format!("http://{address}/health"))
+                    .await
+                    .expect("health")
+                    .status(),
+                reqwest::StatusCode::OK
+            );
+            server.abort();
+        }
     }
 
     #[test]

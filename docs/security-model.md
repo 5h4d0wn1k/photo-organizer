@@ -58,3 +58,74 @@ If the product later adds cloud sync, shared libraries, or remote biometric proc
 - UK ICO biometric expectations around explicit consent.
 - Illinois and Texas biometric obligations.
 - India DPDP duties expected to matter by May 13, 2027.
+
+### Vault key initialization and recovery
+
+Production vault keys use OS secure storage only. Setting
+`PRIVATE_GALLERY_VAULT_KEY_STORAGE=file` (or any value other than `keyring`)
+refuses startup before database initialization. Existing `security/vault-keys`
+material also blocks startup. Preserve that material and the library; this
+version does not include an automatic plaintext-key migration tool. Recovery
+requires the exact original key in the OS credential service
+`private-gallery-vaults`, under `vault-key:<vault UUID>:v<version>`, followed by
+verified decryption. Retain the old material in a separate private offline backup before retiring
+its runtime directory; startup continues to refuse that legacy directory even
+after the OS entry has been restored. Do not delete the recovery backup before
+successful decryption verification.
+Do not paste keys into issues, logs, or command-line arguments. A supported
+operator migration/recovery UI is still outstanding under #110.
+There is currently no supported in-app or command-line workflow to import a
+legacy file key, verify it against every encrypted original, and retire the
+plaintext copy safely. Keep the entire old runtime directory and a separate
+offline backup intact; do not delete `security/vault-keys` or bypass the guard
+with a plaintext backend. Existing file-key installations remain a release
+blocker until that migration workflow is implemented and tested.
+
+Sealing loads an existing key; it never provisions one implicitly. Before the
+first seal, explicit provisioning checks catalog encryption history and the
+vault's ciphertext directory. A per-version nonsecret initialization marker is
+flushed before writing a new key to OS storage, under a per-version process lock.
+An initialized or historically encrypted version with a missing key fails closed:
+imports fail and ciphertext is preserved. Unlock an unavailable OS keychain or
+restore the exact key from the user's own secure backup. Generating a replacement
+under the same key reference cannot recover existing data and is forbidden.
+
+An interrupted first provisioning attempt can leave a provisioning marker
+without a stored key. A retry may provision the key only while there is no
+encrypted-history record or ciphertext directory for that vault. A marker for
+another key version is not proof that ambiguous legacy ciphertext is safe.
+Existing OS-stored keys remain usable; automatic rotation into a missing new
+key version on a populated vault is unsupported until explicit inventory and
+allocation verification exists. Once
+there is any such evidence, a missing key requires exact-key recovery and the
+app will not generate a replacement. Recovery after actual key loss is
+unavailable without a backup.
+These changes protect key storage; they do not fix cross-vault isolation (#112)
+or complete the remaining #110 recovery tooling.
+
+Provider read/create is additionally serialized across runtime roots using
+per-user application locks: `~/.local/share/photo-organizer/vault-key-provider-locks`
+on Linux, `~/Library/Application Support/photo-organizer/vault-key-provider-locks`
+on Apple platforms, and `%LOCALAPPDATA%/photo-organizer/vault-key-provider-locks`
+on Windows. These contain only nonsecret lock files and initialization markers, never keys.
+Shared markers also prevent a fresh runtime from regenerating an initialized
+credential after key loss. Instances
+sharing the OS credential store must use the same OS user application directory;
+changing HOME/LOCALAPPDATA is not a supported way to isolate a shared key store.
+
+### Hidden location and image previews
+
+“Hide exact GPS” removes precise coordinates from app projections, search, Places,
+correction-history responses, and sync metadata. Automatic photo previews also
+render a new image in memory without embedded EXIF, XMP, IPTC, or copied ICC
+metadata; full-size desktop previews and authenticated mobile previews use the
+same boundary. Preview responses use `Cache-Control: no-store`. Private renders
+are bounded before original reads and do not create plaintext preview files.
+
+This action preserves the private catalog coordinates and original bytes so the
+user can unhide them. Explicit original downloads and exports still contain any
+metadata present in the source; hiding is not metadata deletion. Private preview
+rendering currently supports static JPEG and PNG, preserves orientation and PNG
+alpha/16-bit samples, and normalizes supported ICC profiles to sRGB. Unsupported
+formats or color descriptions fail with an error rather than return unsanitized
+original bytes.
