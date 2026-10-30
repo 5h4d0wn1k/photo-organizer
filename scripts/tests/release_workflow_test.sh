@@ -674,6 +674,21 @@ for _builder in ("linux", "windows", "macos", "ios", "android"):
         f"whatever the preflight says",
     )
 
+# Assembling nested code after Flutter's build invalidates its existing seal.
+# Validate the final bundle after assembly, before freezing it into the DMG.
+_mac_package = next((str(s.get("run", "")) for s in steps_of("macos")
+                     if s.get("name") == "Package macOS DMG"), "")
+_mac_code = "\n".join(line for line in _mac_package.splitlines()
+                       if not line.lstrip().startswith("#"))
+expect(
+    'cp -R ml_sidecar' in _mac_code
+    and 'codesign --force --deep --sign - --preserve-metadata=entitlements,requirements,flags "${APP_PATH}"' in _mac_code
+    and 'codesign --verify --deep --strict --verbose=4 "${APP_PATH}"' in _mac_code
+    and _mac_code.index('cp -R ml_sidecar') < _mac_code.index('codesign --force')
+        < _mac_code.index('codesign --verify') < _mac_code.index('hdiutil create'),
+    "macOS must seal and verify the assembled app, preserving entitlements, before packaging the DMG",
+)
+
 # --- release assets: the SBOM must actually ship -----------------------------
 # Consolidating publication dropped this. `docs/RELEASE_CHECKLIST.md` still requires "an
 # SBOM artifact from CI", the `linux` job still generates one, and nothing uploaded it --

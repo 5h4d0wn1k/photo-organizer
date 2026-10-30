@@ -29,9 +29,6 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 start_daemon() {
-  if [[ -x "${DAEMON_BIN}" ]] && ! "${DAEMON_BIN}" --check >/dev/null 2>&1; then
-    : # fall through
-  fi
   if command -v pgrep >/dev/null 2>&1 && pgrep -f "galleryd" >/dev/null 2>&1; then
     return 0
   fi

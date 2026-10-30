@@ -21,8 +21,9 @@
 #       scripts/tests/windows_release_artifact_smoke_test.sh, which substitutes
 #       a fake `pwsh` for the Win32 layer. See that file for the fixtures.
 #
-#     * The SIX PowerShell helper programs below (PS_CAPTURE_SCREENSHOT,
-#       PS_ENUM_WINDOWS, PS_LAUNCH, PS_PROC_LIVE, PS_PROC_KILL, PS_EVENTLOG)
+#     * The SEVEN PowerShell helper programs below (PS_CAPTURE_SCREENSHOT,
+#       PS_ENUM_WINDOWS, PS_FOCUS_WINDOW, PS_LAUNCH, PS_PROC_LIVE,
+#       PS_PROC_KILL, PS_EVENTLOG)
 #       have NEVER BEEN EXECUTED. They were written on a Linux host that has no
 #       PowerShell, no Win32 `user32.dll`/`gdiplus` and no interactive desktop.
 #       They are structurally reviewed and statically linted by the test suite
@@ -421,6 +422,64 @@ $cb = [PoWin+EnumWindowsProc]{
 }
 [void][PoWin]::EnumWindows($cb, [IntPtr]::Zero)
 foreach ($line in $found) { Write-Output $line }
+'
+
+# --- Win32: request foreground ownership ------------------------------------
+# A GUI process started by a non-interactive CI launcher can create a window
+# without Windows making it foreground. This helper restores a visible target,
+# requests foreground ownership, then proves the OS granted it before emitting
+# its sentinel. The independent foreground check stays in the render loop.
+PS_FOCUS_WINDOW='
+$ErrorActionPreference = "Stop"
+$target = [int]$args[0]
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+public class PoFocus {
+  public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+  [DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc cb, IntPtr l);
+  [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+  [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
+  [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr h);
+  [DllImport("user32.dll")] public static extern bool ShowWindowAsync(IntPtr h, int command);
+  [DllImport("user32.dll")] public static extern bool BringWindowToTop(IntPtr h);
+  [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+  [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+}
+"@
+$found = [IntPtr]::Zero
+$cb = [PoFocus+EnumWindowsProc]{
+  param($h, $l)
+  [uint32]$p = 0
+  [void][PoFocus]::GetWindowThreadProcessId($h, [ref]$p)
+  if ($p -eq $target -and [PoFocus]::IsWindowVisible($h)) {
+    # Prefer a normal window, but retain a minimized visible window so it can
+    # be restored below instead of treating it as if the app had no window.
+    if ($script:found -eq [IntPtr]::Zero -or -not [PoFocus]::IsIconic($h)) {
+      $script:found = $h
+    }
+    if (-not [PoFocus]::IsIconic($h)) {
+      return $false
+    }
+  }
+  return $true
+}
+[void][PoFocus]::EnumWindows($cb, [IntPtr]::Zero)
+if ($found -eq [IntPtr]::Zero) { exit 4 }
+[void][PoFocus]::ShowWindowAsync($found, 9)
+[void][PoFocus]::BringWindowToTop($found)
+[void][PoFocus]::SetForegroundWindow($found)
+for ($attempt = 0; $attempt -lt 10; $attempt++) {
+  $fg = [PoFocus]::GetForegroundWindow()
+  [uint32]$fgPid = 0
+  [void][PoFocus]::GetWindowThreadProcessId($fg, [ref]$fgPid)
+  if ($fgPid -eq $target) {
+    Write-Output ("PO-FOCUS-OK {0} {1}" -f $target, $found.ToInt64())
+    exit 0
+  }
+  Start-Sleep -Milliseconds 100
+}
+exit 5
 '
 
 # --- Win32: process launch / exit code ---------------------------------------
@@ -917,6 +976,23 @@ app_window_is_foreground() {
   [[ "${fgpid}" == "${pid}" ]]
 }
 
+# The helper is a request only. The render loop independently verifies foreground
+# ownership before every capture, so this cannot weaken the release verdict.
+request_app_foreground() {
+  local pid="$1" out line marker_pid marker_hwnd
+  out="$(run_ps_helper "${PS_FOCUS_SCRIPT}" "${pid}")" || return 2
+  while IFS= read -r line; do
+    case "${line}" in
+      "PO-FOCUS-OK "*)
+        read -r _ marker_pid marker_hwnd <<<"${line}"
+        [[ "${marker_pid}" == "${pid}" && "${marker_hwnd}" =~ ^-?[0-9]+$ ]] && return 0
+        return 2
+        ;;
+    esac
+  done <<<"${out}"
+  return 2
+}
+
 # --- process helpers ---------------------------------------------------------
 # A cold launch: no arguments, a fresh process, stdout/stderr captured to disk
 # for the crash scan. The artifact is the packaged executable extracted from the
@@ -1321,6 +1397,7 @@ main() {
   # Materialise the PowerShell helpers.
   PS_SCREENSHOT_SCRIPT="$(write_ps_helper capture-screenshot.ps1 <<<"${PS_CAPTURE_SCREENSHOT}")"
   PS_WINDOWS_SCRIPT="$(write_ps_helper enum-windows.ps1 <<<"${PS_ENUM_WINDOWS}")"
+  PS_FOCUS_SCRIPT="$(write_ps_helper focus-window.ps1 <<<"${PS_FOCUS_WINDOW}")"
   PS_LAUNCH_SCRIPT="$(write_ps_helper launch.ps1 <<<"${PS_LAUNCH}")"
   PS_PROC_LIVE_SCRIPT="$(write_ps_helper proc-live.ps1 <<<"${PS_PROC_LIVE}")"
   PS_PROC_KILL_SCRIPT="$(write_ps_helper proc-kill.ps1 <<<"${PS_PROC_KILL}")"
@@ -1459,6 +1536,11 @@ main() {
     fail "the app never created a visible top-level window within ${LAUNCH_TIMEOUT_SECONDS}s"
   fi
   log "app owns a visible top-level window"
+
+  if ! request_app_foreground "${RUN_PID}"; then
+    fail "could not request and verify foreground ownership for the app window; refusing to capture another window or report a focus check that never succeeded"
+  fi
+  log "the OS accepted the app foreground request"
 
   # --- wait for a settled, app-owned, complex frame --------------------------
   if ! await_settled_app_frame; then

@@ -1,7 +1,7 @@
 [Desktop Entry]
 Name=Photo Organizer
 Comment=Local-first photo organizer
-Exec=photo-organizer
+Exec=AppRun
 Icon=photo-organizer
 Type=Application
 Categories=Graphics;Photography;

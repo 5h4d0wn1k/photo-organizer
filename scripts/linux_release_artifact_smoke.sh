@@ -84,17 +84,9 @@
 #     and `chmod +x` on the published file would mutate a checksum-verified
 #     artifact. The gate chmods a private copy and records both modes.
 #
-#   * LIMITATION, stated rather than papered over: `assets/linux/photo-organizer.desktop`
-#     declares `Exec=photo-organizer`, a bare name, while the AppImage ships a FLAT
-#     AppDir in which no file called `photo-organizer` exists (the .deb works
-#     because packaging rewrites `Exec` to the absolute
-#     `/opt/photo-organizer/AppRun`). So for the AppImage the gate asserts the
-#     payload layout and the real launch, and RECORDS the desktop entry's
-#     unresolved `Exec` as a warning instead of asserting it resolves. Fixing the
-#     packaging is out of scope for this issue; a gate that asserted the broken
-#     thing could never go green, and one that deleted the assertion would be a
-#     false pass. The .deb leg does assert absolute-`Exec` resolution, which is
-#     the half that is supposed to work.
+#   * The AppImage desktop entry must name the packaged `AppRun` wrapper. The
+#     `.deb` rewrites that entry to its installed absolute path, but a bare
+#     executable name is not resolvable in a flat AppDir and is a release bug.
 #
 #   * LIMITATION: `--appimage-extract` is used to inspect the AppImage payload,
 #     which needs a working FUSE. A runner without `libfuse2` therefore fails on
@@ -1367,29 +1359,17 @@ require_elf "${PAYLOAD}/galleryd" appimage_payload_not_elf
 record "appimage_payload" "${PAYLOAD}"
 log "appimage: payload layout verified (AppRun, ELF private_gallery_app, galleryd, ml_sidecar, desktop entry)"
 
-# Desktop entry: recorded, not asserted, because the shipped AppImage declares a
-# bare `Exec=photo-organizer` that the flat AppDir does not contain. Asserting it
-# would be asserting a bug; deleting the check would hide it. See the header.
+# Desktop entry: a desktop click must run the same wrapper the gate cold-launches.
 appimage_desktop_exec="$(awk -F= '/^Exec=/ {print $2; exit}' "${PAYLOAD}/photo-organizer.desktop" || true)"
 record "appimage_desktop_exec" "${appimage_desktop_exec:-<none>}"
 if [[ -z "${appimage_desktop_exec}" ]]; then
-  warn "appimage: photo-organizer.desktop has no Exec= line"
-elif [[ "${appimage_desktop_exec}" != /* ]]; then
-  if [[ -x "${PAYLOAD}/${appimage_desktop_exec}" || -x "${PAYLOAD}/usr/bin/${appimage_desktop_exec}" ]]; then
-    log "appimage: the desktop entry Exec=${appimage_desktop_exec} resolves inside the AppDir"
-    record "appimage_desktop_exec_resolves" "yes"
-  else
-    warn "appimage: KNOWN PACKAGING DEFECT - the desktop entry's Exec=${appimage_desktop_exec} is a bare name and no such executable exists in the flat AppDir, so a desktop launch would fail. Recorded, not failed: this is an assets/linux packaging bug, out of scope for issue #98"
-    record "appimage_desktop_exec_resolves" "no"
-  fi
+  fail appimage_desktop_entry_missing "the AppImage desktop entry has no Exec= line"
+elif [[ "${appimage_desktop_exec}" != "AppRun" || ! -x "${PAYLOAD}/AppRun" ]]; then
+  fail appimage_desktop_exec_unresolvable \
+    "the AppImage desktop entry must run executable AppRun, got ${appimage_desktop_exec}"
 else
-  if [[ -x "${PAYLOAD}${appimage_desktop_exec}" ]]; then
-    log "appimage: the desktop entry Exec=${appimage_desktop_exec} resolves inside the AppDir"
-    record "appimage_desktop_exec_resolves" "yes"
-  else
-    fail appimage_desktop_exec_unresolvable \
-      "the AppImage's desktop entry points at ${appimage_desktop_exec}, which is not in the payload"
-  fi
+  log "appimage: the desktop entry Exec=AppRun resolves inside the AppDir"
+  record "appimage_desktop_exec_resolves" "yes"
 fi
 
 run_leg appimage "${APPIMAGE_RUN}"

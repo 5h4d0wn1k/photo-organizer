@@ -705,7 +705,7 @@ make_elf_fixture() {
 make_appimage_template() {
   local dir="$1"
   shift
-  local desktop_exec="photo-organizer"
+  local desktop_exec="AppRun"
   local omit="" not_exec="" not_elf="" wrong_arch=""
   local kv k v
   for kv in "$@"; do
@@ -1387,6 +1387,8 @@ make_elf_fixture
 
 bash -n "${GATE}" 2>/dev/null
 check "the gate parses as bash" "$([[ $? -eq 0 ]] && echo 1 || echo 0)"
+python3 "${REPO_ROOT}/scripts/tests/linux_apprun_test.py"
+check "the packaged launcher reaches Flutter without blocking on galleryd" "$([[ $? -eq 0 ]] && echo 1 || echo 0)"
 
 if command -v shellcheck >/dev/null 2>&1; then
   shellcheck --severity=warning "${GATE}" >/dev/null 2>&1
@@ -1410,8 +1412,8 @@ assert_evidence_contains "evidence records the deb leg completing" \
   "result=pass" happy
 assert_evidence_contains "evidence records the recorded distinct-colour count" \
   "appimage_colours=500" happy
-assert_evidence_contains "the AppImage's bare-name desktop Exec is reported as unresolved" \
-  "appimage_desktop_exec_resolves=no" happy
+assert_evidence_contains "the AppImage desktop entry resolves to its packaged AppRun" \
+  "appimage_desktop_exec_resolves=yes" happy
 # Asserted against the recorded xvfb-run ARGUMENTS, not against the evidence
 # directory. The evidence directory contains `xvfb_server_args=-screen 0
 # 1280x800x24 ...` because the gate records the string it *intends* to pass, so
@@ -1938,37 +1940,24 @@ mut "engine-architecture" appimage_payload_not_elf \
   's/if \[\[ "${machine}" != "3e00" \]\]; then/if [[ "${machine}" == "3e00" ]]; then/'
 
 reset_env
-# The hard `appimage_desktop_exec_unresolvable` failure is only reached when the
-# desktop entry names an ABSOLUTE path that is not in the payload. The good
-# fixture carries the repo's real bare `Exec=photo-organizer`, which is the
-# recorded packaging warning, not this failure -- so the fixture is rebuilt with
-# a broken absolute Exec and the `-x` test is then disabled to show that it is
-# what caught it.
+# Both absolute and bare invalid launchers must fail before launch.
 make_good_artifacts "${WORK}/mut-appimage-desktop-exec-abs" ok
 make_appimage_template "${WORK}/mut-appimage-desktop-exec-abs/appimage-payload" \
   desktop_exec=/opt/photo-organizer/does-not-exist
 TEST_APPIMAGE_TEMPLATE="${WORK}/mut-appimage-desktop-exec-abs/appimage-payload"
 mutation_on_broken "appimage-desktop-exec-abs" appimage_desktop_exec_unresolvable \
-  's/if \[\[ -x "${PAYLOAD}${appimage_desktop_exec}" \]\]; then/if [[ -n "${appimage_desktop_exec}" ]]; then/'
+  's/elif \[\[ "${appimage_desktop_exec}" != "AppRun" || ! -x "${PAYLOAD}\/AppRun" \]\]; then/elif false; then/'
 
 reset_env
-# The bare-name case is a RECORDED warning, not a verdict, so it is proven by
-# showing the recorded value moves. It is proven in the "resolves" direction
-# because that is the only one available: the recorded failure text is a
-# constant, so forcing the check false on the DEFAULT fixture just re-records
-# the same "no". Here the fixture's bare `Exec=AppRun` genuinely resolves, the
-# pristine run records `yes`, and disabling the `-x` test turns that into `no`.
-# With the `resolves=no` assertion on the happy run, both recorded values are
-# then proven computed rather than hard-coded.
+# The previously shipped bare-name launcher must now fail closed too.
 make_good_artifacts "${WORK}/mut-appimage-desktop-exec-warn" ok
 make_appimage_template "${WORK}/mut-appimage-desktop-exec-warn/appimage-payload" \
-  desktop_exec=AppRun
+  desktop_exec=photo-organizer
 TEST_APPIMAGE_TEMPLATE="${WORK}/mut-appimage-desktop-exec-warn/appimage-payload"
 TEST_DEB_TEMPLATE="${WORK}/mut-appimage-desktop-exec-warn/deb-payload"
 TEST_DEB_CONTROL="${WORK}/mut-appimage-desktop-exec-warn/control"
-mutation_flips_evidence "appimage-desktop-exec-warn" \
-  "appimage_desktop_exec_resolves=yes" "appimage_desktop_exec_resolves=no" \
-  's%if \[\[ -x "${PAYLOAD}/${appimage_desktop_exec}" || -x "${PAYLOAD}/usr/bin/${appimage_desktop_exec}" \]\]; then%if false; then%'
+mutation_on_broken "appimage-desktop-exec-bare" appimage_desktop_exec_unresolvable \
+  's/elif \[\[ "${appimage_desktop_exec}" != "AppRun" || ! -x "${PAYLOAD}\/AppRun" \]\]; then/elif false; then/'
 
 reset_env
 mut "artifact-discovery-appimage" artifact_discovery \

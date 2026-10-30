@@ -1541,7 +1541,9 @@ assert_backend_is_reachable() {
     BACKEND_REASON="the backend probe is not executable: ${probe}. An unrunnable probe cannot establish that the artifact reaches a backend, so this gate fails rather than assuming it does."
     return 1
   fi
-  if ! out="$(run_with_deadline "${BACKEND_TIMEOUT_SECONDS}" "${probe}" 2>&1)"; then
+  if out="$(run_with_deadline "${BACKEND_TIMEOUT_SECONDS}" "${probe}" 2>&1)"; then
+    rc=0
+  else
     rc=$?
     {
       printf 'probe exit status: %s\n' "${rc}"
