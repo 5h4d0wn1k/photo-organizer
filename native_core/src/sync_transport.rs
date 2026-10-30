@@ -175,12 +175,10 @@ impl SyncRuntime {
         let local_node_id = secret_key.public().to_string();
         let relay_mode = relay_mode_for_config(&self.config);
         let relay_enabled = !matches!(relay_mode, RelayMode::Disabled);
-        let builder = Endpoint::builder(presets::N0)
-            .secret_key(secret_key)
-            .alpns(vec![ALPN.to_vec()])
-            .relay_mode(relay_mode);
+        let builder = endpoint_builder(&self.config, secret_key);
         #[cfg(test)]
         let builder = builder
+            .clear_address_lookup()
             .clear_ip_transports()
             .bind_addr("127.0.0.1:0")
             .map_err(|err| SyncTransportError::Transport(err.to_string()))?;
@@ -188,6 +186,14 @@ impl SyncRuntime {
             .bind()
             .await
             .map_err(|err| SyncTransportError::Transport(err.to_string()))?;
+
+        #[cfg(test)]
+        assert!(
+            endpoint
+                .address_lookup()
+                .expect("test lookup services")
+                .is_empty()
+        );
 
         if relay_enabled {
             let _ = tokio::time::timeout(Duration::from_secs(2), endpoint.online()).await;
@@ -1966,6 +1972,27 @@ fn secret_key_path(config: &AppConfig) -> PathBuf {
         .join("iroh_endpoint.key")
 }
 
+fn endpoint_builder(config: &AppConfig, secret_key: SecretKey) -> iroh::endpoint::Builder {
+    let builder = Endpoint::builder(presets::N0)
+        .secret_key(secret_key)
+        .alpns(vec![ALPN.to_vec()])
+        .relay_mode(relay_mode_for_config(config));
+    // Disabling relay transport does not disable N0's hosted publisher or
+    // resolvers. Offline operation and tests must not contact discovery.
+    if hosted_discovery_allowed(config) {
+        builder
+    } else {
+        builder.clear_address_lookup()
+    }
+}
+
+fn hosted_discovery_allowed(config: &AppConfig) -> bool {
+    !matches!(
+        config.network_policy,
+        crate::domain::NetworkPolicy::OfflineOnly
+    )
+}
+
 fn relay_mode_for_config(config: &AppConfig) -> RelayMode {
     if cfg!(test)
         || matches!(
@@ -2047,14 +2074,21 @@ mod tests {
         config::AppConfig,
         domain::{
             BlobChunk, BlobRecord, DeviceIdentity, DeviceRole, DeviceStorageProfile,
-            DeviceTrustLevel, ImportMode, MediaKind, StoragePolicy, Vault, VaultFileEntry,
-            VaultFileKind, VaultMember,
+            DeviceTrustLevel, ImportMode, LibrarySettings, MediaKind, OriginalStoragePolicy,
+            PeerEndpointDescriptor, StoragePolicy, SyncTransfer, SyncTransferStatus, Vault,
+            VaultFileEntry, VaultFileKind, VaultMember,
         },
         service::LibraryState,
         storage::{self, StorageBootstrapReport},
     };
     use chrono::Utc;
-    use std::path::PathBuf;
+    use std::{
+        io::{BufRead, BufReader},
+        path::PathBuf,
+        process::{Child, Command, Stdio},
+        sync::mpsc::{self, Receiver},
+        time::{Duration, Instant},
+    };
     use uuid::Uuid;
 
     struct TestRoot(PathBuf);
@@ -2071,6 +2105,694 @@ mod tests {
     impl Drop for TestRoot {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[tokio::test]
+    async fn offline_endpoint_has_no_hosted_address_lookup_services() {
+        let config = AppConfig {
+            network_policy: crate::domain::NetworkPolicy::OfflineOnly,
+            ..AppConfig::default()
+        };
+        assert!(!super::hosted_discovery_allowed(&config));
+        let endpoint = super::endpoint_builder(&config, iroh::SecretKey::generate())
+            .clear_ip_transports()
+            .bind_addr("127.0.0.1:0")
+            .expect("loopback bind")
+            .bind()
+            .await
+            .expect("offline endpoint");
+        assert!(
+            endpoint
+                .address_lookup()
+                .expect("lookup services")
+                .is_empty()
+        );
+        assert!(endpoint.addr().relay_urls().next().is_none());
+        endpoint.close().await;
+    }
+
+    #[test]
+    fn existing_iroh_identity_file_loads_unchanged_after_transport_upgrade() {
+        let root = TestRoot::new();
+        let config = AppConfig {
+            runtime_root: root.0.clone(),
+            ..AppConfig::default()
+        };
+        let identity_dir = root.0.join("identity");
+        std::fs::create_dir_all(&identity_dir).expect("create identity directory");
+        // This is the persisted 32-byte hex format used by the 0.98 app.
+        let saved_key = [7_u8; 32];
+        let saved_text = saved_key
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let identity_path = identity_dir.join("iroh_endpoint.key");
+        std::fs::write(&identity_path, &saved_text).expect("write prior-version identity");
+
+        let loaded = super::load_or_create_secret_key(&config).expect("load prior identity");
+        let expected = iroh::SecretKey::from_bytes(&saved_key);
+        assert_eq!(loaded.public(), expected.public());
+        assert_eq!(std::fs::read_to_string(identity_path).unwrap(), saved_text);
+    }
+
+    struct FixtureProcess {
+        child: Child,
+        lines: Receiver<String>,
+    }
+
+    impl FixtureProcess {
+        fn start(binary: &std::path::Path, arguments: &[String]) -> Self {
+            let mut child = Command::new(binary)
+                .args(arguments)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::inherit())
+                .spawn()
+                .expect("start isolated Iroh 0.98.2 fixture");
+            let stdout = child.stdout.take().expect("fixture stdout");
+            let (sender, lines) = mpsc::channel();
+            std::thread::spawn(move || {
+                for line in BufReader::new(stdout).lines() {
+                    match line {
+                        Ok(line) => {
+                            if sender.send(line).is_err() {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+            Self { child, lines }
+        }
+
+        fn next_json(&self) -> serde_json::Value {
+            let line = self
+                .lines
+                .recv_timeout(Duration::from_secs(20))
+                .expect("fixture must emit its next JSON result before the timeout");
+            serde_json::from_str(&line).expect("fixture must emit valid JSON")
+        }
+
+        fn finish(mut self) -> serde_json::Value {
+            let result = self.next_json();
+            assert_eq!(result["event"], "complete", "{result}");
+            assert_eq!(result["verified"], true, "{result}");
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                if let Some(status) = self.child.try_wait().expect("poll fixture process") {
+                    assert!(status.success(), "fixture exited with {status}");
+                    return result;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "fixture did not exit after completion"
+                );
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+    }
+
+    impl Drop for FixtureProcess {
+        fn drop(&mut self) {
+            if self.child.try_wait().ok().flatten().is_none() {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+            }
+        }
+    }
+
+    fn write_legacy_key(root: &std::path::Path, bytes: &[u8; 32]) -> PathBuf {
+        let path = root.join("iroh-098-test.key");
+        let encoded = bytes
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        std::fs::write(&path, encoded).expect("write test-only fixture key");
+        path
+    }
+
+    fn legacy_node_id(key: &[u8; 32]) -> String {
+        iroh::SecretKey::from_bytes(key).public().to_string()
+    }
+
+    fn write_manifest(root: &std::path::Path, envelope: &TransferEnvelope) -> PathBuf {
+        let path = root.join("transfer-manifest.json");
+        std::fs::write(
+            &path,
+            serde_json::to_vec(envelope).expect("serialize transfer envelope"),
+        )
+        .expect("write transfer manifest");
+        path
+    }
+
+    fn write_chunk_files(
+        library_root: &std::path::Path,
+        chunks: &[BlobChunk],
+        ciphertexts: &[Vec<u8>],
+    ) -> Vec<BlobChunk> {
+        chunks
+            .iter()
+            .zip(ciphertexts)
+            .map(|(chunk, ciphertext)| {
+                let mut stored = chunk.clone();
+                let relative = format!("outgoing/{:08}.pgblob", chunk.chunk_index);
+                let path = library_root.join(&relative);
+                std::fs::create_dir_all(path.parent().unwrap())
+                    .expect("create local encrypted chunk directory");
+                std::fs::write(path, ciphertext).expect("write encrypted chunk bytes");
+                stored.local_path = Some(relative);
+                stored
+            })
+            .collect()
+    }
+
+    fn write_fixture_ciphertexts(
+        root: &std::path::Path,
+        chunks: &[BlobChunk],
+        ciphertexts: &[Vec<u8>],
+    ) -> PathBuf {
+        let dir = root.join("fixture-chunks");
+        std::fs::create_dir_all(&dir).expect("create fixture chunk directory");
+        for (chunk, ciphertext) in chunks.iter().zip(ciphertexts) {
+            std::fs::write(
+                dir.join(format!("{:08}.pgblob", chunk.chunk_index)),
+                ciphertext,
+            )
+            .expect("write fixture ciphertext");
+        }
+        dir
+    }
+
+    fn decode_hex_array<const N: usize>(encoded: &str) -> [u8; N] {
+        assert_eq!(encoded.len(), N * 2, "hex value has the expected length");
+        let mut decoded = [0_u8; N];
+        let (pairs, remainder) = encoded.as_bytes().as_chunks::<2>();
+        assert!(remainder.is_empty(), "hex input has complete byte pairs");
+        for (index, pair) in pairs.iter().enumerate() {
+            decoded[index] =
+                u8::from_str_radix(std::str::from_utf8(pair).expect("hex is ASCII"), 16)
+                    .expect("valid hex");
+        }
+        decoded
+    }
+
+    fn fixture_arguments(
+        mode: &str,
+        key_file: &std::path::Path,
+        operation: &str,
+        extra: &[(&str, &std::path::Path)],
+    ) -> Vec<String> {
+        let mut arguments = vec![
+            mode.to_string(),
+            "--key-file".to_string(),
+            key_file.to_string_lossy().to_string(),
+            "--operation".to_string(),
+            operation.to_string(),
+        ];
+        for (flag, path) in extra {
+            arguments.push((*flag).to_string());
+            arguments.push(path.to_string_lossy().to_string());
+        }
+        arguments
+    }
+
+    fn fixture_descriptor(ready: &serde_json::Value, device_id: Uuid) -> PeerEndpointDescriptor {
+        let node_id = ready["node_id"].as_str().expect("fixture node id");
+        let direct_addresses = ready["direct_addresses"]
+            .as_array()
+            .expect("fixture direct addresses")
+            .iter()
+            .map(|address| address.as_str().expect("address string").to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(ready["iroh_version"], "0.98.2");
+        assert_eq!(ready["alpn"], "private-gallery/vault-sync/1");
+        assert!(ready["relay_urls"].as_array().is_some_and(Vec::is_empty));
+        assert!(!direct_addresses.is_empty());
+        assert!(
+            direct_addresses
+                .iter()
+                .all(|address| address.starts_with("127.0.0.1:"))
+        );
+        PeerEndpointDescriptor {
+            device_id: Some(device_id),
+            device_name: "Iroh 0.98 fixture".to_string(),
+            platform: "test".to_string(),
+            node_id: node_id.to_string(),
+            relay_urls: Vec::new(),
+            direct_addresses,
+            expires_at: Utc::now() + chrono::Duration::minutes(1),
+            trust_level: DeviceTrustLevel::Trusted,
+            role: DeviceRole::Contributor,
+        }
+    }
+
+    struct RuntimeFixtureSpec<'a> {
+        root: &'a std::path::Path,
+        local_device: Uuid,
+        remote_device: Uuid,
+        local_key: &'a [u8; 32],
+        remote_node_id: &'a str,
+        initial_blobs: bool,
+        chunks: &'a [BlobChunk],
+        ciphertexts: &'a [Vec<u8>],
+    }
+
+    fn runtime_for_fixture(
+        spec: RuntimeFixtureSpec<'_>,
+    ) -> (
+        super::SyncRuntime,
+        std::sync::Arc<tokio::sync::RwLock<LibraryState>>,
+        StorageBootstrapReport,
+        PathBuf,
+    ) {
+        let library_root = spec.root.join("library");
+        let config = AppConfig {
+            library_root: library_root.clone(),
+            runtime_root: spec.root.join("runtime"),
+            network_policy: crate::domain::NetworkPolicy::OfflineOnly,
+            ..AppConfig::default()
+        };
+        std::fs::create_dir_all(&library_root).expect("create isolated library root");
+        let identity_path = config.runtime_root.join("identity/iroh_endpoint.key");
+        std::fs::create_dir_all(identity_path.parent().unwrap()).expect("create identity root");
+        let encoded_key = spec
+            .local_key
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        std::fs::write(&identity_path, encoded_key).expect("write app-format identity");
+        let report = storage::bootstrap_storage(&config).expect("bootstrap test database");
+
+        let mut state = authorized_state();
+        let local = state
+            .devices
+            .iter_mut()
+            .find(|device| device.id == spec.local_device)
+            .expect("local test device");
+        local.public_key = format!("local-device-key-pending-iroh-{}", spec.local_device);
+        let remote = state
+            .devices
+            .iter_mut()
+            .find(|device| device.id == spec.remote_device)
+            .expect("remote test device");
+        remote.public_key = spec.remote_node_id.to_string();
+        state.library_settings = Some(LibrarySettings {
+            library_root: library_root.to_string_lossy().to_string(),
+            default_import_mode: ImportMode::Copy,
+            original_storage_policy: OriginalStoragePolicy::EncryptedOnly,
+            initialized_at: Utc::now(),
+            updated_at: Utc::now(),
+        });
+
+        if spec.initial_blobs {
+            let mut stored_blob = blob();
+            stored_blob.bytes = spec.chunks.iter().map(|chunk| chunk.bytes).sum();
+            stored_blob.chunk_count = spec.chunks.len() as u32;
+            let mut hash_input = Vec::new();
+            for chunk in spec.chunks {
+                hash_input.extend_from_slice(chunk.encrypted_hash.as_bytes());
+            }
+            stored_blob.encrypted_hash = sha256_hex(&hash_input);
+            state.blob_records.push(stored_blob);
+            state.blob_chunks.extend_from_slice(spec.chunks);
+            for (chunk, ciphertext) in spec.chunks.iter().zip(spec.ciphertexts) {
+                let path = library_root.join(chunk.local_path.as_deref().expect("chunk path"));
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent).expect("create outgoing chunk directory");
+                }
+                std::fs::write(path, ciphertext).expect("write app-encrypted chunk");
+            }
+        }
+
+        let state = std::sync::Arc::new(tokio::sync::RwLock::new(state));
+        let runtime = super::SyncRuntime::new(config, report.clone(), state.clone());
+        (runtime, state, report, library_root)
+    }
+
+    fn transfer_job(
+        direction: super::TransferDirection,
+        from_device_id: Uuid,
+        to_device_id: Uuid,
+        blob: BlobRecord,
+        chunks: Vec<BlobChunk>,
+        target: PeerEndpointDescriptor,
+    ) -> super::OutboundBlobTransfer {
+        super::OutboundBlobTransfer {
+            direction,
+            transfer: SyncTransfer {
+                id: Uuid::from_u128(6),
+                vault_id: blob.vault_id,
+                blob_id: blob.id,
+                from_device_id: Some(from_device_id),
+                to_device_id,
+                status: SyncTransferStatus::Pending,
+                bytes_total: blob.bytes,
+                bytes_completed: 0,
+                started_at: None,
+                updated_at: Utc::now(),
+                resumable_until: Utc::now() + chrono::Duration::minutes(1),
+            },
+            blob,
+            chunks,
+            target,
+        }
+    }
+
+    fn assert_persisted_completed_transfer(
+        transfers: &[SyncTransfer],
+        envelope: &TransferEnvelope,
+    ) {
+        let transfer = transfers
+            .iter()
+            .find(|transfer| transfer.id == envelope.transfer_id)
+            .expect("completed transfer persisted");
+        assert_eq!(transfer.vault_id, envelope.blob.vault_id);
+        assert_eq!(transfer.blob_id, envelope.blob.id);
+        assert_eq!(transfer.from_device_id, Some(envelope.from_device_id));
+        assert_eq!(transfer.to_device_id, envelope.to_device_id);
+        assert_eq!(transfer.status, SyncTransferStatus::Completed);
+        assert_eq!(transfer.bytes_total, envelope.blob.bytes);
+        assert_eq!(transfer.bytes_completed, envelope.blob.bytes);
+        assert!(transfer.started_at.is_some());
+    }
+
+    fn assert_persisted_healthy_replica(
+        replicas: &[super::BlobReplica],
+        envelope: &TransferEnvelope,
+        device_id: Uuid,
+    ) {
+        let replica = replicas
+            .iter()
+            .find(|replica| replica.blob_id == envelope.blob.id)
+            .expect("replica persisted");
+        assert_eq!(replica.device_id, device_id);
+        assert_eq!(replica.health, super::ReplicaHealth::Healthy);
+        assert_eq!(replica.bytes_present, envelope.blob.bytes);
+        assert_eq!(replica.transfer_id, Some(envelope.transfer_id));
+        assert!(replica.verified_at.is_some());
+    }
+
+    async fn stop_fixture_runtime(runtime: &super::SyncRuntime) {
+        tokio::time::timeout(Duration::from_secs(5), runtime.stop())
+            .await
+            .expect("production endpoint stops before the 5 second test deadline")
+            .expect("stop production test endpoint");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "run through scripts/tests/iroh_mixed_version_sync_test.sh"]
+    async fn mixed_version_iroh_chunk_push_pull() {
+        const LEGACY_KEY: [u8; 32] = [7; 32];
+        const CURRENT_KEY: [u8; 32] = [8; 32];
+        let fixture = std::path::PathBuf::from(
+            std::env::var_os("IROH_098_PEER_BIN")
+                .expect("set IROH_098_PEER_BIN via the mixed-version test script"),
+        );
+        let legacy_node = legacy_node_id(&LEGACY_KEY);
+        let current_node = legacy_node_id(&CURRENT_KEY);
+        let source_id = Uuid::from_u128(7);
+        let receiver_id = Uuid::from_u128(8);
+
+        // Current 1.x production sender -> real 0.98.2 endpoint receiver.
+        {
+            eprintln!("interop case: 1.x sender to 0.98.2 receiver");
+            let root = TestRoot::new();
+            let legacy_key = write_legacy_key(&root.0, &LEGACY_KEY);
+            let output = root.0.join("legacy-received-push");
+            let server_args = fixture_arguments(
+                "server",
+                &legacy_key,
+                "receive-push",
+                &[("--output-dir", &output)],
+            );
+            let legacy = FixtureProcess::start(&fixture, &server_args);
+            let legacy_endpoint = fixture_descriptor(&legacy.next_json(), source_id);
+            assert_eq!(legacy_endpoint.node_id, legacy_node);
+
+            let (key, mut envelope, ciphertexts) = aead_encrypted_envelope();
+            envelope.from_device_id = receiver_id;
+            envelope.to_device_id = source_id;
+            let root_library = root.0.join("library");
+            let chunks = write_chunk_files(&root_library, &envelope.chunks, &ciphertexts);
+            let (runtime, _, report, library_root) = runtime_for_fixture(RuntimeFixtureSpec {
+                root: &root.0,
+                local_device: receiver_id,
+                remote_device: source_id,
+                local_key: &CURRENT_KEY,
+                remote_node_id: &legacy_node,
+                initial_blobs: false,
+                chunks: &chunks,
+                ciphertexts: &ciphertexts,
+            });
+            let local = runtime.start().await.expect("start production 1.x sender");
+            assert_eq!(local.descriptor.node_id, current_node);
+            let job = transfer_job(
+                super::TransferDirection::Push,
+                receiver_id,
+                source_id,
+                envelope.blob.clone(),
+                chunks.clone(),
+                legacy_endpoint,
+            );
+            let transfer_result = tokio::time::timeout(
+                Duration::from_secs(20),
+                runtime.send_blob(&job, &library_root),
+            )
+            .await;
+            stop_fixture_runtime(&runtime).await;
+            assert_eq!(
+                transfer_result
+                    .expect("production Push completes before the 20 second test deadline")
+                    .expect("send production Push to Iroh 0.98.2"),
+                envelope.blob.bytes
+            );
+            let result = legacy.finish();
+            assert_eq!(result["chunk_count"], chunks.len());
+            for chunk in &chunks {
+                let bytes = std::fs::read(output.join(chunk_filename(chunk.chunk_index)))
+                    .expect("read legacy-verified ciphertext");
+                assert_eq!(bytes, ciphertexts[chunk.chunk_index as usize]);
+                assert_eq!(sha256_hex(&bytes), chunk.encrypted_hash);
+            }
+            assert_aead_chunks_match_manifest(&key, &chunks, &ciphertexts);
+            let persisted = storage::load_state(&report).expect("reload sender app state");
+            assert!(persisted.blob_records.is_empty());
+            assert!(persisted.blob_chunks.is_empty());
+            assert!(persisted.sync_transfers.is_empty());
+        }
+
+        // A real 0.98.2 endpoint client -> current 1.x production receiver.
+        {
+            eprintln!("interop case: 0.98.2 sender to 1.x receiver");
+            let root = TestRoot::new();
+            let legacy_key = write_legacy_key(&root.0, &LEGACY_KEY);
+            let (key, envelope, ciphertexts) = aead_encrypted_envelope();
+            let manifest = write_manifest(&root.0, &envelope);
+            let fixture_chunks = write_fixture_ciphertexts(&root.0, &envelope.chunks, &ciphertexts);
+            let (runtime, _, report, library_root) = runtime_for_fixture(RuntimeFixtureSpec {
+                root: &root.0,
+                local_device: receiver_id,
+                remote_device: source_id,
+                local_key: &CURRENT_KEY,
+                remote_node_id: &legacy_node,
+                initial_blobs: false,
+                chunks: &envelope.chunks,
+                ciphertexts: &ciphertexts,
+            });
+            let local = runtime
+                .start()
+                .await
+                .expect("start production 1.x receiver");
+            assert_eq!(local.descriptor.node_id, current_node);
+            assert_ne!(local.descriptor.node_id, legacy_node);
+            let mut args = fixture_arguments(
+                "client",
+                &legacy_key,
+                "push",
+                &[("--manifest", &manifest), ("--chunks-dir", &fixture_chunks)],
+            );
+            args.extend([
+                "--node-id".to_string(),
+                local.descriptor.node_id.clone(),
+                "--direct-address".to_string(),
+                local.descriptor.direct_addresses[0].clone(),
+            ]);
+            let client = FixtureProcess::start(&fixture, &args);
+            let result = client.finish();
+            assert_eq!(result["chunk_count"], envelope.chunks.len());
+            let persisted = storage::load_state(&report).expect("reload received app state");
+            assert_eq!(persisted.blob_records.len(), 1);
+            assert_eq!(persisted.blob_chunks.len(), envelope.chunks.len());
+            assert_eq!(persisted.blob_replicas.len(), 1);
+            assert_eq!(persisted.sync_transfers.len(), 1);
+            assert_persisted_completed_transfer(&persisted.sync_transfers, &envelope);
+            assert_persisted_healthy_replica(&persisted.blob_replicas, &envelope, receiver_id);
+            for (chunk, ciphertext) in persisted.blob_chunks.iter().zip(&ciphertexts) {
+                let relative = chunk.local_path.as_deref().expect("receiver-owned path");
+                let bytes = std::fs::read(library_root.join(relative))
+                    .expect("read committed production replica");
+                assert_eq!(&bytes, ciphertext);
+                assert_eq!(sha256_hex(&bytes), chunk.encrypted_hash);
+            }
+            assert_aead_chunks_match_manifest(&key, &persisted.blob_chunks, &ciphertexts);
+            stop_fixture_runtime(&runtime).await;
+        }
+
+        // Current 1.x production Pull client <- real 0.98.2 endpoint server.
+        {
+            eprintln!("interop case: 1.x Pull client from 0.98.2 server");
+            let root = TestRoot::new();
+            let legacy_key = write_legacy_key(&root.0, &LEGACY_KEY);
+            let (key, envelope, ciphertexts) = aead_encrypted_envelope();
+            let manifest = write_manifest(&root.0, &envelope);
+            let fixture_chunks = write_fixture_ciphertexts(&root.0, &envelope.chunks, &ciphertexts);
+            let server_args = fixture_arguments(
+                "server",
+                &legacy_key,
+                "serve-pull",
+                &[("--manifest", &manifest), ("--chunks-dir", &fixture_chunks)],
+            );
+            let legacy = FixtureProcess::start(&fixture, &server_args);
+            let legacy_endpoint = fixture_descriptor(&legacy.next_json(), source_id);
+            assert_eq!(legacy_endpoint.node_id, legacy_node);
+            let (runtime, _, report, library_root) = runtime_for_fixture(RuntimeFixtureSpec {
+                root: &root.0,
+                local_device: receiver_id,
+                remote_device: source_id,
+                local_key: &CURRENT_KEY,
+                remote_node_id: &legacy_node,
+                initial_blobs: false,
+                chunks: &envelope.chunks,
+                ciphertexts: &ciphertexts,
+            });
+            let local = runtime
+                .start()
+                .await
+                .expect("start production 1.x receiver");
+            let job = transfer_job(
+                super::TransferDirection::Pull,
+                source_id,
+                receiver_id,
+                envelope.blob.clone(),
+                envelope.chunks.clone(),
+                legacy_endpoint,
+            );
+            let transfer_result = tokio::time::timeout(
+                Duration::from_secs(20),
+                runtime.request_blob(&job, &library_root),
+            )
+            .await;
+            stop_fixture_runtime(&runtime).await;
+            assert_eq!(
+                transfer_result
+                    .expect("production Pull completes before the 20 second test deadline")
+                    .expect("request production Pull from Iroh 0.98.2"),
+                envelope.blob.bytes
+            );
+            let result = legacy.finish();
+            assert_eq!(result["chunk_count"], envelope.chunks.len());
+            let persisted = storage::load_state(&report).expect("reload pulled app state");
+            assert_eq!(persisted.blob_records.len(), 1);
+            assert_eq!(persisted.blob_chunks.len(), envelope.chunks.len());
+            assert_eq!(persisted.blob_replicas.len(), 1);
+            assert_persisted_completed_transfer(&persisted.sync_transfers, &envelope);
+            assert_persisted_healthy_replica(&persisted.blob_replicas, &envelope, receiver_id);
+            for (chunk, ciphertext) in persisted.blob_chunks.iter().zip(&ciphertexts) {
+                let relative = chunk.local_path.as_deref().expect("receiver-owned path");
+                let bytes = std::fs::read(library_root.join(relative))
+                    .expect("read pulled production replica");
+                assert_eq!(&bytes, ciphertext);
+                assert_eq!(sha256_hex(&bytes), chunk.encrypted_hash);
+            }
+            assert_aead_chunks_match_manifest(&key, &persisted.blob_chunks, &ciphertexts);
+            assert_eq!(local.descriptor.node_id, current_node);
+        }
+
+        // A real 0.98.2 endpoint client <- current 1.x production Pull server.
+        {
+            eprintln!("interop case: 0.98.2 Pull client from 1.x server");
+            let root = TestRoot::new();
+            let legacy_key = write_legacy_key(&root.0, &LEGACY_KEY);
+            let (key, envelope, ciphertexts) = aead_encrypted_envelope();
+            let request = super::PullRequest {
+                protocol_version: super::PROTOCOL_VERSION,
+                transfer_id: envelope.transfer_id,
+                from_device_id: source_id,
+                to_device_id: receiver_id,
+                vault_id: envelope.blob.vault_id,
+                blob_id: envelope.blob.id,
+            };
+            let request_path = root.0.join("pull-request.json");
+            std::fs::write(
+                &request_path,
+                serde_json::to_vec(&request).expect("serialize pull request"),
+            )
+            .expect("write pull request");
+            let server_chunks =
+                write_chunk_files(&root.0.join("library"), &envelope.chunks, &ciphertexts);
+            let (runtime, _, report, library_root) = runtime_for_fixture(RuntimeFixtureSpec {
+                root: &root.0,
+                local_device: source_id,
+                remote_device: receiver_id,
+                local_key: &CURRENT_KEY,
+                remote_node_id: &legacy_node,
+                initial_blobs: true,
+                chunks: &server_chunks,
+                ciphertexts: &ciphertexts,
+            });
+            let local = runtime.start().await.expect("start production 1.x source");
+            assert_eq!(local.descriptor.node_id, current_node);
+            let output = root.0.join("legacy-pulled");
+            let mut args = fixture_arguments(
+                "client",
+                &legacy_key,
+                "pull",
+                &[("--request", &request_path), ("--output-dir", &output)],
+            );
+            args.extend([
+                "--node-id".to_string(),
+                local.descriptor.node_id.clone(),
+                "--direct-address".to_string(),
+                local.descriptor.direct_addresses[0].clone(),
+            ]);
+            let client = FixtureProcess::start(&fixture, &args);
+            let result = client.finish();
+            assert_eq!(result["chunk_count"], envelope.chunks.len());
+            for (chunk, ciphertext) in envelope.chunks.iter().zip(&ciphertexts) {
+                let bytes = std::fs::read(output.join(chunk_filename(chunk.chunk_index)))
+                    .expect("read old-client verified ciphertext");
+                assert_eq!(&bytes, ciphertext);
+                assert_eq!(sha256_hex(&bytes), chunk.encrypted_hash);
+            }
+            assert_aead_chunks_match_manifest(&key, &envelope.chunks, &ciphertexts);
+            let source_paths_exist = server_chunks.iter().all(|chunk| {
+                chunk
+                    .local_path
+                    .as_deref()
+                    .is_some_and(|path| library_root.join(path).is_file())
+            });
+            assert!(
+                source_paths_exist,
+                "production source retains its encrypted originals"
+            );
+            stop_fixture_runtime(&runtime).await;
+            let persisted = storage::load_state(&report).expect("reload source app state");
+            assert_eq!(persisted.blob_records.len(), 1);
+            assert_eq!(persisted.blob_chunks.len(), envelope.chunks.len());
+            let persisted_blob = persisted
+                .blob_records
+                .iter()
+                .find(|blob| blob.id == envelope.blob.id)
+                .expect("source blob remains persisted");
+            assert_eq!(persisted_blob.encrypted_hash, envelope.blob.encrypted_hash);
+            for (chunk, ciphertext) in persisted.blob_chunks.iter().zip(&ciphertexts) {
+                let relative = chunk.local_path.as_deref().expect("source-owned path");
+                let bytes = std::fs::read(library_root.join(relative))
+                    .expect("read retained production source chunk");
+                assert_eq!(&bytes, ciphertext);
+                assert_eq!(sha256_hex(&bytes), chunk.encrypted_hash);
+            }
         }
     }
 
@@ -2253,6 +2975,87 @@ mod tests {
         }
         envelope.blob.encrypted_hash = sha256_hex(&hash_input);
         (envelope, ciphertexts)
+    }
+
+    fn aead_encrypted_envelope() -> (chacha20poly1305::Key, TransferEnvelope, Vec<Vec<u8>>) {
+        use chacha20poly1305::{
+            XChaCha20Poly1305, XNonce,
+            aead::{Aead, KeyInit, OsRng, Payload},
+        };
+
+        let key = XChaCha20Poly1305::generate_key(&mut OsRng);
+        let cipher = XChaCha20Poly1305::new(&key);
+        let plaintexts = [
+            b"first verified original".as_slice(),
+            b"second verified original".as_slice(),
+        ];
+        let mut chunks = vec![chunk(0, 4, 0), chunk(1, 5, 0)];
+        let mut ciphertexts = Vec::with_capacity(plaintexts.len());
+        for (index, (chunk, plaintext)) in chunks.iter_mut().zip(plaintexts).enumerate() {
+            let nonce = [index as u8 + 1; 24];
+            let aad = format!("mixed-version-transfer-chunk-{index}");
+            let ciphertext = cipher
+                .encrypt(
+                    XNonce::from_slice(&nonce),
+                    Payload {
+                        msg: plaintext,
+                        aad: aad.as_bytes(),
+                    },
+                )
+                .expect("seal interoperability test chunk");
+            chunk.bytes = plaintext.len() as u64;
+            chunk.content_hash = sha256_hex(plaintext);
+            chunk.encrypted_hash = sha256_hex(&ciphertext);
+            chunk.encrypted_bytes = ciphertext.len() as u64;
+            chunk.nonce_hex = Some(super::hex_string(&nonce));
+            chunk.aad = Some(aad);
+            ciphertexts.push(ciphertext);
+        }
+        let mut envelope = envelope(chunks);
+        envelope.blob.bytes = plaintexts.iter().map(|bytes| bytes.len() as u64).sum();
+        envelope.blob.chunk_count = ciphertexts.len() as u32;
+        let mut hash_input = Vec::new();
+        for chunk in &envelope.chunks {
+            hash_input.extend_from_slice(chunk.encrypted_hash.as_bytes());
+        }
+        envelope.blob.encrypted_hash = sha256_hex(&hash_input);
+        (key, envelope, ciphertexts)
+    }
+
+    fn assert_aead_chunks_match_manifest(
+        key: &chacha20poly1305::Key,
+        chunks: &[BlobChunk],
+        ciphertexts: &[Vec<u8>],
+    ) {
+        use chacha20poly1305::{
+            XChaCha20Poly1305, XNonce,
+            aead::{Aead, KeyInit, Payload},
+        };
+
+        let cipher = XChaCha20Poly1305::new(key);
+        assert_eq!(chunks.len(), ciphertexts.len());
+        for (chunk, ciphertext) in chunks.iter().zip(ciphertexts) {
+            assert_eq!(sha256_hex(ciphertext), chunk.encrypted_hash);
+            assert_eq!(ciphertext.len() as u64, chunk.encrypted_bytes);
+            let nonce_bytes = decode_hex_array::<24>(
+                chunk
+                    .nonce_hex
+                    .as_deref()
+                    .expect("authenticated chunk nonce"),
+            );
+            let aad = chunk.aad.as_deref().expect("authenticated chunk AAD");
+            let plaintext = cipher
+                .decrypt(
+                    XNonce::from_slice(&nonce_bytes),
+                    Payload {
+                        msg: ciphertext,
+                        aad: aad.as_bytes(),
+                    },
+                )
+                .expect("stored bytes must remain valid authenticated ciphertext");
+            assert_eq!(plaintext.len() as u64, chunk.bytes);
+            assert_eq!(sha256_hex(&plaintext), chunk.content_hash);
+        }
     }
 
     async fn invoke_receive(
