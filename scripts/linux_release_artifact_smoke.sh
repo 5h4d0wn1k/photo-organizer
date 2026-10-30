@@ -31,16 +31,15 @@
 #     Linux build silently stopped producing one of them, a gate that skipped the
 #     missing one would report a pass it never earned.
 #
-#   * "Install" for the .deb is a faithful *data-layout* extraction performed by
-#     `dpkg-deb -x` (the same tool dpkg itself uses to unpack `data.tar.*`), with
-#     `bsdtar` as a fallback extractor. It is NOT `dpkg -i`. That is a stated
-#     limitation, not a shortcut: `dpkg -i` needs root, mutates the runner, and
-#     would add a second, untestable code path. The package's control file
-#     declares no maintainer scripts, so extraction loses nothing but dpkg's
-#     metadata database. Absolute install paths inside the package
-#     (`/usr/bin/photo-organizer`, `Exec=/opt/photo-organizer/AppRun`) are still
-#     asserted, mapped onto the extraction root, so a package that would not
-#     install into a working layout is still rejected.
+#   * The .deb is installed by `dpkg` into a private staging root with its own
+#     package database. This exercises the real package installer without
+#     changing the runner's system. Before installation, the gate rejects Debian
+#     maintainer scripts (`preinst`, `postinst`, `prerm`, `postrm`, `config`):
+#     dpkg may execute those scripts, and running package-provided code outside
+#     the private root would mutate the host. The shipped package has no such
+#     scripts. The installed absolute paths (`/usr/bin/photo-organizer`,
+#     `Exec=/opt/photo-organizer/AppRun`) are then checked under the staging
+#     root and the installed AppRun is cold-launched.
 #
 #   * "Cold launch" is defined rather than assumed. Each leg gets a fresh process
 #     group (via `setsid --wait`, which also hands back the child's real exit
@@ -1378,27 +1377,37 @@ run_leg appimage "${APPIMAGE_RUN}"
 # Leg 2: the .deb
 # ---------------------------------------------------------------------------
 #
-# "Install" here is a faithful data-layout extraction (dpkg-deb -x, bsdtar
-# fallback) plus the absolute-path checks that decide whether dpkg would produce a
-# working installation. See the header for why this is not `dpkg -i`.
+# Install the exact .deb through dpkg, but keep its package database and files in
+# a private root so the gate does not alter the runner's system installation.
 DEB_ROOT="${SCRATCH}/deb/root"
 mkdir -p "${DEB_ROOT}"
-if command -v dpkg-deb >/dev/null 2>&1; then
-  record "deb_extractor" "dpkg-deb"
-  if ! dpkg-deb -x "${DEB}" "${DEB_ROOT}" \
-    >>"${EVIDENCE_DIR}/linux-smoke-${SMOKE_NAME}-deb-extract.log" 2>&1; then
-    fail deb_extract_failed "dpkg-deb -x could not unpack ${DEB}"
-  fi
-elif command -v bsdtar >/dev/null 2>&1; then
-  record "deb_extractor" "bsdtar"
-  if ! bsdtar -xf "${DEB}" -C "${DEB_ROOT}" \
-    >>"${EVIDENCE_DIR}/linux-smoke-${SMOKE_NAME}-deb-extract.log" 2>&1; then
-    fail deb_extract_failed "bsdtar could not unpack ${DEB}"
-  fi
-else
-  fail deb_extract_failed \
-    "no way to unpack a .deb on this runner: install dpkg (dpkg-deb) or libarchive-tools (bsdtar)"
+DEB_CONTROL_DIR="${SCRATCH}/deb/control"
+if ! command -v dpkg >/dev/null 2>&1; then
+  fail deb_install_failed "dpkg is required to install the .deb into the private staging root"
 fi
+if ! command -v dpkg-deb >/dev/null 2>&1; then
+  fail deb_control_inspection_failed "dpkg-deb is required to inspect the package control archive before installation"
+fi
+mkdir -p "${DEB_CONTROL_DIR}"
+if ! dpkg-deb --control "${DEB}" "${DEB_CONTROL_DIR}" \
+  >>"${EVIDENCE_DIR}/linux-smoke-${SMOKE_NAME}-deb-install.log" 2>&1; then
+  fail deb_control_inspection_failed "dpkg-deb could not inspect the .deb control archive"
+fi
+for maintainer_script in preinst postinst prerm postrm config; do
+  if [[ -e "${DEB_CONTROL_DIR}/${maintainer_script}" || -L "${DEB_CONTROL_DIR}/${maintainer_script}" ]]; then
+    fail deb_maintainer_script_unsupported \
+      "the .deb contains ${maintainer_script}; package-provided scripts are refused so installation cannot mutate the runner outside the private root"
+  fi
+done
+record "deb_installer" "dpkg --root (private staging root)"
+if ! dpkg --root="${DEB_ROOT}" --force-not-root --install "${DEB}" \
+  >>"${EVIDENCE_DIR}/linux-smoke-${SMOKE_NAME}-deb-install.log" 2>&1; then
+  fail deb_install_failed "dpkg could not install ${DEB} into the private staging root"
+fi
+if [[ ! -s "${DEB_ROOT}/var/lib/dpkg/status" ]]; then
+  fail deb_install_unverified "dpkg returned success without creating its private package database"
+fi
+record "deb_install_root" "${DEB_ROOT}"
 if [[ ! -d "${DEB_ROOT}/opt/photo-organizer" ]]; then
   fail deb_layout_missing "the .deb does not lay down /opt/photo-organizer"
 fi
@@ -1476,28 +1485,12 @@ if [[ -n "${deb_icon_name}" ]] \
     "the installed desktop entry names Icon=${deb_icon_name}, which the package does not install at the 512x512 hicolor path"
 fi
 
-# Package metadata: `dpkg -i` rejects a package with a broken control file, and
+# Package metadata: the isolated dpkg install consumes this control file, and
 # these field values are what the published filename promises.
 deb_control_field() {
-  local field="$1" out member archive
-  if command -v dpkg-deb >/dev/null 2>&1; then
-    out="$(dpkg-deb -f "${DEB}" "${field}" 2>/dev/null)" || return 1
-    printf '%s' "${out}"
-    return 0
-  fi
-  member="$(bsdtar -tf "${DEB}" 2>/dev/null | grep -E -m1 '^control\.tar\.')" || return 1
-  if [[ -z "${member}" ]]; then
-    return 1
-  fi
-  archive="${SCRATCH}/deb/control/${member}"
-  mkdir -p "${SCRATCH}/deb/control"
-  bsdtar -xf "${DEB}" -C "${SCRATCH}/deb/control" "${member}" 2>/dev/null || return 1
-  out="$(bsdtar -xOf "${archive}" ./control 2>/dev/null)" \
-    || out="$(bsdtar -xOf "${archive}" control 2>/dev/null)" \
-    || return 1
-  # No `head -1`: the control file has exactly one of each field, and a duplicate
-  # would then leave a newline in the value and fail the checks below.
-  printf '%s\n' "${out}" | sed -n "s/^${field}:[[:space:]]*//p"
+  local field="$1" out
+  out="$(dpkg-deb -f "${DEB}" "${field}" 2>/dev/null)" || return 1
+  printf '%s' "${out}"
 }
 
 deb_pkg="$(deb_control_field Package || true)"
