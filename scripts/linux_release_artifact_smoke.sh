@@ -1381,24 +1381,30 @@ run_leg appimage "${APPIMAGE_RUN}"
 # a private root so the gate does not alter the runner's system installation.
 DEB_ROOT="${SCRATCH}/deb/root"
 mkdir -p "${DEB_ROOT}"
-DEB_CONTROL_DIR="${SCRATCH}/deb/control"
 if ! command -v dpkg >/dev/null 2>&1; then
   fail deb_install_failed "dpkg is required to install the .deb into the private staging root"
 fi
 if ! command -v dpkg-deb >/dev/null 2>&1; then
   fail deb_control_inspection_failed "dpkg-deb is required to inspect the package control archive before installation"
 fi
-mkdir -p "${DEB_CONTROL_DIR}"
-if ! dpkg-deb --control "${DEB}" "${DEB_CONTROL_DIR}" \
-  >>"${EVIDENCE_DIR}/linux-smoke-${SMOKE_NAME}-deb-install.log" 2>&1; then
-  fail deb_control_inspection_failed "dpkg-deb could not inspect the .deb control archive"
+if ! command -v tar >/dev/null 2>&1; then
+  fail deb_control_inspection_failed "tar is required to list the package control archive without extracting it"
 fi
-for maintainer_script in preinst postinst prerm postrm config; do
-  if [[ -e "${DEB_CONTROL_DIR}/${maintainer_script}" || -L "${DEB_CONTROL_DIR}/${maintainer_script}" ]]; then
-    fail deb_maintainer_script_unsupported \
-      "the .deb contains ${maintainer_script}; package-provided scripts are refused so installation cannot mutate the runner outside the private root"
-  fi
-done
+if ! control_members="$(dpkg-deb --ctrl-tarfile "${DEB}" 2>>"${EVIDENCE_DIR}/linux-smoke-${SMOKE_NAME}-deb-install.log" | tar -tf - 2>>"${EVIDENCE_DIR}/linux-smoke-${SMOKE_NAME}-deb-install.log")"; then
+  fail deb_control_inspection_failed "the .deb control archive could not be listed safely"
+fi
+while IFS= read -r control_member; do
+  control_member="${control_member#./}"
+  control_member="${control_member%/}"
+  for maintainer_script in preinst postinst prerm postrm config; do
+    if [[ "${control_member}" == "${maintainer_script}" || "${control_member}" == */"${maintainer_script}" ]]; then
+      fail deb_maintainer_script_unsupported \
+        "the .deb control archive contains ${control_member}; package-provided scripts are refused so installation cannot mutate the runner outside the private root"
+    fi
+  done
+done <<<"${control_members}"
+record "deb_control_members_listed" "yes"
+record "deb_maintainer_scripts" "none"
 record "deb_installer" "dpkg --root (private staging root)"
 if ! dpkg --root="${DEB_ROOT}" --force-not-root --install "${DEB}" \
   >>"${EVIDENCE_DIR}/linux-smoke-${SMOKE_NAME}-deb-install.log" 2>&1; then
@@ -1411,7 +1417,6 @@ record "deb_install_root" "${DEB_ROOT}"
 if [[ ! -d "${DEB_ROOT}/opt/photo-organizer" ]]; then
   fail deb_layout_missing "the .deb does not lay down /opt/photo-organizer"
 fi
-
 for required_rel in \
   "opt/photo-organizer/AppRun" \
   "opt/photo-organizer/private_gallery_app" \

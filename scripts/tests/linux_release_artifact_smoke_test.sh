@@ -127,7 +127,7 @@ check() {
 # under test, which would make every scenario meaningless.
 FARM_CORE_TOOLS=(
   awk basename bash cat chmod cp cut date dirname env find grep head mkdir
-  mktemp mv od readlink rm sed setsid sha256sum sleep sort stat tail tr uname
+  mktemp mv od readlink rm sed setsid sha256sum sleep sort stat tail tar tr uname
   wc
 )
 
@@ -544,9 +544,8 @@ FAKE_EOF
 set -uo pipefail
 mode="${1:-}"
 case "${mode}" in
-  --control)
+  --ctrl-tarfile)
     archive="${2:?}"
-    control_dir="${3:?}"
     if [[ -n "${FAKE_DEB_CONTROL_FAIL:-}" ]]; then
       echo "dpkg-deb: error: control archive has bad magic" >&2
       exit 2
@@ -556,12 +555,15 @@ case "${mode}" in
       echo "dpkg-deb: error: control archive has bad magic" >&2
       exit 2
     fi
-    mkdir -p "${control_dir}"
+    control_dir="$(mktemp -d)"
     cp "${FAKE_DEB_CONTROL:?FAKE_DEB_CONTROL is not set}" "${control_dir}/control"
     if [[ -n "${FAKE_DEB_SCRIPT:-}" ]]; then
       printf '#!/bin/sh\nexit 0\n' >"${control_dir}/${FAKE_DEB_SCRIPT}"
     fi
-    exit 0
+    tar -cf - -C "${control_dir}" .
+    status=$?
+    rm -rf -- "${control_dir}"
+    exit "${status}"
     ;;
   -f)
     field="${3:?}"
@@ -1854,7 +1856,7 @@ reset_env
 make_good_artifacts "${WORK}/s34b" ok
 TEST_DEB_SCRIPT=postinst
 mutation_on_broken "deb-maintainer-script" deb_maintainer_script_unsupported \
-  's/if \[\[ -e "${DEB_CONTROL_DIR}\/${maintainer_script}" || -L "${DEB_CONTROL_DIR}\/${maintainer_script}" \]\]; then/if false; then/'
+  's/if \[\[ "${control_member}" == "${maintainer_script}" || "${control_member}" == \*\/"${maintainer_script}" \]\]; then/if false; then/'
 
 reset_env
 make_good_artifacts "${WORK}/s35" ok
