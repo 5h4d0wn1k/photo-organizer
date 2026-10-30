@@ -51,29 +51,44 @@ restore() {
 # back and confirm it now says what was intended. Writing a file is not evidence
 # that the file contains the intended text.
 apply() {
-  python3 - "$1" "$2" "$3" <<'PYTHON'
+  python3 - "$1" "$2" "$3" "${4:-}" <<'PYTHON'
 import sys
+import yaml
 
-path, old, new = sys.argv[1], sys.argv[2], sys.argv[3]
+path, old, new = sys.argv[1:4]
+scope = sys.argv[4]
 with open(path, encoding="utf-8") as handle:
     text = handle.read()
-count = text.count(old)
+start, end = 0, len(text)
+if scope:
+    document = yaml.compose(text)
+    jobs_node = next(value for key, value in document.value if key.value == "jobs")
+    matches = [(key, value) for key, value in jobs_node.value if key.value == scope]
+    if len(matches) != 1:
+        print("JOB SCOPE IS NOT UNIQUE: " + scope, file=sys.stderr)
+        sys.exit(7)
+    key, value = matches[0]
+    start = key.start_mark.index - key.start_mark.column
+    end = value.end_mark.index
+segment = text[start:end]
+count = segment.count(old)
 if count != 1:
     print(
         f"ANCHOR IS NOT UNIQUE ({count} occurrences): {old[:90]!r}", file=sys.stderr
     )
     sys.exit(4 if count else 3)
 with open(path, "w", encoding="utf-8") as handle:
-    handle.write(text.replace(old, new, 1))
+    handle.write(text[:start] + segment.replace(old, new, 1) + text[end:])
 with open(path, encoding="utf-8") as handle:
     after = handle.read()
-if new and new not in after:
+changed = after[start:len(after) - (len(text) - end)]
+if new and new not in changed:
     print("MUTATION DID NOT LAND: replacement text absent", file=sys.stderr)
     sys.exit(5)
-if old and old in after and old not in new:
+if old and old in changed and old not in new:
     print("MUTATION DID NOT LAND: original text still present", file=sys.stderr)
     sys.exit(6)
-print(text[: text.index(old)].count("\n") + 1)
+print(text[: start + segment.index(old)].count("\n") + 1)
 PYTHON
 }
 
@@ -117,10 +132,11 @@ needle_matches() {
 mutate() {
   local name="$1" old="$2" new="$3" needle="$4"
   local target="${5:-${WORKFLOW}}"
+  local scope="${6:-}"
   MUTATIONS_RUN=$((MUTATIONS_RUN + 1))
   restore
   local line
-  if ! line="$(apply "${target}" "${old}" "${new}" 2>&1)"; then
+  if ! line="$(apply "${target}" "${old}" "${new}" "${scope}" 2>&1)"; then
     mismatches+=("${name}: could not apply the mutation (${line})")
     restore
     return
@@ -143,6 +159,12 @@ mutate() {
     printf '  bites  %s\n' "${name}"
   fi
   restore
+}
+
+# Publisher mutations must select jobs.release even when a nonpublishing
+# candidate downloads the same artifacts and waits for the same platform gates.
+mutate_release() {
+  mutate "$1" "$2" "$3" "$4" "${WORKFLOW}" release
 }
 
 # Derive a workflow's own text instead of restating it, so a Dependabot bump
@@ -837,8 +859,9 @@ mutate "a long platform build stops waiting for the fast-fail preflight" \
 echo "== every upstream gates the publication =="
 
 for upstream in release-signing-preflight linux linux-smoke windows windows-smoke macos macos-smoke ios android-verify; do
-  mutate "\`release\` stops needing \`${upstream}\`" \
+  mutate_release "\`release\` stops needing \`${upstream}\`" \
     "    needs:
+      - tag-release-authorization
       - release-signing-preflight
       - linux
       - linux-smoke
@@ -853,6 +876,7 @@ import sys
 
 drop = sys.argv[1]
 entries = [
+    "tag-release-authorization",
     "release-signing-preflight",
     "linux",
     "linux-smoke",
@@ -934,8 +958,9 @@ mutate "the macos-smoke job stops depending on the macOS build it consumes" \
 
 # `if: always()` is what #82 proposed and is the exact opposite of atomic
 # publication: it runs the publish job even when a dependency failed.
-mutate "the publish job runs even when a dependency failed" \
+mutate_release "the publish job runs even when a dependency failed" \
   '    needs:
+      - tag-release-authorization
       - release-signing-preflight
       - linux
       - linux-smoke
@@ -948,6 +973,7 @@ mutate "the publish job runs even when a dependency failed" \
     permissions:
       contents: write' \
   '    needs:
+      - tag-release-authorization
       - release-signing-preflight
       - linux
       - linux-smoke
@@ -980,7 +1006,7 @@ mutate "the macOS artifact is never downloaded" \
   '' \
   'must download `macos-artifact`'
 
-mutate "the Linux artifact is downloaded under a name no job uploads" \
+mutate_release "the Linux artifact is downloaded under a name no job uploads" \
   '          name: linux-artifacts
           path: incoming/linux' \
   '          name: linux-artifacts-final
@@ -1140,7 +1166,7 @@ mutate "a second job publishes through the gh CLI instead of the release action"
 
 # A download path rename is the same defect spelled differently: the artifact is
 # fetched into a directory the staging loop never reads.
-mutate "the ios artifact is downloaded into a directory the staging loop never visits" \
+mutate_release "the ios artifact is downloaded into a directory the staging loop never visits" \
   '          path: incoming/ios' \
   '          path: incoming/ios-app' \
   "must be exactly the set of directories the download-artifact steps write into"

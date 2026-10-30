@@ -4,6 +4,7 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -11,6 +12,10 @@ permissions:
 concurrency:
   group: release-${{ github.ref_name }}
   cancel-in-progress: false
+
+env:
+  # A valid package version even when dispatching a branch such as main.
+  RELEASE_LABEL: ${{ github.event_name == 'push' && github.ref_name || format('v0.0.0-candidate.{0}', github.run_id) }}
 
 jobs:
   # Fail in seconds, and before any job holds `contents: write`.
@@ -189,12 +194,12 @@ jobs:
           cp assets/linux/photo-organizer.desktop "${APPDIR}/photo-organizer.desktop"
           cp assets/linux/photo-organizer.png "${APPDIR}/photo-organizer.png"
           cp assets/linux/photo-organizer.png "${APPDIR}/.DirIcon"
-          APPIMAGE_EXTRACT_AND_RUN=1 ./appimagetool-x86_64.AppImage "${APPDIR}" "photo-organizer-linux-x86_64-${GITHUB_REF_NAME}.AppImage"
+          APPIMAGE_EXTRACT_AND_RUN=1 ./appimagetool-x86_64.AppImage "${APPDIR}" "photo-organizer-linux-x86_64-${RELEASE_LABEL}.AppImage"
 
       - name: Package .deb
         run: |
           set -euo pipefail
-          VERSION="${GITHUB_REF_NAME#v}"
+          VERSION="${RELEASE_LABEL#v}"
           PKG="photo-organizer_${VERSION}_amd64"
           mkdir -p "${PKG}/DEBIAN" "${PKG}/opt/photo-organizer" "${PKG}/usr/share/applications" "${PKG}/usr/share/icons/hicolor/512x512/apps"
           printf '%s\n' \
@@ -328,7 +333,7 @@ jobs:
       - name: Package Windows ZIP
         shell: pwsh
         run: |
-          $ref = $env:GITHUB_REF_NAME
+          $ref = $env:RELEASE_LABEL
           $ver = $ref.TrimStart('v')
           $releaseDir = "app/build/windows/x64/runner/Release"
           # Copy daemon and ml_sidecar into Release
@@ -385,7 +390,7 @@ jobs:
       - name: Package macOS DMG
         run: |
           set -euo pipefail
-          REF_NAME="${GITHUB_REF_NAME}"
+          REF_NAME="${RELEASE_LABEL}"
           APP_PATH="app/build/macos/Build/Products/Release/private_gallery_app.app"
           if [ ! -d "${APP_PATH}" ]; then
             echo "App not found at expected path: ${APP_PATH}" >&2
@@ -998,7 +1003,7 @@ jobs:
           mkdir -p "${APP_PATH}/Frameworks"
           cp -R target/aarch64-apple-ios/release/galleryd "${APP_PATH}/Frameworks/race"
           cp -R ml_sidecar "${APP_PATH}/ml_sidecar"
-          ditto -c -k --keepParent "${APP_PATH}" "photo-organizer-ios-${GITHUB_REF_NAME}.zip"
+          ditto -c -k --keepParent "${APP_PATH}" "photo-organizer-ios-${RELEASE_LABEL}.zip"
 
       # The device .app above is an `iphoneos` bundle: `simctl install` cannot
       # accept it, so the only iOS surface a free runner can prove is the
@@ -1116,6 +1121,105 @@ jobs:
   #
   # Now nothing can publish until every platform job and the signing preflight is
   # green, so a release is either complete or it does not exist.
+  # A skipped dependency keeps the publisher skipped on every manual run,
+  # without overriding its implicit success() gate on the platform jobs.
+  tag-release-authorization:
+    name: Authorize tag publication
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Confirm tag-only publication
+        run: echo 'Tag publication authorized; manual runs cannot publish.'
+
+  candidate-validation:
+    name: Validate nonpublishing release candidate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    if: github.event_name == 'workflow_dispatch'
+    needs:
+      - release-signing-preflight
+      - linux
+      - linux-smoke
+      - windows
+      - windows-smoke
+      - macos
+      - macos-smoke
+      - ios
+      - android-verify
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      # One download step per artifact, each into its own directory.
+      #
+      # Downloading by name rather than by `pattern:` is deliberate. A pattern
+      # that matched nothing would still succeed, so a renamed or mis-uploaded
+      # artifact would silently contribute zero files to the release. Naming
+      # them one by one makes each absence a hard failure at the step, before
+      # any staging happens.
+      - name: Download candidate Android artifact
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v4
+        with:
+          name: android-artifact
+          path: incoming/android
+
+      - name: Download candidate Linux artifacts
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v4
+        with:
+          name: linux-artifacts
+          path: incoming/linux
+
+      - name: Download candidate Windows artifact
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v4
+        with:
+          name: windows-artifact
+          path: incoming/windows
+
+      - name: Download candidate macOS artifact
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v4
+        with:
+          name: macos-artifact
+          path: incoming/macos
+
+      - name: Download candidate iOS artifact
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v4
+        with:
+          name: ios-artifact
+          path: incoming/ios
+
+      # Flatten into one directory and prove the set is complete before a single
+      # byte is uploaded.
+      #
+      # Two failure modes are handled explicitly, and both were reachable in the
+      # old workflow:
+      #
+      #   * a platform contributing zero files -- previously that platform just
+      #     published an empty set and the release looked fine;
+      #   * two artifacts sharing a basename -- `action-gh-release` uploads by
+      #     basename, so one would silently overwrite the other and the release
+      #     would carry the wrong bytes under a plausible name.
+      #
+      # Staging by hand rather than trusting the action's own glob behaviour also
+      # means `dist/*` is a literal, reviewable file list in the logs, and the
+      # suite can assert on it.
+      - name: Stage candidate artifact set
+        run: bash scripts/stage_release_candidate.sh
+
+      - name: Record exact artifacts and checksums
+        run: python3 scripts/release_artifact_receipt.py dist
+
+      - name: Preserve validated candidate artifacts and receipt
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: release-candidate-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: dist/*
+          if-no-files-found: error
+
   release:
     name: Publish release
     runs-on: ubuntu-24.04
@@ -1133,6 +1237,7 @@ jobs:
       # so adding one without listing it here is not caught -- correct, because there
       # is no artifact to omit, but do not read this as "every new job must be listed".
     needs:
+      - tag-release-authorization
       - release-signing-preflight
       - linux
       - linux-smoke
@@ -1238,6 +1343,9 @@ jobs:
           echo "staged $(find dist -type f | wc -l) files from ${#platforms[@]} platforms:"
           ls -l dist
 
+      - name: Record exact artifacts and checksums
+        run: python3 scripts/release_artifact_receipt.py dist
+
       - name: Publish the release
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
         with:
@@ -1274,7 +1382,7 @@ jobs:
               ${{ needs.release-signing-preflight.outputs.signing_mode == 'release' && 'This artifact is signed with the project release key, so future versions install over it without an uninstall.' || 'This artifact is signed with an ephemeral per-run CI key, so it installs once but a future version will require uninstalling it first — which discards this device’s paired identity.' }}
               **Install:** sideload it -- enable "install unknown apps" for your file manager,
               then open the APK and confirm. There is no store listing.
-              Verify the download with the attached `app-release.apk.sha256`.
+              Verify every download with the attached `SHA256SUMS`; `release-receipt.json` records the source commit and run. The APK also retains `app-release.apk.sha256`.
             * **Linux** — unsigned. No GPG signature and no Debian package signing.
             * **Windows** — unsigned. No Authenticode signing.
             * **macOS** — unsigned. No notarization.
