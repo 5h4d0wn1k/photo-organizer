@@ -3071,6 +3071,12 @@ else
 fi
 
 
+if python3 "${ROOT_DIR}/scripts/tests/release_candidate_validation_test.py"; then
+  ok 'manual candidates cannot publish and complete artifact receipts are verified'
+else
+  bad 'manual candidates cannot publish and complete artifact receipts are verified'
+fi
+
 printf '\n%s passed, %s failed\n' "${PASS_COUNT}" "${FAIL_COUNT}"
 if ((FAIL_COUNT > 0)); then
   exit 1
