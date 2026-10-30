@@ -8,6 +8,9 @@
 #   * CI ran clippy with --all-features -D warnings and this script ran neither
 #     clippy nor a locked test, so a lint error or a stale lockfile only ever
 #     surfaced after a push.
+#   * CI ran Rust tests twice with an isolated TMPDIR and checked that tests
+#     removed their `private-gallery-*` directories; one local pass did not
+#     exercise the repeated-run cleanup contract.
 #   * CI ran `flutter test` and this script ran `flutter analyze` alone, so a
 #     broken widget test looked green until CI said otherwise. Test counts are
 #     omitted because nothing keeps a hard-coded count current.
@@ -43,8 +46,29 @@ if command -v cargo >/dev/null 2>&1; then
   cargo clippy "${RUST_CLIPPY_ARGS[@]}"
 
   echo
-  echo "[cargo] test --all-features --locked"
-  cargo test "${RUST_TEST_ARGS[@]}"
+  echo "[cargo] test --all-features --locked (two passes + temporary-root cleanup)"
+  RUST_TEST_TMPDIR="$(mktemp -d)"
+  cleanup_rust_test_tmpdir() {
+    if [[ -n "${RUST_TEST_TMPDIR:-}" && -d "${RUST_TEST_TMPDIR}" ]]; then
+      rm -rf -- "${RUST_TEST_TMPDIR}"
+    fi
+  }
+  trap cleanup_rust_test_tmpdir EXIT
+  trap 'trap - EXIT INT TERM HUP; cleanup_rust_test_tmpdir; echo "Rust test validation interrupted by INT; no pass is reported." >&2; exit 130' INT
+  trap 'trap - EXIT INT TERM HUP; cleanup_rust_test_tmpdir; echo "Rust test validation interrupted by TERM; no pass is reported." >&2; exit 143' TERM
+  trap 'trap - EXIT INT TERM HUP; cleanup_rust_test_tmpdir; echo "Rust test validation interrupted by HUP; no pass is reported." >&2; exit 129' HUP
+  for run in 1 2; do
+    echo "Rust test pass ${run}/2"
+    TMPDIR="${RUST_TEST_TMPDIR}" cargo test "${RUST_TEST_ARGS[@]}"
+    leaked="$(find "${RUST_TEST_TMPDIR}" -mindepth 1 -maxdepth 1 -type d -name 'private-gallery-*' -print)"
+    if [[ -n "${leaked}" ]]; then
+      echo "Rust tests left temporary directories after pass ${run}:" >&2
+      printf '%s\n' "${leaked}" >&2
+      exit 1
+    fi
+  done
+  cleanup_rust_test_tmpdir
+  trap - EXIT INT TERM HUP
 else
   echo "cargo not available; skipping Rust validation." >&2
   exit 1
