@@ -453,7 +453,7 @@ YAML_SUITES = (
     "required_checks_test.sh",
     "release_workflow_test.sh",
 )
-RUNNERS = ("scripts/tests/", "run_release_gate_tests.sh")
+RUNNERS = ("scripts/tests/run_release_gate_tests.sh",)
 
 
 def step_text(step):

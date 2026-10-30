@@ -17,15 +17,17 @@ jobs:
   rust:
     name: Rust service
     runs-on: ubuntu-24.04
-    timeout-minutes: 50
+    timeout-minutes: 75
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
       - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends gnome-keyring libdbus-1-dev pkg-config libsecret-1-dev
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends gnome-keyring libdbus-1-dev pkg-config libsecret-1-dev libsecret-tools iproute2 util-linux
       - name: Format
         run: cargo fmt --check
       - name: Clippy
@@ -45,10 +47,20 @@ jobs:
               exit 1
             fi
           done
+      - name: Iroh 0.98.2 endpoint and 1.x transfer contract test
+        run: bash scripts/tests/iroh_mixed_version_sync_test.sh
       - name: Verify production vault keys round-trip through Secret Service
         run: bash scripts/test_vault_keyring_e2e.sh
       - name: Verify portable recovery across independent Secret Service sessions
         run: bash scripts/test_portable_recovery_e2e.sh
+      - name: Permit private test network namespaces on the disposable runner
+        # Ubuntu 24.04's AppArmor default restricts unprivileged user namespaces.
+        # Both app versions still run in a namespace with no external route.
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      - name: Historical 0.98.2 and current application Push eviction Pull acceptance
+        env:
+          CARGO_BUILD_JOBS: 2
+        run: bash scripts/tests/iroh_historical_app_test.sh
 
   encryption-durability:
     name: Encryption durability (${{ matrix.os }})
