@@ -29,7 +29,7 @@ rationale.
 
 ## Dependency vulnerabilities
 
-### Resolved in the dependency graph (protocol gate still open)
+### Iroh dependency and compatibility upgrade
 
 - `cmov` CVE GHSA-3rjw-m598-pq24 — fixed by dependabot bump to 0.5.4 (PR #17,
   merged). Query: "Which asset is optional" — used only by `textmarker` in the
@@ -40,15 +40,38 @@ rationale.
   locked dependency graph contains no Hickory packages, so these advisories no
   longer apply to this repository. The Iroh 1.4.1 locked graph also removes the old
   `atomic-polyfill` warning and upgrades `lru` to 0.18.5, above the patched
-  minimum. `cargo audit --json` reports zero vulnerabilities and one visible
-  informational warning: `paste` 1.0.15 is an unmaintained compile-time macro
-  dependency in Iroh's `netwatch` netlink stack; it is not suppressed. The
-  yanked `yoke-derive` 0.8.3 lock entry was advanced to 0.8.4. Issue #122 now
-  has a regression test for the existing persisted identity format and a
-  hermetic four-path Iroh 0.98.2 peer/current 1.x production transfer-contract
-  test. The legacy-side peer is an independent fixture, not the historical
-  Photo Organizer 0.98.2 implementation. Old-app/new-app compatibility is
-  still unproven, so issue #122 remains open.
+  minimum. The yanked `yoke-derive` 0.8.3 lock entry was advanced to 0.8.4.
+  PR #175 merged as `1fd18ae7` after all 27 current checks passed, including
+  the actual historical Photo Organizer 0.98.2 daemon/current 1.x daemon
+  acceptance in both role placements. The gate verifies encrypted Push,
+  persisted replica proof before eviction, restart, Pull, exact original bytes,
+  and enrolled identity preservation after upgrade. The independent wire peer
+  remains separate regression coverage; it is not the historical-app proof.
+
+### Audit refresh: 30 October 2026 (#228)
+
+The PR #175 hosted audit reported no vulnerability errors but five visible
+informational warnings. A green audit exit did not mean that `paste` was the
+only warning:
+
+- `tokio` 1.53.1: RUSTSEC-2026-0386, unsound `AsyncFd` constructors. The
+  production minimum and lock now require 1.53.3, the patched maintenance
+  release. The transport and historical application gates must pass again.
+- `paste` 1.0.15: RUSTSEC-2024-0436, unmaintained compile-time macro dependency
+  through Iroh's netlink stack. It remains visible and unsuppressed.
+- `zbus_names` 3.0.0, `zvariant` 4.2.0 and `zvariant_derive` 4.2.0:
+  RUSTSEC-2026-0371, -0370 and -0372, respectively. These are present in the
+  lockfile through optional keyring dependencies. `cargo tree --locked
+  --target all --all-features -i zbus` (and the equivalent `zvariant` and
+  `secret-service` queries) finds no active reverse dependency for the configured
+  workspace. The selected Linux keyring uses synchronous `dbus-secret-service`.
+  This is an applicability finding, not removal from the lockfile or a claim
+  that those crates are maintained. Reassess before enabling an asynchronous
+  keyring backend or changing keyring features.
+
+No advisory ignores were added. The immutable historical source used only by
+the isolated compatibility harness intentionally retains its original lockfile;
+its dependencies are not part of the shipped product dependency graph.
 
 ### Merged this session
 
