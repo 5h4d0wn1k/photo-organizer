@@ -1193,6 +1193,22 @@ mutate "a gate's evidence upload stops running when the gate fails (macos-smoke)
   '      - name: Upload macOS smoke evidence' \
   "must keep an unconditional evidence upload"
 
+# `failure()` sounds unconditional but skips the upload on a successful gate.
+# It must not satisfy the same guard check as `always()` or `!cancelled()`.
+mutate "a gate's evidence upload only runs after failure (linux-smoke)" \
+  '      - name: Upload Linux smoke evidence
+        if: always()' \
+  '      - name: Upload Linux smoke evidence
+        if: failure()' \
+  "must keep an unconditional evidence upload"
+
+mutate "an evidence upload hides always() in a compound condition" \
+  '      - name: Upload Linux smoke evidence
+        if: always()' \
+  '      - name: Upload Linux smoke evidence
+        if: always() && false' \
+  "must keep an unconditional evidence upload"
+
 # The action's default creates a release with zero assets when the glob matches
 # nothing, which is a live public release missing every platform.
 mutate "the publish step loses fail_on_unmatched_files and can create an empty release" \

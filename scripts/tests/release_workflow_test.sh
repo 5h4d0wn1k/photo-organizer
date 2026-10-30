@@ -484,17 +484,21 @@ expect(
 # Classified structurally -- "runs regardless of prior failure" -- instead of by
 # job or step name, so a newly added unconditional upload inherits the
 # requirement rather than relying on someone remembering it.
-ALWAYS_RUNNING_GUARDS = ("always()", "!cancelled()", "failure()")
+ALWAYS_RUNNING_GUARDS = ("always()", "!cancelled()")
+
+def is_unconditional_guard(value):
+    guard = str(value or "").strip()
+    if guard.startswith("${{") and guard.endswith("}}"):
+        guard = guard[3:-2].strip()
+    return guard in ALWAYS_RUNNING_GUARDS
+
 unconditional_uploads = [
     (unconditional_job, unconditional_step)
     for unconditional_job, unconditional_spec in jobs.items()
     for unconditional_step in ((unconditional_spec or {}).get("steps") or [])
     if isinstance(unconditional_step, dict)
     and "upload-artifact" in str(unconditional_step.get("uses", ""))
-    and any(
-        guard in str(unconditional_step.get("if") or "")
-        for guard in ALWAYS_RUNNING_GUARDS
-    )
+    and is_unconditional_guard(unconditional_step.get("if"))
 ]
 expect(
     len(unconditional_uploads) > 0,
@@ -539,10 +543,7 @@ gates_without_evidence = [
     for evidence_gate in EVIDENCE_CARRYING_GATES
     if not any(
         "upload-artifact" in str(evidence_step.get("uses", ""))
-        and any(
-            guard in str(evidence_step.get("if") or "")
-            for guard in ALWAYS_RUNNING_GUARDS
-        )
+        and is_unconditional_guard(evidence_step.get("if"))
         for evidence_step in ((jobs.get(evidence_gate) or {}).get("steps") or [])
         if isinstance(evidence_step, dict)
     )
