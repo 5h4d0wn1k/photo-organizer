@@ -2,9 +2,11 @@
 
 ## Status
 
-Proposed. The dependency and transfer-contract evidence supports this upgrade,
-but the project acceptance gate remains open until a mixed-version verified
-sync transfer is exercised by both historical and current application code.
+Accepted in PR #175 (`1fd18ae7`) after all 27 hosted checks passed, including
+mixed-version verified sync exercised by the historical and current application
+code. Physical platform acceptance and public relay limitations remain separate
+release requirements. See the current audit refresh in
+`docs/SECURITY_GATES_TRIAGE.md` for later advisory findings and remediation.
 
 ## Context
 
