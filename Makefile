@@ -8,7 +8,7 @@ help:
 	@echo "  lint               cargo clippy -D warnings"
 	@echo "  test               cargo test (Rust workspace)"
 	@echo "  iroh-interop-test  mixed-version Iroh 0.98.2/1.x verified sync transfer test"
-	@echo "  check              scripts/dev-check.sh (Rust + Flutter + release gate when available)"
+	@echo "  check              scripts/dev-check.sh (Rust + Flutter + structural tests + release gate)"
 	@echo "  workspace-status   offline worktree and branch inventory"
 	@echo "  deps               install the hash-pinned test dependencies (scripts/requirements-test.txt)"
 	@echo "  audit              cargo audit"

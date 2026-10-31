@@ -89,6 +89,7 @@ _Generated from `native_core/src/api.rs` by `scripts/generate-api-list.py` -- ed
 - `POST /assets/{asset_id}/flags`
 - `GET /assets/{asset_id}/original`
 - `POST /assets/{asset_id}/pin-local`
+- `GET /assets/{asset_id}/preview`
 - `POST /assets/{asset_id}/tags`
 
 ### `/audit`
@@ -249,6 +250,11 @@ _Generated from `native_core/src/api.rs` by `scripts/generate-api-list.py` -- ed
 
 - `GET /privacy/status`
 
+### `/quarantine`
+
+- `GET /quarantine/originals`
+- `POST /quarantine/originals/{asset_id}/repair`
+
 ### `/release`
 
 - `GET /release/readiness`
@@ -302,6 +308,7 @@ _Generated from `native_core/src/api.rs` by `scripts/generate-api-list.py` -- ed
 ### `/vaults`
 
 - `GET /vaults`
+- `POST /vaults/{vault_id}/imports/assets`
 - `GET /vaults/{vault_id}/status`
 - `POST /vaults/{vault_id}/storage-policy`
 

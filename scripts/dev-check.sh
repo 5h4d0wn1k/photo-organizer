@@ -1,30 +1,112 @@
 #!/usr/bin/env bash
+#
+# The host-local inner loop. Shared Rust and Flutter checks use the same commands
+# and feature flags here as in CI. This is not a substitute for platform-hosted
+# acceptance, provider integrations, or the full CI result. Issue #84 fixed
+# three gaps in the shared local path:
+#
+#   * CI ran clippy with --all-features -D warnings and this script ran neither
+#     clippy nor a locked test, so a lint error or a stale lockfile only ever
+#     surfaced after a push.
+#   * CI ran Rust tests twice with an isolated TMPDIR and checked that tests
+#     removed their `private-gallery-*` directories; one local pass did not
+#     exercise the repeated-run cleanup contract.
+#   * CI ran `flutter test` and this script ran `flutter analyze` alone, so a
+#     broken widget test looked green until CI said otherwise. Test counts are
+#     omitted because nothing keeps a hard-coded count current.
+#   * CI ran workflow_hygiene_test.sh and required_checks_test.sh in the
+#     `security` job and this script ran neither, so a broken workflow contract
+#     looked green until CI said otherwise.
+#
+# This script may run extra device-free checks that CI does not, such as the
+# API-list consistency check. A missing Rust or Flutter toolchain is an error,
+# not a silent skip. The release-gate runner may report a named DEGRADED result
+# when a host-specific SDK is absent; that is never full release evidence.
 
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+CARGO_MANIFEST="${ROOT_DIR}/native_core/Cargo.toml"
+
+# The exact flags CI uses. Kept in one place so a future CI change is a
+# one-line edit here rather than a silent divergence.
+RUST_FMT_ARGS=(--manifest-path "${CARGO_MANIFEST}" --all -- --check)
+RUST_CLIPPY_ARGS=(--manifest-path "${CARGO_MANIFEST}" --all-targets --all-features --locked -- -D warnings)
+RUST_TEST_ARGS=(--manifest-path "${CARGO_MANIFEST}" --all-features --locked)
 
 echo "Running lightweight checks from: ${ROOT_DIR}"
 
 if command -v cargo >/dev/null 2>&1; then
   echo
   echo "[cargo] fmt --check"
-  cargo fmt --manifest-path "${ROOT_DIR}/native_core/Cargo.toml" --all -- --check
+  cargo fmt "${RUST_FMT_ARGS[@]}"
 
   echo
-  echo "[cargo] test"
-  cargo test --manifest-path "${ROOT_DIR}/native_core/Cargo.toml"
+  echo "[cargo] clippy --all-targets --all-features --locked -D warnings"
+  cargo clippy "${RUST_CLIPPY_ARGS[@]}"
+
+  echo
+  echo "[cargo] test --all-features --locked (two passes + temporary-root cleanup)"
+  RUST_TEST_TMPDIR="$(mktemp -d)"
+  cleanup_rust_test_tmpdir() {
+    if [[ -n "${RUST_TEST_TMPDIR:-}" && -d "${RUST_TEST_TMPDIR}" ]]; then
+      rm -rf -- "${RUST_TEST_TMPDIR}"
+    fi
+  }
+  trap cleanup_rust_test_tmpdir EXIT
+  trap 'trap - EXIT INT TERM HUP; cleanup_rust_test_tmpdir; echo "Rust test validation interrupted by INT; no pass is reported." >&2; exit 130' INT
+  trap 'trap - EXIT INT TERM HUP; cleanup_rust_test_tmpdir; echo "Rust test validation interrupted by TERM; no pass is reported." >&2; exit 143' TERM
+  trap 'trap - EXIT INT TERM HUP; cleanup_rust_test_tmpdir; echo "Rust test validation interrupted by HUP; no pass is reported." >&2; exit 129' HUP
+  for run in 1 2; do
+    echo "Rust test pass ${run}/2"
+    TMPDIR="${RUST_TEST_TMPDIR}" cargo test "${RUST_TEST_ARGS[@]}"
+    leaked="$(find "${RUST_TEST_TMPDIR}" -mindepth 1 -maxdepth 1 -type d -name 'private-gallery-*' -print)"
+    if [[ -n "${leaked}" ]]; then
+      echo "Rust tests left temporary directories after pass ${run}:" >&2
+      printf '%s\n' "${leaked}" >&2
+      exit 1
+    fi
+  done
+  cleanup_rust_test_tmpdir
+  trap - EXIT INT TERM HUP
 else
-  echo "cargo not available; skipping Rust validation."
+  echo "cargo not available; skipping Rust validation." >&2
+  exit 1
 fi
 
 if command -v flutter >/dev/null 2>&1; then
+  # `cd` in a subshell rather than passing absolute paths, so the commands are
+  # character-for-character the ones CI runs from `working-directory: app`. A
+  # path argument that Flutter resolves differently from the default is exactly
+  # the kind of drift this script exists to remove.
   echo
   echo "[flutter] analyze"
-  flutter analyze "${ROOT_DIR}/app"
+  (cd "${ROOT_DIR}/app" && flutter analyze)
+
+  echo
+  echo "[flutter] test"
+  (cd "${ROOT_DIR}/app" && flutter test)
 else
-  echo "flutter not available; skipping Flutter validation."
+  echo "flutter not available; skipping Flutter validation." >&2
+  exit 1
 fi
+
+# Structural tests for the things a reviewer cannot see in a diff: the workflow
+# files (which decide what code runs with which secrets) and the required-check
+# contract (which decides what gates a merge). Both are device-free and fast, so
+# there is no reason for them to be CI-only -- that was exactly how the Release
+# gate sat unrequired for a release cycle (#102).
+echo
+echo "[workflow-hygiene] .github/workflows structure"
+bash "${ROOT_DIR}/scripts/tests/workflow_hygiene_test.sh"
+
+echo
+echo "[required-checks] ci.yml job contract"
+bash "${ROOT_DIR}/scripts/tests/required_checks_test.sh"
+
+echo
+echo "[api-list] docs/architecture.md matches api.rs"
+python3 "${ROOT_DIR}/scripts/generate-api-list.py" --check
 
 # The Android release gate is the code that decides whether an artifact users
 # cannot install can be published. It is fast and device-free, so it always runs.
@@ -75,3 +157,6 @@ else
     exit 1
   fi
 fi
+
+echo
+echo "All checks passed."
