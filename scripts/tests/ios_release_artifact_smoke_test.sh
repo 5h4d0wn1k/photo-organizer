@@ -2090,6 +2090,12 @@ scenario_with
 expect_fail "a backend probe that reports unreachable fails the gate" \
   "the backend probe did not succeed" "${WORK_DIR}/Runner.app" \
   "IOS_SMOKE_BACKEND_PROBE=${WORK_DIR}/backend-unreachable"
+if grep -Fq "probe exit status: 7" "${WORK_DIR}/evidence/case-backend.txt" 2>/dev/null; then
+  ok "backend evidence preserves the probe's non-zero exit status"
+else
+  bad "backend evidence preserves the probe's non-zero exit status" \
+    "evidence said: $(tr '\n' '|' <"${WORK_DIR}/evidence/case-backend.txt" 2>/dev/null | cut -c1-240)"
+fi
 # A probe that succeeds but says nothing: an empty answer is the answer to no
 # question, so exit 0 alone must not be believed.
 expect_fail "a backend probe that exits 0 with no output fails the gate" \

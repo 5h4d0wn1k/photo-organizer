@@ -266,10 +266,23 @@ mod tests {
         let mut gap = chunk.clone();
         gap.chunk_index = 1;
         assert!(build(None, &[], &[], std::slice::from_ref(&record), &[gap]).is_err());
-        let json = serde_json::to_string(&inventory).unwrap();
-        assert!(!json.contains("nonce"));
-        assert!(!json.contains("aad"));
-        assert!(!json.contains("not exported"));
+        // Assert the serialized contract structurally. Scanning the rendered
+        // JSON for "aad" can match those letters in a random UUID and make
+        // this test flaky even though no AAD field was serialized.
+        let json = serde_json::to_value(&inventory).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "version": 1,
+                "required_keys": [{
+                    "kind": "quarantine",
+                    "object_id": record.object_id,
+                    "asset_id": record.asset_id,
+                    "key_version": 1,
+                }],
+            })
+        );
+        assert!(!json.to_string().contains("not exported"));
     }
 
     #[test]

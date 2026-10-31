@@ -190,6 +190,7 @@ install_fake_pwsh() {
 #   $FAKE_PWSH_STATE.rendering   exists once a screenshot has been taken AFTER launch
 #   $FAKE_PWSH_STATE.exited      exists once the app has exited; holds the exit code
 #   $FAKE_PWSH_STATE.enum_calls  counts window enumerations (focus-loss modelling)
+#   $FAKE_PWSH_STATE.focused     exists once focus-window.ps1 succeeds
 set -uo pipefail
 
 scenario_value() {
@@ -319,6 +320,11 @@ case "${helper}" in
     # pass this scenario, which is the bug the Android gate's in-loop re-assertion
     # exists to prevent. The fake therefore counts probes on disk.
     fg="$(value_or FG_PID "${target}")"
+    # This makes the happy path prove the focus helper is actually invoked,
+    # rather than merely materialised on disk.
+    if [[ "$(scenario_value REQUIRE_FOCUS_REQUEST || true)" == "1" && ! -f "${state}.focused" ]]; then
+      fg=9999
+    fi
     if [[ "$(scenario_value FG_AFTER_FIRST || true)" == "1" ]]; then
       probe_file="${state}.enum_calls"
       n=0
@@ -344,6 +350,20 @@ case "${helper}" in
       printf 'WIN %s 1234 1 1280x720 %s\n' "${target}" \
         "$(value_or WINDOW_TITLE_B64 "UFJpdml2YXRlIEdhbGxlcnk=")"
     fi
+    exit 0
+    ;;
+  focus-window.ps1)
+    target="${*: -1}"
+    if [[ "$(scenario_value FOCUS_GARBAGE || true)" == "1" ]]; then
+      echo "focus request completed somehow"
+      exit 0
+    fi
+    if [[ "$(scenario_value FOCUS_DENIED || true)" == "1" ]]; then
+      echo "fake pwsh: simulated SetForegroundWindow denial" >&2
+      exit 5
+    fi
+    printf '%s' "${target}" >"${state}.focused"
+    printf 'PO-FOCUS-OK %s 1234\n' "${target}"
     exit 0
     ;;
   launch.ps1)
@@ -464,8 +484,8 @@ for line in text.splitlines():
     stripped = line.rstrip("\r")
     if not stripped.startswith(("PS_", "  ")) and not stripped.endswith("'"):
         pass
-    for key in ("PS_CAPTURE_SCREENSHOT", "PS_ENUM_WINDOWS", "PS_LAUNCH",
-                "PS_PROC_LIVE", "PS_PROC_KILL", "PS_EVENTLOG"):
+    for key in ("PS_CAPTURE_SCREENSHOT", "PS_ENUM_WINDOWS", "PS_FOCUS_WINDOW",
+                "PS_LAUNCH", "PS_PROC_LIVE", "PS_PROC_KILL", "PS_EVENTLOG"):
         if stripped.startswith(key + "='"):
             name = key
             buf = [stripped.split("='", 1)[1]]
@@ -688,7 +708,8 @@ scenario_with() {
 # failure caused by the harness, in an assertion that reads like a gate defect.
 reset_fake_state() {
   rm -f "${FAKE_STATE}" "${FAKE_STATE}".rendering "${FAKE_STATE}".exited \
-    "${FAKE_STATE}".drift "${FAKE_STATE}".exitfile "${FAKE_STATE}".enum_calls
+    "${FAKE_STATE}".drift "${FAKE_STATE}".exitfile "${FAKE_STATE}".enum_calls \
+    "${FAKE_STATE}".focused
 }
 
 run_smoke() {
@@ -1153,6 +1174,21 @@ expect_fail "a window enumeration that throws fails rather than reporting no win
   "refusing to report a window check that never ran" run_smoke
 scenario_with "PS_FAIL="
 
+scenario_with "PS_FAIL=focus-window.ps1"
+expect_fail "a failed foreground request fails rather than capturing another window" \
+  "could not request and verify foreground ownership" run_smoke
+scenario_with "PS_FAIL="
+
+scenario_with "FOCUS_GARBAGE=1"
+expect_fail "an unparseable foreground reply fails rather than guessing success" \
+  "could not request and verify foreground ownership" run_smoke
+scenario_with "FOCUS_GARBAGE="
+
+scenario_with "FOCUS_DENIED=1"
+expect_fail "a denied foreground request fails rather than weakening focus ownership" \
+  "could not request and verify foreground ownership" run_smoke
+scenario_with "FOCUS_DENIED="
+
 scenario_with "PS_FAIL=capture-screenshot.ps1"
 expect_fail "an uncapturable screen fails rather than skipping the render check" \
   "pre-launch desktop baseline could not be captured" run_smoke
@@ -1181,6 +1217,10 @@ expect_fail "a missing pre-launch baseline fails the gate instead of disabling t
 scenario_with "PRELAUNCH_CAPTURE_FAILS="
 
 echo " window and focus"
+scenario_with "REQUIRE_FOCUS_REQUEST=1"
+expect_pass "the happy path invokes the foreground request before evaluating focus" run_smoke
+scenario_with "REQUIRE_FOCUS_REQUEST="
+
 scenario_with "NO_WINDOWS=1"
 expect_fail "an app that never creates a window fails instead of hanging" \
   "never created a visible top-level window" run_smoke
@@ -1461,7 +1501,7 @@ echo " PowerShell helpers (static, structural -- NOT a PowerShell parse)"
 # See the header: shellcheck has no powershell dialect, and nothing on this host
 # can parse PowerShell. These assertions catch the structural mistakes that would
 # otherwise surface only as a runtime error on the runner.
-for helper in PS_CAPTURE_SCREENSHOT PS_ENUM_WINDOWS PS_LAUNCH PS_PROC_LIVE \
+for helper in PS_CAPTURE_SCREENSHOT PS_ENUM_WINDOWS PS_FOCUS_WINDOW PS_LAUNCH PS_PROC_LIVE \
   PS_PROC_KILL PS_EVENTLOG; do
   if lint_out="$(ps_lint_report "${SCRIPT}" "${helper}" 2>&1)"; then
     ok "${helper} is structurally sound"
@@ -1469,11 +1509,12 @@ for helper in PS_CAPTURE_SCREENSHOT PS_ENUM_WINDOWS PS_LAUNCH PS_PROC_LIVE \
     bad "${helper} is structurally sound" "${lint_out}"
   fi
 done
-# The six helpers must be materialised to disk by the gate before anything is run,
+# The seven helpers must be materialised to disk by the gate before anything is run,
 # and each must be referenced by the run that goes on to invoke it. A helper that
 # is written but never wired is dead weight that reads like coverage.
 if grep -q "write_ps_helper capture-screenshot.ps1" "${SCRIPT}" &&
   grep -q "write_ps_helper enum-windows.ps1" "${SCRIPT}" &&
+  grep -q "write_ps_helper focus-window.ps1" "${SCRIPT}" &&
   grep -q "write_ps_helper launch.ps1" "${SCRIPT}" &&
   grep -q "write_ps_helper proc-live.ps1" "${SCRIPT}" &&
   grep -q "write_ps_helper proc-kill.ps1" "${SCRIPT}" &&

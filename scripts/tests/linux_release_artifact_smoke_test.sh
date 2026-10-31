@@ -127,7 +127,7 @@ check() {
 # under test, which would make every scenario meaningless.
 FARM_CORE_TOOLS=(
   awk basename bash cat chmod cp cut date dirname env find grep head mkdir
-  mktemp mv od readlink rm sed setsid sha256sum sleep sort stat tail tr uname
+  mktemp mv od readlink rm sed setsid sha256sum sleep sort stat tail tar tr uname
   wc
 )
 
@@ -535,35 +535,35 @@ exit 1
 FAKE_EOF
   chmod +x "${FARM}/compare"
 
-  # `dpkg-deb` unpacks from a template tree the scenario built, and answers
-  # control-field queries from a control file. `-x` and `-f` are the only two
-  # invocations the gate makes.
+  # `dpkg-deb` exposes the fixture's control archive and answers control-field
+  # queries. The scenario's ordinary payload install goes through the fake
+  # `dpkg` below so the gate's exact isolated-root install command is exercised.
   cat >"${FARM}/dpkg-deb" <<'FAKE_EOF'
 #!/usr/bin/env bash
-# fake dpkg-deb: unpacks a prepared template tree, and answers -f from a control
-# file. FAKE_DEB_TEMPLATE / FAKE_DEB_CONTROL say where the prepared data is.
+# fake dpkg-deb: exports control files and answers -f from a control file.
 set -uo pipefail
 mode="${1:-}"
 case "${mode}" in
-  -x)
-    root="${3:?}"
-    if [[ -n "${FAKE_DEB_X_FAIL:-}" ]]; then
+  --ctrl-tarfile)
+    archive="${2:?}"
+    if [[ -n "${FAKE_DEB_CONTROL_FAIL:-}" ]]; then
       echo "dpkg-deb: error: control archive has bad magic" >&2
       exit 2
     fi
-    # Same rule as the AppImage fake, for the same reason: a real dpkg-deb
-    # refuses a .deb whose ar/tar tail has been cut, and a fake that did not
-    # would make the zero-byte negative test prove nothing about the gate.
-    archive="${2:?}"
     want="$(awk '$1 == "deb" { print $2 }' "${FAKE_FULL_SIZES:-/nonexistent}" 2>/dev/null || true)"
     if [[ -n "${want}" && -r "${archive}" ]] && (( $(wc -c <"${archive}") < want )); then
       echo "dpkg-deb: error: control archive has bad magic" >&2
       exit 2
     fi
-    template="${FAKE_DEB_TEMPLATE:?FAKE_DEB_TEMPLATE is not set}"
-    mkdir -p "${root}"
-    cp -R "${template}/." "${root}/"
-    exit 0
+    control_dir="$(mktemp -d)"
+    cp "${FAKE_DEB_CONTROL:?FAKE_DEB_CONTROL is not set}" "${control_dir}/control"
+    if [[ -n "${FAKE_DEB_SCRIPT:-}" ]]; then
+      printf '#!/bin/sh\nexit 0\n' >"${control_dir}/${FAKE_DEB_SCRIPT}"
+    fi
+    tar -cf - -C "${control_dir}" .
+    status=$?
+    rm -rf -- "${control_dir}"
+    exit "${status}"
     ;;
   -f)
     field="${3:?}"
@@ -587,53 +587,61 @@ esac
 FAKE_EOF
   chmod +x "${FARM}/dpkg-deb"
 
-  # `bsdtar` is the documented fallback extractor, so the suite exercises that
-  # path too rather than leaving it unrun.
-  cat >"${FARM}/bsdtar" <<'FAKE_EOF'
+  cat >"${FARM}/dpkg" <<'FAKE_EOF'
 #!/usr/bin/env bash
-# fake bsdtar: enough of libarchive to stand in for the gate's fallback path.
+# fake dpkg: require the private --root install mode and copy the prepared
+# fixture into that root, recording the actual arguments for evidence checks.
 set -uo pipefail
-template="${FAKE_DEB_TEMPLATE:?}"
-control="${FAKE_DEB_CONTROL:?}"
-case "${1:-}" in
-  -xf)
-    dir=""
-    member=""
-    shift
-    while [[ $# -gt 0 ]]; do
-      case "$1" in
-        -C) dir="$2"; shift 2 ;;
-        -*) shift ;;
-        *) member="$1"; shift ;;
-      esac
-    done
-    if [[ -n "${member}" && "${member}" == control.tar.* ]]; then
-      mkdir -p "${dir}/${member}"
-      cp -f "${control}" "${dir}/${member}/control"
-      exit 0
-    fi
-    if [[ -n "${dir}" ]]; then
-      mkdir -p "${dir}"
-      cp -R "${template}/." "${dir}/"
-    fi
-    exit 0
-    ;;
-  -tf)
-    printf 'debian-binary\ncontrol.tar.gz\ndata.tar.xz\n'
-    exit 0
-    ;;
-  -xOf)
-    # Print the control member's ./control to stdout.
-    cat "${control}"
-    exit 0
-    ;;
+root=""
+archive=""
+install=0
+force_not_root=0
+while (($#)); do
+  case "$1" in
+    --root=*) root="${1#*=}"; shift ;;
+    --force-not-root) force_not_root=1; shift ;;
+    --install) install=1; shift ;;
+    *)
+      if ((install)) && [[ -z "${archive}" ]]; then
+        archive="$1"
+        shift
+      else
+        echo "fake dpkg: unsupported argument $1" >&2
+        exit 2
+      fi
+      ;;
+  esac
+done
+if (( ! install || ! force_not_root )) || [[ -z "${root}" || -z "${archive}" ]]; then
+  echo "fake dpkg: expected --root=DIR --force-not-root --install FILE" >&2
+  exit 2
+fi
+case "${root}" in
+  "${TMPDIR}"/linux-smoke-scratch.*/deb/root) ;;
   *)
-    echo "fake bsdtar: unsupported arguments: $*" >&2
+    echo "fake dpkg: refusing an install root outside the gate's private scratch tree: ${root}" >&2
     exit 2
     ;;
 esac
+if [[ -n "${FAKE_DPKG_INSTALL_FAIL:-}" ]]; then
+  echo "dpkg: error: injected private-root installation failure" >&2
+  exit 2
+fi
+want="$(awk '$1 == "deb" { print $2 }' "${FAKE_FULL_SIZES:-/nonexistent}" 2>/dev/null || true)"
+if [[ -n "${want}" && -r "${archive}" ]] && (( $(wc -c <"${archive}") < want )); then
+  echo "dpkg: error: package archive is truncated" >&2
+  exit 2
+fi
+mkdir -p "${root}"
+cp -R "${FAKE_DEB_TEMPLATE:?FAKE_DEB_TEMPLATE is not set}/." "${root}/"
+mkdir -p "${root}/var/lib/dpkg"
+{
+  sed -n '/^Package:/p; /^Version:/p; /^Architecture:/p' "${FAKE_DEB_CONTROL:?}"
+  printf 'Status: install ok installed\n'
+} >"${root}/var/lib/dpkg/status"
+printf 'fake dpkg isolated install: --root=%s --force-not-root --install %s\n' "${root}" "${archive}"
 FAKE_EOF
-  chmod +x "${FARM}/bsdtar"
+  chmod +x "${FARM}/dpkg"
 }
 
 # ---------------------------------------------------------------------------
@@ -705,7 +713,7 @@ make_elf_fixture() {
 make_appimage_template() {
   local dir="$1"
   shift
-  local desktop_exec="photo-organizer"
+  local desktop_exec="AppRun"
   local omit="" not_exec="" not_elf="" wrong_arch=""
   local kv k v
   for kv in "$@"; do
@@ -854,7 +862,9 @@ make_control() {
   shift
   local omit="${1:-}"
   {
-    printf 'Package: photo-organizer\n'
+    if [[ "${omit}" != "Package" ]]; then
+      printf 'Package: photo-organizer\n'
+    fi
     if [[ "${omit}" != "Version" ]]; then
       printf 'Version: 0.1.7\n'
     fi
@@ -1022,7 +1032,9 @@ run_gate() {
     FAKE_COMPARE_SETTLE_GARBAGE="${TEST_COMPARE_SETTLE_GARBAGE:-}" \
     FAKE_DEB_TEMPLATE="${TEST_DEB_TEMPLATE:-}" \
     FAKE_DEB_CONTROL="${TEST_DEB_CONTROL:-}" \
-    FAKE_DEB_X_FAIL="${TEST_DEB_X_FAIL:-}" \
+    FAKE_DEB_SCRIPT="${TEST_DEB_SCRIPT:-}" \
+    FAKE_DEB_CONTROL_FAIL="${TEST_DEB_CONTROL_FAIL:-}" \
+    FAKE_DPKG_INSTALL_FAIL="${TEST_DPKG_INSTALL_FAIL:-}" \
     FAKE_DEB_F_MISSING="${TEST_DEB_F_MISSING:-}" \
     FAKE_APPIMAGE_TEMPLATE="${TEST_APPIMAGE_TEMPLATE:-}" \
     FAKE_APPIMAGE_EXTRACT_FAIL="${TEST_APPIMAGE_EXTRACT_FAIL:-}" \
@@ -1364,8 +1376,9 @@ reset_env() {
     TEST_COLOURS \
     TEST_SETTLE_DIFF TEST_COMPARE_GARBAGE TEST_COMPARE_SETTLE_GARBAGE \
     TEST_COMPARE_FORMAT \
-    TEST_DEB_TEMPLATE TEST_DEB_CONTROL \
-    TEST_DEB_X_FAIL TEST_DEB_F_MISSING TEST_APPIMAGE_TEMPLATE \
+    TEST_DEB_TEMPLATE TEST_DEB_CONTROL TEST_DEB_SCRIPT \
+    TEST_DEB_CONTROL_FAIL TEST_DPKG_INSTALL_FAIL \
+    TEST_DEB_F_MISSING TEST_APPIMAGE_TEMPLATE \
     TEST_APPIMAGE_EXTRACT_FAIL TEST_APP_BEHAVIOUR TEST_IMPORT_SINK \
     TEST_GATE_TIMEOUT TEST_SETTLE_SECONDS 2>/dev/null || true
   unset FAKE_XWININFO_TREE_MODE FAKE_XWININFO_ID_MODE 2>/dev/null || true
@@ -1387,6 +1400,8 @@ make_elf_fixture
 
 bash -n "${GATE}" 2>/dev/null
 check "the gate parses as bash" "$([[ $? -eq 0 ]] && echo 1 || echo 0)"
+python3 "${REPO_ROOT}/scripts/tests/linux_apprun_test.py"
+check "the packaged launcher reaches Flutter without blocking on galleryd" "$([[ $? -eq 0 ]] && echo 1 || echo 0)"
 
 if command -v shellcheck >/dev/null 2>&1; then
   shellcheck --severity=warning "${GATE}" >/dev/null 2>&1
@@ -1408,10 +1423,16 @@ assert_evidence_contains "evidence records the appimage window geometry" \
   "appimage_window_geometry=1280x720+0+0" happy
 assert_evidence_contains "evidence records the deb leg completing" \
   "result=pass" happy
+assert_evidence_contains "the .deb is installed with dpkg into the isolated root" \
+  "fake dpkg isolated install: --root=" happy
+assert_evidence_contains "the isolated dpkg install uses the exact artifact" \
+  "--force-not-root --install" happy
+assert_evidence_contains "the gate records its private dpkg installer" \
+  "deb_installer=dpkg --root (private staging root)" happy
 assert_evidence_contains "evidence records the recorded distinct-colour count" \
   "appimage_colours=500" happy
-assert_evidence_contains "the AppImage's bare-name desktop Exec is reported as unresolved" \
-  "appimage_desktop_exec_resolves=no" happy
+assert_evidence_contains "the AppImage desktop entry resolves to its packaged AppRun" \
+  "appimage_desktop_exec_resolves=yes" happy
 # Asserted against the recorded xvfb-run ARGUMENTS, not against the evidence
 # directory. The evidence directory contains `xvfb_server_args=-screen 0
 # 1280x800x24 ...` because the gate records the string it *intends* to pass, so
@@ -1778,32 +1799,64 @@ TEST_DEB_CONTROL="${WORK}/s31/control"
 scenario_test "deb-control-missing-version" deb_control_missing
 
 reset_env
-make_good_artifacts "${WORK}/s32" ok
-TEST_DEB_X_FAIL=1
-scenario_test "deb-cannot-be-unpacked" deb_extract_failed
+make_good_artifacts "${WORK}/s31b" ok
+make_control "${WORK}/s31b/control" Package
+TEST_APPIMAGE_TEMPLATE="${WORK}/s31b/appimage-payload"
+TEST_DEB_TEMPLATE="${WORK}/s31b/deb-payload"
+TEST_DEB_CONTROL="${WORK}/s31b/control"
+scenario_test "deb-control-missing-package" deb_control_missing
 
-# A zero-byte .deb is the other truncation, and the one a real dpkg-deb rejects
-# outright. Asserted separately from the injected-extractor-failure above: that
-# one proves the gate reacts to an extractor that says no, this one proves the
-# gate is fed an artifact that any extractor must say no to.
+reset_env
+make_good_artifacts "${WORK}/s31c" ok
+make_control "${WORK}/s31c/control" Architecture
+TEST_APPIMAGE_TEMPLATE="${WORK}/s31c/appimage-payload"
+TEST_DEB_TEMPLATE="${WORK}/s31c/deb-payload"
+TEST_DEB_CONTROL="${WORK}/s31c/control"
+scenario_test "deb-control-missing-architecture" deb_control_missing
+
+reset_env
+make_good_artifacts "${WORK}/s32" ok
+TEST_DPKG_INSTALL_FAIL=1
+scenario_test "deb-install-fails" deb_install_failed
+
+reset_env
+make_good_artifacts "${WORK}/s32-control" ok
+TEST_DEB_CONTROL_FAIL=1
+scenario_test "deb-control-inspection-fails" deb_control_inspection_failed
+
+reset_env
+make_good_artifacts "${WORK}/s32a" ok
+TEST_DEB_SCRIPT=postinst
+scenario_test "deb-maintainer-script-is-refused" deb_maintainer_script_unsupported
+
+# A zero-byte .deb is rejected by the real control-archive inspection before
+# package installation; the fixture double applies the same size check.
 reset_env
 make_good_artifacts "${WORK}/s32b" ok
 : >"${WORK}/s32b/out/photo-organizer_0.1.7_amd64.deb"
-scenario_test "deb-truncated-to-zero-bytes" deb_extract_failed
+scenario_test "deb-truncated-to-zero-bytes" deb_control_inspection_failed
 
 reset_env
 make_good_artifacts "${WORK}/s33" ok
-rm -f "${FARM}/dpkg-deb" "${FARM}/bsdtar"
-scenario_test "no-way-to-unpack-a-deb" deb_extract_failed
+rm -f "${FARM}/dpkg"
+scenario_test "dpkg-installer-missing" deb_install_failed
 
-# The bsdtar fallback path must be exercised, not just written.
 reset_env
 make_good_artifacts "${WORK}/s34" ok
 rm -f "${FARM}/dpkg-deb"
-run_gate s34 "${GATE}"
-assert_green "the bsdtar fallback extractor is used when dpkg-deb is absent"
-assert_evidence_contains "the fallback extractor is named in the evidence" \
-  "deb_extractor=bsdtar" s34
+scenario_test "dpkg-deb-control-inspector-missing" deb_control_inspection_failed
+
+reset_env
+make_good_artifacts "${WORK}/s34a" ok
+TEST_DPKG_INSTALL_FAIL=1
+mutation_on_broken "deb-install" deb_install_failed \
+  's/if ! dpkg --root="${DEB_ROOT}" --force-not-root --install "${DEB}"/if false \&\& dpkg --root="${DEB_ROOT}" --force-not-root --install "${DEB}"/'
+
+reset_env
+make_good_artifacts "${WORK}/s34b" ok
+TEST_DEB_SCRIPT=postinst
+mutation_on_broken "deb-maintainer-script" deb_maintainer_script_unsupported \
+  's/if \[\[ "${control_member}" == "${maintainer_script}" || "${control_member}" == \*\/"${maintainer_script}" \]\]; then/if false; then/'
 
 reset_env
 make_good_artifacts "${WORK}/s35" ok
@@ -1938,37 +1991,24 @@ mut "engine-architecture" appimage_payload_not_elf \
   's/if \[\[ "${machine}" != "3e00" \]\]; then/if [[ "${machine}" == "3e00" ]]; then/'
 
 reset_env
-# The hard `appimage_desktop_exec_unresolvable` failure is only reached when the
-# desktop entry names an ABSOLUTE path that is not in the payload. The good
-# fixture carries the repo's real bare `Exec=photo-organizer`, which is the
-# recorded packaging warning, not this failure -- so the fixture is rebuilt with
-# a broken absolute Exec and the `-x` test is then disabled to show that it is
-# what caught it.
+# Both absolute and bare invalid launchers must fail before launch.
 make_good_artifacts "${WORK}/mut-appimage-desktop-exec-abs" ok
 make_appimage_template "${WORK}/mut-appimage-desktop-exec-abs/appimage-payload" \
   desktop_exec=/opt/photo-organizer/does-not-exist
 TEST_APPIMAGE_TEMPLATE="${WORK}/mut-appimage-desktop-exec-abs/appimage-payload"
 mutation_on_broken "appimage-desktop-exec-abs" appimage_desktop_exec_unresolvable \
-  's/if \[\[ -x "${PAYLOAD}${appimage_desktop_exec}" \]\]; then/if [[ -n "${appimage_desktop_exec}" ]]; then/'
+  's/elif \[\[ "${appimage_desktop_exec}" != "AppRun" || ! -x "${PAYLOAD}\/AppRun" \]\]; then/elif false; then/'
 
 reset_env
-# The bare-name case is a RECORDED warning, not a verdict, so it is proven by
-# showing the recorded value moves. It is proven in the "resolves" direction
-# because that is the only one available: the recorded failure text is a
-# constant, so forcing the check false on the DEFAULT fixture just re-records
-# the same "no". Here the fixture's bare `Exec=AppRun` genuinely resolves, the
-# pristine run records `yes`, and disabling the `-x` test turns that into `no`.
-# With the `resolves=no` assertion on the happy run, both recorded values are
-# then proven computed rather than hard-coded.
+# The previously shipped bare-name launcher must now fail closed too.
 make_good_artifacts "${WORK}/mut-appimage-desktop-exec-warn" ok
 make_appimage_template "${WORK}/mut-appimage-desktop-exec-warn/appimage-payload" \
-  desktop_exec=AppRun
+  desktop_exec=photo-organizer
 TEST_APPIMAGE_TEMPLATE="${WORK}/mut-appimage-desktop-exec-warn/appimage-payload"
 TEST_DEB_TEMPLATE="${WORK}/mut-appimage-desktop-exec-warn/deb-payload"
 TEST_DEB_CONTROL="${WORK}/mut-appimage-desktop-exec-warn/control"
-mutation_flips_evidence "appimage-desktop-exec-warn" \
-  "appimage_desktop_exec_resolves=yes" "appimage_desktop_exec_resolves=no" \
-  's%if \[\[ -x "${PAYLOAD}/${appimage_desktop_exec}" || -x "${PAYLOAD}/usr/bin/${appimage_desktop_exec}" \]\]; then%if false; then%'
+mutation_on_broken "appimage-desktop-exec-bare" appimage_desktop_exec_unresolvable \
+  's/elif \[\[ "${appimage_desktop_exec}" != "AppRun" || ! -x "${PAYLOAD}\/AppRun" \]\]; then/elif false; then/'
 
 reset_env
 mut "artifact-discovery-appimage" artifact_discovery \
@@ -2124,23 +2164,6 @@ mut "imagemagick-tooling" imagemagick_tooling \
 reset_env
 mut "root-geometry" root_geometry \
   's/if \[\[ -z "${dims}" \]\]; then/if [[ -n "${dims}" ]]; then/'
-
-reset_env
-# `deb_extract_failed` has three producers and a good fixture reaches none of
-# them, so a good-artifact mutation is impossible here. The first attempt was
-# `if command -v dpkg-deb` -> `if false`, which does not fail the gate at all:
-# it just selects the bsdtar fallback, which then SUCCEEDS, and the run stays
-# green. The dimension that matters is the one the scenario already covers -- the
-# no-extractor-at-all path. What has to be proven here is that a failing
-# extractor is FATAL, so the broken input is a .deb that cannot be unpacked and
-# the mutation makes the failure branch unreachable: the run then dies later and
-# honestly, on `deb_layout_missing`, because the extraction directory is empty.
-# That is the load-bearing difference -- swallowing the failure still reddens the
-# run, but with a different and much less informative reason.
-make_good_artifacts "${WORK}/mut-deb-extractor" ok
-TEST_DEB_X_FAIL=1
-mutation_on_broken "deb-extractor" deb_extract_failed \
-  's/if ! dpkg-deb -x "${DEB}"/if false \&\& dpkg-deb -x "${DEB}"/'
 
 reset_env
 mut "deb-layout" deb_layout_missing \

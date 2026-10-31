@@ -497,9 +497,9 @@ run_mutation "F2" \
 
 run_mutation "F3" \
   'believe a backend probe that exits non-zero' \
-  'if ! out="$(run_with_deadline "${BACKEND_TIMEOUT_SECONDS}" "${probe}" 2>&1)"; then' \
   'if out="$(run_with_deadline "${BACKEND_TIMEOUT_SECONDS}" "${probe}" 2>&1)"; then' \
-  'a backend probe that reports unreachable fails the gate'
+  'if ! out="$(run_with_deadline "${BACKEND_TIMEOUT_SECONDS}" "${probe}" 2>&1)"; then' \
+  "backend evidence preserves the probe's non-zero exit status"
 
 run_mutation "F4" \
   'record PASS before the backend question is asked' \

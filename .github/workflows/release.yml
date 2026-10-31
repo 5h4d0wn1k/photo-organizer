@@ -403,9 +403,16 @@ jobs:
           rm -rf "${APP_PATH}/Contents/MacOS/ml_sidecar"
           cp -R ml_sidecar "${APP_PATH}/Contents/MacOS/ml_sidecar"
           chmod +x "${APP_PATH}/Contents/MacOS/ml_sidecar/private_gallery_ml_sidecar.py"
+          # Flutter signs its bundle during the build. Adding the daemon and
+          # sidecar afterwards invalidates that seal, which macOS can refuse to
+          # launch even though the DMG mounts successfully. An ad-hoc seal makes
+          # the exact assembled bundle internally consistent; it is not a
+          # Developer ID signature and does not claim notarization.
+          codesign --force --deep --sign - --preserve-metadata=entitlements,requirements,flags "${APP_PATH}"
+          codesign --verify --deep --strict --verbose=4 "${APP_PATH}"
           # Create DMG
           hdiutil create -volname "Photo Organizer" -srcfolder "${APP_PATH}" -ov -format UDZO "photo-organizer-macos-${REF_NAME}.dmg"
-          echo "Note: unsigned build; no notarization performed."
+          echo "Note: ad-hoc signed for launch integrity only; no Developer ID signing or notarization performed."
 
       - name: Upload macOS artifact
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
